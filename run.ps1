@@ -68,6 +68,8 @@ if (-not (Test-Path $DiskImage)) {
 $QemuArgs = @(
     "-machine", "q35",
     "-cpu", "qemu64",
+    "-accel", "whpx",
+    "-accel", "tcg",
     "-m", "256M",
     "-bios", $OvmfFw,
     "-drive", "file=$DiskImage,format=raw",

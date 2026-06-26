@@ -56,6 +56,8 @@ echo ""
 qemu-system-x86_64              \
     -machine q35                \
     -cpu qemu64                 \
+    -accel kvm                  \
+    -accel tcg                  \
     -m 256M                     \
     -bios "$OVMF"              \
     -drive file="$DISK",format=raw \
