@@ -19,6 +19,7 @@
 #include <wynland/vmm.h>
 #include <wynland/heap.h>
 #include <wynland/irq.h>
+#include <wynland/mouse.h>
 
 #include <wynland/font.h>
 
@@ -326,6 +327,7 @@ static void draw_circle(BootInfo *info, uint32_t cx, uint32_t cy, uint32_t r, ui
 
 static void draw_terminal_window(BootInfo *info)
 {
+    mouse_hide();
     /* Terminal window parameters - sized dynamically to screen resolution */
     term_w = info->fb_width * 4 / 5;
     term_h = info->fb_height * 3 / 4;
@@ -370,6 +372,7 @@ static void draw_terminal_window(BootInfo *info)
     uint32_t title_len = str_len(title);
     uint32_t title_start_x = term_x + (term_w - title_len * CHAR_STEP) / 2;
     fb_draw_string(info, title_start_x, term_y + 7, title, 0x00FFFFFF, 0x001A1A26);
+    mouse_show();
 }
 
 /* ============================================================
@@ -502,10 +505,12 @@ void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
 
 void console_print_string(BootInfo *info, const char *str, uint32_t fg, uint32_t bg)
 {
+    mouse_hide();
     while (*str) {
         console_print_char(info, *str, fg, bg);
         str++;
     }
+    mouse_show();
 }
 
 /* ============================================================
@@ -548,6 +553,7 @@ static const char* find_suggestion(const char *prefix, int len)
 
 static void draw_input_line(BootInfo *info, const char *prompt, const char *input, const char *suggestion)
 {
+    mouse_hide();
     disable_serial_mirror = true;
 
     /* Clear line, then print prompt + user text */
@@ -571,6 +577,7 @@ static void draw_input_line(BootInfo *info, const char *prompt, const char *inpu
     fb_draw_char(info, console_start_x + cursor_x * CHAR_STEP, console_start_y + cursor_y * LINE_STEP, '_', 0x0000FF00, term_bg_color);
 
     disable_serial_mirror = false;
+    mouse_show();
 }
 
 /* ============================================================
@@ -849,6 +856,9 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize IRQs ---- */
     irq_init();
 
+    /* ---- Initialize Mouse ---- */
+    mouse_init(boot_info);
+
     /* ---- Initialize Serial Port (COM1) ---- */
     serial_init();
     serial_write_string("\r\nWynlandOS Kernel Starting...\r\n");
@@ -943,7 +953,9 @@ void kernel_main(BootInfo *boot_info)
                     draw_input_line(boot_info, prompt, input_buf, NULL);
                     console_print_string(boot_info, "\n", 0xFFFFFFFF, term_bg_color);
                     
+                    mouse_hide();
                     execute_command(boot_info, input_buf);
+                    mouse_show();
                     
                     input_buf[0] = '\0';
                     input_len = 0;

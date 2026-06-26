@@ -94,8 +94,8 @@ static void pic_remap(int offset1, int offset2)
     outb(PIC2_DATA, 0x01);
     io_wait();
 
-    /* Unmask Timer (IRQ0) and Keyboard (IRQ1). Mask others for now. */
-    outb(PIC1_DATA, 0xFC); /* 1111 1100 -> unmask IRQ0 and IRQ1 */
+    /* Unmask Timer (IRQ0), Keyboard (IRQ1), and Cascade (IRQ2). Mask others for now. */
+    outb(PIC1_DATA, 0xF8); /* 1111 1000 -> unmask IRQ0, IRQ1, and IRQ2 */
     outb(PIC2_DATA, 0xFF);
 }
 
@@ -130,6 +130,11 @@ void irq_handler(InterruptRegisters *regs)
         /* Keyboard interrupt */
         uint8_t scancode = inb(0x60);
         keyboard_push_scancode(scancode);
+    } else if (irq == 12) {
+        /* Mouse interrupt */
+        uint8_t data = inb(0x60);
+        extern void mouse_handle_interrupt(uint8_t data);
+        mouse_handle_interrupt(data);
     }
 
     /* Send End of Interrupt (EOI) to PIC */
