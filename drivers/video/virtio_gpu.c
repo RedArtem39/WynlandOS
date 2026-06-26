@@ -21,7 +21,7 @@ extern uint32_t  comp_get_height(void);
 
 /* PCI IDs for VirtIO */
 #define VIRTIO_VENDOR_ID         0x1AF4
-#define VIRTIO_GPU_DEVICE_LEGACY 0x1012  /* Transitional/Legacy GPU ID */
+#define VIRTIO_GPU_DEVICE_LEGACY 0x1050  /* Transitional/Legacy GPU ID (0x1050) */
 
 /* PCI command register bits */
 #define PCI_CMD_BUS_MASTER       0x04

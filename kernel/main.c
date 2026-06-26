@@ -1505,10 +1505,14 @@ void kernel_main(BootInfo *boot_info)
     tcp_init();
 
     /* ---- Draw gradient background ---- */
+    serial_write_string("Main: Drawing gradient background...\r\n");
     fb_draw_gradient(boot_info);
+    serial_write_string("Main: Gradient background drawn successfully.\r\n");
 
     /* ---- Draw Terminal Window ---- */
+    serial_write_string("Main: Drawing terminal window...\r\n");
     draw_terminal_window(boot_info);
+    serial_write_string("Main: Terminal window drawn successfully.\r\n");
 
     cursor_x = 0;
     cursor_y = 0;
