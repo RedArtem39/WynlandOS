@@ -322,8 +322,12 @@ static void draw_terminal_content(Window *self)
     uint32_t cw = self->w - 2;
     uint32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
 
-    /* Fill background with alpha */
-    comp_fill_rect_alpha(cx, cy, cw, ch, THEME_TERM_BG);
+    /* Fill background with alpha, or solid if maximized */
+    if (self->is_maximized) {
+        comp_fill_rect(cx, cy, cw, ch, THEME_TERM_BG & 0x00FFFFFF);
+    } else {
+        comp_fill_rect_alpha(cx, cy, cw, ch, THEME_TERM_BG);
+    }
 
     /* Render characters inside viewport */
     for (int r = 0; r < TERM_ROWS; r++) {
@@ -352,8 +356,12 @@ static void draw_settings_content(Window *self)
     uint32_t cw = self->w - 2;
     uint32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
 
-    /* Fill background with alpha */
-    comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+    /* Fill background with alpha, or solid if maximized */
+    if (self->is_maximized) {
+        comp_fill_rect(cx, cy, cw, ch, THEME_WINDOW_BG & 0x00FFFFFF);
+    } else {
+        comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+    }
 
     /* Title of settings panel */
     comp_draw_string(cx + 20, cy + 20, "WynlandOS Configuration", THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
@@ -520,9 +528,22 @@ void wm_draw_desktop(void)
                     /* Restore old background under cursor */
                     comp_restore_cursor_back();
 
-                    /* Restore wallpaper inside the union rect */
+                    /* Restore wallpaper inside the union rect (skip if top window is maximized) */
                     extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
-                    comp_draw_wallpaper_rect(ux1, uy1, ux2 - ux1, uy2 - uy1);
+                    bool loc_top_max = false;
+                    {
+                        Window *tw = g_windows_head;
+                        while (tw) {
+                            if (tw->is_visible) {
+                                if (tw->is_maximized) loc_top_max = true;
+                                break;
+                            }
+                            tw = tw->next;
+                        }
+                    }
+                    if (!loc_top_max) {
+                        comp_draw_wallpaper_rect(ux1, uy1, ux2 - ux1, uy2 - uy1);
+                    }
 
                     /* Redraw all windows from bottom to top, but only if they intersect the dirty bounds */
                     Window *win = g_windows_tail;
@@ -540,7 +561,7 @@ void wm_draw_desktop(void)
                                 if (win->draw_content) {
                                     win->draw_content(win);
                                 }
-                                if (win->is_focused) {
+                                if (win->is_focused && !win->is_maximized) {
                                     int32_t rx = win->x + win->w - 12;
                                     int32_t ry = win->y + win->h - 12;
                                     comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
@@ -684,7 +705,22 @@ void wm_draw_desktop(void)
 
     /* 1. Wallpaper (clears any saved cursor state since we reconstruct from scratch) */
     comp_clear_saved_cursor();
-    comp_draw_wallpaper();
+
+    /* Check if the top-most visible window is maximized — skip wallpaper entirely */
+    bool top_maximized = false;
+    {
+        Window *tw = g_windows_head;
+        while (tw) {
+            if (tw->is_visible) {
+                if (tw->is_maximized) top_maximized = true;
+                break;
+            }
+            tw = tw->next;
+        }
+    }
+    if (!top_maximized) {
+        comp_draw_wallpaper();
+    }
 
     /* 2. Draw all windows in reverse Z-order (bottom-most to top-most) */
     Window *win = g_windows_tail;
@@ -694,8 +730,8 @@ void wm_draw_desktop(void)
             if (win->draw_content) {
                 win->draw_content(win);
             }
-            /* Draw a resize handle in bottom-right corner of window */
-            if (win->is_focused) {
+            /* Draw a resize handle in bottom-right corner of window (skip if maximized) */
+            if (win->is_focused && !win->is_maximized) {
                 int32_t rx = win->x + win->w - 12;
                 int32_t ry = win->y + win->h - 12;
                 comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
@@ -867,8 +903,54 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         break;
                     }
 
-                    /* 2. Dragging titlebar */
-                    if (my < (int32_t)(win->y + THEME_TITLEBAR_HEIGHT)) {
+                    /* 1b. Minimize button hit (yellow, cx=38 cy=14) */
+                    int32_t min_dx = mx - (win->x + 38);
+                    int32_t min_dy = my - (win->y + 14);
+                    if (min_dx * min_dx + min_dy * min_dy <= 6 * 6) {
+                        win->is_visible = false;
+                        comp_mark_dirty();
+                        break;
+                    }
+
+                    /* 1c. Maximize button hit (green, cx=58 cy=14) */
+                    int32_t max_dx = mx - (win->x + 58);
+                    int32_t max_dy = my - (win->y + 14);
+                    if (max_dx * max_dx + max_dy * max_dy <= 6 * 6) {
+                        uint32_t scr_w = comp_get_width();
+                        uint32_t scr_h = comp_get_height();
+                        if (!win->is_maximized) {
+                            /* Save normal floating bounds */
+                            win->normal_x = win->x;
+                            win->normal_y = win->y;
+                            win->normal_w = win->w;
+                            win->normal_h = win->h;
+                            /* Expand to fill screen below panel */
+                            win->x = 0;
+                            win->y = THEME_PANEL_HEIGHT;
+                            win->w = scr_w;
+                            win->h = scr_h - THEME_PANEL_HEIGHT;
+                            win->is_maximized = true;
+                        } else {
+                            /* Restore normal floating bounds */
+                            win->x = win->normal_x;
+                            win->y = win->normal_y;
+                            win->w = win->normal_w;
+                            win->h = win->normal_h;
+                            win->is_maximized = false;
+                        }
+                        /* Sync terminal console boundaries if terminal */
+                        if (win->id == 1) {
+                            console_start_x = win->x + 15;
+                            console_start_y = win->y + 40;
+                            console_end_x = win->x + win->w - 15;
+                            console_end_y = win->y + win->h - 15;
+                        }
+                        comp_mark_dirty();
+                        break;
+                    }
+
+                    /* 2. Dragging titlebar (blocked for maximized windows) */
+                    if (!win->is_maximized && my < (int32_t)(win->y + THEME_TITLEBAR_HEIGHT)) {
                         g_dragged_window = win;
                         g_drag_offset_x = mx - win->x;
                         g_drag_offset_y = my - win->y;
@@ -882,26 +964,33 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         g_prev_outline_h = win->h;
                     }
 
-                    /* 3. Resize handle in bottom-right corner */
-                    int32_t rx = win->x + win->w - 12;
-                    int32_t ry = win->y + win->h - 12;
-                    if (mx >= rx && mx < (int32_t)(win->x + win->w) &&
-                        my >= ry && my < (int32_t)(win->y + win->h)) {
-                        g_resizing_window = win;
-                        g_resize_start_w = win->w;
-                        g_resize_start_h = win->h;
-                        g_resize_start_mx = mx;
-                        g_resize_start_my = my;
-                        g_outline_x = win->x;
-                        g_outline_y = win->y;
-                        g_outline_w = win->w;
-                        g_outline_h = win->h;
-                        g_prev_outline_x = win->x;
-                        g_prev_outline_y = win->y;
-                        g_prev_outline_w = win->w;
-                        g_prev_outline_h = win->h;
+                    /* 3. Resize handle in bottom-right corner (blocked for maximized) */
+                    if (!win->is_maximized) {
+                        int32_t rx = win->x + win->w - 12;
+                        int32_t ry = win->y + win->h - 12;
+                        if (mx >= rx && mx < (int32_t)(win->x + win->w) &&
+                            my >= ry && my < (int32_t)(win->y + win->h)) {
+                            g_resizing_window = win;
+                            g_resize_start_w = win->w;
+                            g_resize_start_h = win->h;
+                            g_resize_start_mx = mx;
+                            g_resize_start_my = my;
+                            g_outline_x = win->x;
+                            g_outline_y = win->y;
+                            g_outline_w = win->w;
+                            g_outline_h = win->h;
+                            g_prev_outline_x = win->x;
+                            g_prev_outline_y = win->y;
+                            g_prev_outline_w = win->w;
+                            g_prev_outline_h = win->h;
+                        } else {
+                            /* 4. Custom window mouse event */
+                            if (win->handle_mouse) {
+                                win->handle_mouse(win, mx, my, buttons);
+                            }
+                        }
                     } else {
-                        /* 4. Custom window mouse event */
+                        /* Maximized: only custom mouse, no resize */
                         if (win->handle_mouse) {
                             win->handle_mouse(win, mx, my, buttons);
                         }

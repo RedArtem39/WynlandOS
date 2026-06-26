@@ -109,7 +109,12 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         return status;
     }
 
-    /* Enumerate all available modes and find a standard crisp resolution (prefer exactly 1024x768 or 1280x720) */
+    /* Enumerate all available modes and find a standard crisp resolution (prefer exactly 1280x720 first, then 1024x768) */
+    UINT32 found1280 = 0;
+    UINT32 mode1280 = 0;
+    UINT32 found1024 = 0;
+    UINT32 mode1024 = 0;
+
     for (modeNum = 0; modeNum < gop->Mode->MaxMode; modeNum++) {
         EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *modeInfo;
         UINTN infoSize;
@@ -127,12 +132,13 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         UINT32 w = modeInfo->HorizontalResolution;
         UINT32 h = modeInfo->VerticalResolution;
 
-        /* Prefer exactly 1024x768 or 1280x720 to avoid window scaling issues */
-        if ((w == 1024 && h == 768) || (w == 1280 && h == 720)) {
-            bestMode = modeNum;
-            bestWidth = w;
-            bestHeight = h;
-            break; /* Found a perfect standard resolution */
+        if (w == 1280 && h == 720) {
+            found1280 = 1;
+            mode1280 = modeNum;
+        }
+        if (w == 1024 && h == 768) {
+            found1024 = 1;
+            mode1024 = modeNum;
         }
 
         /* Fallback: pick the largest mode that is <= 1280x1024 */
@@ -143,6 +149,16 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
                 bestHeight = h;
             }
         }
+    }
+
+    if (found1280) {
+        bestMode = mode1280;
+        bestWidth = 1280;
+        bestHeight = 720;
+    } else if (found1024) {
+        bestMode = mode1024;
+        bestWidth = 1024;
+        bestHeight = 768;
     }
 
     /* Fallback if no moderate resolution mode is found */

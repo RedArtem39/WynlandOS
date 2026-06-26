@@ -20,6 +20,13 @@ typedef struct Window {
     char title[MAX_TITLE_LEN];
     bool is_visible;
     bool is_focused;
+    bool is_maximized;
+
+    /* Original floating bounds saved before maximization */
+    int32_t normal_x;
+    int32_t normal_y;
+    uint32_t normal_w;
+    uint32_t normal_h;
 
     /* Previous bounds for optimized dirty rect rendering */
     int32_t prev_x;

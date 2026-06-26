@@ -319,7 +319,11 @@ void draw_forge_content(Window *self)
     uint32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
 
     if (forge_viewing_file) {
-        comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+        if (self->is_maximized) {
+            comp_fill_rect(cx, cy, cw, ch, THEME_WINDOW_BG & 0x00FFFFFF);
+        } else {
+            comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+        }
         
         /* 1. Header of the file viewer */
         comp_fill_rect(cx, cy, cw, 30, NORD1 & 0x00FFFFFF);
@@ -363,8 +367,12 @@ void draw_forge_content(Window *self)
         return;
     }
 
-    /* Fill client area background (Nord0 with alpha support) */
-    comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+    /* Fill client area background (Nord0 with alpha/solid support) */
+    if (self->is_maximized) {
+        comp_fill_rect(cx, cy, cw, ch, THEME_WINDOW_BG & 0x00FFFFFF);
+    } else {
+        comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+    }
 
     /* 1. Header (Address bar and Navigation) */
     comp_fill_rect(cx, cy, cw, 30, NORD1 & 0x00FFFFFF);
