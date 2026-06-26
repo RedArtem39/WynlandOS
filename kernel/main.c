@@ -1489,6 +1489,10 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize Compositor ---- */
     compositor_init(boot_info);
 
+    /* ---- Initialize VirtIO-GPU ---- */
+    extern bool virtio_gpu_init(void);
+    virtio_gpu_init();
+
     /* ---- Initialize Serial Port (COM1) ---- */
     serial_init();
     serial_write_string("\r\nWynlandOS Kernel Starting...\r\n");

@@ -61,6 +61,8 @@ qemu-system-x86_64              \
     -m 256M                     \
     -bios "$OVMF"              \
     -drive file="$DISK",format=raw \
+    -vga none                  \
+    -device virtio-gpu-pci,disable-legacy=off,disable-modern=on \
     $NET_ARGS                   \
     -serial stdio              \
     -no-reboot                 \

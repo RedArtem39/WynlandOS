@@ -187,6 +187,13 @@ void compositor_flip(void)
                    &g_comp.back_buffer[y * w + x1],
                    copy_width_bytes);
         }
+
+        /* If VirtIO-GPU driver is active, notify the host */
+        extern bool virtio_gpu_is_active(void);
+        extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+        if (virtio_gpu_is_active()) {
+            virtio_gpu_flush(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
+        }
     }
 
     /* Reset dirty bounds */
