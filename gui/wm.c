@@ -39,6 +39,15 @@ static uint32_t g_resize_start_h = 0;
 static int32_t g_resize_start_mx = 0;
 static int32_t g_resize_start_my = 0;
 
+static int32_t g_outline_x = 0;
+static int32_t g_outline_y = 0;
+static int32_t g_outline_w = 0;
+static int32_t g_outline_h = 0;
+static int32_t g_prev_outline_x = 0;
+static int32_t g_prev_outline_y = 0;
+static int32_t g_prev_outline_w = 0;
+static int32_t g_prev_outline_h = 0;
+
 static bool g_gui_active = false;
 static bool g_wm_needs_redraw = true;
 static uint8_t g_prev_buttons = 0;
@@ -398,6 +407,8 @@ void wm_draw_desktop(void)
     static int32_t last_my = -1;
     static uint8_t last_buttons = 0;
 
+    bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
+
     /* Lock interrupts to make desktop drawing and mouse updates atomic and prevent races */
     uint64_t rflags = save_irq_disable();
 
@@ -433,7 +444,6 @@ void wm_draw_desktop(void)
         /* If only the mouse moved, buttons changed, or compositor is dirty, do flip */
         extern bool comp_is_dirty(void);
         if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty() || clock_changed) {
-            bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
             bool near_dock = (my >= 650) || (last_my >= 650);
 
             if (dragging || near_dock) {
@@ -446,39 +456,22 @@ void wm_draw_desktop(void)
                 int32_t ux2 = -999999;
                 int32_t uy2 = -999999;
 
-                /* Include window old and new bounds */
-                if (g_dragged_window) {
-                    Window *win = g_dragged_window;
-                    int32_t px = win->prev_x;
-                    int32_t py = win->prev_y;
-                    uint32_t pw = win->prev_w;
-                    uint32_t ph = win->prev_h;
+                /* Include outline old and new bounds */
+                if (dragging) {
+                    int32_t px = g_prev_outline_x;
+                    int32_t py = g_prev_outline_y;
+                    uint32_t pw = g_prev_outline_w;
+                    uint32_t ph = g_prev_outline_h;
 
                     if (px < ux1) ux1 = px - 8;
                     if (py < uy1) uy1 = py - 8;
                     if (px + (int32_t)pw > ux2) ux2 = px + (int32_t)pw + 16;
                     if (py + (int32_t)ph > uy2) uy2 = py + (int32_t)ph + 16;
 
-                    if (win->x < ux1) ux1 = win->x - 8;
-                    if (win->y < uy1) uy1 = win->y - 8;
-                    if (win->x + (int32_t)win->w > ux2) ux2 = win->x + (int32_t)win->w + 16;
-                    if (win->y + (int32_t)win->h > uy2) uy2 = win->y + (int32_t)win->h + 16;
-                } else if (g_resizing_window) {
-                    Window *win = g_resizing_window;
-                    int32_t px = win->prev_x;
-                    int32_t py = win->prev_y;
-                    uint32_t pw = win->prev_w;
-                    uint32_t ph = win->prev_h;
-
-                    if (px < ux1) ux1 = px - 8;
-                    if (py < uy1) uy1 = py - 8;
-                    if (px + (int32_t)pw > ux2) ux2 = px + (int32_t)pw + 16;
-                    if (py + (int32_t)ph > uy2) uy2 = py + (int32_t)ph + 16;
-
-                    if (win->x < ux1) ux1 = win->x - 8;
-                    if (win->y < uy1) uy1 = win->y - 8;
-                    if (win->x + (int32_t)win->w > ux2) ux2 = win->x + (int32_t)win->w + 16;
-                    if (win->y + (int32_t)win->h > uy2) uy2 = win->y + (int32_t)win->h + 16;
+                    if (g_outline_x < ux1) ux1 = g_outline_x - 8;
+                    if (g_outline_y < uy1) uy1 = g_outline_y - 8;
+                    if (g_outline_x + (int32_t)g_outline_w > ux2) ux2 = g_outline_x + (int32_t)g_outline_w + 16;
+                    if (g_outline_y + (int32_t)g_outline_h > uy2) uy2 = g_outline_y + (int32_t)g_outline_h + 16;
                 }
 
                 /* Include dock bounds */
@@ -555,6 +548,10 @@ void wm_draw_desktop(void)
                             }
                         }
                         win = win->prev;
+                    }
+
+                    if (dragging) {
+                        comp_draw_rounded_rect_border(g_outline_x, g_outline_y, g_outline_w, g_outline_h, 8, THEME_ACCENT & 0x00FFFFFF);
                     }
 
                     /* Redraw top panel if it overlaps the union rect */
@@ -656,17 +653,12 @@ void wm_draw_desktop(void)
                     /* Flip! */
                     compositor_flip();
 
-                    /* Update previous bounds */
-                    if (g_dragged_window) {
-                        g_dragged_window->prev_x = g_dragged_window->x;
-                        g_dragged_window->prev_y = g_dragged_window->y;
-                        g_dragged_window->prev_w = g_dragged_window->w;
-                        g_dragged_window->prev_h = g_dragged_window->h;
-                    } else if (g_resizing_window) {
-                        g_resizing_window->prev_x = g_resizing_window->x;
-                        g_resizing_window->prev_y = g_resizing_window->y;
-                        g_resizing_window->prev_w = g_resizing_window->w;
-                        g_resizing_window->prev_h = g_resizing_window->h;
+                    /* Update previous outline bounds */
+                    if (dragging) {
+                        g_prev_outline_x = g_outline_x;
+                        g_prev_outline_y = g_outline_y;
+                        g_prev_outline_w = g_outline_w;
+                        g_prev_outline_h = g_outline_h;
                     }
                 }
             } else {
@@ -712,7 +704,9 @@ void wm_draw_desktop(void)
         win = win->prev;
     }
 
-
+    if (dragging) {
+        comp_draw_rounded_rect_border(g_outline_x, g_outline_y, g_outline_w, g_outline_h, 8, THEME_ACCENT & 0x00FFFFFF);
+    }
 
     /* 3. Top panel */
     comp_draw_panel();
@@ -878,6 +872,14 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         g_dragged_window = win;
                         g_drag_offset_x = mx - win->x;
                         g_drag_offset_y = my - win->y;
+                        g_outline_x = win->x;
+                        g_outline_y = win->y;
+                        g_outline_w = win->w;
+                        g_outline_h = win->h;
+                        g_prev_outline_x = win->x;
+                        g_prev_outline_y = win->y;
+                        g_prev_outline_w = win->w;
+                        g_prev_outline_h = win->h;
                     }
 
                     /* 3. Resize handle in bottom-right corner */
@@ -890,6 +892,14 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         g_resize_start_h = win->h;
                         g_resize_start_mx = mx;
                         g_resize_start_my = my;
+                        g_outline_x = win->x;
+                        g_outline_y = win->y;
+                        g_outline_w = win->w;
+                        g_outline_h = win->h;
+                        g_prev_outline_x = win->x;
+                        g_prev_outline_y = win->y;
+                        g_prev_outline_w = win->w;
+                        g_prev_outline_h = win->h;
                     } else {
                         /* 4. Custom window mouse event */
                         if (win->handle_mouse) {
@@ -936,20 +946,12 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
 
     /* Dragging action */
     if (left_pressed && g_dragged_window) {
-        g_dragged_window->x = mx - g_drag_offset_x;
-        g_dragged_window->y = my - g_drag_offset_y;
+        g_outline_x = mx - g_drag_offset_x;
+        g_outline_y = my - g_drag_offset_y;
 
         /* Clamp y to panel height */
-        if (g_dragged_window->y < (int32_t)THEME_PANEL_HEIGHT) {
-            g_dragged_window->y = THEME_PANEL_HEIGHT;
-        }
-
-        /* Dynamically synchronize shell text boundaries with moving window */
-        if (g_dragged_window->id == 1) {
-            console_start_x = g_dragged_window->x + 15;
-            console_start_y = g_dragged_window->y + 40;
-            console_end_x = g_dragged_window->x + g_dragged_window->w - 15;
-            console_end_y = g_dragged_window->y + g_dragged_window->h - 15;
+        if (g_outline_y < (int32_t)THEME_PANEL_HEIGHT) {
+            g_outline_y = THEME_PANEL_HEIGHT;
         }
     }
 
@@ -964,22 +966,38 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
         if (new_w < 180) new_w = 180;
         if (new_h < 120) new_h = 120;
 
-        g_resizing_window->w = new_w;
-        g_resizing_window->h = new_h;
-
-        /* Dynamically synchronize console text boundaries with resized window */
-        if (g_resizing_window->id == 1) {
-            console_start_x = g_resizing_window->x + 15;
-            console_start_y = g_resizing_window->y + 40;
-            console_end_x = g_resizing_window->x + g_resizing_window->w - 15;
-            console_end_y = g_resizing_window->y + g_resizing_window->h - 15;
-        }
+        g_outline_w = new_w;
+        g_outline_h = new_h;
     }
 
     /* Release drag/resize locks */
     if (clicked_up) {
-        g_dragged_window = NULL;
-        g_resizing_window = NULL;
+        if (g_dragged_window) {
+            g_dragged_window->x = g_outline_x;
+            g_dragged_window->y = g_outline_y;
+
+            /* Dynamically synchronize shell text boundaries with final window position */
+            if (g_dragged_window->id == 1) {
+                console_start_x = g_dragged_window->x + 15;
+                console_start_y = g_dragged_window->y + 40;
+                console_end_x = g_dragged_window->x + g_dragged_window->w - 15;
+                console_end_y = g_dragged_window->y + g_dragged_window->h - 15;
+            }
+            g_dragged_window = NULL;
+        }
+        if (g_resizing_window) {
+            g_resizing_window->w = g_outline_w;
+            g_resizing_window->h = g_outline_h;
+
+            /* Dynamically synchronize console text boundaries with final window size */
+            if (g_resizing_window->id == 1) {
+                console_start_x = g_resizing_window->x + 15;
+                console_start_y = g_resizing_window->y + 40;
+                console_end_x = g_resizing_window->x + g_resizing_window->w - 15;
+                console_end_y = g_resizing_window->y + g_resizing_window->h - 15;
+            }
+            g_resizing_window = NULL;
+        }
     }
 
     g_prev_buttons = buttons;
