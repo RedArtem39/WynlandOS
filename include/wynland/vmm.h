@@ -10,6 +10,8 @@
 #define PAGE_PRESENT  (1ULL << 0)
 #define PAGE_WRITE    (1ULL << 1)
 #define PAGE_USER     (1ULL << 2)
+#define PAGE_WRITE_THROUGH (1ULL << 3)  /* PWT bit */
+#define PAGE_CACHE_DISABLE (1ULL << 4)  /* PCD bit */
 #define PAGE_NX       0ULL         /* Disabled to prevent hypervisor crashes when EFER.NXE is not enabled */
 
 #define PML4_INDEX(addr) (((addr) >> 39) & 0x1FF)

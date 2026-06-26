@@ -150,7 +150,7 @@ void vmm_init(BootInfo *boot_info)
     fb_size = (fb_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (uint64_t offset = 0; offset < fb_size; offset += PAGE_SIZE) {
-        vmm_map_page(pml4, fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX);
+        vmm_map_page(pml4, fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH);
     }
 
     /* 4. Switch to our new PML4 page table by loading it into CR3 */
@@ -174,7 +174,7 @@ void vmm_map_mmio(uint64_t phys_addr, uint64_t size)
     uint64_t end = (phys_addr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     
     for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        vmm_map_page(pml4, addr, addr, PAGE_WRITE | PAGE_NX);
+        vmm_map_page(pml4, addr, addr, PAGE_WRITE | PAGE_NX | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH);
     }
 }
 
