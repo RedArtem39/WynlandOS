@@ -173,7 +173,7 @@ void wm_raise_window(Window *win)
         console_start_y = win->y + 40;
         console_end_x = win->x + win->w - 15;
         console_end_y = win->y + win->h - 15;
-        term_bg_color = THEME_WINDOW_BG;
+        term_bg_color = 0;
     }
 
     comp_mark_dirty();
@@ -220,7 +220,7 @@ void wm_init(void)
     console_start_y = term->y + 40;
     console_end_x = term->x + term->w - 15;
     console_end_y = term->y + term->h - 15;
-    term_bg_color = THEME_WINDOW_BG;
+    term_bg_color = 0;
 
     /* Raise Terminal to make it default focused */
     wm_raise_window(term);
