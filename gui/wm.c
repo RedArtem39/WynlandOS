@@ -317,12 +317,6 @@ void wm_draw_desktop(void)
     static uint64_t last_sec = 999999;
     uint64_t total_sec = timer_get_ticks() / 100;
 
-    /* Force redraw every second to update clock */
-    if (total_sec != last_sec) {
-        g_wm_needs_redraw = true;
-        last_sec = total_sec;
-    }
-
     int32_t mx = mouse_get_x();
     int32_t my = mouse_get_y();
     uint8_t buttons = mouse_get_buttons();
@@ -335,6 +329,32 @@ void wm_draw_desktop(void)
     uint64_t rflags = save_irq_disable();
 
     if (!g_wm_needs_redraw) {
+        /* Update only the clock area in back buffer if second changed */
+        if (total_sec != last_sec) {
+            last_sec = total_sec;
+
+            uint32_t sw = comp_get_width();
+            uint32_t sec = total_sec % 60;
+            uint32_t min = (total_sec / 60) % 60;
+            uint32_t hr  = (total_sec / 3600) % 24;
+
+            char time_str[9];
+            time_str[0] = '0' + (hr / 10);
+            time_str[1] = '0' + (hr % 10);
+            time_str[2] = ':';
+            time_str[3] = '0' + (min / 10);
+            time_str[4] = '0' + (min % 10);
+            time_str[5] = ':';
+            time_str[6] = '0' + (sec / 10);
+            time_str[7] = '0' + (sec % 10);
+            time_str[8] = '\0';
+
+            extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
+            comp_draw_wallpaper_rect(sw - 80, 0, 80, THEME_PANEL_HEIGHT);
+            comp_fill_rect_alpha(sw - 80, 0, 80, THEME_PANEL_HEIGHT, THEME_PANEL_BG);
+            comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
+        }
+
         /* If only the mouse moved, buttons changed, or compositor is dirty, do lightweight flip */
         extern bool comp_is_dirty(void);
         if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty()) {
