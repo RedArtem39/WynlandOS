@@ -1,0 +1,36 @@
+/*
+ * WynlandOS - Virtual Memory Manager (VMM) Header
+ */
+
+#pragma once
+
+#include <wynland/types.h>
+#include <wynland/boot_info.h>
+
+#define PAGE_PRESENT  (1ULL << 0)
+#define PAGE_WRITE    (1ULL << 1)
+#define PAGE_USER     (1ULL << 2)
+#define PAGE_NX       (1ULL << 63) /* No Execute */
+
+#define PML4_INDEX(addr) (((addr) >> 39) & 0x1FF)
+#define PDPT_INDEX(addr) (((addr) >> 30) & 0x1FF)
+#define PD_INDEX(addr)   (((addr) >> 21) & 0x1FF)
+#define PT_INDEX(addr)   (((addr) >> 12) & 0x1FF)
+
+typedef uint64_t PageTableEntry;
+
+typedef struct {
+    PageTableEntry entries[512];
+} PageTable;
+
+/* Initialize the VMM: sets up a new PML4 page table structure and loads it into CR3 */
+void vmm_init(BootInfo *boot_info);
+
+/* Map a virtual page to a physical page with specific flags */
+void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags);
+
+/* Unmap a virtual page */
+void vmm_unmap_page(PageTable *pml4, uint64_t virt);
+
+/* Get the current PML4 page table root */
+PageTable *vmm_get_current_pml4(void);

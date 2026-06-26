@@ -1,0 +1,21 @@
+# Build output
+build/
+*.o
+*.elf
+*.efi
+*.img
+*.iso
+*.bin
+
+# Tools (downloaded)
+tools/ovmf/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS specific
+Thumbs.db
+.DS_Store
