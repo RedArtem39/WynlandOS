@@ -54,7 +54,7 @@ echo "╚═══════════════════════�
 echo ""
 
 qemu-system-x86_64              \
-    -machine q35                \
+    -machine q35,kernel-irqchip=off \
     -cpu qemu64                 \
     -accel kvm                  \
     -accel tcg                  \

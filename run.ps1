@@ -66,7 +66,7 @@ if (-not (Test-Path $DiskImage)) {
 # -- Build QEMU arguments ------------------------------------------------------
 
 $QemuArgs = @(
-    "-machine", "q35",
+    "-machine", "q35,kernel-irqchip=off",
     "-cpu", "qemu64",
     "-accel", "whpx",
     "-accel", "tcg",

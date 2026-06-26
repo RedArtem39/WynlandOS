@@ -121,6 +121,11 @@ void vmm_init(BootInfo *boot_info)
     uint32_t region_count = boot_info->mmap_entries;
 
     for (uint32_t i = 0; i < region_count; i++) {
+        /* Skip reserved and bad memory to avoid mapping unbacked/MMIO holes */
+        if (regions[i].type == MEMORY_RESERVED || regions[i].type == MEMORY_BAD) {
+            continue;
+        }
+
         uint64_t base = regions[i].base;
         uint64_t size = regions[i].size;
 
