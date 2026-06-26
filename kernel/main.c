@@ -1210,9 +1210,12 @@ static void execute_command(BootInfo *info, const char *cmd)
         console_print_string(info, "\n", 0x00FFFFFF, term_bg_color);
         
         console_print_string(info, "                    Memory: ", 0x00FFFFFF, term_bg_color);
-        uint_to_str(info->total_memory / (1024 * 1024), buf);
+        uint_to_str(pmm_get_used_memory() / (1024 * 1024), buf);
         console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        console_print_string(info, " MB usable\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, " MB / ", 0x00FFFFFF, term_bg_color);
+        uint_to_str(pmm_get_total_memory() / (1024 * 1024), buf);
+        console_print_string(info, buf, 0x0000FF00, term_bg_color);
+        console_print_string(info, " MB\n", 0x00FFFFFF, term_bg_color);
     } else if (str_compare(cmd, "reboot") == 0) {
         console_print_string(info, "Rebooting system...\n", 0x00FF0000, term_bg_color);
         for (volatile int i = 0; i < 50000000; i++);

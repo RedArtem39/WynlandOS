@@ -289,6 +289,20 @@ static void draw_settings_content(Window *self)
  * Desktop Render and Events
  * ============================================================ */
 
+static inline uint64_t save_irq_disable(void)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    return rflags;
+}
+
+static inline void restore_irq(uint64_t rflags)
+{
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+}
+
 void wm_draw_desktop(void)
 {
     static uint64_t last_sec = 999999;
@@ -300,20 +314,48 @@ void wm_draw_desktop(void)
         last_sec = total_sec;
     }
 
-    /* Return immediately if no UI updates were requested to save CPU cycles */
+    int32_t mx = mouse_get_x();
+    int32_t my = mouse_get_y();
+    uint8_t buttons = mouse_get_buttons();
+
+    static int32_t last_mx = -1;
+    static int32_t last_my = -1;
+    static uint8_t last_buttons = 0;
+
+    /* Lock interrupts to make desktop drawing and mouse updates atomic and prevent races */
+    uint64_t rflags = save_irq_disable();
+
     if (!g_wm_needs_redraw) {
+        /* If only the mouse moved or buttons changed, we do a lightweight cursor update */
+        if (mx != last_mx || my != last_my || buttons != last_buttons) {
+            /* 1. Restore old background under cursor */
+            comp_restore_cursor_back();
+
+            /* 2. Draw cursor at new position */
+            comp_draw_cursor(mx, my, buttons);
+
+            /* 3. Flip only the dirty regions (old and new cursor areas) */
+            compositor_flip();
+
+            last_mx = mx;
+            last_my = my;
+            last_buttons = buttons;
+        }
+        restore_irq(rflags);
         return;
     }
+
+    /* Full desktop redraw */
     g_wm_needs_redraw = false;
 
     uint32_t sw = comp_get_width();
     uint32_t sh = comp_get_height();
 
-    /* 1. Wallpaper */
+    /* 1. Wallpaper (clears any saved cursor state since we reconstruct from scratch) */
+    comp_clear_saved_cursor();
     comp_draw_wallpaper();
 
     /* 2. Draw all windows in reverse Z-order (bottom-most to top-most) */
-    /* Find tail first */
     Window *win = g_windows_tail;
     while (win) {
         if (win->is_visible) {
@@ -359,9 +401,6 @@ void wm_draw_desktop(void)
     comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
 
     /* 4. Draw Dock Panel with Magnification */
-    int32_t mx = mouse_get_x();
-    int32_t my = mouse_get_y();
-
     uint32_t dock_w = 220;
     uint32_t dock_h = THEME_DOCK_HEIGHT;
     int32_t dock_x = (sw - dock_w) / 2;
@@ -406,19 +445,27 @@ void wm_draw_desktop(void)
     }
 
     /* 5. Draw cursor on the back-buffer right before flipping */
-    extern void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons);
-    comp_draw_cursor(mx, my, mouse_get_buttons());
+    comp_draw_cursor(mx, my, buttons);
 
     /* Flip onto screen */
     compositor_flip();
+
+    last_mx = mx;
+    last_my = my;
+    last_buttons = buttons;
+
+    restore_irq(rflags);
 }
 
 void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
 {
+    static int32_t g_prev_my = 0;
     bool left_pressed  = (buttons & 1) != 0;
     bool prev_left     = (g_prev_buttons & 1) != 0;
     bool clicked_down  = left_pressed && !prev_left;
     bool clicked_up    = !left_pressed && prev_left;
+
+    bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
 
     if (clicked_down) {
         /* Check if clicked on a window */
@@ -552,7 +599,15 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
     }
 
     g_prev_buttons = buttons;
-    comp_mark_dirty();
+
+    /* Detect if we are close to the dock to trigger animation updates */
+    bool near_dock = (my >= 650) || (g_prev_my >= 650);
+    g_prev_my = my;
+
+    /* Only trigger a full desktop redraw if something major changed (clicks, drag/resize active, near dock) */
+    if (clicked_down || clicked_up || (left_pressed && dragging) || near_dock) {
+        comp_mark_dirty();
+    }
 }
 
 void wm_handle_key(uint8_t scancode, char ascii)

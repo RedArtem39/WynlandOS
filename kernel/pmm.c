@@ -11,6 +11,7 @@ static uint8_t  *bitmap = NULL;
 static uint64_t total_pages = 0;
 static uint64_t free_pages = 0;
 static uint64_t total_mem_size = 0;
+static uint64_t total_usable_memory = 0;
 
 /* Helpers for bitmap operations */
 static inline void bitmap_set(uint64_t page_index)
@@ -33,12 +34,16 @@ void pmm_init(BootInfo *boot_info)
     MemoryRegion *regions = (MemoryRegion *)(uintptr_t)boot_info->mmap_addr;
     uint32_t region_count = boot_info->mmap_entries;
 
-    /* 1. Find the highest physical memory address to size our bitmap */
+    /* 1. Find the highest physical memory address to size our bitmap and sum usable memory */
     uint64_t highest_address = 0;
+    total_usable_memory = 0;
     for (uint32_t i = 0; i < region_count; i++) {
         uint64_t limit = regions[i].base + regions[i].size;
         if (limit > highest_address) {
             highest_address = limit;
+        }
+        if (regions[i].type == MEMORY_USABLE) {
+            total_usable_memory += regions[i].size;
         }
     }
 
@@ -164,7 +169,7 @@ void pmm_free_page(void *addr)
 
 uint64_t pmm_get_total_memory(void)
 {
-    return total_mem_size;
+    return total_usable_memory;
 }
 
 uint64_t pmm_get_free_memory(void)
@@ -174,5 +179,5 @@ uint64_t pmm_get_free_memory(void)
 
 uint64_t pmm_get_used_memory(void)
 {
-    return (total_pages - free_pages) * PAGE_SIZE;
+    return total_usable_memory - (free_pages * PAGE_SIZE);
 }

@@ -54,6 +54,10 @@ uint32_t  comp_get_height(void);
 
 /* ---- Mark dirty ---- */
 void comp_mark_dirty(void);
+void comp_mark_area_dirty(int32_t x1, int32_t y1, int32_t x2, int32_t y2);
+void comp_restore_cursor_back(void);
+void comp_save_cursor_back(int32_t mx, int32_t my);
+void comp_clear_saved_cursor(void);
 
 /* ---- Desktop wallpaper ---- */
 void comp_draw_wallpaper(void);
