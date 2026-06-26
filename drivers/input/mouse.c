@@ -4,22 +4,29 @@
 
 #include <wynland/mouse.h>
 
-#define CURSOR_W 12
-#define CURSOR_H 12
+#define CURSOR_W 18
+#define CURSOR_H 19
 
-static const uint8_t cursor_mask[12][12] = {
-    { 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0 },
-    { 1, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0 },
-    { 1, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0 }
+static const uint8_t cursor_mask[19][18] = {
+    { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 1, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 1, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 0, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 static BootInfo *g_boot_info = NULL;
@@ -160,6 +167,9 @@ static int mouse_hide_count = 0;
 
 void mouse_hide(void)
 {
+    extern bool wm_is_gui_active(void);
+    if (wm_is_gui_active()) return;
+
     if (mouse_hide_count == 0 && cursor_visible) {
         mouse_restore_background();
         cursor_visible = false;
@@ -169,6 +179,9 @@ void mouse_hide(void)
 
 void mouse_show(void)
 {
+    extern bool wm_is_gui_active(void);
+    if (wm_is_gui_active()) return;
+
     mouse_hide_count--;
     if (mouse_hide_count <= 0) {
         mouse_hide_count = 0;
@@ -264,11 +277,23 @@ void mouse_handle_interrupt(uint8_t data)
             if (new_y >= (int32_t)g_boot_info->fb_height) new_y = g_boot_info->fb_height - 1;
 
             if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons)) {
-                mouse_hide();
+                extern bool wm_is_gui_active(void);
+                bool gui = wm_is_gui_active();
+
+                if (!gui) {
+                    mouse_hide();
+                }
+
                 mouse_x = new_x;
                 mouse_y = new_y;
                 mouse_buttons = buttons & 0x07;
-                mouse_show();
+
+                if (gui) {
+                    extern void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons);
+                    wm_handle_mouse(mouse_x, mouse_y, mouse_buttons);
+                } else {
+                    mouse_show();
+                }
             }
             break;
     }

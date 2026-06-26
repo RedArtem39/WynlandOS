@@ -34,3 +34,6 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt);
 
 /* Get the current PML4 page table root */
 PageTable *vmm_get_current_pml4(void);
+
+/* Map a memory-mapped I/O (MMIO) region */
+void vmm_map_mmio(uint64_t phys_addr, uint64_t size);

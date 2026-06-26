@@ -124,18 +124,18 @@ void vmm_init(BootInfo *boot_info)
         uint64_t base = regions[i].base;
         uint64_t size = regions[i].size;
 
-        /* Skip kernel region (we mapped it explicitly above) */
-        if (base >= kernel_start && base < kernel_end) {
-            continue;
-        }
-
         uint64_t flags = PAGE_WRITE;
         if (regions[i].type != MEMORY_USABLE) {
             flags |= PAGE_NX; /* Mark non-usable memory as No-Execute */
         }
 
         for (uint64_t offset = 0; offset < size; offset += PAGE_SIZE) {
-            vmm_map_page(pml4, base + offset, base + offset, flags);
+            uint64_t addr = base + offset;
+            /* Skip only the pages that fall within the kernel boundaries (already mapped) */
+            if (addr >= kernel_start && addr < kernel_end) {
+                continue;
+            }
+            vmm_map_page(pml4, addr, addr, flags);
         }
     }
 
@@ -161,3 +161,15 @@ PageTable *vmm_get_current_pml4(void)
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
     return (PageTable *)(uintptr_t)cr3;
 }
+
+void vmm_map_mmio(uint64_t phys_addr, uint64_t size)
+{
+    PageTable *pml4 = vmm_get_current_pml4();
+    uint64_t start = phys_addr & ~(PAGE_SIZE - 1);
+    uint64_t end = (phys_addr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    
+    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+        vmm_map_page(pml4, addr, addr, PAGE_WRITE | PAGE_NX);
+    }
+}
+

@@ -22,11 +22,13 @@ SECTIONS
     /* Read-only data */
     .rodata ALIGN(4K) : {
         *(.rodata .rodata.*)
+        *(.lrodata .lrodata.*)
     }
 
     /* Initialized data */
     .data ALIGN(4K) : {
         *(.data .data.*)
+        *(.ldata .ldata.*)
     }
 
     /* Uninitialized data (BSS) */
@@ -34,6 +36,7 @@ SECTIONS
         __bss_start = .;
         *(COMMON)
         *(.bss .bss.*)
+        *(.lbss .lbss.*)
         __bss_end = .;
     }
 

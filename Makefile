@@ -39,6 +39,8 @@ SRC_BOOT       = boot
 SRC_KERNEL     = kernel
 SRC_DRIVERS    = drivers
 SRC_LIB        = lib
+SRC_PKG        = pkg
+SRC_GUI        = gui
 INC_DIR        = include
 
 BUILD          = build
@@ -46,6 +48,8 @@ BUILD_BOOT     = $(BUILD)/boot
 BUILD_KERNEL   = $(BUILD)/kernel
 BUILD_DRIVERS  = $(BUILD)/drivers
 BUILD_LIB      = $(BUILD)/lib
+BUILD_PKG      = $(BUILD)/pkg
+BUILD_GUI      = $(BUILD)/gui
 BUILD_ESP      = $(BUILD)/esp
 
 # ============================================================================
@@ -113,8 +117,16 @@ DRIVER_ASM_OBJ = $(patsubst $(SRC_DRIVERS)/%.asm, $(BUILD_DRIVERS)/%.o, $(DRIVER
 LIB_C_SRC      = $(wildcard $(SRC_LIB)/*.c)
 LIB_OBJ        = $(patsubst $(SRC_LIB)/%.c, $(BUILD_LIB)/%.o, $(LIB_C_SRC))
 
+# Package manager sources
+PKG_C_SRC      = $(wildcard $(SRC_PKG)/*.c)
+PKG_OBJ        = $(patsubst $(SRC_PKG)/%.c, $(BUILD_PKG)/%.o, $(PKG_C_SRC))
+
+# GUI sources
+GUI_C_SRC      = $(wildcard $(SRC_GUI)/*.c)
+GUI_OBJ        = $(patsubst $(SRC_GUI)/%.c, $(BUILD_GUI)/%.o, $(GUI_C_SRC))
+
 # All kernel-side objects
-KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ)
+KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ)
 
 # ============================================================================
 # Output Files
@@ -145,6 +157,8 @@ dirs:
 	@mkdir -p $(BUILD_KERNEL)
 	@mkdir -p $(BUILD_DRIVERS)
 	@mkdir -p $(BUILD_LIB)
+	@mkdir -p $(BUILD_PKG)
+	@mkdir -p $(BUILD_GUI)
 	@mkdir -p $(BUILD_ESP)/EFI/BOOT
 
 # ---------- Bootloader ----------
@@ -191,6 +205,18 @@ $(BUILD_LIB)/%.o: $(SRC_LIB)/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC(LIB)    $<"
 	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $< -o $@
+
+# Package manager objects
+$(BUILD_PKG)/%.o: $(SRC_PKG)/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC(PKG)    $<"
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $< -o $@
+
+# GUI objects
+$(BUILD_GUI)/%.o: $(SRC_GUI)/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC(GUI)    $<"
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_ALL_OBJ)
 	@echo "  LD(KERN)   $@"
