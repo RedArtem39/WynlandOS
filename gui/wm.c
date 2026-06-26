@@ -8,6 +8,8 @@
 #include <wynland/heap.h>
 #include <wynland/irq.h>
 #include <wynland/mouse.h>
+#include <wynland/net.h>
+#include <wynland/http.h>
 
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
@@ -42,6 +44,10 @@ static bool g_wm_needs_redraw = true;
 static uint8_t g_prev_buttons = 0;
 static Window *g_term_window = NULL;
 static Window *g_settings_window = NULL;
+static Window *g_browser_window = NULL;
+static Window *g_forge_window = NULL;
+static char g_browser_url[256] = "10.0.2.2:8000";
+static char g_browser_content_buf[4096] = {0};
 
 /* Terminal buffer */
 #define TERM_ROWS 30
@@ -51,7 +57,7 @@ static uint32_t g_term_fg_grid[TERM_ROWS][TERM_COLS];
 static uint32_t g_term_bg_grid[TERM_ROWS][TERM_COLS];
 
 /* Dock configurations */
-#define DOCK_ICON_COUNT 3
+#define DOCK_ICON_COUNT 4
 typedef struct {
     char name[16];
     uint32_t color;
@@ -63,12 +69,34 @@ typedef struct {
 static DockIcon g_dock_icons[DOCK_ICON_COUNT] = {
     { "Terminal", 0x88C0D0, 0, 0, 16, 16 },
     { "Settings", 0xB48EAD, 0, 0, 16, 16 },
-    { "Browser",  0xD08770, 0, 0, 16, 16 }
+    { "Browser",  0xD08770, 0, 0, 16, 16 },
+    { "Forge",    0xA3BE8C, 0, 0, 16, 16 }
 };
 
 /* Forward declarations */
 static void draw_terminal_content(Window *self);
 static void draw_settings_content(Window *self);
+static void draw_browser_content(Window *self);
+static void handle_browser_key(Window *self, uint8_t scancode, char ascii);
+static void handle_browser_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
+static void browser_load_page(void);
+
+extern void comp_draw_icon_forge(int32_t cx, int32_t cy, int32_t r);
+
+static void draw_dock_icon(int i, int32_t cx, int32_t cy, int32_t r)
+{
+    if (i == 0) {
+        comp_draw_icon_terminal(cx, cy, r);
+    } else if (i == 1) {
+        comp_draw_icon_settings(cx, cy, r);
+    } else if (i == 2) {
+        comp_draw_icon_browser(cx, cy, r);
+    } else if (i == 3) {
+        comp_draw_icon_forge(cx, cy, r);
+    } else {
+        comp_draw_circle(cx, cy, r, g_dock_icons[i].color);
+    }
+}
 
 bool wm_is_gui_active(void)
 {
@@ -141,6 +169,10 @@ void wm_register_window(Window *win)
     if (!g_windows_tail) {
         g_windows_tail = win;
     }
+    win->prev_x = win->x;
+    win->prev_y = win->y;
+    win->prev_w = win->w;
+    win->prev_h = win->h;
     comp_mark_dirty();
 }
 
@@ -189,6 +221,7 @@ void wm_init(void)
 
     /* Create Terminal Window (ID 1) */
     Window *term = (Window *)kmalloc(sizeof(Window));
+    memset(term, 0, sizeof(Window));
     term->id = 1;
     term->x = 60;
     term->y = 80;
@@ -203,6 +236,7 @@ void wm_init(void)
 
     /* Create Settings Window (ID 2) */
     Window *settings = (Window *)kmalloc(sizeof(Window));
+    memset(settings, 0, sizeof(Window));
     settings->id = 2;
     settings->x = 420;
     settings->y = 140;
@@ -214,6 +248,45 @@ void wm_init(void)
     settings->draw_content = draw_settings_content;
     g_settings_window = settings;
     wm_register_window(settings);
+
+    /* Create Browser Window (ID 3) */
+    Window *browser = (Window *)kmalloc(sizeof(Window));
+    memset(browser, 0, sizeof(Window));
+    browser->id = 3;
+    browser->x = 100;
+    browser->y = 120;
+    browser->w = 540;
+    browser->h = 360;
+    memcpy(browser->title, "WynlandOS Browser", 18);
+    browser->is_visible = false; /* Starts hidden, open from Dock */
+    browser->is_focused = false;
+    browser->draw_content = draw_browser_content;
+    browser->handle_key = handle_browser_key;
+    browser->handle_mouse = handle_browser_mouse;
+    g_browser_window = browser;
+    wm_register_window(browser);
+
+    /* Create Forge Window (ID 4) */
+    Window *forge = (Window *)kmalloc(sizeof(Window));
+    memset(forge, 0, sizeof(Window));
+    forge->id = 4;
+    forge->x = 180;
+    forge->y = 100;
+    forge->w = 500;
+    forge->h = 340;
+    memcpy(forge->title, "Forge File Explorer", 20);
+    forge->is_visible = false; /* Starts hidden, open from Dock */
+    forge->is_focused = false;
+
+    extern void draw_forge_content(Window *self);
+    extern void handle_forge_key(Window *self, uint8_t scancode, char ascii);
+    extern void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
+
+    forge->draw_content = draw_forge_content;
+    forge->handle_key = handle_forge_key;
+    forge->handle_mouse = handle_forge_mouse;
+    g_forge_window = forge;
+    wm_register_window(forge);
 
     /* Set up terminal buffer character step mapping */
     console_start_x = term->x + 15;
@@ -330,8 +403,10 @@ void wm_draw_desktop(void)
 
     if (!g_wm_needs_redraw) {
         /* Update only the clock area in back buffer if second changed */
+        bool clock_changed = false;
         if (total_sec != last_sec) {
             last_sec = total_sec;
+            clock_changed = true;
 
             uint32_t sw = comp_get_width();
             uint32_t sec = total_sec % 60;
@@ -355,17 +430,251 @@ void wm_draw_desktop(void)
             comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
         }
 
-        /* If only the mouse moved, buttons changed, or compositor is dirty, do lightweight flip */
+        /* If only the mouse moved, buttons changed, or compositor is dirty, do flip */
         extern bool comp_is_dirty(void);
-        if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty()) {
-            /* 1. Restore old background under cursor */
-            comp_restore_cursor_back();
+        if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty() || clock_changed) {
+            bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
+            bool near_dock = (my >= 650) || (last_my >= 650);
 
-            /* 2. Draw cursor at new position */
-            comp_draw_cursor(mx, my, buttons);
+            if (dragging || near_dock) {
+                /* Localized Redraw Path for window dragging/resizing and dock magnification */
+                uint32_t sw = comp_get_width();
+                uint32_t sh = comp_get_height();
 
-            /* 3. Flip only the dirty regions (old/new cursor + other dirty regions) */
-            compositor_flip();
+                int32_t ux1 = 999999;
+                int32_t uy1 = 999999;
+                int32_t ux2 = -999999;
+                int32_t uy2 = -999999;
+
+                /* Include window old and new bounds */
+                if (g_dragged_window) {
+                    Window *win = g_dragged_window;
+                    int32_t px = win->prev_x;
+                    int32_t py = win->prev_y;
+                    uint32_t pw = win->prev_w;
+                    uint32_t ph = win->prev_h;
+
+                    if (px < ux1) ux1 = px - 8;
+                    if (py < uy1) uy1 = py - 8;
+                    if (px + (int32_t)pw > ux2) ux2 = px + (int32_t)pw + 16;
+                    if (py + (int32_t)ph > uy2) uy2 = py + (int32_t)ph + 16;
+
+                    if (win->x < ux1) ux1 = win->x - 8;
+                    if (win->y < uy1) uy1 = win->y - 8;
+                    if (win->x + (int32_t)win->w > ux2) ux2 = win->x + (int32_t)win->w + 16;
+                    if (win->y + (int32_t)win->h > uy2) uy2 = win->y + (int32_t)win->h + 16;
+                } else if (g_resizing_window) {
+                    Window *win = g_resizing_window;
+                    int32_t px = win->prev_x;
+                    int32_t py = win->prev_y;
+                    uint32_t pw = win->prev_w;
+                    uint32_t ph = win->prev_h;
+
+                    if (px < ux1) ux1 = px - 8;
+                    if (py < uy1) uy1 = py - 8;
+                    if (px + (int32_t)pw > ux2) ux2 = px + (int32_t)pw + 16;
+                    if (py + (int32_t)ph > uy2) uy2 = py + (int32_t)ph + 16;
+
+                    if (win->x < ux1) ux1 = win->x - 8;
+                    if (win->y < uy1) uy1 = win->y - 8;
+                    if (win->x + (int32_t)win->w > ux2) ux2 = win->x + (int32_t)win->w + 16;
+                    if (win->y + (int32_t)win->h > uy2) uy2 = win->y + (int32_t)win->h + 16;
+                }
+
+                /* Include dock bounds */
+                uint32_t dock_w = 220;
+                uint32_t dock_h = THEME_DOCK_HEIGHT;
+                int32_t dock_x = (sw - dock_w) / 2;
+                int32_t dock_y = sh - dock_h - 15;
+
+                if (near_dock || dragging) {
+                    int32_t dx1 = dock_x - 40;
+                    int32_t dy1 = dock_y - 60;
+                    int32_t dx2 = dock_x + (int32_t)dock_w + 40;
+                    int32_t dy2 = dock_y + (int32_t)dock_h + 20;
+
+                    if (dx1 < ux1) ux1 = dx1;
+                    if (dy1 < uy1) uy1 = dy1;
+                    if (dx2 > ux2) ux2 = dx2;
+                    if (dy2 > uy2) uy2 = dy2;
+                }
+
+                /* Include old cursor bounds */
+                int32_t sc_x = -1, sc_y = -1;
+                bool has_cursor = false;
+                extern void comp_get_cursor_save_info(int32_t *x, int32_t *y, bool *has_cursor);
+                comp_get_cursor_save_info(&sc_x, &sc_y, &has_cursor);
+                if (has_cursor) {
+                    if (sc_x < ux1) ux1 = sc_x;
+                    if (sc_y < uy1) uy1 = sc_y;
+                    if (sc_x + 18 > ux2) ux2 = sc_x + 18;
+                    if (sc_y + 19 > uy2) uy2 = sc_y + 19;
+                }
+
+                /* Include new cursor bounds */
+                if (mx < ux1) ux1 = mx;
+                if (my < uy1) uy1 = my;
+                if (mx + 18 > ux2) ux2 = mx + 18;
+                if (my + 19 > uy2) uy2 = my + 19;
+
+                /* Clamp union to screen */
+                if (ux1 < 0) ux1 = 0;
+                if (uy1 < 0) uy1 = 0;
+                if (ux2 > (int32_t)sw) ux2 = (int32_t)sw;
+                if (uy2 > (int32_t)sh) uy2 = (int32_t)sh;
+
+                if (ux1 < ux2 && uy1 < uy2) {
+                    /* Restore old background under cursor */
+                    comp_restore_cursor_back();
+
+                    /* Restore wallpaper inside the union rect */
+                    extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
+                    comp_draw_wallpaper_rect(ux1, uy1, ux2 - ux1, uy2 - uy1);
+
+                    /* Redraw all windows from bottom to top, but only if they intersect the dirty bounds */
+                    Window *win = g_windows_tail;
+                    while (win) {
+                        if (win->is_visible) {
+                            int32_t wx1 = win->x;
+                            int32_t wy1 = win->y;
+                            int32_t wx2 = win->x + (int32_t)win->w;
+                            int32_t wy2 = win->y + (int32_t)win->h;
+
+                            /* Include shadow (+4px bottom-right) in intersection check */
+                            if (wx1 < ux2 && (wx2 + 4) > ux1 &&
+                                wy1 < uy2 && (wy2 + 4) > uy1) {
+                                draw_window_decorations(win);
+                                if (win->draw_content) {
+                                    win->draw_content(win);
+                                }
+                                if (win->is_focused) {
+                                    int32_t rx = win->x + win->w - 12;
+                                    int32_t ry = win->y + win->h - 12;
+                                    comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
+                                }
+                            }
+                        }
+                        win = win->prev;
+                    }
+
+                    /* Redraw top panel if it overlaps the union rect */
+                    if (uy1 < (int32_t)THEME_PANEL_HEIGHT) {
+                        comp_draw_panel();
+                        
+                        /* Redraw clock */
+                        uint32_t sec = total_sec % 60;
+                        uint32_t min = (total_sec / 60) % 60;
+                        uint32_t hr  = (total_sec / 3600) % 24;
+
+                        char time_str[9];
+                        time_str[0] = '0' + (hr / 10);
+                        time_str[1] = '0' + (hr % 10);
+                        time_str[2] = ':';
+                        time_str[3] = '0' + (min / 10);
+                        time_str[4] = '0' + (min % 10);
+                        time_str[5] = ':';
+                        time_str[6] = '0' + (sec / 10);
+                        time_str[7] = '0' + (sec % 10);
+                        time_str[8] = '\0';
+                        comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
+                    }
+
+                    /* Redraw dock if near dock or dragging */
+                    if (near_dock || dragging) {
+                        comp_fill_rect_alpha(dock_x, dock_y, dock_w, dock_h, THEME_DOCK_BG);
+                        comp_draw_rounded_rect(dock_x, dock_y, dock_w, dock_h, 12, THEME_DOCK_BG);
+                        comp_draw_rounded_rect_border(dock_x, dock_y, dock_w, dock_h, 12, 0x40FFFFFF);
+
+                        int spacing = dock_w / (DOCK_ICON_COUNT + 1);
+                        for (int i = 0; i < DOCK_ICON_COUNT; i++) {
+                            g_dock_icons[i].cx = dock_x + spacing * (i + 1);
+                            g_dock_icons[i].cy = dock_y + dock_h / 2;
+
+                            int32_t dx = mx - g_dock_icons[i].cx;
+                            int32_t dy = my - g_dock_icons[i].cy;
+                            int32_t dist_sq = dx * dx + dy * dy;
+
+                            if (dist_sq < 80 * 80) {
+                                uint32_t zoom = (80 * 80 - dist_sq) / 400;
+                                g_dock_icons[i].current_radius = g_dock_icons[i].base_radius + zoom;
+                            } else {
+                                g_dock_icons[i].current_radius = g_dock_icons[i].base_radius;
+                            }
+
+                            draw_dock_icon(i, g_dock_icons[i].cx, g_dock_icons[i].cy, g_dock_icons[i].current_radius);
+                            if (i == 0 && g_term_window && g_term_window->is_visible) {
+                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+                            }
+                            if (i == 1 && g_settings_window && g_settings_window->is_visible) {
+                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+                            }
+                            if (i == 2 && g_browser_window && g_browser_window->is_visible) {
+                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+                            }
+                            if (i == 3 && g_forge_window && g_forge_window->is_visible) {
+                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+                            }
+                        }
+
+                        /* Hover Tooltip in Localized Path */
+                        int32_t hovered_idx = -1;
+                        int32_t min_dist_sq = 999999;
+                        for (int k = 0; k < DOCK_ICON_COUNT; k++) {
+                            int32_t dx = mx - g_dock_icons[k].cx;
+                            int32_t dy = my - g_dock_icons[k].cy;
+                            int32_t dist_sq = dx*dx + dy*dy;
+                            if (dist_sq < 35 * 35 && dist_sq < min_dist_sq) {
+                                min_dist_sq = dist_sq;
+                                hovered_idx = k;
+                            }
+                        }
+
+                        if (hovered_idx != -1) {
+                            int k = hovered_idx;
+                            int32_t rad = g_dock_icons[k].current_radius;
+                            const char *name = g_dock_icons[k].name;
+                            uint32_t name_len = 0;
+                            while (name[name_len]) name_len++;
+                            
+                            uint32_t box_w = name_len * 9 + 16;
+                            uint32_t box_h = 20;
+                            int32_t box_x = g_dock_icons[k].cx - (int32_t)box_w / 2;
+                            int32_t box_y = g_dock_icons[k].cy - rad - 24;
+
+                            comp_draw_rounded_rect(box_x, box_y, box_w, box_h, 6, 0xD52E3440);
+                            comp_draw_string(box_x + 8, box_y + 2, name, 0xFFECEFF4, 0);
+                        }
+                    }
+
+                    /* Set compositor dirty region to the union rect */
+                    extern void comp_set_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y2);
+                    comp_set_dirty_rect(ux1, uy1, ux2 - 1, uy2 - 1);
+
+                    /* Draw cursor at new position */
+                    comp_draw_cursor(mx, my, buttons);
+
+                    /* Flip! */
+                    compositor_flip();
+
+                    /* Update previous bounds */
+                    if (g_dragged_window) {
+                        g_dragged_window->prev_x = g_dragged_window->x;
+                        g_dragged_window->prev_y = g_dragged_window->y;
+                        g_dragged_window->prev_w = g_dragged_window->w;
+                        g_dragged_window->prev_h = g_dragged_window->h;
+                    } else if (g_resizing_window) {
+                        g_resizing_window->prev_x = g_resizing_window->x;
+                        g_resizing_window->prev_y = g_resizing_window->y;
+                        g_resizing_window->prev_w = g_resizing_window->w;
+                        g_resizing_window->prev_h = g_resizing_window->h;
+                    }
+                }
+            } else {
+                /* Cursor-only fast path */
+                comp_restore_cursor_back();
+                comp_draw_cursor(mx, my, buttons);
+                compositor_flip();
+            }
 
             last_mx = mx;
             last_my = my;
@@ -403,14 +712,9 @@ void wm_draw_desktop(void)
         win = win->prev;
     }
 
-    /* Check if dragging or resizing is active to bypass blur computations for 60fps */
-    bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
+
 
     /* 3. Top panel */
-    if (!dragging) {
-        extern void comp_box_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius);
-        comp_box_blur(0, 0, sw, THEME_PANEL_HEIGHT, 1);
-    }
     comp_draw_panel();
 
     /* Draw actual clocks on top panel */
@@ -436,14 +740,12 @@ void wm_draw_desktop(void)
     int32_t dock_x = (sw - dock_w) / 2;
     int32_t dock_y = sh - dock_h - 15;
 
-    /* Blur under Dock if not dragging */
-    if (!dragging) {
-        comp_box_blur(dock_x, dock_y, dock_w, dock_h, 2);
-    }
+    /* Blur under Dock bypassed for performance */
 
     /* Draw semi-transparent dock background */
     comp_fill_rect_alpha(dock_x, dock_y, dock_w, dock_h, THEME_DOCK_BG);
     comp_draw_rounded_rect(dock_x, dock_y, dock_w, dock_h, 12, THEME_DOCK_BG);
+    comp_draw_rounded_rect_border(dock_x, dock_y, dock_w, dock_h, 12, 0x40FFFFFF);
 
     /* Draw dock icons with magnification effect */
     int spacing = dock_w / (DOCK_ICON_COUNT + 1);
@@ -466,12 +768,50 @@ void wm_draw_desktop(void)
         }
 
         /* Draw icon circle */
-        comp_draw_circle(g_dock_icons[i].cx, g_dock_icons[i].cy, g_dock_icons[i].current_radius, g_dock_icons[i].color);
+        draw_dock_icon(i, g_dock_icons[i].cx, g_dock_icons[i].cy, g_dock_icons[i].current_radius);
         
         /* Draw little dot under active app */
-        if (i == 0) { /* Terminal is running */
+        if (i == 0 && g_term_window && g_term_window->is_visible) {
             comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
         }
+        if (i == 1 && g_settings_window && g_settings_window->is_visible) {
+            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+        }
+        if (i == 2 && g_browser_window && g_browser_window->is_visible) {
+            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+        }
+        if (i == 3 && g_forge_window && g_forge_window->is_visible) {
+            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
+        }
+    }
+
+    /* Hover Tooltip in Full Redraw Path */
+    int32_t hovered_idx = -1;
+    int32_t min_dist_sq = 999999;
+    for (int k = 0; k < DOCK_ICON_COUNT; k++) {
+        int32_t dx = mx - g_dock_icons[k].cx;
+        int32_t dy = my - g_dock_icons[k].cy;
+        int32_t dist_sq = dx*dx + dy*dy;
+        if (dist_sq < 35 * 35 && dist_sq < min_dist_sq) {
+            min_dist_sq = dist_sq;
+            hovered_idx = k;
+        }
+    }
+
+    if (hovered_idx != -1) {
+        int k = hovered_idx;
+        int32_t rad = g_dock_icons[k].current_radius;
+        const char *name = g_dock_icons[k].name;
+        uint32_t name_len = 0;
+        while (name[name_len]) name_len++;
+        
+        uint32_t box_w = name_len * 9 + 16;
+        uint32_t box_h = 20;
+        int32_t box_x = g_dock_icons[k].cx - (int32_t)box_w / 2;
+        int32_t box_y = g_dock_icons[k].cy - rad - 24;
+
+        comp_draw_rounded_rect(box_x, box_y, box_w, box_h, 6, 0xD52E3440);
+        comp_draw_string(box_x + 8, box_y + 2, name, 0xFFECEFF4, 0);
     }
 
     /* 5. Draw cursor on the back-buffer right before flipping */
@@ -479,6 +819,16 @@ void wm_draw_desktop(void)
 
     /* Flip onto screen */
     compositor_flip();
+
+    /* Make sure windows have correct initial previous bounds */
+    Window *w_curr = g_windows_tail;
+    while (w_curr) {
+        w_curr->prev_x = w_curr->x;
+        w_curr->prev_y = w_curr->y;
+        w_curr->prev_w = w_curr->w;
+        w_curr->prev_h = w_curr->h;
+        w_curr = w_curr->prev;
+    }
 
     last_mx = mx;
     last_my = my;
@@ -489,13 +839,10 @@ void wm_draw_desktop(void)
 
 void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
 {
-    static int32_t g_prev_my = 0;
     bool left_pressed  = (buttons & 1) != 0;
     bool prev_left     = (g_prev_buttons & 1) != 0;
     bool clicked_down  = left_pressed && !prev_left;
     bool clicked_up    = !left_pressed && prev_left;
-
-    bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
 
     if (clicked_down) {
         /* Check if clicked on a window */
@@ -543,6 +890,11 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         g_resize_start_h = win->h;
                         g_resize_start_mx = mx;
                         g_resize_start_my = my;
+                    } else {
+                        /* 4. Custom window mouse event */
+                        if (win->handle_mouse) {
+                            win->handle_mouse(win, mx, my, buttons);
+                        }
                     }
 
                     break; /* Found clicked window, skip others underneath */
@@ -568,6 +920,12 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         } else if (i == 1 && g_settings_window) {
                             g_settings_window->is_visible = true;
                             wm_raise_window(g_settings_window);
+                        } else if (i == 2 && g_browser_window) {
+                            g_browser_window->is_visible = true;
+                            wm_raise_window(g_browser_window);
+                        } else if (i == 3 && g_forge_window) {
+                            g_forge_window->is_visible = true;
+                            wm_raise_window(g_forge_window);
                         }
                         break;
                     }
@@ -593,8 +951,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
             console_end_x = g_dragged_window->x + g_dragged_window->w - 15;
             console_end_y = g_dragged_window->y + g_dragged_window->h - 15;
         }
-
-        comp_mark_dirty();
     }
 
     /* Resizing action */
@@ -618,8 +974,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
             console_end_x = g_resizing_window->x + g_resizing_window->w - 15;
             console_end_y = g_resizing_window->y + g_resizing_window->h - 15;
         }
-
-        comp_mark_dirty();
     }
 
     /* Release drag/resize locks */
@@ -630,12 +984,8 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
 
     g_prev_buttons = buttons;
 
-    /* Detect if we are close to the dock to trigger animation updates */
-    bool near_dock = (my >= 650) || (g_prev_my >= 650);
-    g_prev_my = my;
-
-    /* Only trigger a full desktop redraw if something major changed (clicks, drag/resize active, near dock) */
-    if (clicked_down || clicked_up || (left_pressed && dragging) || near_dock) {
+    /* Only trigger a full desktop redraw if something major changed (clicks) */
+    if (clicked_down || clicked_up) {
         comp_mark_dirty();
     }
 }
@@ -648,4 +998,278 @@ void wm_handle_key(uint8_t scancode, char ascii)
             g_windows_head->handle_key(g_windows_head, scancode, ascii);
         }
     }
+}
+
+/* ============================================================
+ * Web Browser Application Implementation
+ * ============================================================ */
+
+static void draw_browser_content(Window *self)
+{
+    /* Client area */
+    int32_t cx = self->x + 1;
+    int32_t cy = self->y + THEME_TITLEBAR_HEIGHT + 1;
+    uint32_t cw = self->w - 2;
+    uint32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
+
+    /* Fill title/address bar bg */
+    comp_fill_rect(cx, cy, cw, 30, NORD1 & 0x00FFFFFF);
+
+    /* Draw URL input box: Nord3 background, white text */
+    comp_draw_rounded_rect(cx + 10, cy + 5, cw - 80, 20, 4, NORD3 & 0x00FFFFFF);
+    
+    /* Draw URL text */
+    comp_draw_string(cx + 15, cy + 7, g_browser_url, 0xFFECEFF4, 0);
+
+    /* Draw blinking or simple edit cursor if browser is focused and active */
+    if (self->is_focused) {
+        uint32_t url_len = 0;
+        while (g_browser_url[url_len]) url_len++;
+        comp_draw_string(cx + 15 + url_len * 9, cy + 7, "|", THEME_ACCENT & 0x00FFFFFF, 0);
+    }
+
+    /* Draw GO button: accent color (blue), white text */
+    comp_draw_rounded_rect(cx + cw - 65, cy + 5, 55, 20, 4, NORD8 & 0x00FFFFFF);
+    comp_draw_string(cx + cw - 52, cy + 7, "GO", THEME_WINDOW_BG & 0x00FFFFFF, 0);
+
+    /* Draw separator under address bar */
+    comp_fill_rect(cx, cy + 30, cw, 1, NORD3 & 0x00FFFFFF);
+
+    /* Main rendering canvas: white background (NORD6) */
+    int32_t rx = cx;
+    int32_t ry = cy + 31;
+    uint32_t rw = cw;
+    uint32_t rh = ch - 31;
+
+    comp_fill_rect(rx, ry, rw, rh, 0x00ECEFF4); // solid paper color
+
+    /* If buffer is empty, show homepage */
+    if (g_browser_content_buf[0] == '\0') {
+        int32_t text_y = ry + 20;
+        comp_draw_string(rx + 20, text_y, "WynlandOS Browser v1.0", 0xFF2E3440, 0); text_y += 18;
+        comp_draw_string(rx + 20, text_y, "======================", 0xFF2E3440, 0); text_y += 24;
+        comp_draw_string(rx + 20, text_y, "Welcome to the web!", 0xFF5E81AC, 0); text_y += 24;
+        comp_draw_string(rx + 20, text_y, "The network stack is up and running.", 0xFF2E3440, 0); text_y += 18;
+        comp_draw_string(rx + 20, text_y, "Host HTTP Server is accessible at:", 0xFF2E3440, 0); text_y += 18;
+        comp_draw_string(rx + 30, text_y, "http://10.0.2.2:8000/", 0xFF81A1C1, 0); text_y += 24;
+        comp_draw_string(rx + 20, text_y, "Instructions:", 0xFF2E3440, 0); text_y += 18;
+        comp_draw_string(rx + 30, text_y, "- Click inside the URL bar to type", 0xFF2E3440, 0); text_y += 18;
+        comp_draw_string(rx + 30, text_y, "- Press Enter or click GO to load", 0xFF2E3440, 0); text_y += 18;
+        return;
+    }
+
+    /* Simple HTML renderer */
+    int32_t curr_x = rx + 15;
+    int32_t curr_y = ry + 15;
+    bool is_h1 = false;
+    bool is_h2 = false;
+    bool is_link = false;
+
+    const char *html = g_browser_content_buf;
+    while (*html) {
+        if (*html == '<') {
+            /* Parse HTML tag */
+            html++;
+            if (*html == '/') {
+                html++;
+                if (*html == 'h' || *html == 'H') {
+                    html++;
+                    if (*html == '1') is_h1 = false;
+                    else if (*html == '2' || *html == '3') is_h2 = false;
+                } else if (*html == 'a' || *html == 'A') {
+                    is_link = false;
+                }
+            } else {
+                if (*html == 'h' || *html == 'H') {
+                    html++;
+                    if (*html == '1') is_h1 = true;
+                    else if (*html == '2' || *html == '3') is_h2 = true;
+                } else if (*html == 'a' || *html == 'A') {
+                    is_link = true;
+                } else if ((*html == 'b' || *html == 'B') && (*(html+1) == 'r' || *(html+1) == 'R')) {
+                    curr_x = rx + 15;
+                    curr_y += 18;
+                } else if (*html == 'p' || *html == 'P') {
+                    curr_x = rx + 15;
+                    curr_y += 24; // paragraph break
+                }
+            }
+            /* Skip until '>' */
+            while (*html && *html != '>') {
+                html++;
+            }
+            if (*html == '>') html++;
+        } else if (*html == '\r' || *html == '\n') {
+            if (*html == '\n') {
+                curr_x = rx + 15;
+                curr_y += 18;
+            }
+            html++;
+        } else {
+            /* Draw normal char */
+            uint32_t color = 0xFF2E3440; // Default text color (Nord dark grey)
+            if (is_h1) {
+                color = 0xFF5E81AC; // Nord Frost blue for H1
+            } else if (is_h2) {
+                color = 0xFF8FBCBB; // Nord Frost green-blue for H2
+            } else if (is_link) {
+                color = 0xFF81A1C1; // Nord Frost link blue
+            }
+
+            /* Wrap line if out of bounds */
+            if (curr_x + 9 > (int32_t)(rx + rw - 15)) {
+                curr_x = rx + 15;
+                curr_y += 18;
+            }
+
+            /* Stop if we go below the window */
+            if (curr_y + 16 > (int32_t)(ry + rh - 10)) {
+                break;
+            }
+
+            comp_draw_char(curr_x, curr_y, *html, color, 0x00ECEFF4);
+            curr_x += 9;
+            html++;
+        }
+    }
+}
+
+static void handle_browser_key(Window *self, uint8_t scancode, char ascii)
+{
+    (void)self;
+    /* If ascii is printable, append to g_browser_url */
+    uint32_t len = 0;
+    while (g_browser_url[len]) len++;
+
+    if (ascii >= 32 && ascii <= 126) {
+        if (len < sizeof(g_browser_url) - 2) {
+            g_browser_url[len] = ascii;
+            g_browser_url[len + 1] = '\0';
+            comp_mark_dirty();
+        }
+    } else if (scancode == 0x0E) { /* Backspace */
+        if (len > 0) {
+            g_browser_url[len - 1] = '\0';
+            comp_mark_dirty();
+        }
+    } else if (scancode == 0x1C) { /* Enter */
+        browser_load_page();
+    }
+}
+
+static void handle_browser_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons)
+{
+    bool left_pressed  = (buttons & 1) != 0;
+    static bool prev_left = false;
+    bool clicked_down  = left_pressed && !prev_left;
+    prev_left = left_pressed;
+
+    if (clicked_down) {
+        int32_t cx = self->x + 1;
+        int32_t cy = self->y + THEME_TITLEBAR_HEIGHT + 1;
+        uint32_t cw = self->w - 2;
+
+        /* GO button bounds */
+        int32_t btn_x1 = cx + cw - 65;
+        int32_t btn_x2 = cx + cw - 10;
+        int32_t btn_y1 = cy + 5;
+        int32_t btn_y2 = cy + 25;
+
+        if (mx >= btn_x1 && mx <= btn_x2 && my >= btn_y1 && my <= btn_y2) {
+            browser_load_page();
+        }
+    }
+}
+
+static void browser_load_page(void)
+{
+    /* Clear display buffer */
+    memset(g_browser_content_buf, 0, sizeof(g_browser_content_buf));
+    
+    /* Draw connecting... status message */
+    int32_t cx = g_browser_window->x + 1;
+    int32_t cy = g_browser_window->y + THEME_TITLEBAR_HEIGHT + 1;
+    uint32_t cw = g_browser_window->w - 2;
+    uint32_t ch = g_browser_window->h - THEME_TITLEBAR_HEIGHT - 2;
+    int32_t rx = cx;
+    int32_t ry = cy + 31;
+    uint32_t rw = cw;
+    uint32_t rh = ch - 31;
+
+    comp_fill_rect(rx, ry, rw, rh, 0x00ECEFF4);
+    comp_draw_string(rx + 20, ry + 20, "Connecting and loading page...", 0xFFBF616A, 0);
+    compositor_flip();
+
+    char host[128] = {0};
+    uint16_t port = 80;
+    char path[128] = "/";
+
+    /* Parse g_browser_url */
+    const char *src = g_browser_url;
+    
+    /* Skip http:// if present */
+    if (src[0] == 'h' && src[1] == 't' && src[2] == 't' && src[3] == 'p') {
+        src += 4;
+        if (src[0] == 's') src++;
+        if (src[0] == ':' && src[1] == '/' && src[2] == '/') {
+            src += 3;
+        }
+    }
+
+    /* Extract host */
+    uint32_t hi = 0;
+    while (*src && *src != ':' && *src != '/') {
+        if (hi < sizeof(host) - 1) {
+            host[hi++] = *src;
+        }
+        src++;
+    }
+    host[hi] = '\0';
+
+    /* Extract port if present */
+    if (*src == ':') {
+        src++;
+        uint32_t pval = 0;
+        while (*src && *src >= '0' && *src <= '9') {
+            pval = pval * 10 + (*src - '0');
+            src++;
+        }
+        if (pval > 0) port = (uint16_t)pval;
+    }
+
+    /* Extract path if present */
+    if (*src == '/') {
+        uint32_t pi = 0;
+        while (*src && pi < sizeof(path) - 1) {
+            path[pi++] = *src++;
+        }
+        path[pi] = '\0';
+    }
+
+    /* Perform HTTP GET */
+    HttpResponse resp;
+    int bytes_read = http_get(host, port, path, g_browser_content_buf, sizeof(g_browser_content_buf) - 1, &resp);
+
+    if (bytes_read < 0) {
+        /* Fallback: try host as IP directly */
+        uint32_t ip = net_str_to_ip(host);
+        if (ip != 0) {
+            bytes_read = http_get_ip(ip, port, host, path, g_browser_content_buf, sizeof(g_browser_content_buf) - 1, &resp);
+        }
+    }
+
+    if (bytes_read >= 0) {
+        g_browser_content_buf[bytes_read] = '\0';
+    } else {
+        /* Write error HTML into buffer */
+        const char *err_msg = "<html><h1>Error: Connection Failed</h1><p>Failed to connect to host or DNS resolution failed.</p><p>Check if host is reachable.</p></html>";
+        uint32_t j = 0;
+        while (err_msg[j]) {
+            g_browser_content_buf[j] = err_msg[j];
+            j++;
+        }
+        g_browser_content_buf[j] = '\0';
+    }
+
+    comp_mark_dirty();
 }

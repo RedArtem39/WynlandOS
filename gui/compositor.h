@@ -42,6 +42,13 @@ void comp_draw_string(uint32_t x, uint32_t y, const char *str, uint32_t fg, uint
 void comp_draw_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color);
 void comp_draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                             uint32_t r, uint32_t color);
+void comp_draw_rounded_rect_border(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                   uint32_t r, uint32_t color);
+void comp_draw_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, uint32_t color);
+void comp_draw_icon_terminal(int32_t cx, int32_t cy, int32_t r);
+void comp_draw_icon_settings(int32_t cx, int32_t cy, int32_t r);
+void comp_draw_icon_browser(int32_t cx, int32_t cy, int32_t r);
+void comp_draw_icon_forge(int32_t cx, int32_t cy, int32_t r);
 
 /* ---- Alpha blending & Blur ---- */
 void comp_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t argb);
@@ -59,6 +66,8 @@ void comp_mark_area_dirty(int32_t x1, int32_t y1, int32_t x2, int32_t y2);
 void comp_restore_cursor_back(void);
 void comp_save_cursor_back(int32_t mx, int32_t my);
 void comp_clear_saved_cursor(void);
+void comp_set_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y2);
+void comp_get_cursor_save_info(int32_t *x, int32_t *y, bool *has_cursor);
 
 /* ---- Desktop wallpaper ---- */
 void comp_draw_wallpaper(void);

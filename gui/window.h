@@ -21,6 +21,12 @@ typedef struct Window {
     bool is_visible;
     bool is_focused;
 
+    /* Previous bounds for optimized dirty rect rendering */
+    int32_t prev_x;
+    int32_t prev_y;
+    uint32_t prev_w;
+    uint32_t prev_h;
+
     /* Window specific custom drawing callback */
     void (*draw_content)(struct Window *self);
 
@@ -30,6 +36,9 @@ typedef struct Window {
 
     struct Window *next;
     struct Window *prev;
+
+    /* backing store for VM-drawn window content */
+    uint32_t *backing_store;
 } Window;
 
 /* Drawing helpers */

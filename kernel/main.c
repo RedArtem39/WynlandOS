@@ -166,18 +166,33 @@ static void fb_draw_gradient(BootInfo *info)
     uint8_t *fb = (uint8_t *)(uintptr_t)info->fb_addr;
 
     for (uint32_t y = 0; y < h; y++) {
-        /* Interpolate RGB values from top to bottom */
-        uint8_t r = (uint8_t)(10 + (y * 16 / h));   /* 0x0A -> 0x1A */
-        uint8_t g = 10;                                /* constant 0x0A */
-        uint8_t b = (uint8_t)(46 + (y * 10 / h));   /* 0x2E -> 0x38 */
+        /* Base interpolated color components */
+        int32_t r_base = 10 + (y * 16 / h);
+        int32_t g_base = 10;
+        int32_t b_base = 46 + (y * 10 / h);
 
-        /* Pack as BGRA (most common UEFI framebuffer format) */
-        uint32_t color = ((uint32_t)b) | ((uint32_t)g << 8) |
-                         ((uint32_t)r << 16) | (0xFF000000u);
-
-        /* Fill the entire row */
         uint32_t *row_ptr = (uint32_t *)(fb + y * info->fb_pitch);
         for (uint32_t x = 0; x < w; x++) {
+            /* 2x2 ordered dither to prevent banding */
+            int32_t dither = 0;
+            uint32_t dx = x & 1;
+            uint32_t dy = y & 1;
+            if (dx == 0 && dy == 0) dither = -1;
+            else if (dx == 1 && dy == 0) dither = 1;
+            else if (dx == 0 && dy == 1) dither = 2;
+            else dither = 0;
+
+            int32_t r = r_base + dither;
+            int32_t g = g_base + dither;
+            int32_t b = b_base + dither;
+
+            if (r < 0) r = 0; else if (r > 255) r = 255;
+            if (g < 0) g = 0; else if (g > 255) g = 255;
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+
+            /* Pack as BGRA (most common UEFI framebuffer format) */
+            uint32_t color = ((uint32_t)b) | ((uint32_t)g << 8) |
+                             ((uint32_t)r << 16) | (0xFF000000u);
             row_ptr[x] = color;
         }
     }
@@ -641,6 +656,96 @@ void console_print_string(BootInfo *info, const char *str, uint32_t fg, uint32_t
  * Autocomplete Suggestion Logic & Redrawing
  * ============================================================ */
 
+#define HISTORY_MAX_ITEMS 32
+#define HISTORY_ITEM_LEN  64
+static char history[HISTORY_MAX_ITEMS][HISTORY_ITEM_LEN];
+static int history_count = 0;
+static int history_index = -1;
+
+static int input_cursor = 0;
+
+static bool alt_pressed = false;
+static bool layout_ru = false;
+
+static char translate_scancode_ru(uint8_t sc, bool shift)
+{
+    /* QWERTY to JCUKEN layout translation using CP866 character codes */
+    static const uint8_t ru_lower[59] = {
+        0,   27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+        '\t', 0xA9, 0xE6, 0xE3, 0xAA, 0xA5, 0xAD, 0xA3, 0xE8, 0xE9, 0xA7, 0xE5, 0xEA, '\n',
+        0,   0xE4, 0xEB, 0xA2, 0xA0, 0xAF, 0xE0, 0xAE, 0xAB, 0xA4, 0xE6, 0xED, 0,
+        0,   0xEF, 0xE7, 0xE1, 0xAC, 0xA8, 0xE2, 0xEC, 0xA1, 0xEE, '.', 0, '*', 0, ' '
+    };
+
+    static const uint8_t ru_upper[59] = {
+        0,   27,  '!', '"', 0xFC, ';', '%', ':', '?', '*', '(', ')', '_', '+', '\b',
+        '\t', 0x89, 0x96, 0x93, 0x8A, 0x85, 0x8D, 0x83, 0x98, 0x99, 0x87, 0x95, 0x9A, '\n',
+        0,   0x94, 0x9B, 0x82, 0x80, 0x8F, 0x90, 0x8E, 0x8B, 0x84, 0x96, 0x9D, 0,
+        0,   0x9F, 0x97, 0x91, 0x8C, 0x88, 0x92, 0x8C, 0x81, 0x9E, ',', 0, '*', 0, ' '
+    };
+
+    if (sc >= 59) return 0;
+    return shift ? (char)ru_upper[sc] : (char)ru_lower[sc];
+}
+
+static void load_history(void)
+{
+    VfsFile *f = vfs_open("/history.txt");
+    if (!f) return;
+
+    static char file_buf[2048];
+    int bytes = vfs_read(f, file_buf, sizeof(file_buf) - 1);
+    vfs_close(f);
+
+    if (bytes <= 0) return;
+    file_buf[bytes] = '\0';
+
+    history_count = 0;
+    const char *p = file_buf;
+    while (*p) {
+        char line[HISTORY_ITEM_LEN];
+        int li = 0;
+        while (*p && *p != '\n' && *p != '\r' && li < (HISTORY_ITEM_LEN - 1)) {
+            line[li++] = *p++;
+        }
+        line[li] = '\0';
+
+        while (*p == '\n' || *p == '\r') p++;
+
+        if (li > 0 && history_count < HISTORY_MAX_ITEMS) {
+            str_copy(history[history_count++], line);
+        }
+    }
+    history_index = history_count;
+}
+
+static void add_history(const char *cmd)
+{
+    if (str_len(cmd) == 0) return;
+
+    if (history_count > 0 && str_compare(history[history_count - 1], cmd) == 0) {
+        history_index = history_count;
+        return;
+    }
+
+    VfsFile *f = vfs_open_flags("/history.txt", VFS_O_WRITE | VFS_O_CREATE | VFS_O_APPEND);
+    if (f) {
+        vfs_write(f, cmd, str_len(cmd));
+        vfs_write(f, "\n", 1);
+        vfs_close(f);
+    }
+
+    if (history_count >= HISTORY_MAX_ITEMS) {
+        for (int i = 1; i < HISTORY_MAX_ITEMS; i++) {
+            str_copy(history[i - 1], history[i]);
+        }
+        str_copy(history[HISTORY_MAX_ITEMS - 1], cmd);
+    } else {
+        str_copy(history[history_count++], cmd);
+    }
+    history_index = history_count;
+}
+
 static const char scancode_to_ascii_lower[59] = {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -658,8 +763,8 @@ static const char scancode_to_ascii_upper[59] = {
 static const char* find_suggestion(const char *prefix, int len)
 {
     if (len == 0) return NULL;
-    const char* commands[] = {"help", "clear", "about", "mmap", "neofetch", "tasks", "reboot", "poweroff", "panic", "heap_test", "ifconfig", "dhcp", "ping", "dns", "wget", "wynpkg"};
-    int cmd_count = 16;
+    const char* commands[] = {"help", "clear", "about", "mmap", "neofetch", "tasks", "reboot", "poweroff", "panic", "heap_test", "ifconfig", "dhcp", "ping", "dns", "wget", "wynpkg", "wynasm", "wynrun"};
+    int cmd_count = 18;
     for (int i = 0; i < cmd_count; i++) {
         bool match = true;
         for (int j = 0; j < len; j++) {
@@ -675,7 +780,7 @@ static const char* find_suggestion(const char *prefix, int len)
     return NULL;
 }
 
-static void draw_input_line(BootInfo *info, const char *prompt, const char *input, const char *suggestion)
+static void draw_input_line(BootInfo *info, const char *prompt, const char *input, int input_cursor_offset, const char *suggestion)
 {
     mouse_hide();
     disable_serial_mirror = true;
@@ -683,21 +788,22 @@ static void draw_input_line(BootInfo *info, const char *prompt, const char *inpu
     /* Clear line, then print prompt + user text */
     console_clear_current_line(info);
     console_print_string(info, prompt, 0x00886EFF, term_bg_color);
+
+    uint32_t prompt_cur_x = cursor_x;
+    uint32_t prompt_cur_y = cursor_y;
+
     console_print_string(info, input, 0x00FFFFFF, term_bg_color);
-    
-    uint32_t cur_x = cursor_x;
-    uint32_t cur_y = cursor_y;
-    
+
     /* Draw inline autocomplete suggestion in dim color */
     if (suggestion && suggestion[0] != '\0') {
         int input_len = str_len(input);
         const char *suffix = suggestion + input_len;
         console_print_string(info, suffix, 0x00555577, term_bg_color);
     }
-    
-    /* Reset cursor back to end of user input and render cursor block */
-    cursor_x = cur_x;
-    cursor_y = cur_y;
+
+    /* Reset cursor back to specific input cursor offset and render cursor block */
+    cursor_x = prompt_cur_x + input_cursor_offset;
+    cursor_y = prompt_cur_y;
     fb_draw_char(info, console_start_x + cursor_x * CHAR_STEP, console_start_y + cursor_y * LINE_STEP, '_', 0x0000FF00, term_bg_color);
 
     disable_serial_mirror = false;
@@ -817,6 +923,9 @@ static void execute_command(BootInfo *info, const char *cmd)
         console_print_string(info, "  wget <url>        - HTTP GET request\n", 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n  Package Manager:\n", 0x0000FFFF, term_bg_color);
         console_print_string(info, "  wynpkg <cmd>      - Package manager commands\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "\n  WynVM (Virtual Machine):\n", 0x0000FFFF, term_bg_color);
+        console_print_string(info, "  wynasm <src> <dst>- Compile WynVM assembly to binary (.wbin)\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  wynrun <bin>      - Execute compiled WynVM binary in background\n", 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n  Desktop:\n", 0x0000FFFF, term_bg_color);
         console_print_string(info, "  gui               - Launch WynlandDE desktop\n", 0x00FFFFFF, term_bg_color);
     } else if (str_compare(cmd, "pwd") == 0) {
@@ -1444,6 +1553,78 @@ static void execute_command(BootInfo *info, const char *cmd)
     } else if (str_compare(cmd, "wynpkg") == 0 || str_starts_with(cmd, "wynpkg ")) {
         cmd_wynpkg(info, cmd);
 
+    } else if (str_starts_with(cmd, "wynasm ")) {
+        const char *p = cmd + 7;
+        while (*p && (*p == ' ' || *p == '\t')) p++;
+        if (*p == '\0') {
+            console_print_string(info, "Usage: wynasm <src.wasm> <dst.wbin>\n", 0x00FF0000, term_bg_color);
+        } else {
+            char src_arg[256];
+            uint32_t i = 0;
+            while (*p && *p != ' ' && *p != '\t' && i < 255) {
+                src_arg[i++] = *p++;
+            }
+            src_arg[i] = '\0';
+
+            while (*p && (*p == ' ' || *p == '\t')) p++;
+            if (*p == '\0') {
+                console_print_string(info, "Usage: wynasm <src.wasm> <dst.wbin>\n", 0x00FF0000, term_bg_color);
+            } else {
+                char dst_arg[256];
+                uint32_t j = 0;
+                while (*p && *p != ' ' && *p != '\t' && j < 255) {
+                    dst_arg[j++] = *p++;
+                }
+                dst_arg[j] = '\0';
+
+                char resolved_src[512];
+                char resolved_dst[512];
+                resolve_path(src_arg, resolved_src);
+                resolve_path(dst_arg, resolved_dst);
+
+                console_print_string(info, "Assembling: ", 0x00FFFF00, term_bg_color);
+                console_print_string(info, resolved_src, 0x00FFFFFF, term_bg_color);
+                console_print_string(info, " -> ", 0x00FFFF00, term_bg_color);
+                console_print_string(info, resolved_dst, 0x00FFFFFF, term_bg_color);
+                console_print_string(info, "\n", 0, term_bg_color);
+
+                extern bool wynvm_assemble(const char *src_path, const char *dest_path);
+                if (wynvm_assemble(resolved_src, resolved_dst)) {
+                    console_print_string(info, "Assembly completed successfully.\n", 0x0000FF00, term_bg_color);
+                } else {
+                    console_print_string(info, "Assembly failed.\n", 0x00FF0000, term_bg_color);
+                }
+            }
+        }
+
+    } else if (str_starts_with(cmd, "wynrun ")) {
+        const char *p = cmd + 7;
+        while (*p && (*p == ' ' || *p == '\t')) p++;
+        if (*p == '\0') {
+            console_print_string(info, "Usage: wynrun <file.wbin>\n", 0x00FF0000, term_bg_color);
+        } else {
+            char arg[256];
+            uint32_t i = 0;
+            while (*p && *p != ' ' && *p != '\t' && i < 255) {
+                arg[i++] = *p++;
+            }
+            arg[i] = '\0';
+
+            char resolved[512];
+            resolve_path(arg, resolved);
+
+            console_print_string(info, "Running VM binary: ", 0x00FFFF00, term_bg_color);
+            console_print_string(info, resolved, 0x00FFFFFF, term_bg_color);
+            console_print_string(info, "\n", 0, term_bg_color);
+
+            extern bool wynvm_run(const char *bin_path);
+            if (wynvm_run(resolved)) {
+                console_print_string(info, "VM started successfully in background thread.\n", 0x0000FF00, term_bg_color);
+            } else {
+                console_print_string(info, "Failed to start VM.\n", 0x00FF0000, term_bg_color);
+            }
+        }
+
     } else if (str_len(cmd) > 0) {
         console_print_string(info, "wynland: command not found: ", 0x00FF0000, term_bg_color);
         console_print_string(info, cmd, 0x00FFFFFF, term_bg_color);
@@ -1501,6 +1682,8 @@ void kernel_main(BootInfo *boot_info)
 
     /* ---- Initialize Filesystem ---- */
     vfs_init();
+    vfs_mkdir("/apps");
+    vfs_mkdir("/docs");
 
     /* ---- Initialize Network Stack ---- */
     net_init();
@@ -1541,6 +1724,10 @@ void kernel_main(BootInfo *boot_info)
     bool shift_pressed = false;
     bool needs_redraw = true;
     const char *prompt = "wynland ~ ";
+
+    /* Load persistent command history and set cursor */
+    load_history();
+    input_cursor = 0;
 
     /* Drain keyboard controller buffer from BIOS/UEFI legacy inputs with timeout */
     int drain_timeout = 1000;
@@ -1611,26 +1798,39 @@ void kernel_main(BootInfo *boot_info)
 
         if (serial_char != 0) {
             if (serial_char == '\r' || serial_char == '\n') {
-                draw_input_line(boot_info, prompt, input_buf, NULL);
+                draw_input_line(boot_info, prompt, input_buf, input_cursor, NULL);
                 console_print_string(boot_info, "\n", 0xFFFFFFFF, term_bg_color);
                 
                 mouse_hide();
+                if (input_len > 0) {
+                    add_history(input_buf);
+                }
                 execute_command(boot_info, input_buf);
                 mouse_show();
                 
                 input_buf[0] = '\0';
                 input_len = 0;
+                input_cursor = 0;
                 
                 console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
                 needs_redraw = true;
             } else if (serial_char == '\b' || serial_char == 127) {
-                if (input_len > 0) {
+                if (input_cursor > 0) {
+                    for (int i = input_cursor - 1; i < input_len - 1; i++) {
+                        input_buf[i] = input_buf[i + 1];
+                    }
                     input_len--;
+                    input_cursor--;
                     input_buf[input_len] = '\0';
                     needs_redraw = true;
                 }
             } else if (serial_char >= 32 && serial_char <= 126 && input_len < 60) {
-                input_buf[input_len++] = serial_char;
+                for (int i = input_len; i > input_cursor; i--) {
+                    input_buf[i] = input_buf[i - 1];
+                }
+                input_buf[input_cursor] = serial_char;
+                input_len++;
+                input_cursor++;
                 input_buf[input_len] = '\0';
                 needs_redraw = true;
             }
@@ -1646,12 +1846,48 @@ void kernel_main(BootInfo *boot_info)
             }
             uint8_t sc2 = keyboard_has_scancode() ? keyboard_pop_scancode() : 0;
             if (sc2 != 0 && !(sc2 & 0x80)) {
-                if (sc2 == 0x4D) { /* Right Arrow: Autocomplete */
-                    const char *sug = find_suggestion(input_buf, input_len);
-                    if (sug) {
-                        str_copy(input_buf, sug);
-                        input_len = str_len(input_buf);
+                if (sc2 == 0x4D) { /* Right Arrow */
+                    if (input_cursor < input_len) {
+                        input_cursor++;
                         needs_redraw = true;
+                    } else {
+                        /* Autocomplete at end of line */
+                        const char *sug = find_suggestion(input_buf, input_len);
+                        if (sug) {
+                            str_copy(input_buf, sug);
+                            input_len = str_len(input_buf);
+                            input_cursor = input_len;
+                            needs_redraw = true;
+                        }
+                    }
+                } else if (sc2 == 0x4B) { /* Left Arrow */
+                    if (input_cursor > 0) {
+                        input_cursor--;
+                        needs_redraw = true;
+                    }
+                } else if (sc2 == 0x48) { /* Up Arrow: History backward */
+                    if (history_count > 0 && history_index > 0) {
+                        history_index--;
+                        str_copy(input_buf, history[history_index]);
+                        input_len = str_len(input_buf);
+                        input_cursor = input_len;
+                        needs_redraw = true;
+                    }
+                } else if (sc2 == 0x50) { /* Down Arrow: History forward */
+                    if (history_count > 0) {
+                        if (history_index < history_count - 1) {
+                            history_index++;
+                            str_copy(input_buf, history[history_index]);
+                            input_len = str_len(input_buf);
+                            input_cursor = input_len;
+                            needs_redraw = true;
+                        } else if (history_index == history_count - 1) {
+                            history_index = history_count;
+                            input_buf[0] = '\0';
+                            input_len = 0;
+                            input_cursor = 0;
+                            needs_redraw = true;
+                        }
                     }
                 }
             }
@@ -1661,14 +1897,28 @@ void kernel_main(BootInfo *boot_info)
                 uint8_t released_sc = sc & 0x7F;
                 if (released_sc == 0x2A || released_sc == 0x36) {
                     shift_pressed = false;
+                } else if (released_sc == 0x38) {
+                    alt_pressed = false;
                 }
             } else {
                 /* Key press */
                 if (sc == 0x2A || sc == 0x36) {
                     shift_pressed = true;
+                    if (alt_pressed) {
+                        layout_ru = !layout_ru;
+                    }
+                } else if (sc == 0x38) {
+                    alt_pressed = true;
+                    if (shift_pressed) {
+                        layout_ru = !layout_ru;
+                    }
                 } else if (sc == 0x0E) { /* Backspace */
-                    if (input_len > 0) {
+                    if (input_cursor > 0) {
+                        for (int i = input_cursor - 1; i < input_len - 1; i++) {
+                            input_buf[i] = input_buf[i + 1];
+                        }
                         input_len--;
+                        input_cursor--;
                         input_buf[input_len] = '\0';
                         needs_redraw = true;
                     }
@@ -1677,27 +1927,44 @@ void kernel_main(BootInfo *boot_info)
                     if (sug) {
                         str_copy(input_buf, sug);
                         input_len = str_len(input_buf);
+                        input_cursor = input_len;
                         needs_redraw = true;
                     }
+                } else if (sc == 177) { /* Enter */
+                    /* Handled internally by compiler syntax parser */
                 } else if (sc == 0x1C) { /* Enter */
                     /* Draw final input text without suggestion gray suffix */
-                    draw_input_line(boot_info, prompt, input_buf, NULL);
+                    draw_input_line(boot_info, prompt, input_buf, input_cursor, NULL);
                     console_print_string(boot_info, "\n", 0xFFFFFFFF, term_bg_color);
-                    
+
                     mouse_hide();
+                    if (input_len > 0) {
+                        add_history(input_buf);
+                    }
                     execute_command(boot_info, input_buf);
                     mouse_show();
-                    
+
                     input_buf[0] = '\0';
                     input_len = 0;
-                    
+                    input_cursor = 0;
+
                     console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
                     needs_redraw = true;
                 } else {
                     if (sc < 59) {
-                        char ascii = shift_pressed ? scancode_to_ascii_upper[sc] : scancode_to_ascii_lower[sc];
-                        if (ascii >= 32 && ascii <= 126 && input_len < 60) {
-                            input_buf[input_len++] = ascii;
+                        char ascii;
+                        if (layout_ru) {
+                            ascii = translate_scancode_ru(sc, shift_pressed);
+                        } else {
+                            ascii = shift_pressed ? scancode_to_ascii_upper[sc] : scancode_to_ascii_lower[sc];
+                        }
+                        if (ascii >= 32 && input_len < 60) {
+                            for (int i = input_len; i > input_cursor; i--) {
+                                input_buf[i] = input_buf[i - 1];
+                            }
+                            input_buf[input_cursor] = ascii;
+                            input_len++;
+                            input_cursor++;
                             input_buf[input_len] = '\0';
                             needs_redraw = true;
                         }
@@ -1708,9 +1975,8 @@ void kernel_main(BootInfo *boot_info)
 
         if (needs_redraw) {
             const char *sug = find_suggestion(input_buf, input_len);
-            draw_input_line(boot_info, prompt, input_buf, sug);
+            draw_input_line(boot_info, prompt, input_buf, input_cursor, sug);
             needs_redraw = false;
         }
     }
 }
-

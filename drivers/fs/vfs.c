@@ -97,22 +97,6 @@ static int str_compare(const char *s1, const char *s2) {
     return *s1 - *s2;
 }
 
-static int str_compare_nocase(const char *s1, const char *s2) {
-    while (*s1 && *s2) {
-        char c1 = *s1;
-        char c2 = *s2;
-        if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-        if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-        if (c1 != c2) return c1 - c2;
-        s1++;
-        s2++;
-    }
-    char c1 = *s1;
-    char c2 = *s2;
-    if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-    if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-    return c1 - c2;
-}
 
 static uint32_t str_len_local(const char *s) {
     uint32_t len = 0;
@@ -335,6 +319,9 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                                uint32_t *out_entry_offset) {
     uint32_t curr_cluster = dir_cluster;
 
+    char short_name[11];
+    format_to_83_name(short_name, name);
+
     while (curr_cluster < 0x0FFFFFF8) {
         uint32_t base_sector = fat32_cluster_to_sector(curr_cluster);
 
@@ -354,11 +341,16 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                 if ((uint8_t)e->name[0] == 0xE5) continue;       /* Deleted entry */
                 if (e->attr == 0x0F) continue;                    /* LFN entry */
 
-                char formatted[256];
-                format_short_name(formatted, e->name);
+                bool match = true;
+                for (int k = 0; k < 11; k++) {
+                    if (e->name[k] != short_name[k]) {
+                        match = false;
+                        break;
+                    }
+                }
 
-                if (str_compare_nocase(formatted, name) == 0) {
-                    str_copy(out_node->name, formatted);
+                if (match) {
+                    format_short_name(out_node->name, e->name);
                     out_node->size = e->file_size;
                     out_node->is_dir = (e->attr & 0x10) != 0;
                     out_node->first_cluster = e->first_cluster_low |

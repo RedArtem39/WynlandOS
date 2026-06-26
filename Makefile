@@ -235,6 +235,7 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF)
 	@mmd -i $@ ::/EFI/BOOT
 	@mcopy -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -i $@ $(KERNEL_ELF) ::/kernel.elf
+	@mcopy -i $@ app.wasm ::/app.was
 	@echo "  => wynland.img created (64 MB)"
 
 # ---------- Run in QEMU ----------
