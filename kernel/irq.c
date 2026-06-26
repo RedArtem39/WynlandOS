@@ -3,6 +3,8 @@
  */
 
 #include <wynland/irq.h>
+#include <wynland/sched.h>
+
 
 #define PIC1          0x20
 #define PIC2          0xA0
@@ -126,6 +128,10 @@ void irq_handler(InterruptRegisters *regs)
     if (irq == 0) {
         /* Timer interrupt */
         timer_ticks++;
+        /* Send End of Interrupt (EOI) to PIC before yielding */
+        outb(PIC1_COMMAND, PIC_EOI);
+        sched_preempt_tick();
+        return;
     } else if (irq == 1) {
         /* Keyboard interrupt */
         uint8_t scancode = inb(0x60);

@@ -20,6 +20,8 @@
 #include <wynland/heap.h>
 #include <wynland/irq.h>
 #include <wynland/mouse.h>
+#include <wynland/sched.h>
+
 
 #include <wynland/font.h>
 
@@ -414,6 +416,17 @@ void serial_write_string(const char *str)
     }
 }
 
+static bool serial_received(void)
+{
+    return inb(PORT_COM1 + 5) & 1;
+}
+
+static char serial_read_char(void)
+{
+    return inb(PORT_COM1);
+}
+
+
 /* ============================================================
  * Terminal Console Text Engine
  * ============================================================ */
@@ -607,6 +620,29 @@ static void poweroff(void)
     outw(0x4004, 0x3400);
 }
 
+static volatile int test_thread_1_done = 0;
+static volatile int test_thread_2_done = 0;
+
+static void test_thread_1(void *arg) {
+    (void)arg;
+    for (int i = 1; i <= 5; i++) {
+        serial_write_string("Thread 1: Running...\r\n");
+        for (volatile int d = 0; d < 20000000; d++);
+    }
+    serial_write_string("Thread 1: Terminating\r\n");
+    test_thread_1_done = 1;
+}
+
+static void test_thread_2(void *arg) {
+    (void)arg;
+    for (int i = 1; i <= 5; i++) {
+        serial_write_string("Thread 2: Running...\r\n");
+        for (volatile int d = 0; d < 20000000; d++);
+    }
+    serial_write_string("Thread 2: Terminating\r\n");
+    test_thread_2_done = 1;
+}
+
 /* ============================================================
  * Command Executor
  * ============================================================ */
@@ -615,46 +651,31 @@ static void execute_command(BootInfo *info, const char *cmd)
 {
     if (str_compare(cmd, "help") == 0) {
         console_print_string(info, "Available commands:\n", 0x0000FF00, term_bg_color);
-        console_print_string(info, "  help      - Show this help message\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  clear     - Clear the terminal screen\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  about     - Show system information\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  mmap      - Print the memory map\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  neofetch  - Show OS logo and specs\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  tasks     - Show active system tasks\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  reboot    - Reboot the system\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  poweroff  - Shut down the PC\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  panic     - Trigger a test CPU exception\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  heap_test - Run dynamic memory allocation test\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  help       - Show this help message\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  clear      - Clear the terminal screen\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  about      - Show system information\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  mmap       - Print the memory map\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  neofetch   - Show OS logo and specs\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  tasks      - Show active system tasks\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  reboot     - Reboot the system\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  poweroff   - Shut down the PC\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  panic      - Trigger a test CPU exception\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  heap_test  - Run dynamic memory allocation test\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  sched_test - Run multitasking scheduler test\n", 0x00FFFFFF, term_bg_color);
     } else if (str_compare(cmd, "tasks") == 0) {
-        console_print_string(info, "WynlandOS Task Manager (Minimal)\n", 0x0000FFFF, term_bg_color);
-        console_print_string(info, "PID  | Task Name       | Status   | CPU %  | Memory\n", 0x00CCCCCC, term_bg_color);
-        console_print_string(info, "-----|-----------------|----------|--------|---------\n", 0x00888888, term_bg_color);
-        
-        uint64_t t = rdtsc();
-        uint32_t shell_cpu = 15 + (uint32_t)(t % 10);
-        uint32_t idle_cpu = 100 - shell_cpu - 1;
-        char buf[32];
-        
-        console_print_string(info, "0    | idle            | IDLE     | ", 0x00FFFFFF, term_bg_color);
-        uint_to_str(idle_cpu, buf);
-        str_append(buf, ".0");
-        console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        int pad = 7 - str_len(buf);
-        while (pad-- > 0) console_print_char(info, ' ', 0, term_bg_color);
-        console_print_string(info, "| 16 KB\n", 0x00FFFFFF, term_bg_color);
-        
-        console_print_string(info, "1    | kernel          | SLEEP    | 0.1    | 256 KB\n", 0x00FFFFFF, term_bg_color);
-        
-        console_print_string(info, "2    | wynland_shell   | RUNNING  | ", 0x00FFFFFF, term_bg_color);
-        uint_to_str(shell_cpu, buf);
-        str_append(buf, ".2");
-        console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        pad = 7 - str_len(buf);
-        while (pad-- > 0) console_print_char(info, ' ', 0, term_bg_color);
-        console_print_string(info, "| 64 KB\n", 0x00FFFFFF, term_bg_color);
-        
-        console_print_string(info, "3    | compositor      | SLEEP    | 0.0    | 1024 KB\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "4    | kbd_driver      | SLEEP    | 0.0    | 32 KB\n", 0x00FFFFFF, term_bg_color);
+        sched_print_tasks(info, term_bg_color);
+    } else if (str_compare(cmd, "sched_test") == 0) {
+        console_print_string(info, "Running multitasking scheduler test...\n", 0x00FFFF00, term_bg_color);
+        test_thread_1_done = 0;
+        test_thread_2_done = 0;
+
+        thread_create(test_thread_1, NULL);
+        thread_create(test_thread_2, NULL);
+
+        while (!test_thread_1_done || !test_thread_2_done) {
+            sched_yield();
+        }
+        console_print_string(info, "Multitasking test completed successfully!\n", 0x0000FF00, term_bg_color);
     } else if (str_compare(cmd, "clear") == 0) {
         for (uint32_t y = console_start_y; y < console_end_y; y++) {
             uint32_t *row_ptr = (uint32_t *)((uint8_t *)(uintptr_t)info->fb_addr + y * info->fb_pitch);
@@ -853,6 +874,9 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize Heap ---- */
     heap_init();
 
+    /* ---- Initialize Scheduler ---- */
+    sched_init();
+
     /* ---- Initialize IRQs ---- */
     irq_init();
 
@@ -898,11 +922,42 @@ void kernel_main(BootInfo *boot_info)
 
     while (1) {
         uint8_t sc = 0;
+        char serial_char = 0;
         if (keyboard_has_scancode()) {
             sc = keyboard_pop_scancode();
+        } else if (serial_received()) {
+            serial_char = serial_read_char();
         } else {
-            /* Put CPU to sleep until next interrupt (timer or keyboard) */
+            /* Put CPU to sleep until next interrupt */
             __asm__ volatile("hlt");
+            continue;
+        }
+
+        if (serial_char != 0) {
+            if (serial_char == '\r' || serial_char == '\n') {
+                draw_input_line(boot_info, prompt, input_buf, NULL);
+                console_print_string(boot_info, "\n", 0xFFFFFFFF, term_bg_color);
+                
+                mouse_hide();
+                execute_command(boot_info, input_buf);
+                mouse_show();
+                
+                input_buf[0] = '\0';
+                input_len = 0;
+                
+                console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
+                needs_redraw = true;
+            } else if (serial_char == '\b' || serial_char == 127) {
+                if (input_len > 0) {
+                    input_len--;
+                    input_buf[input_len] = '\0';
+                    needs_redraw = true;
+                }
+            } else if (serial_char >= 32 && serial_char <= 126 && input_len < 60) {
+                input_buf[input_len++] = serial_char;
+                input_buf[input_len] = '\0';
+                needs_redraw = true;
+            }
             continue;
         }
 

@@ -25,9 +25,8 @@ static const uint8_t cursor_mask[12][12] = {
 static BootInfo *g_boot_info = NULL;
 static int32_t mouse_x = 0;
 static int32_t mouse_y = 0;
-static int32_t old_mouse_x = 0;
-static int32_t old_mouse_y = 0;
 static uint8_t mouse_buttons = 0;
+
 
 static uint32_t saved_background[CURSOR_W * CURSOR_H];
 static bool cursor_visible = false;
@@ -119,10 +118,10 @@ static void mouse_restore_background(void)
     uint32_t pitch_pixels = g_boot_info->fb_pitch / 4;
 
     for (int y = 0; y < CURSOR_H; y++) {
-        int screen_y = old_mouse_y + y;
+        int screen_y = mouse_y + y;
         if (screen_y >= (int)g_boot_info->fb_height) break;
         for (int x = 0; x < CURSOR_W; x++) {
-            int screen_x = old_mouse_x + x;
+            int screen_x = mouse_x + x;
             if (screen_x >= (int)g_boot_info->fb_width) break;
             fb[screen_y * pitch_pixels + screen_x] = saved_background[y * CURSOR_W + x];
         }
@@ -186,8 +185,6 @@ void mouse_init(BootInfo *info)
     g_boot_info = info;
     mouse_x = info->fb_width / 2;
     mouse_y = info->fb_height / 2;
-    old_mouse_x = mouse_x;
-    old_mouse_y = mouse_y;
     mouse_buttons = 0;
     cursor_visible = false;
 
@@ -268,8 +265,6 @@ void mouse_handle_interrupt(uint8_t data)
 
             if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons)) {
                 mouse_hide();
-                old_mouse_x = mouse_x;
-                old_mouse_y = mouse_y;
                 mouse_x = new_x;
                 mouse_y = new_y;
                 mouse_buttons = buttons & 0x07;
