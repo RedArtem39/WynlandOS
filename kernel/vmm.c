@@ -40,7 +40,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
         pdpt = vmm_alloc_table();
         *pml4_entry = (uint64_t)(uintptr_t)pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
     } else {
-        pdpt = (PageTable *)(uintptr_t)(*pml4_entry & ~0xFFFU);
+        pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
     }
 
     /* 2. Traverse PDPT -> PD */
@@ -50,7 +50,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
         pd = vmm_alloc_table();
         *pdpt_entry = (uint64_t)(uintptr_t)pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
     } else {
-        pd = (PageTable *)(uintptr_t)(*pdpt_entry & ~0xFFFU);
+        pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
     }
 
     /* 3. Traverse PD -> PT */
@@ -60,7 +60,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
         pt = vmm_alloc_table();
         *pd_entry = (uint64_t)(uintptr_t)pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
     } else {
-        pt = (PageTable *)(uintptr_t)(*pd_entry & ~0xFFFU);
+        pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
     }
 
     /* 4. Map the physical address in the Page Table */
@@ -81,15 +81,15 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
     if (!(*pml4_entry & PAGE_PRESENT)) return;
     
-    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & ~0xFFFU);
+    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
     if (!(*pdpt_entry & PAGE_PRESENT)) return;
 
-    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & ~0xFFFU);
+    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
     if (!(*pd_entry & PAGE_PRESENT)) return;
 
-    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & ~0xFFFU);
+    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
     
     /* Clear entry */
     pt->entries[pt_idx] = 0;

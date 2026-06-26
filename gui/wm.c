@@ -91,7 +91,6 @@ void wm_term_set_cell(int row, int col, char c, uint32_t fg, uint32_t bg)
         g_term_grid[row][col] = c;
         g_term_fg_grid[row][col] = fg;
         g_term_bg_grid[row][col] = bg;
-        comp_mark_dirty();
     }
 }
 
@@ -110,7 +109,17 @@ void wm_term_clear_line(int row)
 {
     if (row >= 0 && row < TERM_ROWS) {
         memset(g_term_grid[row], 0, TERM_COLS);
-        comp_mark_dirty();
+        if (g_term_window) {
+            int32_t cx = g_term_window->x + 1;
+            int32_t cy = g_term_window->y + THEME_TITLEBAR_HEIGHT + 1;
+            int32_t line_y = cy + 10 + row * 18;
+            int32_t line_x = cx + 10;
+            uint32_t line_w = g_term_window->w - 20;
+
+            extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
+            comp_draw_wallpaper_rect(line_x, line_y, line_w, 16);
+            comp_fill_rect_alpha(line_x, line_y, line_w, 16, THEME_TERM_BG);
+        }
     }
 }
 
@@ -326,15 +335,16 @@ void wm_draw_desktop(void)
     uint64_t rflags = save_irq_disable();
 
     if (!g_wm_needs_redraw) {
-        /* If only the mouse moved or buttons changed, we do a lightweight cursor update */
-        if (mx != last_mx || my != last_my || buttons != last_buttons) {
+        /* If only the mouse moved, buttons changed, or compositor is dirty, do lightweight flip */
+        extern bool comp_is_dirty(void);
+        if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty()) {
             /* 1. Restore old background under cursor */
             comp_restore_cursor_back();
 
             /* 2. Draw cursor at new position */
             comp_draw_cursor(mx, my, buttons);
 
-            /* 3. Flip only the dirty regions (old and new cursor areas) */
+            /* 3. Flip only the dirty regions (old/new cursor + other dirty regions) */
             compositor_flip();
 
             last_mx = mx;

@@ -73,8 +73,7 @@ $QemuArgs = @(
     "-m", "256M",
     "-bios", $OvmfFw,
     "-drive", "file=$DiskImage,format=raw",
-    "-vga", "none",
-    "-device", "virtio-gpu-pci,disable-legacy=off,disable-modern=on",
+    "-vga", "virtio",
     "-serial", "stdio",
     "-no-reboot",
     "-no-shutdown"

@@ -91,12 +91,14 @@ static void fb_draw_char(BootInfo *info, uint32_t x, uint32_t y,
 {
     extern bool wm_is_gui_active(void);
     extern void wm_term_set_cell(int row, int col, char c, uint32_t fg, uint32_t bg);
+    extern void comp_draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg);
     extern uint32_t console_start_x;
     extern uint32_t console_start_y;
     if (wm_is_gui_active()) {
         int col = (int)(x - console_start_x) / CHAR_STEP;
         int row = (int)(y - console_start_y) / LINE_STEP;
         wm_term_set_cell(row, col, c, fg, bg);
+        comp_draw_char(x, y, c, fg, bg);
         return;
     }
     const uint8_t *glyph = font_8x16[(uint8_t)c];
@@ -1506,6 +1508,22 @@ void kernel_main(BootInfo *boot_info)
 
     /* ---- Draw gradient background ---- */
     serial_write_string("Main: Drawing gradient background...\r\n");
+    {
+        char temp_buf[32];
+        serial_write_string("FB Addr: ");
+        uint_to_hex(boot_info->fb_addr, temp_buf);
+        serial_write_string(temp_buf);
+        serial_write_string("\r\nFB Width: ");
+        uint_to_str(boot_info->fb_width, temp_buf);
+        serial_write_string(temp_buf);
+        serial_write_string("\r\nFB Height: ");
+        uint_to_str(boot_info->fb_height, temp_buf);
+        serial_write_string(temp_buf);
+        serial_write_string("\r\nFB Pitch: ");
+        uint_to_str(boot_info->fb_pitch, temp_buf);
+        serial_write_string(temp_buf);
+        serial_write_string("\r\n");
+    }
     fb_draw_gradient(boot_info);
     serial_write_string("Main: Gradient background drawn successfully.\r\n");
 

@@ -456,6 +456,11 @@ void comp_mark_dirty(void)
     wm_mark_dirty();
 }
 
+bool comp_is_dirty(void)
+{
+    return g_comp.dirty;
+}
+
 /* ============================================================
  * Desktop Wallpaper (Nord gradient)
  * ============================================================ */
@@ -497,6 +502,46 @@ void comp_draw_wallpaper(void)
         }
     }
     comp_mark_area_dirty(0, 0, w - 1, h - 1);
+}
+
+void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh)
+{
+    uint32_t w = g_comp.fb_width;
+    uint32_t h = g_comp.fb_height;
+
+    if (rx >= w || ry >= h) return;
+    if (rx + rw > w) rw = w - rx;
+    if (ry + rh > h) rh = h - ry;
+
+    uint32_t top_r = 0x2E, top_g = 0x34, top_b = 0x40;
+    uint32_t bot_r = 0x23, bot_g = 0x28, bot_b = 0x31;
+
+    for (uint32_t y = ry; y < ry + rh; y++) {
+        uint32_t r = top_r + (bot_r - top_r) * y / h;
+        uint32_t g = top_g + (bot_g - top_g) * y / h;
+        uint32_t b = top_b + (bot_b - top_b) * y / h;
+
+        uint32_t *row = &g_comp.back_buffer[y * w];
+        for (uint32_t x = rx; x < rx + rw; x++) {
+            int32_t cx = (int32_t)x - (int32_t)(w / 2);
+            int32_t cy = (int32_t)y - (int32_t)(h / 2);
+            int32_t dist_sq = cx * cx + cy * cy;
+            int32_t max_dist = (int32_t)((w/2) * (w/2) + (h/2) * (h/2));
+
+            int32_t darken = (dist_sq * 40) / max_dist;
+            if (darken > 40) darken = 40;
+
+            int32_t pr = (int32_t)r - darken;
+            int32_t pg = (int32_t)g - darken;
+            int32_t pb = (int32_t)b - darken;
+            if (pr < 0) pr = 0;
+            if (pg < 0) pg = 0;
+            if (pb < 0) pb = 0;
+
+            row[x] = ((uint32_t)pr << 16) | ((uint32_t)pg << 8) | (uint32_t)pb;
+        }
+    }
+    comp_mark_area_dirty(rx, ry, rx + rw - 1, ry + rh - 1);
 }
 
 /* ============================================================
