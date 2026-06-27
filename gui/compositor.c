@@ -468,9 +468,46 @@ void comp_box_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radi
     comp_mark_area_dirty(x, y, x + w - 1, y + h - 1);
 }
 
-void comp_draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg)
+static void get_braille_glyph(uint8_t mask, uint8_t *glyph)
 {
-    const uint8_t *glyph = font_8x16[(uint8_t)c];
+    for (int i = 0; i < 16; i++) {
+        glyph[i] = 0;
+    }
+    /*
+       Dot 1 (bit 0): Col 1, Row 1 (glyph rows 2, 3)
+       Dot 2 (bit 1): Col 1, Row 2 (glyph rows 6, 7)
+       Dot 3 (bit 2): Col 1, Row 3 (glyph rows 10, 11)
+       Dot 4 (bit 3): Col 2, Row 1 (glyph rows 2, 3)
+       Dot 5 (bit 4): Col 2, Row 2 (glyph rows 6, 7)
+       Dot 6 (bit 5): Col 2, Row 3 (glyph rows 10, 11)
+       Dot 7 (bit 6): Col 1, Row 4 (glyph rows 14, 15)
+       Dot 8 (bit 7): Col 2, Row 4 (glyph rows 14, 15)
+
+       We'll place Braille Col 1 at glyph column 3 (bit 5, 0x20) and Col 2 at glyph column 6 (bit 2, 0x04).
+    */
+    if (mask & 0x01) { glyph[2] |= 0x20; glyph[3] |= 0x20; }
+    if (mask & 0x02) { glyph[6] |= 0x20; glyph[7] |= 0x20; }
+    if (mask & 0x04) { glyph[10] |= 0x20; glyph[11] |= 0x20; }
+    if (mask & 0x08) { glyph[2] |= 0x04; glyph[3] |= 0x04; }
+    if (mask & 0x10) { glyph[6] |= 0x04; glyph[7] |= 0x04; }
+    if (mask & 0x20) { glyph[10] |= 0x04; glyph[11] |= 0x04; }
+    if (mask & 0x40) { glyph[14] |= 0x20; glyph[15] |= 0x20; }
+    if (mask & 0x80) { glyph[14] |= 0x04; glyph[15] |= 0x04; }
+}
+
+void comp_draw_char(uint32_t x, uint32_t y, uint16_t c, uint32_t fg, uint32_t bg)
+{
+    uint8_t braille_buf[16];
+    const uint8_t *glyph;
+
+    if (c >= 0x2800 && c <= 0x28FF) {
+        get_braille_glyph((uint8_t)(c - 0x2800), braille_buf);
+        glyph = braille_buf;
+    } else if (c < 256) {
+        glyph = font_8x16[c];
+    } else {
+        glyph = font_8x16['?'];
+    }
 
     for (uint32_t row = 0; row < 16; row++) {
         uint8_t bits = glyph[row];

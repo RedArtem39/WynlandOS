@@ -55,13 +55,15 @@ static Window *g_term_window = NULL;
 static Window *g_settings_window = NULL;
 static Window *g_browser_window = NULL;
 static Window *g_forge_window = NULL;
+/*
 static char g_browser_url[256] = "10.0.2.2:8000";
 static char g_browser_content_buf[4096] = {0};
+*/
 
 /* Terminal buffer */
 #define TERM_ROWS 30
 #define TERM_COLS 100
-static char g_term_grid[TERM_ROWS][TERM_COLS];
+static uint16_t g_term_grid[TERM_ROWS][TERM_COLS];
 static uint32_t g_term_fg_grid[TERM_ROWS][TERM_COLS];
 static uint32_t g_term_bg_grid[TERM_ROWS][TERM_COLS];
 
@@ -85,10 +87,12 @@ static DockIcon g_dock_icons[DOCK_ICON_COUNT] = {
 /* Forward declarations */
 static void draw_terminal_content(Window *self);
 static void draw_settings_content(Window *self);
+/*
 static void draw_browser_content(Window *self);
 static void handle_browser_key(Window *self, uint8_t scancode, char ascii);
 static void handle_browser_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
 static void browser_load_page(void);
+*/
 
 extern void comp_draw_icon_forge(int32_t cx, int32_t cy, int32_t r);
 
@@ -117,12 +121,18 @@ void wm_exit_gui(void)
     g_gui_active = false;
 }
 
+bool wm_is_terminal_focused(void)
+{
+    return (g_windows_head == g_term_window);
+}
+
+
 void wm_mark_dirty(void)
 {
     g_wm_needs_redraw = true;
 }
 
-void wm_term_set_cell(int row, int col, char c, uint32_t fg, uint32_t bg)
+void wm_term_set_cell(int row, int col, uint16_t c, uint32_t fg, uint32_t bg)
 {
     if (row >= 0 && row < TERM_ROWS && col >= 0 && col < TERM_COLS) {
         g_term_grid[row][col] = c;
@@ -134,18 +144,18 @@ void wm_term_set_cell(int row, int col, char c, uint32_t fg, uint32_t bg)
 void wm_term_scroll(void)
 {
     for (int r = 0; r < TERM_ROWS - 1; r++) {
-        memcpy(g_term_grid[r], g_term_grid[r + 1], TERM_COLS);
+        memcpy(g_term_grid[r], g_term_grid[r + 1], sizeof(g_term_grid[r]));
         memcpy(g_term_fg_grid[r], g_term_fg_grid[r + 1], TERM_COLS * 4);
         memcpy(g_term_bg_grid[r], g_term_bg_grid[r + 1], TERM_COLS * 4);
     }
-    memset(g_term_grid[TERM_ROWS - 1], 0, TERM_COLS);
+    memset(g_term_grid[TERM_ROWS - 1], 0, sizeof(g_term_grid[TERM_ROWS - 1]));
     comp_mark_dirty();
 }
 
 void wm_term_clear_line(int row)
 {
     if (row >= 0 && row < TERM_ROWS) {
-        memset(g_term_grid[row], 0, TERM_COLS);
+        memset(g_term_grid[row], 0, sizeof(g_term_grid[row]));
         if (g_term_window) {
             int32_t cx = g_term_window->x + 1;
             int32_t cy = g_term_window->y + THEME_TITLEBAR_HEIGHT + 1;
@@ -220,6 +230,29 @@ void wm_raise_window(Window *win)
     comp_mark_dirty();
 }
 
+int32_t wm_get_browser_x(void) { return g_browser_window ? g_browser_window->x : 0; }
+int32_t wm_get_browser_y(void) { return g_browser_window ? g_browser_window->y : 0; }
+int32_t wm_get_browser_w(void) { return g_browser_window ? g_browser_window->w : 0; }
+int32_t wm_get_browser_h(void) { return g_browser_window ? g_browser_window->h : 0; }
+
+void draw_browser_content_wlang(Window *self) {
+    (void)self;
+    extern void wlang_call_on_draw(void);
+    wlang_call_on_draw();
+}
+
+void handle_browser_key_wlang(Window *self, uint8_t scancode, char ascii) {
+    (void)self;
+    extern void wlang_call_on_key(uint8_t scancode, char ascii);
+    wlang_call_on_key(scancode, ascii);
+}
+
+void handle_browser_mouse_wlang(Window *self, int32_t mx, int32_t my, uint8_t buttons) {
+    (void)self;
+    extern void wlang_call_on_mouse(int32_t mx, int32_t my, uint8_t buttons);
+    wlang_call_on_mouse(mx, my, buttons);
+}
+
 void wm_init(void)
 {
     serial_write_string("WM: Initializing Stacking Window Manager...\r\n");
@@ -269,9 +302,9 @@ void wm_init(void)
     memcpy(browser->title, "WynlandOS Browser", 18);
     browser->is_visible = false; /* Starts hidden, open from Dock */
     browser->is_focused = false;
-    browser->draw_content = draw_browser_content;
-    browser->handle_key = handle_browser_key;
-    browser->handle_mouse = handle_browser_mouse;
+    browser->draw_content = draw_browser_content_wlang;
+    browser->handle_key = handle_browser_key_wlang;
+    browser->handle_mouse = handle_browser_mouse_wlang;
     g_browser_window = browser;
     wm_register_window(browser);
 
@@ -307,6 +340,9 @@ void wm_init(void)
     /* Raise Terminal to make it default focused */
     wm_raise_window(term);
 
+    extern void wlang_browser_init(void);
+    wlang_browser_init();
+
     serial_write_string("WM: Initialized successfully.\r\n");
 }
 
@@ -338,7 +374,7 @@ static void draw_terminal_content(Window *self)
             int32_t char_x = cx + 10 + c * 9;
             if (char_x + 8 > (int32_t)(self->x + self->w - 10)) break;
 
-            char ch = g_term_grid[r][c];
+            uint16_t ch = g_term_grid[r][c];
             if (ch != '\0') {
                 uint32_t fg = g_term_fg_grid[r][c];
                 uint32_t bg = g_term_bg_grid[r][c];
@@ -1111,6 +1147,7 @@ void wm_handle_key(uint8_t scancode, char ascii)
  * Web Browser Application Implementation
  * ============================================================ */
 
+#if 0
 static void draw_browser_content(Window *self)
 {
     /* Client area */
@@ -1380,3 +1417,4 @@ static void browser_load_page(void)
 
     comp_mark_dirty();
 }
+#endif

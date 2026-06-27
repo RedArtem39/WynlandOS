@@ -108,7 +108,20 @@ void *kmalloc(size_t size)
         return NULL;
     }
 
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    void *result = NULL;
     size_t aligned_size = align_up(size);
+
+    serial_write_string("kmalloc: size=0x");
+    char buf[32];
+    uint_to_hex((uint64_t)size, buf); serial_write_string(buf);
+    serial_write_string(" first=0x");
+    uint_to_hex((uint64_t)(uintptr_t)heap_first, buf); serial_write_string(buf);
+    serial_write_string(" end=0x");
+    uint_to_hex(heap_end_addr, buf); serial_write_string(buf);
+    serial_write_string("\r\n");
 
     /* Search for first free block that fits */
     HeapHeader *curr = heap_first;
@@ -122,7 +135,7 @@ void *kmalloc(size_t size)
     /* If no block is found, grow the heap */
     if (curr == NULL) {
         if (!heap_grow(aligned_size)) {
-            return NULL; /* Out of memory */
+            goto cleanup; /* Out of memory */
         }
         /* Search again from the start (should succeed now) */
         curr = heap_first;
@@ -133,7 +146,7 @@ void *kmalloc(size_t size)
             curr = curr->next;
         }
         if (curr == NULL) {
-            return NULL;
+            goto cleanup;
         }
     }
 
@@ -149,11 +162,20 @@ void *kmalloc(size_t size)
     }
 
     curr->is_free = false;
-    return (void *)((uintptr_t)curr + sizeof(HeapHeader));
+    result = (void *)((uintptr_t)curr + sizeof(HeapHeader));
+
+cleanup:
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+    return result;
 }
 
 void kfree(void *ptr)
 {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
     if (ptr != NULL) {
         HeapHeader *block = (HeapHeader *)((uintptr_t)ptr - sizeof(HeapHeader));
         block->is_free = true;
@@ -168,6 +190,10 @@ void kfree(void *ptr)
         } else {
             curr = curr->next;
         }
+    }
+
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
     }
 }
 

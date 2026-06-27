@@ -4,6 +4,7 @@
 
 #include <wynland/idt.h>
 #include <wynland/boot_info.h>
+#include <wynland/vmm.h>
 
 /* Declare all assembly ISR stubs */
 extern void isr0();
@@ -257,6 +258,38 @@ void exception_handler(InterruptRegisters *regs)
             console_print_string(g_boot_info, "Unknown", 0x00FF3333, bg_color);
         }
         console_print_string(g_boot_info, "\n\nRegisters state:\n", 0x00E0E0E0, bg_color);
+
+        if (regs->int_no == 14) { /* Page Fault */
+            uint64_t cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            print_reg(g_boot_info, "CR2", cr2);
+
+            /* Dump page tables for CR2 */
+            extern PageTable *vmm_get_current_pml4(void);
+            PageTable *pml4 = vmm_get_current_pml4();
+            uint64_t pml4_idx = PML4_INDEX(cr2);
+            uint64_t pdpt_idx = PDPT_INDEX(cr2);
+            uint64_t pd_idx   = PD_INDEX(cr2);
+            uint64_t pt_idx   = PT_INDEX(cr2);
+
+            PageTableEntry pml4_e = pml4->entries[pml4_idx];
+            print_reg(g_boot_info, "PML4E", pml4_e);
+            if (pml4_e & PAGE_PRESENT) {
+                PageTable *pdpt = (PageTable *)(uintptr_t)(pml4_e & PAGE_ADDR_MASK);
+                PageTableEntry pdpt_e = pdpt->entries[pdpt_idx];
+                print_reg(g_boot_info, "PDPTE", pdpt_e);
+                if (pdpt_e & PAGE_PRESENT) {
+                    PageTable *pd = (PageTable *)(uintptr_t)(pdpt_e & PAGE_ADDR_MASK);
+                    PageTableEntry pd_e = pd->entries[pd_idx];
+                    print_reg(g_boot_info, "PDE  ", pd_e);
+                    if (pd_e & PAGE_PRESENT) {
+                        PageTable *pt = (PageTable *)(uintptr_t)(pd_e & PAGE_ADDR_MASK);
+                        PageTableEntry pt_e = pt->entries[pt_idx];
+                        print_reg(g_boot_info, "PTE  ", pt_e);
+                    }
+                }
+            }
+        }
 
         print_reg(g_boot_info, "RIP", regs->rip);
         print_reg(g_boot_info, "CS ", regs->cs);

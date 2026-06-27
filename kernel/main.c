@@ -22,6 +22,7 @@
 #include <wynland/mouse.h>
 #include <wynland/sched.h>
 #include <wynland/vfs.h>
+#include <wynland/wlang.h>
 #include <wynland/net.h>
 #include <wynland/tcp.h>
 #include <wynland/http.h>
@@ -86,12 +87,27 @@ static UNUSED void fb_fill_rect(BootInfo *info, uint32_t x, uint32_t y,
 #define CHAR_STEP   (9 * FONT_SCALE)
 #define LINE_STEP   (18 * FONT_SCALE)
 
+static void get_braille_glyph(uint8_t mask, uint8_t *glyph)
+{
+    for (int i = 0; i < 16; i++) {
+        glyph[i] = 0;
+    }
+    if (mask & 0x01) { glyph[2] |= 0x20; glyph[3] |= 0x20; }
+    if (mask & 0x02) { glyph[6] |= 0x20; glyph[7] |= 0x20; }
+    if (mask & 0x04) { glyph[10] |= 0x20; glyph[11] |= 0x20; }
+    if (mask & 0x08) { glyph[2] |= 0x04; glyph[3] |= 0x04; }
+    if (mask & 0x10) { glyph[6] |= 0x04; glyph[7] |= 0x04; }
+    if (mask & 0x20) { glyph[10] |= 0x04; glyph[11] |= 0x04; }
+    if (mask & 0x40) { glyph[14] |= 0x20; glyph[15] |= 0x20; }
+    if (mask & 0x80) { glyph[14] |= 0x04; glyph[15] |= 0x04; }
+}
+
 static void fb_draw_char(BootInfo *info, uint32_t x, uint32_t y,
-                          char c, uint32_t fg, uint32_t bg)
+                          uint16_t c, uint32_t fg, uint32_t bg)
 {
     extern bool wm_is_gui_active(void);
-    extern void wm_term_set_cell(int row, int col, char c, uint32_t fg, uint32_t bg);
-    extern void comp_draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg);
+    extern void wm_term_set_cell(int row, int col, uint16_t c, uint32_t fg, uint32_t bg);
+    extern void comp_draw_char(uint32_t x, uint32_t y, uint16_t c, uint32_t fg, uint32_t bg);
     extern uint32_t console_start_x;
     extern uint32_t console_start_y;
     if (wm_is_gui_active()) {
@@ -101,7 +117,18 @@ static void fb_draw_char(BootInfo *info, uint32_t x, uint32_t y,
         comp_draw_char(x, y, c, fg, bg);
         return;
     }
-    const uint8_t *glyph = font_8x16[(uint8_t)c];
+    
+    uint8_t braille_buf[16];
+    const uint8_t *glyph;
+
+    if (c >= 0x2800 && c <= 0x28FF) {
+        get_braille_glyph((uint8_t)(c - 0x2800), braille_buf);
+        glyph = braille_buf;
+    } else if (c < 256) {
+        glyph = font_8x16[c];
+    } else {
+        glyph = font_8x16['?'];
+    }
 
     for (uint32_t row = 0; row < 16; row++) {
         uint8_t bits = glyph[row];
@@ -598,8 +625,14 @@ static void console_clear_current_line(BootInfo *info)
 
 static bool disable_serial_mirror = false;
 
+static int g_utf8_state = 0;
+static uint32_t g_utf8_code = 0;
+
 void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
 {
+    uint8_t b = (uint8_t)c;
+    uint16_t decoded_c = 0;
+
     /* Mirror output to COM1 serial port */
     if (!disable_serial_mirror) {
         if (c == '\n') {
@@ -614,22 +647,51 @@ void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
         }
     }
 
-    if (c == '\n') {
+    if (g_utf8_state == 0) {
+        if ((b & 0x80) == 0) {
+            decoded_c = b;
+        } else if ((b & 0xE0) == 0xC0) {
+            g_utf8_code = b & 0x1F;
+            g_utf8_state = 1;
+            return;
+        } else if ((b & 0xF0) == 0xE0) {
+            g_utf8_code = b & 0x0F;
+            g_utf8_state = 2;
+            return;
+        } else {
+            return; // ignore invalid lead bytes
+        }
+    } else {
+        if ((b & 0xC0) == 0x80) {
+            g_utf8_code = (g_utf8_code << 6) | (b & 0x3F);
+            g_utf8_state--;
+            if (g_utf8_state == 0) {
+                decoded_c = (uint16_t)g_utf8_code;
+            } else {
+                return;
+            }
+        } else {
+            g_utf8_state = 0;
+            return;
+        }
+    }
+
+    if (decoded_c == '\n') {
         cursor_x = 0;
         cursor_y++;
         if (console_start_y + cursor_y * LINE_STEP >= console_end_y) {
             console_scroll(info);
             cursor_y--;
         }
-    } else if (c == '\r') {
+    } else if (decoded_c == '\r') {
         cursor_x = 0;
-    } else if (c == '\b') {
+    } else if (decoded_c == '\b') {
         if (cursor_x > 0) {
             cursor_x--;
             fb_draw_char(info, console_start_x + cursor_x * CHAR_STEP, console_start_y + cursor_y * LINE_STEP, ' ', fg, bg);
         }
     } else {
-        fb_draw_char(info, console_start_x + cursor_x * CHAR_STEP, console_start_y + cursor_y * LINE_STEP, c, fg, bg);
+        fb_draw_char(info, console_start_x + cursor_x * CHAR_STEP, console_start_y + cursor_y * LINE_STEP, decoded_c, fg, bg);
         cursor_x++;
         if (console_start_x + cursor_x * CHAR_STEP >= console_end_x) {
             cursor_x = 0;
@@ -763,8 +825,8 @@ static const char scancode_to_ascii_upper[59] = {
 static const char* find_suggestion(const char *prefix, int len)
 {
     if (len == 0) return NULL;
-    const char* commands[] = {"help", "clear", "about", "mmap", "neofetch", "tasks", "reboot", "poweroff", "panic", "heap_test", "ifconfig", "dhcp", "ping", "dns", "wget", "wynpkg", "wynasm", "wynrun"};
-    int cmd_count = 18;
+    const char* commands[] = {"help", "clear", "about", "mmap", "neofetch", "tasks", "reboot", "poweroff", "panic", "heap_test", "ifconfig", "dhcp", "ping", "dns", "wget", "wynpkg", "wlang", "run", "wynasm", "wynrun"};
+    int cmd_count = 20;
     for (int i = 0; i < cmd_count; i++) {
         bool match = true;
         for (int j = 0; j < len; j++) {
@@ -888,6 +950,89 @@ static void test_thread_2(void *arg) {
  * Command Executor
  * ============================================================ */
 
+/* WynLang output callback — called by the interpreter's print() */
+static BootInfo *g_wlang_info = NULL;
+void wlang_print_output(const char *text)
+{
+    if (g_wlang_info) {
+        console_print_string(g_wlang_info, text, 0x00E0E0E0, term_bg_color);
+    }
+}
+
+void wlang_read_input(char *buf, uint32_t max_len)
+{
+    if (!g_wlang_info) {
+        if (max_len > 0) buf[0] = '\0';
+        return;
+    }
+    int lpos = 0;
+    memset(buf, 0, max_len);
+    bool repl_shift = false;
+
+    while (1) {
+        extern bool keyboard_has_scancode(void);
+        extern uint8_t keyboard_pop_scancode(void);
+
+        if (!keyboard_has_scancode()) {
+            /* Also check serial */
+            uint8_t lsr = 0;
+            __asm__ volatile("inb %1, %0" : "=a"(lsr) : "Nd"((uint16_t)0x3FD));
+            if (lsr & 0x01) {
+                uint8_t ch = 0;
+                __asm__ volatile("inb %1, %0" : "=a"(ch) : "Nd"((uint16_t)0x3F8));
+                if (ch == '\r' || ch == '\n') break;
+                if (ch == 0x7F || ch == '\b') {
+                    if (lpos > 0) { lpos--; buf[lpos] = '\0'; console_print_char(g_wlang_info, '\b', 0, term_bg_color); }
+                    continue;
+                }
+                if (lpos < (int)(max_len - 1)) {
+                    buf[lpos++] = (char)ch;
+                    buf[lpos] = '\0';
+                    console_print_char(g_wlang_info, (char)ch, 0x00FFFFFF, term_bg_color);
+                }
+            }
+            __asm__ volatile("hlt");
+            continue;
+        }
+
+        uint8_t sc = keyboard_pop_scancode();
+        if (sc & 0x80) { /* Key release */
+            uint8_t released_sc = sc & 0x7F;
+            if (released_sc == 0x2A || released_sc == 0x36) {
+                repl_shift = false;
+            }
+            continue;
+        }
+        if (sc == 0x2A || sc == 0x36) { /* Shift press */
+            repl_shift = true;
+            continue;
+        }
+
+        if (sc == 0x1C) { /* Enter */
+            console_print_string(g_wlang_info, "\n", 0, term_bg_color);
+            break;
+        }
+        if (sc == 0x0E) { /* Backspace */
+            if (lpos > 0) {
+                lpos--;
+                buf[lpos] = '\0';
+                console_print_char(g_wlang_info, '\b', 0, term_bg_color);
+            }
+            continue;
+        }
+
+        char ch = 0;
+        if (sc < 59) {
+            ch = repl_shift ? scancode_to_ascii_upper[sc] : scancode_to_ascii_lower[sc];
+        }
+        if (ch && lpos < (int)(max_len - 1)) {
+            buf[lpos++] = ch;
+            buf[lpos] = '\0';
+            console_print_char(g_wlang_info, ch, 0x00FFFFFF, term_bg_color);
+        }
+    }
+}
+
 static void execute_command(BootInfo *info, const char *cmd)
 {
     if (str_compare(cmd, "help") == 0) {
@@ -923,9 +1068,10 @@ static void execute_command(BootInfo *info, const char *cmd)
         console_print_string(info, "  wget <url>        - HTTP GET request\n", 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n  Package Manager:\n", 0x0000FFFF, term_bg_color);
         console_print_string(info, "  wynpkg <cmd>      - Package manager commands\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "\n  WynVM (Virtual Machine):\n", 0x0000FFFF, term_bg_color);
-        console_print_string(info, "  wynasm <src> <dst>- Compile WynVM assembly to binary (.wbin)\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "  wynrun <bin>      - Execute compiled WynVM binary in background\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "\n  WynLang:\n", 0x0000FFFF, term_bg_color);
+        console_print_string(info, "  wlang             - WynLang REPL (interactive)\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  run <file.wyn>    - Run a WynLang script\n", 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "  wlang -e <code>   - Execute one-liner\n", 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n  Desktop:\n", 0x0000FFFF, term_bg_color);
         console_print_string(info, "  gui               - Launch WynlandDE desktop\n", 0x00FFFFFF, term_bg_color);
     } else if (str_compare(cmd, "pwd") == 0) {
@@ -1305,28 +1451,139 @@ static void execute_command(BootInfo *info, const char *cmd)
             console_print_string(info, " more regions.\n", 0x00888888, term_bg_color);
         }
     } else if (str_compare(cmd, "neofetch") == 0) {
-        console_print_string(info, "      /\\_ /\\       wynland@wynlandos\n", 0x0000FFFF, term_bg_color);
-        console_print_string(info, "     (  o.o  )      -----------------\n", 0x0000FFFF, term_bg_color);
-        console_print_string(info, "      >  ^  <       OS: WynlandOS v0.1 x64\n", 0x0000FFFF, term_bg_color);
-        console_print_string(info, "     /   *   \\      Kernel: Freestanding Monolithic (Phase 2)\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "    /    |    \\     Shell: WynlandShell v0.1\n", 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "   (____/ \\____)    Resolution: ", 0x00FFFFFF, term_bg_color);
-        
-        char buf[32];
-        uint_to_str(info->fb_width, buf);
-        console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        console_print_string(info, "x", 0x00FFFFFF, term_bg_color);
-        uint_to_str(info->fb_height, buf);
-        console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        console_print_string(info, "\n", 0x00FFFFFF, term_bg_color);
-        
-        console_print_string(info, "                    Memory: ", 0x00FFFFFF, term_bg_color);
-        uint_to_str(pmm_get_used_memory() / (1024 * 1024), buf);
-        console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        console_print_string(info, " MB / ", 0x00FFFFFF, term_bg_color);
-        uint_to_str(pmm_get_total_memory() / (1024 * 1024), buf);
-        console_print_string(info, buf, 0x0000FF00, term_bg_color);
-        console_print_string(info, " MB\n", 0x00FFFFFF, term_bg_color);
+        char buf[64];
+        uint32_t c_logo  = 0x0088C0D0; // Nord8 Cyan
+        uint32_t c_label = 0x0081A1C1; // Nord9 Blue
+        uint32_t c_val   = 0x00ECEFF4; // Nord4 White
+        uint32_t c_user  = 0x00A3BE8C; // Nord14 Green
+
+        /* Line 1: User & Host */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA0\x80\xE2\xA1\x94\xE2\xA0\x89\xE2\xA0\x91\xE2\xA2\xA4\xE2\xA1\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA2\x80\xE2\xA3\xB0\xE2\xA0\x8B\xE2\xA0\x89\xE2\xA0\x89\xE2\xA0\x93\xE2\xA1\x86\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "wynland", c_user, term_bg_color);
+        console_print_string(info, "@", c_val, term_bg_color);
+        console_print_string(info, "wynlandos\n", c_user, term_bg_color);
+
+        /* Line 2: Separator */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA3\xB8\xE2\xA0\x81\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x99\xE2\xA2\xA6\xE2\xA1\x80\xE2\xA2\xB8\xE2\xA1\x89\xE2\xA0\x93\xE2\xA0\xB2\xE2\xA3\x84\xE2\xA1\x80\xE2\xA2\x80\xE2\xA1\x9E\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA3\x80\xE2\xA3\xBD\xE2\xA1\xA4\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "-----------------\n", 0x004C566A, term_bg_color); // Nord3 Gray
+
+        /* Line 3: OS */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA1\x87\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x99\xE2\xA3\xA6\xE2\xA0\xB7\xE2\xA0\x84\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x99\xE2\xA0\x9E\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x92\xE2\xA0\x9A\xE2\xA1\x8F\xE2\xA0\x81", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "OS: ", c_label, term_bg_color);
+        console_print_string(info, "WynlandOS v0.1 x86_64\n", c_val, term_bg_color);
+
+        /* Line 4: Host */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA1\x87\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA1\x9A\xE2\xA0\x93\xE2\xA0\x92\xE2\xA0\x92\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA1\x87\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "Host: ", c_label, term_bg_color);
+        console_print_string(info, "QEMU Virtual Machine\n", c_val, term_bg_color);
+
+        /* Line 5: Kernel */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA1\x87\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA1\x8E\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x88\xE2\xA1\x86\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x98\xE2\xA2\x84\xE2\xA3\x80\xE2\xA3\x80\xE2\xA1\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA3\xB8\xE2\xA0\x81\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "Kernel: ", c_label, term_bg_color);
+        console_print_string(info, "Freestanding Monolithic (C11)\n", c_val, term_bg_color);
+
+        /* Line 6: Uptime */
+        console_print_string(info, "\xE2\xA0\x88\xE2\xA3\x87\xE2\xA0\x80\xE2\xA0\x90\xE2\xA1\xB6\xE2\xA0\x96\xE2\xA3\xB2\xE2\xA3\xB6\xE2\xA1\x86\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA3\xB6\xE2\xA3\xB6\xE2\xA1\x92\xE2\xA0\xB2\xE2\xA1\x92\xE2\xA0\x80\xE2\xA2\x80\xE2\xA1\xBC\xE2\xA0\x81\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "Uptime: ", c_label, term_bg_color);
+        extern uint64_t timer_get_ticks(void);
+        uint64_t total_sec = timer_get_ticks() / 100;
+        uint64_t hrs = total_sec / 3600;
+        uint64_t mins = (total_sec / 60) % 60;
+        uint64_t secs = total_sec % 60;
+        if (hrs > 0) {
+            uint_to_str(hrs, buf); console_print_string(info, buf, c_val, term_bg_color);
+            console_print_string(info, " hours, ", c_val, term_bg_color);
+            uint_to_str(mins, buf); console_print_string(info, buf, c_val, term_bg_color);
+            console_print_string(info, " mins", c_val, term_bg_color);
+        } else if (mins > 0) {
+            uint_to_str(mins, buf); console_print_string(info, buf, c_val, term_bg_color);
+            console_print_string(info, " mins, ", c_val, term_bg_color);
+            uint_to_str(secs, buf); console_print_string(info, buf, c_val, term_bg_color);
+            console_print_string(info, " secs", c_val, term_bg_color);
+        } else {
+            uint_to_str(secs, buf); console_print_string(info, buf, c_val, term_bg_color);
+            console_print_string(info, " secs", c_val, term_bg_color);
+        }
+        console_print_string(info, "\n", c_val, term_bg_color);
+
+        /* Line 7: Shell */
+        console_print_string(info, "\xE2\xA0\xB0\xE2\xA3\x96\xE2\xA0\xBA\xE2\xA0\xA7\xE2\xA2\xB8\xE2\xA0\x81\xE2\xA0\x80\xE2\xA3\xBF\xE2\xA3\xBF\xE2\xA0\x87\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA3\xBF\xE2\xA3\xBF\xE2\xA0\x87\xE2\xA0\x80\xE2\xA1\x87\xE2\xA0\x80\xE2\xA0\x89\xE2\xA3\xA9\xE2\xA0\x87\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "Shell: ", c_label, term_bg_color);
+        console_print_string(info, "WynlandShell v0.1\n", c_val, term_bg_color);
+
+        /* Line 8: Resolution */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA0\x88\xE2\xA3\xB3\xE2\xA0\x80\xE2\xA3\xA8\xE2\xA2\x83\xE2\xA0\x80\xE2\xA0\x88\xE2\xA0\x89\xE2\xA0\x80\xE2\xA0\x92\xE2\xA0\x82\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x88\xE2\xA0\x81\xE2\xA2\x80\xE2\xA0\x84\xE2\xA1\xA1\xE2\xA0\x80\xE2\xA2\xBC\xE2\xA1\x81\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "Resolution: ", c_label, term_bg_color);
+        uint_to_str(info->fb_width, buf); console_print_string(info, buf, c_val, term_bg_color);
+        console_print_string(info, "x", c_val, term_bg_color);
+        uint_to_str(info->fb_height, buf); console_print_string(info, buf, c_val, term_bg_color);
+        console_print_string(info, "\n", c_val, term_bg_color);
+
+        /* Line 9: DE */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA2\xB0\xE2\xA3\x83\xE2\xA3\x88\xE2\xA3\x80\xE2\xA0\x81\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\xA6\xE2\xA0\x94\xE2\xA0\x93\xE2\xA0\xB2\xE2\xA1\xB2\xE2\xA0\x83\xE2\xA0\x80\xE2\xA0\x80\xE2\xA2\x88\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\xB9\xE2\xA1\x84\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "DE: ", c_label, term_bg_color);
+        console_print_string(info, "WynlandDE\n", c_val, term_bg_color);
+
+        /* Line 10: WM */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x89\xE2\xA2\xB3\xE2\xA0\xB2\xE2\xA0\xA4\xE2\xA2\x84\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\xA0\xE2\xA2\xB6\xE2\xA0\x92\xE2\xA3\x8F\xE2\xA0\x89\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "WM: ", c_label, term_bg_color);
+        console_print_string(info, "Stacking Window Manager (Nord Theme)\n", c_val, term_bg_color);
+
+        /* Line 11: Terminal */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x88\xE2\xA3\xB3\xE2\xA0\x92\xE2\xA2\xB2\xE2\xA0\x8B\xE2\xA2\xB1\xE2\xA0\xA4\xE2\xA0\xA7\xE2\xA0\x9A\xE2\xA0\x8B\xE2\xA0\x98\xE2\xA1\x86\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "Terminal: ", c_label, term_bg_color);
+        console_print_string(info, "WynlandOS Terminal\n", c_val, term_bg_color);
+
+        /* Line 12: CPU */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x98\xE2\xA0\x93\xE2\xA1\x86\xE2\xA0\x88\xE2\xA0\x92\xE2\xA0\x81\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA2\xB9\xE2\xA1\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "CPU: ", c_label, term_bg_color);
+        console_print_string(info, "QEMU x86_64 Virtual CPU\n", c_val, term_bg_color);
+
+        /* Line 13: GPU */
+        console_print_string(info, "\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA3\xBC\xE2\xA3\x81\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA3\x80\xE2\xA1\x87\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80\xE2\xA0\x80", c_logo, term_bg_color);
+        console_print_string(info, "  ", 0, term_bg_color);
+        console_print_string(info, "GPU: ", c_label, term_bg_color);
+        console_print_string(info, "VirtIO-GPU Device\n", c_val, term_bg_color);
+
+        /* Line 14: Memory */
+        console_print_string(info, "                            ", c_logo, term_bg_color);
+        console_print_string(info, "Memory: ", c_label, term_bg_color);
+        extern uint64_t pmm_get_used_memory(void);
+        extern uint64_t pmm_get_total_memory(void);
+        uint_to_str(pmm_get_used_memory() / (1024 * 1024), buf); console_print_string(info, buf, c_val, term_bg_color);
+        console_print_string(info, " MB / ", c_val, term_bg_color);
+        uint_to_str(pmm_get_total_memory() / (1024 * 1024), buf); console_print_string(info, buf, c_val, term_bg_color);
+        console_print_string(info, " MB\n", c_val, term_bg_color);
+
+        /* Line 15: Color Blocks */
+        console_print_string(info, "                            ", c_logo, term_bg_color);
+        uint32_t colors[8] = {
+            0x00BF616A, // Nord11 Red
+            0x00A3BE8C, // Nord14 Green
+            0x00EBCB8B, // Nord13 Yellow
+            0x0081A1C1, // Nord9 Blue
+            0x00B48EAD, // Nord15 Purple
+            0x0088C0D0, // Nord8 Cyan
+            0x00E5E9F0, // Nord5 Light Gray
+            0x00ECEFF4  // Nord4 White
+        };
+        char block_str[4] = {(char)219, (char)219, ' ', '\0'};
+        for (int i = 0; i < 8; i++) {
+            console_print_string(info, block_str, colors[i], term_bg_color);
+        }
+        console_print_string(info, "\n", c_val, term_bg_color);
     } else if (str_compare(cmd, "reboot") == 0) {
         console_print_string(info, "Rebooting system...\n", 0x00FF0000, term_bg_color);
         for (volatile int i = 0; i < 50000000; i++);
@@ -1625,6 +1882,151 @@ static void execute_command(BootInfo *info, const char *cmd)
             }
         }
 
+    } else if (str_compare(cmd, "wlang") == 0) {
+        /* WynLang REPL mode */
+        g_wlang_info = info;
+        console_print_string(info, "WynLang v1.0 — Interactive Mode\n", 0x0000FFFF, term_bg_color);
+        console_print_string(info, "Type code and press Enter. Type exit() to quit.\n", 0x00CCCCCC, term_bg_color);
+        console_print_string(info, "Tip: use 'run <file.wyn>' for multi-line scripts.\n\n", 0x00CCCCCC, term_bg_color);
+
+        /* Simple REPL: collect lines, execute when 'end' or single-line stmt */
+        char repl_buf[2048];
+        char line_buf[256];
+        repl_buf[0] = '\0';
+        bool in_block = false;
+        bool repl_running = true;
+
+        while (repl_running) {
+            /* Print prompt */
+            if (in_block) {
+                console_print_string(info, "... ", 0x00888888, term_bg_color);
+            } else {
+                console_print_string(info, ">>> ", 0x0000FF00, term_bg_color);
+            }
+
+            /* Read a line (reusing scancode reading) */
+            int lpos = 0;
+            memset(line_buf, 0, sizeof(line_buf));
+            bool repl_shift = false;
+
+            while (1) {
+                /* Poll keyboard */
+                extern bool keyboard_has_scancode(void);
+                extern uint8_t keyboard_pop_scancode(void);
+
+                if (!keyboard_has_scancode()) {
+                    /* Also check serial */
+                    uint8_t lsr = 0;
+                    __asm__ volatile("inb %1, %0" : "=a"(lsr) : "Nd"((uint16_t)0x3FD));
+                    if (lsr & 0x01) {
+                        uint8_t ch = 0;
+                        __asm__ volatile("inb %1, %0" : "=a"(ch) : "Nd"((uint16_t)0x3F8));
+                        if (ch == '\r' || ch == '\n') break;
+                        if (ch == 0x7F || ch == '\b') {
+                            if (lpos > 0) { lpos--; line_buf[lpos] = '\0'; console_print_char(info, '\b', 0, term_bg_color); }
+                            continue;
+                        }
+                        if (lpos < 254) {
+                            line_buf[lpos++] = (char)ch;
+                            line_buf[lpos] = '\0';
+                            console_print_char(info, (char)ch, 0x00FFFFFF, term_bg_color);
+                        }
+                    }
+                    __asm__ volatile("hlt");
+                    continue;
+                }
+
+                uint8_t sc = keyboard_pop_scancode();
+                if (sc & 0x80) { /* Key release */
+                    uint8_t released_sc = sc & 0x7F;
+                    if (released_sc == 0x2A || released_sc == 0x36) {
+                        repl_shift = false;
+                    }
+                    continue;
+                }
+                if (sc == 0x2A || sc == 0x36) { /* Shift press */
+                    repl_shift = true;
+                    continue;
+                }
+
+                if (sc == 0x1C) { /* Enter */
+                    console_print_string(info, "\n", 0, term_bg_color);
+                    break;
+                }
+                if (sc == 0x0E) { /* Backspace */
+                    if (lpos > 0) {
+                        lpos--;
+                        line_buf[lpos] = '\0';
+                        console_print_char(info, '\b', 0, term_bg_color);
+                    }
+                    continue;
+                }
+
+                char ch = 0;
+                if (sc < 59) {
+                    ch = repl_shift ? scancode_to_ascii_upper[sc] : scancode_to_ascii_lower[sc];
+                }
+                if (ch && lpos < 254) {
+                    line_buf[lpos++] = ch;
+                    line_buf[lpos] = '\0';
+                    console_print_char(info, ch, 0x00FFFFFF, term_bg_color);
+                }
+            }
+
+            /* Check for exit */
+            if (str_compare(line_buf, "exit()") == 0 || str_compare(line_buf, "exit") == 0) {
+                console_print_string(info, "Bye!\n", 0x0000FFFF, term_bg_color);
+                repl_running = false;
+                continue;
+            }
+
+            /* Check if line ends with ':' (block start) */
+            uint32_t llen = str_len(line_buf);
+            bool ends_colon = (llen > 0 && line_buf[llen - 1] == ':');
+
+            /* Append to buffer */
+            str_append(repl_buf, line_buf);
+            str_append(repl_buf, "\n");
+
+            if (ends_colon) {
+                in_block = true;
+                continue;
+            }
+
+            if (in_block) {
+                /* Check if this line is 'end' */
+                if (str_compare(line_buf, "end") == 0) {
+                    in_block = false;
+                    /* Fall through to execute */
+                } else {
+                    continue; /* Keep collecting block lines */
+                }
+            }
+
+            /* Execute collected code */
+            wlang_run(repl_buf);
+            repl_buf[0] = '\0';
+        }
+
+    } else if (str_starts_with(cmd, "wlang -e ")) {
+        /* Execute one-liner */
+        g_wlang_info = info;
+        const char *code = cmd + 9;
+        wlang_run(code);
+
+    } else if (str_starts_with(cmd, "run ")) {
+        /* Run .wyn file */
+        g_wlang_info = info;
+        char resolved[512];
+        resolve_path(cmd + 4, resolved);
+        console_print_string(info, "Running: ", 0x0000FFFF, term_bg_color);
+        console_print_string(info, resolved, 0x00FFFFFF, term_bg_color);
+        console_print_string(info, "\n", 0, term_bg_color);
+        int result = wlang_run_file(resolved);
+        if (result == WLANG_OK) {
+            console_print_string(info, "\n[OK]\n", 0x0000FF00, term_bg_color);
+        }
+
     } else if (str_len(cmd) > 0) {
         console_print_string(info, "wynland: command not found: ", 0x00FF0000, term_bg_color);
         console_print_string(info, cmd, 0x00FFFFFF, term_bg_color);
@@ -1795,6 +2197,68 @@ void kernel_main(BootInfo *boot_info)
             __asm__ volatile("hlt");
             continue;
         }
+
+        if (wm_is_gui_active()) {
+            extern bool wm_is_terminal_focused(void);
+            if (!wm_is_terminal_focused()) {
+                if (sc == 0xE0) {
+                    /* Handle extended scancodes (arrows, etc.) */
+                    int timeout = 100000;
+                    while (!keyboard_has_scancode() && timeout > 0) {
+                        timeout--;
+                        __asm__ volatile("nop");
+                    }
+                    uint8_t sc2 = keyboard_has_scancode() ? keyboard_pop_scancode() : 0;
+                    if (sc2 != 0) {
+                        extern void wm_handle_key(uint8_t scancode, char ascii);
+                        wm_handle_key(sc2, 0);
+                    }
+                } else if (sc > 0) {
+                    extern void wm_handle_key(uint8_t scancode, char ascii);
+                    
+                    /* Keep track of shift and alt state locally so we can translate scancodes correctly */
+                    if (sc & 0x80) {
+                        uint8_t released_sc = sc & 0x7F;
+                        if (released_sc == 0x2A || released_sc == 0x36) {
+                            shift_pressed = false;
+                        } else if (released_sc == 0x38) {
+                            alt_pressed = false;
+                        }
+                        wm_handle_key(sc, 0);
+                    } else {
+                        if (sc == 0x2A || sc == 0x36) {
+                            shift_pressed = true;
+                            if (alt_pressed) {
+                                layout_ru = !layout_ru;
+                            }
+                            wm_handle_key(sc, 0);
+                        } else if (sc == 0x38) {
+                            alt_pressed = true;
+                            if (shift_pressed) {
+                                layout_ru = !layout_ru;
+                            }
+                            wm_handle_key(sc, 0);
+                        } else {
+                            char ascii = 0;
+                            if (sc == 0x1C) {
+                                ascii = '\n';
+                            } else if (sc == 0x0E) {
+                                ascii = '\b';
+                            } else if (sc < 59) {
+                                if (layout_ru) {
+                                    ascii = translate_scancode_ru(sc, shift_pressed);
+                                } else {
+                                    ascii = shift_pressed ? scancode_to_ascii_upper[sc] : scancode_to_ascii_lower[sc];
+                                }
+                            }
+                            wm_handle_key(sc, ascii);
+                        }
+                    }
+                }
+                continue; /* Skip shell loop processing */
+            }
+        }
+
 
         if (serial_char != 0) {
             if (serial_char == '\r' || serial_char == '\n') {

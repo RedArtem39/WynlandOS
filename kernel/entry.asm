@@ -117,7 +117,7 @@ gdt_descriptor:
 section .bss
 align 16
 kernel_stack_bottom:
-    resb 16384          ; 16 KB stack
+    resb 65536          ; 64 KB stack
 kernel_stack_top:
 
 ; ============================================================

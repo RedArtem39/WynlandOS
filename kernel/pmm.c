@@ -6,6 +6,7 @@
 #include <wynland/boot_info.h>
 
 extern uint8_t __kernel_end[];
+extern void serial_write_string(const char *str);
 
 static uint8_t  *bitmap = NULL;
 static uint64_t total_pages = 0;
@@ -136,6 +137,10 @@ void pmm_init(BootInfo *boot_info)
 
 void *pmm_alloc_page(void)
 {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    void *result = NULL;
     uint64_t bitmap_bytes = (total_pages + 7) / 8;
     for (uint64_t i = 0; i < bitmap_bytes; i++) {
         if (bitmap[i] != 0xFF) { /* At least one free bit */
@@ -147,23 +152,43 @@ void *pmm_alloc_page(void)
                 if (!bitmap_test(idx)) {
                     bitmap_set(idx);
                     free_pages--;
-                    return (void *)(idx * PAGE_SIZE);
+                    result = (void *)(idx * PAGE_SIZE);
+                    goto cleanup;
                 }
             }
         }
     }
-    return NULL; /* Out of physical memory */
+
+cleanup:
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+    if (result) {
+        serial_write_string("PMM Alloc: ");
+        char buf[32];
+        extern void uint_to_hex(uint64_t val, char *buf);
+        uint_to_hex((uint64_t)(uintptr_t)result, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
+    }
+    return result;
 }
 
 void pmm_free_page(void *addr)
 {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
     uint64_t idx = (uint64_t)addr / PAGE_SIZE;
-    if (idx >= total_pages) {
-        return;
+    if (idx < total_pages) {
+        if (bitmap_test(idx)) {
+            bitmap_clear(idx);
+            free_pages++;
+        }
     }
-    if (bitmap_test(idx)) {
-        bitmap_clear(idx);
-        free_pages++;
+
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
     }
 }
 

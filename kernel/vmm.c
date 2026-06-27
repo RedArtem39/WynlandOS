@@ -24,6 +24,9 @@ static PageTable *vmm_alloc_table(void)
 
 void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
     /* Round addresses to page boundaries */
     virt &= ~(PAGE_SIZE - 1);
     phys &= ~(PAGE_SIZE - 1);
@@ -66,12 +69,30 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     /* 4. Map the physical address in the Page Table */
     pt->entries[pt_idx] = phys | flags | PAGE_PRESENT;
 
+    if (virt >= 0x10000000 && virt < 0x11000000) {
+        serial_write_string("VMM Map: ");
+        char buf[32];
+        extern void uint_to_hex(uint64_t val, char *buf);
+        extern void uint_to_str(uint64_t val, char *buf);
+        uint_to_hex(virt, buf); serial_write_string(buf); serial_write_string(" -> ");
+        uint_to_hex(phys, buf); serial_write_string(buf); serial_write_string(" (pt=");
+        uint_to_hex((uint64_t)(uintptr_t)pt, buf); serial_write_string(buf); serial_write_string(" idx=");
+        uint_to_str(pt_idx, buf); serial_write_string(buf); serial_write_string(")\r\n");
+    }
+
     /* 5. Invalidate TLB for this virtual address */
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
 }
 
 void vmm_unmap_page(PageTable *pml4, uint64_t virt)
 {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
     virt &= ~(PAGE_SIZE - 1);
     uint64_t pml4_idx = PML4_INDEX(virt);
     uint64_t pdpt_idx = PDPT_INDEX(virt);
@@ -79,15 +100,15 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
     uint64_t pt_idx   = PT_INDEX(virt);
 
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
-    if (!(*pml4_entry & PAGE_PRESENT)) return;
+    if (!(*pml4_entry & PAGE_PRESENT)) goto cleanup;
     
     PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
-    if (!(*pdpt_entry & PAGE_PRESENT)) return;
+    if (!(*pdpt_entry & PAGE_PRESENT)) goto cleanup;
 
     PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
-    if (!(*pd_entry & PAGE_PRESENT)) return;
+    if (!(*pd_entry & PAGE_PRESENT)) goto cleanup;
 
     PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
     
@@ -96,6 +117,11 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
 
     /* Invalidate TLB */
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+
+cleanup:
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
 }
 
 void vmm_init(BootInfo *boot_info)

@@ -236,6 +236,11 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF)
 	@mcopy -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -i $@ $(KERNEL_ELF) ::/kernel.elf
 	@mcopy -i $@ app.wasm ::/app.was
+	@mcopy -i $@ hello.wyn ::/hello.wyn
+	@mcopy -i $@ browser.wyn ::/browser.wyn
+	@mcopy -i $@ wynui.wyn ::/wynui.wyn
+	@mcopy -i $@ node.wyn ::/node.wyn
+	@mcopy -i $@ script.js ::/script.js
 	@echo "  => wynland.img created (64 MB)"
 
 # ---------- Run in QEMU ----------

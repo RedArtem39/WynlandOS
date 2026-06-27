@@ -18,4 +18,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons);
 void wm_handle_key(uint8_t scancode, char ascii);
 
 bool wm_is_gui_active(void);
+bool wm_is_terminal_focused(void);
 void wm_exit_gui(void);
+
