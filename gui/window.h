@@ -55,6 +55,9 @@ typedef struct Window {
 
     /* backing store for VM-drawn window content */
     uint32_t *backing_store;
+
+    /* C++ Widget tree root pointer */
+    void *cpp_widgets_root;
 } Window;
 
 /* Drawing helpers */

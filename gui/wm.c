@@ -339,6 +339,11 @@ void wm_init(void)
     settings->is_visible = true;
     settings->is_focused = false;
     settings->draw_content = draw_settings_content;
+    
+    /* Initialize C++ Widgets container for Settings window */
+    extern void wm_init_settings_widgets(void *settings_win_ptr);
+    wm_init_settings_widgets(settings);
+
     g_settings_window = settings;
     wm_register_window(settings);
 
@@ -456,25 +461,12 @@ static void draw_settings_content(Window *self)
         comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
     }
 
-    /* Title of settings panel */
-    comp_draw_string(cx + 20, cy + 20, "WynlandOS Configuration", THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
-
-    /* Draw some pretty mock settings items (Nord color palette demonstration) */
-    comp_draw_string(cx + 20, cy + 50, "Desktop Theme:", THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
-    comp_draw_rounded_rect(cx + 140, cy + 47, 80, 20, 4, NORD8 & 0x00FFFFFF);
-    comp_draw_string(cx + 155, cy + 49, "Nord", THEME_WINDOW_BG & 0x00FFFFFF, 0);
-
-    comp_draw_string(cx + 20, cy + 80, "Window Mode:", THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
-    comp_draw_rounded_rect(cx + 140, cy + 77, 80, 20, 4, NORD3 & 0x00FFFFFF);
-    comp_draw_string(cx + 150, cy + 79, "Stacking", THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
-
-    /* Draw colored boxes to represent Nord aurora color palette */
-    comp_draw_string(cx + 20, cy + 120, "Aurora Colors:", THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
-    comp_fill_rect(cx + 20, cy + 140, 24, 24, NORD11 & 0x00FFFFFF);
-    comp_fill_rect(cx + 50, cy + 140, 24, 24, NORD12 & 0x00FFFFFF);
-    comp_fill_rect(cx + 80, cy + 140, 24, 24, NORD13 & 0x00FFFFFF);
-    comp_fill_rect(cx + 110, cy + 140, 24, 24, NORD14 & 0x00FFFFFF);
-    comp_fill_rect(cx + 140, cy + 140, 24, 24, NORD15 & 0x00FFFFFF);
+    if (self->cpp_widgets_root) {
+        extern void wm_set_widgets_root_pos(void *root, int32_t x, int32_t y);
+        extern void wm_paint_cpp_widgets(void *root);
+        wm_set_widgets_root_pos(self->cpp_widgets_root, cx, cy);
+        wm_paint_cpp_widgets(self->cpp_widgets_root);
+    }
 }
 
 /* ============================================================
