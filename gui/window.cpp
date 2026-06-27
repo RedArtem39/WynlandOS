@@ -42,6 +42,9 @@ extern "C" void draw_window_decorations(Window *win)
         comp_fill_rect(tx, ty, tw, THEME_TITLEBAR_HEIGHT, titlebar & 0x00FFFFFF);
     } else {
         /* Floating: rounded corners, drop shadow, padded titlebar */
+        /* Apply box blur behind window for macOS/KDE glassmorphism */
+        comp_box_blur(tx, ty, tw, th, 4);
+
         /* Window shadow (subtle dark rect behind window) */
         comp_fill_rect_alpha(tx + 4, ty + 4, tw, th, 0x40000000);
 

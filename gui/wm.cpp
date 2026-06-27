@@ -552,6 +552,9 @@ static void wm_draw_control_panel(uint32_t sw, uint32_t sh)
     int32_t pw = 280;
     int32_t ph = 360;
 
+    /* Apply box blur behind panel for premium glassmorphism */
+    comp_box_blur(px, py, pw, ph, 4);
+
     /* Shadow */
     comp_fill_rect_alpha(px + 4, py + 4, pw, ph, 0x30000000);
 
@@ -846,7 +849,7 @@ extern "C" void wm_draw_desktop(void)
                                 uint32_t orig_h = win->h;
                                 int32_t scale = win->scale_spring.current;
 
-                                if (scale < 256 || win->scale_spring.velocity != 0) {
+                                 if (scale != 256 || win->scale_spring.velocity != 0) {
                                     win->w = (orig_w * scale) / 256;
                                     win->h = (orig_h * scale) / 256;
                                     win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
@@ -1016,7 +1019,7 @@ extern "C" void wm_draw_desktop(void)
             uint32_t orig_h = win->h;
             int32_t scale = win->scale_spring.current;
 
-            if (scale < 256 || win->scale_spring.velocity != 0) {
+            if (scale != 256 || win->scale_spring.velocity != 0) {
                 win->w = (orig_w * scale) / 256;
                 win->h = (orig_h * scale) / 256;
                 win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
