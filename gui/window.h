@@ -44,6 +44,9 @@ typedef struct Window {
     struct Window *next;
     struct Window *prev;
 
+    int32_t anim_step;      /* 0 to 8 scale steps */
+    int32_t anim_direction; /* 1: open/zoom in, -1: close/zoom out, 0: idle */
+
     /* backing store for VM-drawn window content */
     uint32_t *backing_store;
 } Window;

@@ -493,6 +493,27 @@ void wm_draw_desktop(void)
 
     bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
 
+    /* Tick window scale animations */
+    bool any_animating = false;
+    Window *curr = g_windows_head;
+    while (curr) {
+        if (curr->anim_direction > 0 && curr->anim_step < 8) {
+            curr->anim_step++;
+            any_animating = true;
+        } else if (curr->anim_direction < 0 && curr->anim_step > 0) {
+            curr->anim_step--;
+            any_animating = true;
+            if (curr->anim_step == 0) {
+                curr->is_visible = false;
+                curr->anim_direction = 0;
+            }
+        }
+        curr = curr->next;
+    }
+    if (any_animating) {
+        g_wm_needs_redraw = true;
+    }
+
     /* Lock interrupts to make desktop drawing and mouse updates atomic and prevent races */
     uint64_t rflags = save_irq_disable();
 
@@ -618,15 +639,36 @@ void wm_draw_desktop(void)
                             /* Include shadow (+4px bottom-right) in intersection check */
                             if (wx1 < ux2 && (wx2 + 4) > ux1 &&
                                 wy1 < uy2 && (wy2 + 4) > uy1) {
+                                
+                                int32_t orig_x = win->x;
+                                int32_t orig_y = win->y;
+                                uint32_t orig_w = win->w;
+                                uint32_t orig_h = win->h;
+                                int32_t step = win->anim_step;
+
+                                if (step < 8) {
+                                    win->w = (orig_w * step) / 8;
+                                    win->h = (orig_h * step) / 8;
+                                    win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
+                                    win->y = orig_y + (int32_t)(orig_h - win->h) / 2;
+                                    if (win->w < 1) win->w = 1;
+                                    if (win->h < 1) win->h = 1;
+                                }
+
                                 draw_window_decorations(win);
-                                if (win->draw_content) {
+                                if (win->draw_content && step > 3) {
                                     win->draw_content(win);
                                 }
-                                if (win->is_focused && !win->is_maximized) {
+                                if (win->is_focused && !win->is_maximized && step == 8) {
                                     int32_t rx = win->x + win->w - 12;
                                     int32_t ry = win->y + win->h - 12;
                                     comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
                                 }
+
+                                win->x = orig_x;
+                                win->y = orig_y;
+                                win->w = orig_w;
+                                win->h = orig_h;
                             }
                         }
                         win = win->prev;
@@ -780,16 +822,36 @@ void wm_draw_desktop(void)
     Window *win = g_windows_tail;
     while (win) {
         if (win->is_visible) {
+            int32_t orig_x = win->x;
+            int32_t orig_y = win->y;
+            uint32_t orig_w = win->w;
+            uint32_t orig_h = win->h;
+            int32_t step = win->anim_step;
+
+            if (step < 8) {
+                win->w = (orig_w * step) / 8;
+                win->h = (orig_h * step) / 8;
+                win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
+                win->y = orig_y + (int32_t)(orig_h - win->h) / 2;
+                if (win->w < 1) win->w = 1;
+                if (win->h < 1) win->h = 1;
+            }
+
             draw_window_decorations(win);
-            if (win->draw_content) {
+            if (win->draw_content && step > 3) {
                 win->draw_content(win);
             }
             /* Draw a resize handle in bottom-right corner of window (skip if maximized) */
-            if (win->is_focused && !win->is_maximized) {
+            if (win->is_focused && !win->is_maximized && step == 8) {
                 int32_t rx = win->x + win->w - 12;
                 int32_t ry = win->y + win->h - 12;
                 comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
             }
+
+            win->x = orig_x;
+            win->y = orig_y;
+            win->w = orig_w;
+            win->h = orig_h;
         }
         win = win->prev;
     }
@@ -919,6 +981,19 @@ void wm_draw_desktop(void)
     restore_irq(rflags);
 }
 
+static void wm_show_window(Window *win)
+{
+    if (win) {
+        if (!win->is_visible || win->anim_step < 8) {
+            win->is_visible = true;
+            win->anim_direction = 1;
+            win->anim_step = 0;
+        }
+        wm_raise_window(win);
+        comp_mark_dirty();
+    }
+}
+
 void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
 {
     bool left_pressed  = (buttons & 1) != 0;
@@ -928,11 +1003,10 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
 
     if (clicked_down) {
         /* Check if clicked on a window */
-        Window *win = g_windows_head;
         bool handled = false;
-
+        Window *win = g_windows_head;
         while (win) {
-            if (win->is_visible) {
+            if (win->is_visible && win->anim_step == 8) { /* Only interact if fully open */
                 /* Check boundary */
                 if (mx >= win->x && mx < (int32_t)(win->x + win->w) &&
                     my >= win->y && my < (int32_t)(win->y + win->h)) {
@@ -941,28 +1015,31 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                     wm_raise_window(win);
                     handled = true;
 
-                    /* 1. Close button hit */
-                    int32_t close_dx = mx - (win->x + 18);
-                    int32_t close_dy = my - (win->y + 14);
-                    if (close_dx * close_dx + close_dy * close_dy <= 6 * 6) {
-                        if (win->id == 1) {
-                            /* Exit GUI mode if terminal is closed */
-                            wm_exit_gui();
-                        } else {
-                            win->is_visible = false;
-                            comp_mark_dirty();
+                    /* 1. Titlebar buttons hit test */
+                    if (my < (int32_t)(win->y + THEME_TITLEBAR_HEIGHT)) {
+                        
+                        /* 1a. Close button hit (red, cx=18 cy=14) */
+                        int32_t close_dx = mx - (win->x + 18);
+                        int32_t close_dy = my - (win->y + 14);
+                        if (close_dx * close_dx + close_dy * close_dy <= 6 * 6) {
+                            if (win->id == 1) {
+                                /* Exit GUI mode if terminal is closed */
+                                wm_exit_gui();
+                            } else {
+                                win->anim_direction = -1; /* Close zoom-out animation */
+                                comp_mark_dirty();
+                            }
+                            break;
                         }
-                        break;
-                    }
 
-                    /* 1b. Minimize button hit (yellow, cx=38 cy=14) */
-                    int32_t min_dx = mx - (win->x + 38);
-                    int32_t min_dy = my - (win->y + 14);
-                    if (min_dx * min_dx + min_dy * min_dy <= 6 * 6) {
-                        win->is_visible = false;
-                        comp_mark_dirty();
-                        break;
-                    }
+                        /* 1b. Minimize button hit (yellow, cx=38 cy=14) */
+                        int32_t min_dx = mx - (win->x + 38);
+                        int32_t min_dy = my - (win->y + 14);
+                        if (min_dx * min_dx + min_dy * min_dy <= 6 * 6) {
+                            win->anim_direction = -1; /* Minimize zoom-out animation */
+                            comp_mark_dirty();
+                            break;
+                        }
 
                     /* 1c. Maximize button hit (green, cx=58 cy=14) */
                     int32_t max_dx = mx - (win->x + 58);
@@ -1000,6 +1077,7 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         comp_mark_dirty();
                         break;
                     }
+                }
 
                     /* 2. Dragging titlebar (blocked for maximized windows) */
                     if (!win->is_maximized && my < (int32_t)(win->y + THEME_TITLEBAR_HEIGHT)) {
@@ -1050,17 +1128,13 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                     if (dx*dx + dy*dy <= (int32_t)(g_dock_icons[i].current_radius * g_dock_icons[i].current_radius)) {
                         /* Action! Launch/Focus window */
                         if (i == 0 && g_term_window) {
-                            g_term_window->is_visible = true;
-                            wm_raise_window(g_term_window);
+                            wm_show_window(g_term_window);
                         } else if (i == 1 && g_settings_window) {
-                            g_settings_window->is_visible = true;
-                            wm_raise_window(g_settings_window);
+                            wm_show_window(g_settings_window);
                         } else if (i == 2 && g_browser_window) {
-                            g_browser_window->is_visible = true;
-                            wm_raise_window(g_browser_window);
+                            wm_show_window(g_browser_window);
                         } else if (i == 3 && g_forge_window) {
-                            g_forge_window->is_visible = true;
-                            wm_raise_window(g_forge_window);
+                            wm_show_window(g_forge_window);
                         }
                         break;
                     }
