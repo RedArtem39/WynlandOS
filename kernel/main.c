@@ -2155,6 +2155,7 @@ void kernel_main(BootInfo *boot_info)
         /* Refresh GUI if active */
         if (wm_is_gui_active()) {
             wm_draw_desktop();
+            sched_yield();
             was_gui_active = true;
         } else if (was_gui_active) {
             /* Transitioning back to CLI mode */

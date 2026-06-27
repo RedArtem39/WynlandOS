@@ -55,6 +55,7 @@ static uint32_t g_resize_start_w = 0;
 static uint32_t g_resize_start_h = 0;
 static int32_t g_resize_start_mx = 0;
 static int32_t g_resize_start_my = 0;
+Window *g_mouse_captured_window = NULL;
 
 /* outline variables removed for real-time dragging */
 
@@ -500,7 +501,7 @@ static void wm_draw_panel_contents(uint32_t sw, uint32_t total_sec)
     /* 2. Active application / window title */
     extern Window *g_windows_head;
     const char *active_title = "Desktop";
-    if (g_windows_head && g_windows_head->is_visible && g_windows_head->scale_spring.current == 256) {
+    if (g_windows_head && g_windows_head->is_visible && g_windows_head->scale_spring.target == 256) {
         active_title = g_windows_head->title;
     }
     comp_draw_string(110, 4, "|", pipe_fg, 0);
@@ -1179,6 +1180,20 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
     bool clicked_down  = left_pressed && !prev_left;
     bool clicked_up    = !left_pressed && prev_left;
 
+    /* If we have a captured window, forward all mouse events to it first */
+    extern Window *g_mouse_captured_window;
+    if (g_mouse_captured_window) {
+        g_mouse_captured_window->handle_mouse(mx, my, buttons);
+        if (clicked_up) {
+            g_mouse_captured_window = NULL;
+        }
+        g_prev_buttons = buttons;
+        if (clicked_down || clicked_up) {
+            comp_mark_dirty();
+        }
+        return;
+    }
+
     if (clicked_down) {
         bool handled = false;
 
@@ -1257,7 +1272,7 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
         /* 3. Check if clicked on a window */
         Window *win = g_windows_head;
         while (win) {
-            if (win->is_visible && win->scale_spring.current == 256) { /* Only interact if fully open */
+            if (win->is_visible && win->scale_spring.target == 256) { /* Only interact if open */
                 /* Check boundary */
                 if (mx >= win->x && mx < (int32_t)(win->x + win->w) &&
                     my >= win->y && my < (int32_t)(win->y + win->h)) {
@@ -1353,10 +1368,12 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         } else {
                             /* 4. Custom window mouse event */
                             win->handle_mouse(mx, my, buttons);
+                            g_mouse_captured_window = win;
                         }
                     } else {
                         /* Maximized: only custom mouse, no resize */
                         win->handle_mouse(mx, my, buttons);
+                        g_mouse_captured_window = win;
                     }
 
                     break; /* Found clicked window, skip others underneath */
@@ -1453,9 +1470,25 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
             g_resizing_window = NULL;
             comp_mark_dirty();
         }
+        g_mouse_captured_window = NULL;
     }
 
     g_prev_buttons = buttons;
+
+    /* Forward hover/move events to the window under the mouse */
+    if (!left_pressed && !g_dragged_window && !g_resizing_window) {
+        Window *hover_win = g_windows_head;
+        while (hover_win) {
+            if (hover_win->is_visible && hover_win->scale_spring.target == 256) {
+                if (mx >= hover_win->x && mx < hover_win->x + (int32_t)hover_win->w &&
+                    my >= hover_win->y && my < hover_win->y + (int32_t)hover_win->h) {
+                    hover_win->handle_mouse(mx, my, buttons);
+                    break;
+                }
+            }
+            hover_win = hover_win->next;
+        }
+    }
 
     /* Only trigger a full desktop redraw if something major changed (clicks) */
     if (clicked_down || clicked_up) {
