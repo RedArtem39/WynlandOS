@@ -875,7 +875,7 @@ static void draw_input_line(BootInfo *info, const char *prompt, const char *inpu
  * Hardware Reset Commands
  * ============================================================ */
 
-static void reboot(void)
+void sys_reboot(void)
 {
     /* 1. Pulse CPU reset via keyboard controller (port 0x64) */
     uint8_t temp = 0x02;
@@ -888,7 +888,7 @@ static void reboot(void)
     __asm__ volatile("lidt %0; int3" :: "m"((uint16_t[3]){0, 0, 0}));
 }
 
-static void poweroff(void)
+void sys_poweroff(void)
 {
     /* QEMU q35 ACPI shutdown */
     outw(0x604, 0x2000);
@@ -1586,11 +1586,11 @@ static void execute_command(BootInfo *info, const char *cmd)
     } else if (str_compare(cmd, "reboot") == 0) {
         console_print_string(info, "Rebooting system...\n", 0x00FF0000, term_bg_color);
         for (volatile int i = 0; i < 50000000; i++);
-        reboot();
+        sys_reboot();
     } else if (str_compare(cmd, "poweroff") == 0) {
         console_print_string(info, "Shutting down...\n", 0x00FF0000, term_bg_color);
         for (volatile int i = 0; i < 50000000; i++);
-        poweroff();
+        sys_poweroff();
     } else if (str_compare(cmd, "panic") == 0) {
         console_print_string(info, "Triggering test CPU exception...\n", 0x00FF0000, term_bg_color);
         for (volatile int i = 0; i < 20000000; i++);

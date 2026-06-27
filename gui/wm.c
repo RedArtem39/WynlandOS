@@ -382,6 +382,10 @@ void wm_init(void)
     wlang_browser_init();
 
     serial_write_string("WM: Initialized successfully.\r\n");
+
+    /* Play the startup chime sound chord */
+    extern void play_startup_chime(void);
+    play_startup_chime();
 }
 
 /* ============================================================
@@ -547,6 +551,103 @@ static void wm_draw_panel_contents(uint32_t sw, uint32_t total_sec)
     comp_draw_string(sw - 75, 4, time_str, fg, 0);
 }
 
+static bool g_control_panel_visible = false;
+
+static void wm_draw_control_panel(uint32_t sw, uint32_t sh)
+{
+    (void)sh;
+    int32_t px = sw - 290;
+    int32_t py = THEME_PANEL_HEIGHT + 5;
+    int32_t pw = 280;
+    int32_t ph = 360;
+
+    /* Shadow */
+    comp_fill_rect_alpha(px + 4, py + 4, pw, ph, 0x30000000);
+
+    /* Background panel */
+    comp_draw_rounded_rect(px, py, pw, ph, 12, 0xE520242C); /* Nord dark with 90% alpha */
+    comp_draw_rounded_rect_border(px, py, pw, ph, 12, NORD3 & 0x00FFFFFF);
+
+    /* Header */
+    comp_draw_string(px + 15, py + 15, "Control Center", NORD6 & 0x00FFFFFF, 0);
+    comp_fill_rect(px + 15, py + 32, pw - 30, 1, NORD3 & 0x00FFFFFF);
+
+    /* --- SECTION 1: CALENDAR (June 2026) --- */
+    comp_draw_string(px + 15, py + 42, "June 2026", NORD8 & 0x00FFFFFF, 0);
+    
+    /* Weekdays header */
+    comp_draw_string(px + 15, py + 62, "Mo Tu We Th Fr Sa Su", NORD4 & 0x00FFFFFF, 0);
+
+    /* Days grid */
+    const char *days[] = {
+        " 1  2  3  4  5  6  7",
+        " 8  9 10 11 12 13 14",
+        "15 16 17 18 19 20 21",
+        "22 23 24 25 26 27 28", /* 27 is Saturday */
+        "29 30"
+    };
+
+    for (int i = 0; i < 5; i++) {
+        comp_draw_string(px + 15, py + 82 + i * 16, days[i], NORD6 & 0x00FFFFFF, 0);
+    }
+
+    /* Highlight Saturday 27th */
+    comp_fill_rect_alpha(px + 15 + 15 * 9 - 2, py + 82 + 3 * 16 - 1, 19, 14, 0x8088C0D0); /* Nord8 highlight */
+    comp_draw_string(px + 15 + 15 * 9, py + 82 + 3 * 16, "27", 0x002E3440, 0); /* dark text */
+
+    comp_fill_rect(px + 15, py + 172, pw - 30, 1, NORD3 & 0x00FFFFFF);
+
+    /* --- SECTION 2: AUDIO VOLUME SLIDER --- */
+    comp_draw_string(px + 15, py + 182, "Volume Control", NORD4 & 0x00FFFFFF, 0);
+
+    /* Progress bar track */
+    int32_t sx = px + 15;
+    int32_t sy = py + 204;
+    int32_t sw_slider = pw - 30;
+    int32_t sh_slider = 12;
+    comp_draw_rounded_rect(sx, sy, sw_slider, sh_slider, 6, NORD1 & 0x00FFFFFF);
+
+    /* Volume level (0 to 100) */
+    extern int g_sys_volume;
+    int32_t fill_w = (sw_slider * g_sys_volume) / 100;
+    if (fill_w > 0) {
+        comp_draw_rounded_rect(sx, sy, fill_w, sh_slider, 6, NORD8 & 0x00FFFFFF);
+    }
+    
+    /* Display text */
+    char vol_str[16] = "Vol: ";
+    char vol_num[8];
+    extern void uint_to_str(uint64_t val, char *buf);
+    uint_to_str((uint64_t)g_sys_volume, vol_num);
+    wm_str_cat(vol_str, vol_num);
+    wm_str_cat(vol_str, "%");
+    comp_draw_string(px + 190, py + 182, vol_str, NORD6 & 0x00FFFFFF, 0);
+
+    comp_fill_rect(px + 15, py + 232, pw - 30, 1, NORD3 & 0x00FFFFFF);
+
+    /* --- SECTION 3: SOUND MELODIES --- */
+    comp_draw_string(px + 15, py + 242, "Sound Test", NORD4 & 0x00FFFFFF, 0);
+
+    /* Buttons */
+    comp_draw_rounded_rect(px + 15, py + 264, 75, 24, 4, NORD2 & 0x00FFFFFF);
+    comp_draw_string(px + 28, py + 268, "Chime", NORD6 & 0x00FFFFFF, 0);
+
+    comp_draw_rounded_rect(px + 100, py + 264, 75, 24, 4, NORD2 & 0x00FFFFFF);
+    comp_draw_string(px + 118, py + 268, "Beep", NORD6 & 0x00FFFFFF, 0);
+
+    comp_draw_rounded_rect(px + 185, py + 264, 80, 24, 4, NORD2 & 0x00FFFFFF);
+    comp_draw_string(px + 208, py + 268, "Mute", NORD6 & 0x00FFFFFF, 0);
+
+    comp_fill_rect(px + 15, py + 304, pw - 30, 1, NORD3 & 0x00FFFFFF);
+
+    /* --- SECTION 4: POWER OPTIONS --- */
+    comp_draw_rounded_rect(px + 15, py + 318, 120, 26, 4, 0x80BF616A); /* red */
+    comp_draw_string(px + 40, py + 323, "Shut Down", NORD6 & 0x00FFFFFF, 0);
+
+    comp_draw_rounded_rect(px + 145, py + 318, 120, 26, 4, 0x80D08770); /* orange */
+    comp_draw_string(px + 185, py + 323, "Reboot", NORD6 & 0x00FFFFFF, 0);
+}
+
 void wm_draw_desktop(void)
 {
     static uint64_t last_sec = 999999;
@@ -601,8 +702,10 @@ void wm_draw_desktop(void)
         extern bool comp_is_dirty(void);
         if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty() || clock_changed) {
             bool near_dock = (my >= 650) || (last_my >= 650);
+            static bool g_prev_control_panel_visible = false;
+            bool ctrl_panel_active = g_control_panel_visible || g_prev_control_panel_visible;
 
-            if (dragging || near_dock) {
+            if (dragging || near_dock || ctrl_panel_active) {
                 /* Localized Redraw Path for window dragging/resizing and dock magnification */
                 uint32_t sw = comp_get_width();
                 uint32_t sh = comp_get_height();
@@ -611,6 +714,20 @@ void wm_draw_desktop(void)
                 int32_t uy1 = 999999;
                 int32_t ux2 = -999999;
                 int32_t uy2 = -999999;
+
+                /* Include Control Center bounds if it was or is active */
+                if (ctrl_panel_active) {
+                    int32_t cpx = sw - 290;
+                    int32_t cpy = THEME_PANEL_HEIGHT + 5;
+                    int32_t cpw = 280;
+                    int32_t cph = 360;
+
+                    if (cpx < ux1) ux1 = cpx;
+                    if (cpy < uy1) uy1 = cpy;
+                    if (cpx + cpw > ux2) ux2 = cpx + cpw;
+                    if (cpy + cph > uy2) uy2 = cpy + cph;
+                }
+                g_prev_control_panel_visible = g_control_panel_visible;
 
                 /* Include moving/dragged/resized window's old and new bounds in dirty rect */
                 if (dragging) {
@@ -822,6 +939,11 @@ void wm_draw_desktop(void)
                         }
                     }
 
+                    /* Draw Control Center overlay in localized path if visible */
+                    if (g_control_panel_visible) {
+                        wm_draw_control_panel(sw, sh);
+                    }
+
                     /* Set compositor dirty region to the union rect */
                     extern void comp_set_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y2);
                     comp_set_dirty_rect(ux1, uy1, ux2 - 1, uy2 - 1);
@@ -998,6 +1120,11 @@ void wm_draw_desktop(void)
         comp_draw_string(box_x + 8, box_y + 2, name, 0xFFECEFF4, 0);
     }
 
+    /* Draw Control Center overlay if visible */
+    if (g_control_panel_visible) {
+        wm_draw_control_panel(sw, sh);
+    }
+
     /* 5. Draw cursor on the back-buffer right before flipping */
     comp_draw_cursor(mx, my, buttons);
 
@@ -1042,8 +1169,81 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
     bool clicked_up    = !left_pressed && prev_left;
 
     if (clicked_down) {
-        /* Check if clicked on a window */
         bool handled = false;
+
+        /* 1. Control Center Interactivity */
+        if (g_control_panel_visible) {
+            uint32_t sw = comp_get_width();
+            int32_t px = sw - 290;
+            int32_t py = THEME_PANEL_HEIGHT + 5;
+            int32_t pw = 280;
+            int32_t ph = 360;
+
+            if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
+                handled = true;
+
+                /* Volume Slider click: y = py + 204 to py + 216 */
+                if (mx >= px + 15 && mx < px + pw - 15 && my >= py + 204 && my < py + 216) {
+                    int32_t offset_x = mx - (px + 15);
+                    extern int g_sys_volume;
+                    g_sys_volume = (offset_x * 100) / 250;
+                    if (g_sys_volume < 0) g_sys_volume = 0;
+                    if (g_sys_volume > 100) g_sys_volume = 100;
+                    
+                    /* Feedback beep */
+                    extern void beep(uint32_t freq, uint32_t duration_ms);
+                    beep(440 + g_sys_volume * 4, 40);
+                    comp_mark_dirty();
+                }
+
+                /* Chime button click */
+                if (mx >= px + 15 && mx < px + 90 && my >= py + 264 && my < py + 288) {
+                    extern void play_startup_chime(void);
+                    play_startup_chime();
+                }
+
+                /* Beep button click */
+                if (mx >= px + 100 && mx < px + 175 && my >= py + 264 && my < py + 288) {
+                    extern void beep(uint32_t freq, uint32_t duration_ms);
+                    beep(800, 100);
+                }
+
+                /* Mute button click */
+                if (mx >= px + 185 && mx < px + 265 && my >= py + 264 && my < py + 288) {
+                    extern void nosound(void);
+                    nosound();
+                }
+
+                /* Shut Down button click */
+                if (mx >= px + 15 && mx < px + 135 && my >= py + 318 && my < py + 344) {
+                    extern void sys_poweroff(void);
+                    sys_poweroff();
+                }
+
+                /* Reboot button click */
+                if (mx >= px + 145 && mx < px + 265 && my >= py + 318 && my < py + 344) {
+                    extern void sys_reboot(void);
+                    sys_reboot();
+                }
+            } else {
+                /* Clicked outside Control Center: close it! */
+                g_control_panel_visible = false;
+                comp_mark_dirty();
+                handled = true; /* consume click */
+            }
+        }
+
+        /* 2. Check if clicked on top-right clock/status area to open Control Center */
+        if (!handled && my < (int32_t)THEME_PANEL_HEIGHT) {
+            uint32_t sw = comp_get_width();
+            if (mx >= (int32_t)sw - 120) {
+                g_control_panel_visible = true;
+                comp_mark_dirty();
+                handled = true;
+            }
+        }
+
+        /* 3. Check if clicked on a window */
         Window *win = g_windows_head;
         while (win) {
             if (win->is_visible && win->anim_step == 8) { /* Only interact if fully open */
