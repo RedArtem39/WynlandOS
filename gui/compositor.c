@@ -906,14 +906,6 @@ void comp_draw_panel(void)
 
     /* Draw subtle bottom separator line */
     comp_fill_rect(0, panel_h - 1, w, 1, NORD3 & 0x00FFFFFF);
-
-    /* Left side: WynlandOS logo / name */
-    uint32_t fg = THEME_TEXT_PRIMARY & 0x00FFFFFF;
-    comp_draw_string(10, 4, "W", THEME_ACCENT & 0x00FFFFFF, 0);
-    comp_draw_string(19, 4, "ynlandOS", fg, 0);
-
-    /* Right side: placeholder clock */
-    comp_draw_string(w - 80, 4, "00:00:00", fg, 0);
 }
 
 void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)

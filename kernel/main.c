@@ -726,7 +726,7 @@ static int history_index = -1;
 static int input_cursor = 0;
 
 static bool alt_pressed = false;
-static bool layout_ru = false;
+bool layout_ru = false;
 
 static char translate_scancode_ru(uint8_t sc, bool shift)
 {

@@ -478,6 +478,75 @@ static inline void restore_irq(uint64_t rflags)
     }
 }
 
+static void wm_str_cat(char *dest, const char *src)
+{
+    while (*dest) dest++;
+    while (*src) {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+}
+
+static void wm_draw_panel_contents(uint32_t sw, uint32_t total_sec)
+{
+    /* Restore wallpaper under the entire panel to prevent alpha accumulation */
+    extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
+    comp_draw_wallpaper_rect(0, 0, sw, THEME_PANEL_HEIGHT);
+
+    /* Draw base panel background and separator border */
+    comp_draw_panel();
+
+    uint32_t fg = THEME_TEXT_PRIMARY & 0x00FFFFFF;
+    uint32_t pipe_fg = NORD3 & 0x00FFFFFF;
+
+    /* 1. Left side: WynlandOS Logo & Name */
+    comp_draw_string(10, 4, "W", THEME_ACCENT & 0x00FFFFFF, 0);
+    comp_draw_string(19, 4, "ynlandOS", fg, 0);
+
+    /* 2. Active application / window title */
+    extern Window *g_windows_head;
+    const char *active_title = "Desktop";
+    if (g_windows_head && g_windows_head->is_visible && g_windows_head->anim_step == 8) {
+        active_title = g_windows_head->title;
+    }
+    comp_draw_string(110, 4, "|", pipe_fg, 0);
+    comp_draw_string(125, 4, active_title, NORD8 & 0x00FFFFFF, 0);
+
+    /* 3. Keyboard Layout Indicator */
+    extern bool layout_ru;
+    comp_draw_string(sw - 130, 4, "|", pipe_fg, 0);
+    comp_draw_string(sw - 110, 4, layout_ru ? "RU" : "EN", THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
+
+    /* 4. RAM / Heap memory stats */
+    extern size_t heap_get_used_memory(void);
+    size_t used_kb = heap_get_used_memory() / 1024;
+    char ram_str[32] = "RAM: ";
+    char used_str[16];
+    extern void uint_to_str(uint64_t val, char *buf);
+    uint_to_str((uint64_t)used_kb, used_str);
+    wm_str_cat(ram_str, used_str);
+    wm_str_cat(ram_str, " KB");
+    comp_draw_string(sw - 230, 4, ram_str, NORD7 & 0x00FFFFFF, 0);
+    comp_draw_string(sw - 245, 4, "|", pipe_fg, 0);
+
+    /* 5. Right side: Clock time */
+    uint32_t sec = total_sec % 60;
+    uint32_t min = (total_sec / 60) % 60;
+    uint32_t hr  = (total_sec / 3600) % 24;
+
+    char time_str[9];
+    time_str[0] = '0' + (hr / 10);
+    time_str[1] = '0' + (hr % 10);
+    time_str[2] = ':';
+    time_str[3] = '0' + (min / 10);
+    time_str[4] = '0' + (min % 10);
+    time_str[5] = ':';
+    time_str[6] = '0' + (sec / 10);
+    time_str[7] = '0' + (sec % 10);
+    time_str[8] = '\0';
+    comp_draw_string(sw - 75, 4, time_str, fg, 0);
+}
+
 void wm_draw_desktop(void)
 {
     static uint64_t last_sec = 999999;
@@ -525,25 +594,7 @@ void wm_draw_desktop(void)
             clock_changed = true;
 
             uint32_t sw = comp_get_width();
-            uint32_t sec = total_sec % 60;
-            uint32_t min = (total_sec / 60) % 60;
-            uint32_t hr  = (total_sec / 3600) % 24;
-
-            char time_str[9];
-            time_str[0] = '0' + (hr / 10);
-            time_str[1] = '0' + (hr % 10);
-            time_str[2] = ':';
-            time_str[3] = '0' + (min / 10);
-            time_str[4] = '0' + (min % 10);
-            time_str[5] = ':';
-            time_str[6] = '0' + (sec / 10);
-            time_str[7] = '0' + (sec % 10);
-            time_str[8] = '\0';
-
-            extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
-            comp_draw_wallpaper_rect(sw - 80, 0, 80, THEME_PANEL_HEIGHT);
-            comp_fill_rect_alpha(sw - 80, 0, 80, THEME_PANEL_HEIGHT, THEME_PANEL_BG);
-            comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
+            wm_draw_panel_contents(sw, total_sec);
         }
 
         /* If only the mouse moved, buttons changed, or compositor is dirty, do flip */
@@ -701,24 +752,7 @@ void wm_draw_desktop(void)
 
                     /* Redraw top panel if it overlaps the union rect */
                     if (uy1 < (int32_t)THEME_PANEL_HEIGHT) {
-                        comp_draw_panel();
-                        
-                        /* Redraw clock */
-                        uint32_t sec = total_sec % 60;
-                        uint32_t min = (total_sec / 60) % 60;
-                        uint32_t hr  = (total_sec / 3600) % 24;
-
-                        char time_str[9];
-                        time_str[0] = '0' + (hr / 10);
-                        time_str[1] = '0' + (hr % 10);
-                        time_str[2] = ':';
-                        time_str[3] = '0' + (min / 10);
-                        time_str[4] = '0' + (min % 10);
-                        time_str[5] = ':';
-                        time_str[6] = '0' + (sec / 10);
-                        time_str[7] = '0' + (sec % 10);
-                        time_str[8] = '\0';
-                        comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
+                        wm_draw_panel_contents(sw, total_sec);
                     }
 
                     /* Redraw dock if near dock or dragging */
@@ -882,24 +916,7 @@ void wm_draw_desktop(void)
     /* Wireframe outline rendering removed for real-time dragging */
 
     /* 3. Top panel */
-    comp_draw_panel();
-
-    /* Draw actual clocks on top panel */
-    uint32_t sec = total_sec % 60;
-    uint32_t min = (total_sec / 60) % 60;
-    uint32_t hr  = (total_sec / 3600) % 24;
-
-    char time_str[9];
-    time_str[0] = '0' + (hr / 10);
-    time_str[1] = '0' + (hr % 10);
-    time_str[2] = ':';
-    time_str[3] = '0' + (min / 10);
-    time_str[4] = '0' + (min % 10);
-    time_str[5] = ':';
-    time_str[6] = '0' + (sec / 10);
-    time_str[7] = '0' + (sec % 10);
-    time_str[8] = '\0';
-    comp_draw_string(sw - 80, 4, time_str, THEME_TEXT_PRIMARY & 0x00FFFFFF, 0);
+    wm_draw_panel_contents(sw, total_sec);
 
     /* 4. Draw Dock Panel with Magnification */
     uint32_t dock_w = 220;
