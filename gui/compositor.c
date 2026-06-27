@@ -7,6 +7,9 @@
  *   3. Inline pixel raw drawing to bypass tracking inside loops
  */
 
+#pragma GCC optimize("O3")
+#pragma GCC target("sse2")
+
 #include "compositor.h"
 #include "theme.h"
 #include <wynland/heap.h>
@@ -346,15 +349,20 @@ void comp_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     if (y + h > bh) h = bh - y;
 
     uint32_t alpha = (argb >> 24) & 0xFF;
+    if (alpha == 0) return;
+    if (alpha == 255) {
+        comp_fill_rect(x, y, w, h, argb & 0x00FFFFFF);
+        return;
+    }
+
     uint32_t src_r = (argb >> 16) & 0xFF;
     uint32_t src_g = (argb >>  8) & 0xFF;
     uint32_t src_b = (argb      ) & 0xFF;
 
-    /* Pre-multiply for speed */
     uint32_t inv_alpha = 255 - alpha;
 
     for (uint32_t row = 0; row < h; row++) {
-        uint32_t *dst = &g_comp.back_buffer[(y + row) * bw + x];
+        uint32_t *__restrict dst = &g_comp.back_buffer[(y + row) * bw + x];
         for (uint32_t col = 0; col < w; col++) {
             uint32_t bg = dst[col];
             uint32_t bg_r = (bg >> 16) & 0xFF;
@@ -365,7 +373,6 @@ void comp_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
             uint32_t g_sum = src_g * alpha + bg_g * inv_alpha;
             uint32_t b_sum = src_b * alpha + bg_b * inv_alpha;
 
-            /* Division-free bitwise approximation of '/ 255' */
             uint32_t out_r = (r_sum + 1 + (r_sum >> 8)) >> 8;
             uint32_t out_g = (g_sum + 1 + (g_sum >> 8)) >> 8;
             uint32_t out_b = (b_sum + 1 + (b_sum >> 8)) >> 8;
