@@ -601,6 +601,7 @@ static void console_scroll(BootInfo *info)
             row_ptr[x] = term_bg_color;
         }
     }
+    cursor_y--;
 }
 
 static void console_clear_current_line(BootInfo *info)
@@ -681,7 +682,6 @@ void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
         cursor_y++;
         if (console_start_y + cursor_y * LINE_STEP >= console_end_y) {
             console_scroll(info);
-            cursor_y--;
         }
     } else if (decoded_c == '\r') {
         cursor_x = 0;
@@ -698,7 +698,6 @@ void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
             cursor_y++;
             if (console_start_y + cursor_y * LINE_STEP >= console_end_y) {
                 console_scroll(info);
-                cursor_y--;
             }
         }
     }

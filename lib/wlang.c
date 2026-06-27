@@ -98,7 +98,7 @@ enum {
     T_INT, T_STR, T_TRUE, T_FALSE, T_NIL, T_IDENT,
     T_IF, T_ELIF, T_ELSE, T_WHILE, T_FOR, T_IN, T_FN, T_RETURN,
     T_AND, T_OR, T_NOT, T_END,
-    T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT,
+    T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT, T_CARET,
     T_EQ, T_NEQ, T_LT, T_GT, T_LE, T_GE, T_ASSIGN,
     T_LPAREN, T_RPAREN, T_LBRACKET, T_RBRACKET,
     T_COMMA, T_COLON, T_NEWLINE,
@@ -246,6 +246,7 @@ static Token lex_next(Lexer *l) {
         case '*': t.type = T_STAR; break;
         case '/': t.type = T_SLASH; break;
         case '%': t.type = T_PERCENT; break;
+        case '^': t.type = T_CARET; break;
         case '(': t.type = T_LPAREN; break;
         case ')': t.type = T_RPAREN; break;
         case '[': t.type = T_LBRACKET; break;
@@ -555,14 +556,27 @@ static Node *parse_postfix(Parser *p) {
     return n;
 }
 
-static Node *parse_mul(Parser *p) {
+static Node *parse_pow(Parser *p) {
     Node *left = parse_postfix(p);
-    while (p->cur.type == T_STAR || p->cur.type == T_SLASH || p->cur.type == T_PERCENT) {
+    while (p->cur.type == T_CARET) {
         int op = p->cur.type;
         int line = p->cur.line;
         p->cur = parser_next(p);
         Node *n = node_new(N_BINOP, line);
         n->op = op; n->left = left; n->right = parse_postfix(p);
+        left = n;
+    }
+    return left;
+}
+
+static Node *parse_mul(Parser *p) {
+    Node *left = parse_pow(p);
+    while (p->cur.type == T_STAR || p->cur.type == T_SLASH || p->cur.type == T_PERCENT) {
+        int op = p->cur.type;
+        int line = p->cur.line;
+        p->cur = parser_next(p);
+        Node *n = node_new(N_BINOP, line);
+        n->op = op; n->left = left; n->right = parse_pow(p);
         left = n;
     }
     return left;
@@ -1046,6 +1060,41 @@ static bool call_builtin(const char *name, Val *args, int nargs, Val *out) {
         return true;
     }
 
+    if (wl_strcmp(name, "get_time") == 0 && nargs == 0) {
+        extern uint64_t timer_get_ticks(void);
+        *out = val_int((int64_t)(timer_get_ticks() * 10)); /* 100 Hz timer -> 10ms ticks */
+        return true;
+    }
+
+    if (wl_strcmp(name, "network_ping") == 0 && nargs == 1) {
+        if (args[0].type == V_STR) {
+            extern uint32_t net_str_to_ip(const char *str);
+            extern int net_ping(uint32_t ip);
+            uint32_t target_ip = net_str_to_ip(args[0].sval ? args[0].sval : "");
+            if (target_ip == 0) {
+                *out = val_int(-1);
+            } else {
+                *out = val_int((int64_t)net_ping(target_ip));
+            }
+        } else {
+            *out = val_int(-1);
+        }
+        return true;
+    }
+
+    if (wl_strcmp(name, "delay") == 0 && nargs == 1) {
+        if (args[0].type == V_INT) {
+            extern uint64_t timer_get_ticks(void);
+            uint64_t start = timer_get_ticks();
+            uint64_t ticks_to_wait = args[0].ival / 10;
+            while (timer_get_ticks() - start < ticks_to_wait) {
+                __asm__ volatile("hlt");
+            }
+        }
+        *out = val_nil();
+        return true;
+    }
+
     if (wl_strcmp(name, "str_find") == 0 && nargs == 2) {
         if (args[0].type == V_STR && args[1].type == V_STR) {
             const char *haystack = args[0].sval ? args[0].sval : "";
@@ -1221,6 +1270,17 @@ static bool call_builtin(const char *name, Val *args, int nargs, Val *out) {
     return false;
 }
 
+static int64_t int_pow(int64_t base, int64_t exp) {
+    if (exp < 0) return 0;
+    int64_t result = 1;
+    while (exp > 0) {
+        if (exp & 1) result *= base;
+        base *= base;
+        exp >>= 1;
+    }
+    return result;
+}
+
 static Val eval(Node *node, Env *env) {
     if (!node || wl_ctx.had_error || wl_ctx.returning) return val_nil();
 
@@ -1302,6 +1362,8 @@ static Val eval(Node *node, Env *env) {
             case T_PERCENT:
                 if (right.ival == 0) { wl_error(node->line, "modulo by zero"); return val_nil(); }
                 return val_int(left.ival % right.ival);
+            case T_CARET:
+                return val_int(int_pow(left.ival, right.ival));
             case T_LT: return val_bool(left.ival < right.ival);
             case T_GT: return val_bool(left.ival > right.ival);
             case T_LE: return val_bool(left.ival <= right.ival);

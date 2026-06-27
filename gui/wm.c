@@ -29,24 +29,17 @@ extern uint32_t term_bg_color;
 static Window *g_windows_head = NULL; /* Top-most / Focused window */
 static Window *g_windows_tail = NULL; /* Bottom-most window */
 
-static Window *g_dragged_window = NULL;
+Window *g_dragged_window = NULL;
 static int32_t g_drag_offset_x = 0;
 static int32_t g_drag_offset_y = 0;
 
-static Window *g_resizing_window = NULL;
+Window *g_resizing_window = NULL;
 static uint32_t g_resize_start_w = 0;
 static uint32_t g_resize_start_h = 0;
 static int32_t g_resize_start_mx = 0;
 static int32_t g_resize_start_my = 0;
 
-static int32_t g_outline_x = 0;
-static int32_t g_outline_y = 0;
-static int32_t g_outline_w = 0;
-static int32_t g_outline_h = 0;
-static int32_t g_prev_outline_x = 0;
-static int32_t g_prev_outline_y = 0;
-static int32_t g_prev_outline_w = 0;
-static int32_t g_prev_outline_h = 0;
+/* outline variables removed for real-time dragging */
 
 static bool g_gui_active = false;
 static bool g_wm_needs_redraw = true;
@@ -61,11 +54,13 @@ static char g_browser_content_buf[4096] = {0};
 */
 
 /* Terminal buffer */
-#define TERM_ROWS 30
+#define TERM_ROWS 300
 #define TERM_COLS 100
 static uint16_t g_term_grid[TERM_ROWS][TERM_COLS];
 static uint32_t g_term_fg_grid[TERM_ROWS][TERM_COLS];
 static uint32_t g_term_bg_grid[TERM_ROWS][TERM_COLS];
+static int32_t g_term_view_offset = 0;
+static int32_t g_term_user_scroll = 0;
 
 /* Dock configurations */
 #define DOCK_ICON_COUNT 4
@@ -134,28 +129,47 @@ void wm_mark_dirty(void)
 
 void wm_term_set_cell(int row, int col, uint16_t c, uint32_t fg, uint32_t bg)
 {
-    if (row >= 0 && row < TERM_ROWS && col >= 0 && col < TERM_COLS) {
-        g_term_grid[row][col] = c;
-        g_term_fg_grid[row][col] = fg;
-        g_term_bg_grid[row][col] = bg;
+    int abs_row = g_term_view_offset + row;
+    if (abs_row >= 0 && abs_row < TERM_ROWS && col >= 0 && col < TERM_COLS) {
+        g_term_grid[abs_row][col] = c;
+        g_term_fg_grid[abs_row][col] = fg;
+        g_term_bg_grid[abs_row][col] = bg;
+        
+        /* Auto scroll to bottom when new characters are printed */
+        g_term_user_scroll = g_term_view_offset;
     }
 }
 
 void wm_term_scroll(void)
 {
-    for (int r = 0; r < TERM_ROWS - 1; r++) {
-        memcpy(g_term_grid[r], g_term_grid[r + 1], sizeof(g_term_grid[r]));
-        memcpy(g_term_fg_grid[r], g_term_fg_grid[r + 1], TERM_COLS * 4);
-        memcpy(g_term_bg_grid[r], g_term_bg_grid[r + 1], TERM_COLS * 4);
+    extern uint32_t cursor_y;
+    
+    if (cursor_y < TERM_ROWS) {
+        g_term_view_offset++;
+    } else {
+        /* Shift the entire history buffer up by 1 row */
+        for (int r = 0; r < TERM_ROWS - 1; r++) {
+            memcpy(g_term_grid[r], g_term_grid[r + 1], sizeof(g_term_grid[r]));
+            memcpy(g_term_fg_grid[r], g_term_fg_grid[r + 1], TERM_COLS * 4);
+            memcpy(g_term_bg_grid[r], g_term_bg_grid[r + 1], TERM_COLS * 4);
+        }
+        cursor_y--;
     }
-    memset(g_term_grid[TERM_ROWS - 1], 0, sizeof(g_term_grid[TERM_ROWS - 1]));
+    
+    int new_bottom_row = g_term_view_offset + 19; /* viewport size is 20 rows */
+    if (new_bottom_row < TERM_ROWS) {
+        memset(g_term_grid[new_bottom_row], 0, sizeof(g_term_grid[0]));
+    }
+    
+    g_term_user_scroll = g_term_view_offset;
     comp_mark_dirty();
 }
 
 void wm_term_clear_line(int row)
 {
-    if (row >= 0 && row < TERM_ROWS) {
-        memset(g_term_grid[row], 0, sizeof(g_term_grid[row]));
+    int abs_row = g_term_view_offset + row;
+    if (abs_row >= 0 && abs_row < TERM_ROWS) {
+        memset(g_term_grid[abs_row], 0, sizeof(g_term_grid[abs_row]));
         if (g_term_window) {
             int32_t cx = g_term_window->x + 1;
             int32_t cy = g_term_window->y + THEME_TITLEBAR_HEIGHT + 1;
@@ -172,7 +186,11 @@ void wm_term_clear_line(int row)
 
 void wm_term_clear(void)
 {
+    extern uint32_t cursor_y;
     memset(g_term_grid, 0, sizeof(g_term_grid));
+    g_term_view_offset = 0;
+    g_term_user_scroll = 0;
+    cursor_y = 0;
     comp_mark_dirty();
 }
 
@@ -253,6 +271,25 @@ void handle_browser_mouse_wlang(Window *self, int32_t mx, int32_t my, uint8_t bu
     wlang_call_on_mouse(mx, my, buttons);
 }
 
+static void handle_term_key(Window *self, uint8_t scancode, char ascii)
+{
+    (void)self; (void)ascii;
+    if (scancode == 0x49) { /* Page Up */
+        if (g_term_user_scroll > 0) {
+            g_term_user_scroll -= 5;
+            if (g_term_user_scroll < 0) g_term_user_scroll = 0;
+            comp_mark_dirty();
+        }
+    }
+    else if (scancode == 0x51) { /* Page Down */
+        if (g_term_user_scroll < g_term_view_offset) {
+            g_term_user_scroll += 5;
+            if (g_term_user_scroll > g_term_view_offset) g_term_user_scroll = g_term_view_offset;
+            comp_mark_dirty();
+        }
+    }
+}
+
 void wm_init(void)
 {
     serial_write_string("WM: Initializing Stacking Window Manager...\r\n");
@@ -273,6 +310,7 @@ void wm_init(void)
     term->is_visible = true;
     term->is_focused = true;
     term->draw_content = draw_terminal_content;
+    term->handle_key = handle_term_key;
     g_term_window = term;
     wm_register_window(term);
 
@@ -366,8 +404,9 @@ static void draw_terminal_content(Window *self)
     }
 
     /* Render characters inside viewport */
-    for (int r = 0; r < TERM_ROWS; r++) {
-        int32_t char_y = cy + 10 + r * 18;
+    int32_t visible_r = 0;
+    for (int r = g_term_user_scroll; r < TERM_ROWS; r++) {
+        int32_t char_y = cy + 10 + visible_r * 18;
         if (char_y + 16 > (int32_t)(self->y + self->h - 10)) break;
 
         for (int c = 0; c < TERM_COLS; c++) {
@@ -381,6 +420,7 @@ static void draw_terminal_content(Window *self)
                 comp_draw_char(char_x, char_y, ch, fg, bg);
             }
         }
+        visible_r++;
     }
 }
 
@@ -501,22 +541,7 @@ void wm_draw_desktop(void)
                 int32_t uy2 = -999999;
 
                 /* Include outline old and new bounds */
-                if (dragging) {
-                    int32_t px = g_prev_outline_x;
-                    int32_t py = g_prev_outline_y;
-                    uint32_t pw = g_prev_outline_w;
-                    uint32_t ph = g_prev_outline_h;
-
-                    if (px < ux1) ux1 = px - 8;
-                    if (py < uy1) uy1 = py - 8;
-                    if (px + (int32_t)pw > ux2) ux2 = px + (int32_t)pw + 16;
-                    if (py + (int32_t)ph > uy2) uy2 = py + (int32_t)ph + 16;
-
-                    if (g_outline_x < ux1) ux1 = g_outline_x - 8;
-                    if (g_outline_y < uy1) uy1 = g_outline_y - 8;
-                    if (g_outline_x + (int32_t)g_outline_w > ux2) ux2 = g_outline_x + (int32_t)g_outline_w + 16;
-                    if (g_outline_y + (int32_t)g_outline_h > uy2) uy2 = g_outline_y + (int32_t)g_outline_h + 16;
-                }
+                /* Include outline old and new bounds not needed in real-time */
 
                 /* Include dock bounds */
                 uint32_t dock_w = 220;
@@ -607,9 +632,7 @@ void wm_draw_desktop(void)
                         win = win->prev;
                     }
 
-                    if (dragging) {
-                        comp_draw_rounded_rect_border(g_outline_x, g_outline_y, g_outline_w, g_outline_h, 8, THEME_ACCENT & 0x00FFFFFF);
-                    }
+                    /* Wireframe outline rendering removed for real-time dragging */
 
                     /* Redraw top panel if it overlaps the union rect */
                     if (uy1 < (int32_t)THEME_PANEL_HEIGHT) {
@@ -711,12 +734,7 @@ void wm_draw_desktop(void)
                     compositor_flip();
 
                     /* Update previous outline bounds */
-                    if (dragging) {
-                        g_prev_outline_x = g_outline_x;
-                        g_prev_outline_y = g_outline_y;
-                        g_prev_outline_w = g_outline_w;
-                        g_prev_outline_h = g_outline_h;
-                    }
+                    /* previous outline bounds updates removed */
                 }
             } else {
                 /* Cursor-only fast path */
@@ -776,9 +794,7 @@ void wm_draw_desktop(void)
         win = win->prev;
     }
 
-    if (dragging) {
-        comp_draw_rounded_rect_border(g_outline_x, g_outline_y, g_outline_w, g_outline_h, 8, THEME_ACCENT & 0x00FFFFFF);
-    }
+    /* Wireframe outline rendering removed for real-time dragging */
 
     /* 3. Top panel */
     comp_draw_panel();
@@ -990,14 +1006,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         g_dragged_window = win;
                         g_drag_offset_x = mx - win->x;
                         g_drag_offset_y = my - win->y;
-                        g_outline_x = win->x;
-                        g_outline_y = win->y;
-                        g_outline_w = win->w;
-                        g_outline_h = win->h;
-                        g_prev_outline_x = win->x;
-                        g_prev_outline_y = win->y;
-                        g_prev_outline_w = win->w;
-                        g_prev_outline_h = win->h;
                     }
 
                     /* 3. Resize handle in bottom-right corner (blocked for maximized) */
@@ -1011,14 +1019,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                             g_resize_start_h = win->h;
                             g_resize_start_mx = mx;
                             g_resize_start_my = my;
-                            g_outline_x = win->x;
-                            g_outline_y = win->y;
-                            g_outline_w = win->w;
-                            g_outline_h = win->h;
-                            g_prev_outline_x = win->x;
-                            g_prev_outline_y = win->y;
-                            g_prev_outline_w = win->w;
-                            g_prev_outline_h = win->h;
                         } else {
                             /* 4. Custom window mouse event */
                             if (win->handle_mouse) {
@@ -1069,18 +1069,32 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
         }
     }
 
-    /* Dragging action */
+    /* Dragging action in real time */
     if (left_pressed && g_dragged_window) {
-        g_outline_x = mx - g_drag_offset_x;
-        g_outline_y = my - g_drag_offset_y;
+        int32_t new_x = mx - g_drag_offset_x;
+        int32_t new_y = my - g_drag_offset_y;
 
         /* Clamp y to panel height */
-        if (g_outline_y < (int32_t)THEME_PANEL_HEIGHT) {
-            g_outline_y = THEME_PANEL_HEIGHT;
+        if (new_y < (int32_t)THEME_PANEL_HEIGHT) {
+            new_y = THEME_PANEL_HEIGHT;
+        }
+
+        if (g_dragged_window->x != new_x || g_dragged_window->y != new_y) {
+            g_dragged_window->x = new_x;
+            g_dragged_window->y = new_y;
+
+            /* Synchronize console text boundaries in real time */
+            if (g_dragged_window->id == 1) {
+                console_start_x = g_dragged_window->x + 15;
+                console_start_y = g_dragged_window->y + 40;
+                console_end_x = g_dragged_window->x + g_dragged_window->w - 15;
+                console_end_y = g_dragged_window->y + g_dragged_window->h - 15;
+            }
+            comp_mark_dirty();
         }
     }
 
-    /* Resizing action */
+    /* Resizing action in real time */
     if (left_pressed && g_resizing_window) {
         int32_t dw = mx - g_resize_start_mx;
         int32_t dh = my - g_resize_start_my;
@@ -1091,37 +1105,30 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
         if (new_w < 180) new_w = 180;
         if (new_h < 120) new_h = 120;
 
-        g_outline_w = new_w;
-        g_outline_h = new_h;
-    }
+        if ((int32_t)g_resizing_window->w != new_w || (int32_t)g_resizing_window->h != new_h) {
+            g_resizing_window->w = new_w;
+            g_resizing_window->h = new_h;
 
-    /* Release drag/resize locks */
-    if (clicked_up) {
-        if (g_dragged_window) {
-            g_dragged_window->x = g_outline_x;
-            g_dragged_window->y = g_outline_y;
-
-            /* Dynamically synchronize shell text boundaries with final window position */
-            if (g_dragged_window->id == 1) {
-                console_start_x = g_dragged_window->x + 15;
-                console_start_y = g_dragged_window->y + 40;
-                console_end_x = g_dragged_window->x + g_dragged_window->w - 15;
-                console_end_y = g_dragged_window->y + g_dragged_window->h - 15;
-            }
-            g_dragged_window = NULL;
-        }
-        if (g_resizing_window) {
-            g_resizing_window->w = g_outline_w;
-            g_resizing_window->h = g_outline_h;
-
-            /* Dynamically synchronize console text boundaries with final window size */
+            /* Synchronize console text boundaries in real time */
             if (g_resizing_window->id == 1) {
                 console_start_x = g_resizing_window->x + 15;
                 console_start_y = g_resizing_window->y + 40;
                 console_end_x = g_resizing_window->x + g_resizing_window->w - 15;
                 console_end_y = g_resizing_window->y + g_resizing_window->h - 15;
             }
+            comp_mark_dirty();
+        }
+    }
+
+    /* Release drag/resize locks */
+    if (clicked_up) {
+        if (g_dragged_window) {
+            g_dragged_window = NULL;
+            comp_mark_dirty();
+        }
+        if (g_resizing_window) {
             g_resizing_window = NULL;
+            comp_mark_dirty();
         }
     }
 

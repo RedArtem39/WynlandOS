@@ -22,6 +22,7 @@ static char current_forge_dir[256];
 static ForgeItem forge_items[FORGE_MAX_ITEMS];
 static uint32_t forge_item_count = 0;
 static int32_t selected_index = -1;
+static int32_t forge_scroll_offset = 0;
 static bool forge_initialized = false;
 
 static uint64_t last_click_time = 0;
@@ -264,6 +265,7 @@ static void read_forge_directory(void)
 {
     forge_item_count = 0;
     selected_index = -1;
+    forge_scroll_offset = 0;
     vfs_readdir(current_forge_dir, forge_readdir_callback);
 }
 
@@ -348,8 +350,14 @@ void draw_forge_content(Window *self)
         int32_t line_y = ty;
         int32_t line_h = 16;
         int32_t max_lines = th / line_h;
-        int32_t line_count = 0;
         
+        int skip = file_view_scroll;
+        while (*p && skip > 0) {
+            if (*p == '\n') skip--;
+            p++;
+        }
+        
+        int32_t line_count = 0;
         while (*p && line_count < max_lines) {
             char line_buf[80];
             int li = 0;
@@ -411,8 +419,8 @@ void draw_forge_content(Window *self)
     int32_t row_h = 24;
     int32_t max_rows = rh / row_h;
     
-    for (uint32_t i = 0; i < forge_item_count && i < (uint32_t)max_rows; i++) {
-        int32_t item_y = ry + i * row_h;
+    for (uint32_t i = forge_scroll_offset; i < forge_item_count && (i - forge_scroll_offset) < (uint32_t)max_rows; i++) {
+        int32_t item_y = ry + (i - forge_scroll_offset) * row_h;
         ForgeItem *item = &forge_items[i];
 
         /* Draw selection background if this row is selected */
@@ -489,7 +497,160 @@ void draw_forge_content(Window *self)
 
 void handle_forge_key(Window *self, uint8_t scancode, char ascii)
 {
-    (void)self; (void)scancode; (void)ascii;
+    (void)ascii;
+    int32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
+    int32_t rh = ch - 61;
+    int32_t row_h = 24;
+    int32_t max_rows = rh / row_h;
+
+    if (forge_viewing_file) {
+        if (scancode == 0x01) { /* Escape */
+            forge_viewing_file = false;
+            comp_mark_dirty();
+            return;
+        }
+        if (scancode == 0x48) { /* Arrow Up */
+            if (file_view_scroll > 0) {
+                file_view_scroll--;
+                comp_mark_dirty();
+            }
+        }
+        if (scancode == 0x50) { /* Arrow Down */
+            int total_lines = 0;
+            const char *p = file_view_buf;
+            while (*p) {
+                if (*p == '\n') total_lines++;
+                p++;
+            }
+            if (file_view_scroll + (ch - 50) / 16 < total_lines) {
+                file_view_scroll++;
+                comp_mark_dirty();
+            }
+        }
+        if (scancode == 0x49) { /* Page Up */
+            file_view_scroll -= 10;
+            if (file_view_scroll < 0) file_view_scroll = 0;
+            comp_mark_dirty();
+        }
+        if (scancode == 0x51) { /* Page Down */
+            int total_lines = 0;
+            const char *p = file_view_buf;
+            while (*p) {
+                if (*p == '\n') total_lines++;
+                p++;
+            }
+            file_view_scroll += 10;
+            int max_scroll = total_lines - (ch - 50) / 16;
+            if (max_scroll < 0) max_scroll = 0;
+            if (file_view_scroll > max_scroll) file_view_scroll = max_scroll;
+            comp_mark_dirty();
+        }
+        return;
+    }
+
+    if (forge_item_count == 0) return;
+
+    if (scancode == 0x48) { /* Arrow Up */
+        if (selected_index == -1) {
+            selected_index = 0;
+        } else {
+            selected_index--;
+            if (selected_index < 0) {
+                selected_index = forge_item_count - 1;
+            }
+        }
+        if (selected_index < forge_scroll_offset) {
+            forge_scroll_offset = selected_index;
+        } else if (selected_index >= forge_scroll_offset + max_rows) {
+            forge_scroll_offset = selected_index - max_rows + 1;
+        }
+        comp_mark_dirty();
+    }
+    else if (scancode == 0x50) { /* Arrow Down */
+        if (selected_index == -1) {
+            selected_index = 0;
+        } else {
+            selected_index++;
+            if (selected_index >= (int32_t)forge_item_count) {
+                selected_index = 0;
+            }
+        }
+        if (selected_index < forge_scroll_offset) {
+            forge_scroll_offset = selected_index;
+        } else if (selected_index >= forge_scroll_offset + max_rows) {
+            forge_scroll_offset = selected_index - max_rows + 1;
+        }
+        comp_mark_dirty();
+    }
+    else if (scancode == 0x49) { /* Page Up */
+        selected_index -= max_rows;
+        if (selected_index < 0) selected_index = 0;
+        if (selected_index < forge_scroll_offset) {
+            forge_scroll_offset = selected_index;
+        }
+        comp_mark_dirty();
+    }
+    else if (scancode == 0x51) { /* Page Down */
+        selected_index += max_rows;
+        if (selected_index >= (int32_t)forge_item_count) selected_index = forge_item_count - 1;
+        if (selected_index >= forge_scroll_offset + max_rows) {
+            forge_scroll_offset = selected_index - max_rows + 1;
+        }
+        comp_mark_dirty();
+    }
+    else if (scancode == 0x0E) { /* Backspace (Go Up) */
+        if (str_compare_local(current_forge_dir, "/") != 0) {
+            uint32_t len = str_len_local(current_forge_dir);
+            if (len > 1) {
+                int32_t last_slash = -1;
+                for (int32_t i = len - 1; i >= 0; i--) {
+                    if (current_forge_dir[i] == '/') {
+                        last_slash = i;
+                        break;
+                    }
+                }
+                if (last_slash == 0) {
+                    current_forge_dir[1] = '\0';
+                } else if (last_slash > 0) {
+                    current_forge_dir[last_slash] = '\0';
+                }
+            }
+            read_forge_directory();
+            comp_mark_dirty();
+        }
+    }
+    else if (scancode == 0x1C) { /* Enter */
+        if (selected_index >= 0 && selected_index < (int32_t)forge_item_count) {
+            ForgeItem *item = &forge_items[selected_index];
+            if (item->is_dir) {
+                if (str_compare_local(current_forge_dir, "/") == 0) {
+                    str_copy_local(current_forge_dir + 1, item->name);
+                } else {
+                    uint32_t len = str_len_local(current_forge_dir);
+                    current_forge_dir[len] = '/';
+                    str_copy_local(current_forge_dir + len + 1, item->name);
+                }
+                read_forge_directory();
+            } else {
+                if (str_ends_with_local(item->name, ".wbin")) {
+                    char full_path[512];
+                    str_copy_local(full_path, current_forge_dir);
+                    if (str_compare_local(current_forge_dir, "/") != 0) {
+                        uint32_t len = str_len_local(full_path);
+                        full_path[len] = '/';
+                        full_path[len + 1] = '\0';
+                    }
+                    str_append_local(full_path, item->name);
+                    
+                    extern bool wynvm_run(const char *bin_path);
+                    wynvm_run(full_path);
+                } else {
+                    forge_view_selected();
+                }
+            }
+            comp_mark_dirty();
+        }
+    }
 }
 
 void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons)
@@ -603,7 +764,7 @@ void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons)
 
     if (mx >= rx && mx <= (int32_t)(rx + rw) && my >= ry && my <= (int32_t)(ry + rh)) {
         int32_t row_h = 24;
-        int32_t clicked_row = (my - ry) / row_h;
+        int32_t clicked_row = (my - ry) / row_h + forge_scroll_offset;
         if (clicked_row >= 0 && clicked_row < (int32_t)forge_item_count) {
             uint64_t current_time = timer_get_ticks();
             

@@ -37,7 +37,7 @@
 #define THEME_DESKTOP_BOT      0xFF232831   /* slightly darker than NORD0  */
 #define THEME_PANEL_BG         0xC03B4252   /* NORD1 with 75% alpha        */
 #define THEME_PANEL_HEIGHT     24
-#define THEME_TITLEBAR_BG      NORD1
+#define THEME_TITLEBAR_BG      0xD53B4252   /* NORD1 with 83% alpha        */
 #define THEME_TITLEBAR_HEIGHT  28
 #define THEME_TITLEBAR_FG      NORD6
 #define THEME_WINDOW_BG        0xD52E3440   /* NORD0 with 83% alpha */

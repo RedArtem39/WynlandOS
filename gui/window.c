@@ -16,8 +16,8 @@ void draw_window_decorations(Window *win)
     uint32_t th = win->h;
 
     /* Theme colors */
-    uint32_t win_bg     = THEME_WINDOW_BG & 0x00FFFFFF;
-    uint32_t titlebar   = (win->is_focused ? THEME_TITLEBAR_BG : NORD2) & 0x00FFFFFF;
+    uint32_t win_bg     = THEME_WINDOW_BG;
+    uint32_t titlebar   = win->is_focused ? THEME_TITLEBAR_BG : ((NORD2 & 0x00FFFFFF) | 0xD5000000);
     uint32_t border     = THEME_WINDOW_BORDER & 0x00FFFFFF;
     uint32_t text_fg    = (win->is_focused ? THEME_TITLEBAR_FG : NORD4) & 0x00FFFFFF;
 
@@ -26,10 +26,18 @@ void draw_window_decorations(Window *win)
     uint32_t min_c      = (win->is_focused ? THEME_BTN_MINIMIZE : NORD3) & 0x00FFFFFF;
     uint32_t max_c      = (win->is_focused ? THEME_BTN_MAXIMIZE : NORD3) & 0x00FFFFFF;
 
+    /* If window is currently being dragged or resized, make it more translucent! */
+    extern Window *g_dragged_window;
+    extern Window *g_resizing_window;
+    if (win == g_dragged_window || win == g_resizing_window) {
+        win_bg = (win_bg & 0x00FFFFFF) | 0x90000000;      /* 56% alpha */
+        titlebar = (titlebar & 0x00FFFFFF) | 0x90000000;  /* 56% alpha */
+    }
+
     if (win->is_maximized) {
         /* Maximized: solid fill, no shadow, sharp corners, flat titlebar */
-        comp_fill_rect(tx, ty, tw, th, win_bg);
-        comp_fill_rect(tx, ty, tw, THEME_TITLEBAR_HEIGHT, titlebar);
+        comp_fill_rect(tx, ty, tw, th, win_bg & 0x00FFFFFF);
+        comp_fill_rect(tx, ty, tw, THEME_TITLEBAR_HEIGHT, titlebar & 0x00FFFFFF);
     } else {
         /* Floating: rounded corners, drop shadow, padded titlebar */
         /* Window shadow (subtle dark rect behind window) */
@@ -38,10 +46,10 @@ void draw_window_decorations(Window *win)
         /* Window body with rounded corners */
         comp_draw_rounded_rect(tx, ty, tw, th, 8, win_bg);
 
-        /* Title bar (flat filled area on top portion of the window) */
-        comp_fill_rect(tx + 8, ty, tw - 16, THEME_TITLEBAR_HEIGHT, titlebar);
-        comp_fill_rect(tx, ty + 8, 8, THEME_TITLEBAR_HEIGHT - 8, titlebar);
-        comp_fill_rect(tx + tw - 8, ty + 8, 8, THEME_TITLEBAR_HEIGHT - 8, titlebar);
+        /* Title bar (flat filled area on top portion of the window) using alpha blending */
+        comp_fill_rect_alpha(tx + 8, ty, tw - 16, THEME_TITLEBAR_HEIGHT, titlebar);
+        comp_fill_rect_alpha(tx, ty + 8, 8, THEME_TITLEBAR_HEIGHT - 8, titlebar);
+        comp_fill_rect_alpha(tx + tw - 8, ty + 8, 8, THEME_TITLEBAR_HEIGHT - 8, titlebar);
     }
 
     /* Top border line under titlebar */
