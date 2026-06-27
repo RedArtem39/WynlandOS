@@ -11,6 +11,12 @@
 
 struct Window;
 
+typedef struct {
+    int32_t current;   /* scale, 0 to 256 (256 = 100%) */
+    int32_t target;    /* target scale, 0 or 256 */
+    int32_t velocity;  /* spring velocity */
+} Spring;
+
 typedef struct Window {
     uint32_t id;
     int32_t x;
@@ -44,8 +50,8 @@ typedef struct Window {
     struct Window *next;
     struct Window *prev;
 
-    int32_t anim_step;      /* 0 to 8 scale steps */
-    int32_t anim_direction; /* 1: open/zoom in, -1: close/zoom out, 0: idle */
+    Spring scale_spring;
+    int32_t anim_direction; /* 1: opening, -1: closing, 0: idle */
 
     /* backing store for VM-drawn window content */
     uint32_t *backing_store;

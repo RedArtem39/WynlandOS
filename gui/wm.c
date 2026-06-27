@@ -210,6 +210,19 @@ void wm_register_window(Window *win)
     win->prev_y = win->y;
     win->prev_w = win->w;
     win->prev_h = win->h;
+
+    /* Initialize spring physics states */
+    if (win->is_visible) {
+        win->scale_spring.current = 256;
+        win->scale_spring.target = 256;
+        win->scale_spring.velocity = 0;
+    } else {
+        win->scale_spring.current = 0;
+        win->scale_spring.target = 0;
+        win->scale_spring.velocity = 0;
+    }
+    win->anim_direction = 0;
+
     comp_mark_dirty();
 }
 
@@ -510,7 +523,7 @@ static void wm_draw_panel_contents(uint32_t sw, uint32_t total_sec)
     /* 2. Active application / window title */
     extern Window *g_windows_head;
     const char *active_title = "Desktop";
-    if (g_windows_head && g_windows_head->is_visible && g_windows_head->anim_step == 8) {
+    if (g_windows_head && g_windows_head->is_visible && g_windows_head->scale_spring.current == 256) {
         active_title = g_windows_head->title;
     }
     comp_draw_string(110, 4, "|", pipe_fg, 0);
@@ -663,19 +676,37 @@ void wm_draw_desktop(void)
 
     bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
 
-    /* Tick window scale animations */
+    /* Tick window scale animations using Spring Physics */
     bool any_animating = false;
     Window *curr = g_windows_head;
     while (curr) {
-        if (curr->anim_direction > 0 && curr->anim_step < 8) {
-            curr->anim_step++;
+        /* Spring Constants: stiffness = 40, damping = 12 (scaled by 256) */
+        int32_t stiffness = 40;
+        int32_t damping = 12;
+
+        int32_t displacement = curr->scale_spring.current - curr->scale_spring.target;
+        
+        if (displacement != 0 || curr->scale_spring.velocity != 0) {
+            int32_t force = (-stiffness * displacement - damping * curr->scale_spring.velocity) / 32;
+            curr->scale_spring.velocity += force;
+            curr->scale_spring.current += curr->scale_spring.velocity;
+
             any_animating = true;
-        } else if (curr->anim_direction < 0 && curr->anim_step > 0) {
-            curr->anim_step--;
-            any_animating = true;
-            if (curr->anim_step == 0) {
-                curr->is_visible = false;
-                curr->anim_direction = 0;
+
+            /* Check snap to target */
+            int32_t new_disp = curr->scale_spring.current - curr->scale_spring.target;
+            int32_t abs_disp = new_disp < 0 ? -new_disp : new_disp;
+            int32_t abs_vel = curr->scale_spring.velocity < 0 ? -curr->scale_spring.velocity : curr->scale_spring.velocity;
+            
+            if (abs_disp < 2 && abs_vel < 2) {
+                curr->scale_spring.current = curr->scale_spring.target;
+                curr->scale_spring.velocity = 0;
+                
+                /* If target was 0, hide the window completely */
+                if (curr->scale_spring.target == 0) {
+                    curr->is_visible = false;
+                    curr->anim_direction = 0;
+                }
             }
         }
         curr = curr->next;
@@ -835,11 +866,11 @@ void wm_draw_desktop(void)
                                 int32_t orig_y = win->y;
                                 uint32_t orig_w = win->w;
                                 uint32_t orig_h = win->h;
-                                int32_t step = win->anim_step;
+                                int32_t scale = win->scale_spring.current;
 
-                                if (step < 8) {
-                                    win->w = (orig_w * step) / 8;
-                                    win->h = (orig_h * step) / 8;
+                                if (scale < 256 || win->scale_spring.velocity != 0) {
+                                    win->w = (orig_w * scale) / 256;
+                                    win->h = (orig_h * scale) / 256;
                                     win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
                                     win->y = orig_y + (int32_t)(orig_h - win->h) / 2;
                                     if (win->w < 1) win->w = 1;
@@ -847,10 +878,10 @@ void wm_draw_desktop(void)
                                 }
 
                                 draw_window_decorations(win);
-                                if (win->draw_content && step > 3) {
+                                if (win->draw_content && scale > 96) {
                                     win->draw_content(win);
                                 }
-                                if (win->is_focused && !win->is_maximized && step == 8) {
+                                if (win->is_focused && !win->is_maximized && scale == 256) {
                                     int32_t rx = win->x + win->w - 12;
                                     int32_t ry = win->y + win->h - 12;
                                     comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
@@ -1005,11 +1036,11 @@ void wm_draw_desktop(void)
             int32_t orig_y = win->y;
             uint32_t orig_w = win->w;
             uint32_t orig_h = win->h;
-            int32_t step = win->anim_step;
+            int32_t scale = win->scale_spring.current;
 
-            if (step < 8) {
-                win->w = (orig_w * step) / 8;
-                win->h = (orig_h * step) / 8;
+            if (scale < 256 || win->scale_spring.velocity != 0) {
+                win->w = (orig_w * scale) / 256;
+                win->h = (orig_h * scale) / 256;
                 win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
                 win->y = orig_y + (int32_t)(orig_h - win->h) / 2;
                 if (win->w < 1) win->w = 1;
@@ -1017,11 +1048,11 @@ void wm_draw_desktop(void)
             }
 
             draw_window_decorations(win);
-            if (win->draw_content && step > 3) {
+            if (win->draw_content && scale > 96) {
                 win->draw_content(win);
             }
             /* Draw a resize handle in bottom-right corner of window (skip if maximized) */
-            if (win->is_focused && !win->is_maximized && step == 8) {
+            if (win->is_focused && !win->is_maximized && scale == 256) {
                 int32_t rx = win->x + win->w - 12;
                 int32_t ry = win->y + win->h - 12;
                 comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
@@ -1151,10 +1182,13 @@ void wm_draw_desktop(void)
 static void wm_show_window(Window *win)
 {
     if (win) {
-        if (!win->is_visible || win->anim_step < 8) {
+        if (!win->is_visible || win->scale_spring.current < 256) {
             win->is_visible = true;
             win->anim_direction = 1;
-            win->anim_step = 0;
+            win->scale_spring.target = 256;
+            if (win->scale_spring.current == 0) {
+                win->scale_spring.velocity = 0;
+            }
         }
         wm_raise_window(win);
         comp_mark_dirty();
@@ -1246,7 +1280,7 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
         /* 3. Check if clicked on a window */
         Window *win = g_windows_head;
         while (win) {
-            if (win->is_visible && win->anim_step == 8) { /* Only interact if fully open */
+            if (win->is_visible && win->scale_spring.current == 256) { /* Only interact if fully open */
                 /* Check boundary */
                 if (mx >= win->x && mx < (int32_t)(win->x + win->w) &&
                     my >= win->y && my < (int32_t)(win->y + win->h)) {
@@ -1267,6 +1301,7 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                                 wm_exit_gui();
                             } else {
                                 win->anim_direction = -1; /* Close zoom-out animation */
+                                win->scale_spring.target = 0;
                                 comp_mark_dirty();
                             }
                             break;
@@ -1277,6 +1312,7 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         int32_t min_dy = my - (win->y + 14);
                         if (min_dx * min_dx + min_dy * min_dy <= 6 * 6) {
                             win->anim_direction = -1; /* Minimize zoom-out animation */
+                            win->scale_spring.target = 0;
                             comp_mark_dirty();
                             break;
                         }

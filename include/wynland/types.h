@@ -24,10 +24,11 @@ typedef uint64_t  uintptr_t;
 typedef int64_t   intptr_t;
 typedef int64_t   ptrdiff_t;
 
-/* Boolean */
+#ifndef __cplusplus
 typedef _Bool bool;
 #define true  1
 #define false 0
+#endif
 
 /* Null */
 #define NULL ((void*)0)

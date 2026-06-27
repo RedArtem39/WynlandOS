@@ -326,9 +326,11 @@ void comp_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t col
 
     for (uint32_t row = 0; row < h; row++) {
         uint32_t *dst = &g_comp.back_buffer[(y + row) * bw + x];
-        for (uint32_t col = 0; col < w; col++) {
-            dst[col] = color;
-        }
+        uint64_t count = w;
+        __asm__ volatile("rep stosl" 
+                         : "+D"(dst), "+c"(count) 
+                         : "a"(color) 
+                         : "memory");
     }
     comp_mark_area_dirty(x, y, x + w - 1, y + h - 1);
 }

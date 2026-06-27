@@ -23,6 +23,7 @@ LD_BOOT    = x86_64-w64-mingw32-ld
 
 # Kernel compiler (system gcc works on x86_64 with freestanding flags)
 CC_KERNEL  = gcc
+CXX_KERNEL = g++
 LD_KERNEL  = ld
 
 # Assembler
@@ -87,6 +88,17 @@ CFLAGS_KERNEL  = $(COMMON_FLAGS)          \
                  -std=c11                 \
                  -O2
 
+CXXFLAGS_KERNEL = $(COMMON_FLAGS)         \
+                  -mcmodel=large          \
+                  -fno-pie                \
+                  -fno-pic                \
+                  -fno-rtti               \
+                  -fno-exceptions         \
+                  -nostdlib               \
+                  -nostdinc               \
+                  -std=c++17              \
+                  -O2
+
 LDFLAGS_KERNEL = -T $(SRC_KERNEL)/linker.ld \
                  -nostdlib                  \
                  -z max-page-size=0x1000
@@ -101,10 +113,12 @@ ASFLAGS        = -f elf64 -g
 BOOT_C_SRC     = $(wildcard $(SRC_BOOT)/*.c)
 BOOT_OBJ       = $(patsubst $(SRC_BOOT)/%.c, $(BUILD_BOOT)/%.o, $(BOOT_C_SRC))
 
-# Kernel sources (C + ASM)
+# Kernel sources (C + CPP + ASM)
 KERNEL_C_SRC   = $(wildcard $(SRC_KERNEL)/*.c)
+KERNEL_CPP_SRC = $(wildcard $(SRC_KERNEL)/*.cpp)
 KERNEL_ASM_SRC = $(wildcard $(SRC_KERNEL)/*.asm)
 KERNEL_C_OBJ   = $(patsubst $(SRC_KERNEL)/%.c, $(BUILD_KERNEL)/%.o, $(KERNEL_C_SRC))
+KERNEL_CPP_OBJ = $(patsubst $(SRC_KERNEL)/%.cpp, $(BUILD_KERNEL)/%.o, $(KERNEL_CPP_SRC))
 KERNEL_ASM_OBJ = $(patsubst $(SRC_KERNEL)/%.asm, $(BUILD_KERNEL)/%.o, $(KERNEL_ASM_SRC))
 
 # Driver sources
@@ -123,10 +137,12 @@ PKG_OBJ        = $(patsubst $(SRC_PKG)/%.c, $(BUILD_PKG)/%.o, $(PKG_C_SRC))
 
 # GUI sources
 GUI_C_SRC      = $(wildcard $(SRC_GUI)/*.c)
+GUI_CPP_SRC    = $(wildcard $(SRC_GUI)/*.cpp)
 GUI_OBJ        = $(patsubst $(SRC_GUI)/%.c, $(BUILD_GUI)/%.o, $(GUI_C_SRC))
+GUI_CPP_OBJ    = $(patsubst $(SRC_GUI)/%.cpp, $(BUILD_GUI)/%.o, $(GUI_CPP_SRC))
 
 # All kernel-side objects
-KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ)
+KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ) $(GUI_CPP_OBJ)
 
 # ============================================================================
 # Output Files
@@ -184,6 +200,11 @@ $(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.c
 	@echo "  CC(KERN)   $<"
 	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $< -o $@
 
+$(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "  CXX(KERN)  $<"
+	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -c $< -o $@
+
 $(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.asm
 	@mkdir -p $(dir $@)
 	@echo "  AS(KERN)   $<"
@@ -212,11 +233,15 @@ $(BUILD_PKG)/%.o: $(SRC_PKG)/%.c
 	@echo "  CC(PKG)    $<"
 	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $< -o $@
 
-# GUI objects
 $(BUILD_GUI)/%.o: $(SRC_GUI)/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC(GUI)    $<"
 	@$(CC_KERNEL) $(CFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
+
+$(BUILD_GUI)/%.o: $(SRC_GUI)/%.cpp
+	@mkdir -p $(dir $@)
+	@echo "  CXX(GUI)   $<"
+	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_ALL_OBJ)
 	@echo "  LD(KERN)   $@"
