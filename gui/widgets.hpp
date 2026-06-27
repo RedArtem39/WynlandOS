@@ -68,6 +68,7 @@ public:
 
     void handle_mouse(int32_t mx, int32_t my, uint8_t buttons) override {
         bool is_left = (buttons & 1) != 0;
+        bool old_pressed = m_pressed;
         if (is_left) {
             m_pressed = true;
         } else {
@@ -78,7 +79,9 @@ public:
                 }
             }
         }
-        comp_mark_dirty();
+        if (m_pressed != old_pressed) {
+            comp_mark_dirty();
+        }
         
         /* Propagate to child widgets if any */
         Widget::handle_mouse(mx, my, buttons);
@@ -117,15 +120,17 @@ public:
             int32_t ax, ay;
             get_absolute_pos(ax, ay);
             int32_t offset_x = mx - ax;
-            m_val = (offset_x * 100) / (int32_t)w;
-            if (m_val < 0) m_val = 0;
-            if (m_val > 100) m_val = 100;
+            int32_t new_val = (offset_x * 100) / (int32_t)w;
+            if (new_val < 0) new_val = 0;
+            if (new_val > 100) new_val = 100;
             
-            if (m_on_change) {
-                m_on_change(m_val);
+            if (new_val != m_val) {
+                m_val = new_val;
+                if (m_on_change) {
+                    m_on_change(m_val);
+                }
+                comp_mark_dirty();
             }
-            
-            comp_mark_dirty();
         }
         Widget::handle_mouse(mx, my, buttons);
     }

@@ -552,9 +552,6 @@ static void wm_draw_control_panel(uint32_t sw, uint32_t sh)
     int32_t pw = 280;
     int32_t ph = 360;
 
-    /* Apply box blur behind panel for premium glassmorphism */
-    comp_box_blur(px, py, pw, ph, 4);
-
     /* Shadow */
     comp_fill_rect_alpha(px + 4, py + 4, pw, ph, 0x30000000);
 
@@ -1282,9 +1279,7 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                     
                     /* Click is inside the window! Raise it to front */
                     wm_raise_window(win);
-                    handled = true;
-
-                    /* 1. Titlebar buttons hit test */
+                    handled = true;                    /* 1. Titlebar click */
                     if (my < (int32_t)(win->y + THEME_TITLEBAR_HEIGHT)) {
                         
                         /* 1a. Close button hit (red, cx=18 cy=14) */
@@ -1312,71 +1307,73 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                             break;
                         }
 
-                    /* 1c. Maximize button hit (green, cx=58 cy=14) */
-                    int32_t max_dx = mx - (win->x + 58);
-                    int32_t max_dy = my - (win->y + 14);
-                    if (max_dx * max_dx + max_dy * max_dy <= 6 * 6) {
-                        uint32_t scr_w = comp_get_width();
-                        uint32_t scr_h = comp_get_height();
+                        /* 1c. Maximize button hit (green, cx=58 cy=14) */
+                        int32_t max_dx = mx - (win->x + 58);
+                        int32_t max_dy = my - (win->y + 14);
+                        if (max_dx * max_dx + max_dy * max_dy <= 6 * 6) {
+                            uint32_t scr_w = comp_get_width();
+                            uint32_t scr_h = comp_get_height();
+                            if (!win->is_maximized) {
+                                /* Save normal floating bounds */
+                                win->normal_x = win->x;
+                                win->normal_y = win->y;
+                                win->normal_w = win->w;
+                                win->normal_h = win->h;
+                                /* Expand to fill screen below panel */
+                                win->x = 0;
+                                win->y = THEME_PANEL_HEIGHT;
+                                win->w = scr_w;
+                                win->h = scr_h - THEME_PANEL_HEIGHT;
+                                win->is_maximized = true;
+                            } else {
+                                /* Restore normal floating bounds */
+                                win->x = win->normal_x;
+                                win->y = win->normal_y;
+                                win->w = win->normal_w;
+                                win->h = win->normal_h;
+                                win->is_maximized = false;
+                            }
+                            /* Sync terminal console boundaries if terminal */
+                            if (win->id == 1) {
+                                console_start_x = win->x + 15;
+                                console_start_y = win->y + 40;
+                                console_end_x = win->x + win->w - 15;
+                                console_end_y = win->y + win->h - 15;
+                            }
+                            comp_mark_dirty();
+                            break;
+                        }
+
+                        /* 1d. Dragging titlebar (blocked for maximized windows) */
                         if (!win->is_maximized) {
-                            /* Save normal floating bounds */
-                            win->normal_x = win->x;
-                            win->normal_y = win->y;
-                            win->normal_w = win->w;
-                            win->normal_h = win->h;
-                            /* Expand to fill screen below panel */
-                            win->x = 0;
-                            win->y = THEME_PANEL_HEIGHT;
-                            win->w = scr_w;
-                            win->h = scr_h - THEME_PANEL_HEIGHT;
-                            win->is_maximized = true;
-                        } else {
-                            /* Restore normal floating bounds */
-                            win->x = win->normal_x;
-                            win->y = win->normal_y;
-                            win->w = win->normal_w;
-                            win->h = win->normal_h;
-                            win->is_maximized = false;
+                            g_dragged_window = win;
+                            g_drag_offset_x = mx - win->x;
+                            g_drag_offset_y = my - win->y;
                         }
-                        /* Sync terminal console boundaries if terminal */
-                        if (win->id == 1) {
-                            console_start_x = win->x + 15;
-                            console_start_y = win->y + 40;
-                            console_end_x = win->x + win->w - 15;
-                            console_end_y = win->y + win->h - 15;
-                        }
-                        comp_mark_dirty();
-                        break;
                     }
-                }
-
-                    /* 2. Dragging titlebar (blocked for maximized windows) */
-                    if (!win->is_maximized && my < (int32_t)(win->y + THEME_TITLEBAR_HEIGHT)) {
-                        g_dragged_window = win;
-                        g_drag_offset_x = mx - win->x;
-                        g_drag_offset_y = my - win->y;
-                    }
-
-                    /* 3. Resize handle in bottom-right corner (blocked for maximized) */
-                    if (!win->is_maximized) {
-                        int32_t rx = win->x + win->w - 12;
-                        int32_t ry = win->y + win->h - 12;
-                        if (mx >= rx && mx < (int32_t)(win->x + win->w) &&
-                            my >= ry && my < (int32_t)(win->y + win->h)) {
-                            g_resizing_window = win;
-                            g_resize_start_w = win->w;
-                            g_resize_start_h = win->h;
-                            g_resize_start_mx = mx;
-                            g_resize_start_my = my;
+                    /* 2. Client area click */
+                    else {
+                        /* 2a. Resize handle in bottom-right corner (blocked for maximized) */
+                        if (!win->is_maximized) {
+                            int32_t rx = win->x + win->w - 12;
+                            int32_t ry = win->y + win->h - 12;
+                            if (mx >= rx && mx < (int32_t)(win->x + win->w) &&
+                                my >= ry && my < (int32_t)(win->y + win->h)) {
+                                g_resizing_window = win;
+                                g_resize_start_w = win->w;
+                                g_resize_start_h = win->h;
+                                g_resize_start_mx = mx;
+                                g_resize_start_my = my;
+                            } else {
+                                /* 2b. Custom window mouse event */
+                                win->handle_mouse(mx, my, buttons);
+                                g_mouse_captured_window = win;
+                            }
                         } else {
-                            /* 4. Custom window mouse event */
+                            /* Maximized: only custom mouse, no resize */
                             win->handle_mouse(mx, my, buttons);
                             g_mouse_captured_window = win;
                         }
-                    } else {
-                        /* Maximized: only custom mouse, no resize */
-                        win->handle_mouse(mx, my, buttons);
-                        g_mouse_captured_window = win;
                     }
 
                     break; /* Found clicked window, skip others underneath */
