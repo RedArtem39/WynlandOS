@@ -561,8 +561,31 @@ void wm_draw_desktop(void)
                 int32_t ux2 = -999999;
                 int32_t uy2 = -999999;
 
-                /* Include outline old and new bounds */
-                /* Include outline old and new bounds not needed in real-time */
+                /* Include moving/dragged/resized window's old and new bounds in dirty rect */
+                if (dragging) {
+                    Window *aw = g_dragged_window ? g_dragged_window : g_resizing_window;
+                    if (aw) {
+                        int32_t px = aw->prev_x;
+                        int32_t py = aw->prev_y;
+                        uint32_t pw = aw->prev_w;
+                        uint32_t ph = aw->prev_h;
+
+                        if (px - 8 < ux1) ux1 = px - 8;
+                        if (py - 8 < uy1) uy1 = py - 8;
+                        if (px + (int32_t)pw + 16 > ux2) ux2 = px + (int32_t)pw + 16;
+                        if (py + (int32_t)ph + 16 > uy2) uy2 = py + (int32_t)ph + 16;
+
+                        int32_t cx = aw->x;
+                        int32_t cy = aw->y;
+                        uint32_t cw = aw->w;
+                        uint32_t ch = aw->h;
+
+                        if (cx - 8 < ux1) ux1 = cx - 8;
+                        if (cy - 8 < uy1) uy1 = cy - 8;
+                        if (cx + (int32_t)cw + 16 > ux2) ux2 = cx + (int32_t)cw + 16;
+                        if (cy + (int32_t)ch + 16 > uy2) uy2 = cy + (int32_t)ch + 16;
+                    }
+                }
 
                 /* Include dock bounds */
                 uint32_t dock_w = 220;
