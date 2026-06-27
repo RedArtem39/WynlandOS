@@ -31,7 +31,11 @@ typedef _Bool bool;
 #endif
 
 /* Null */
+#ifdef __cplusplus
+#define NULL 0
+#else
 #define NULL ((void*)0)
+#endif
 
 /* Compiler attributes */
 #define PACKED       __attribute__((packed))
@@ -51,5 +55,11 @@ typedef _Bool bool;
 #define MAX(a, b)    ((a) > (b) ? (a) : (b))
 
 /* Standard Memory functions */
+#ifdef __cplusplus
+extern "C" {
+#endif
 void *memcpy(void *dest, const void *src, size_t n);
 void *memset(void *s, int c, size_t n);
+#ifdef __cplusplus
+}
+#endif

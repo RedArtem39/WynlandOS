@@ -4,26 +4,29 @@
  */
 
 #include <wynland/types.h>
+#include "../gui/window.h"
+
+extern "C" {
 #include <wynland/vfs.h>
 #include <wynland/heap.h>
 #include <wynland/sched.h>
 #include <wynland/font.h>
-#include "../gui/window.h"
 #include "../gui/theme.h"
 
-extern void serial_write_string(const char *str);
-extern void uint_to_str(uint64_t val, char *buf);
-extern void uint_to_hex(uint64_t val, char *buf);
-extern void *memcpy(void *dest, const void *src, size_t n);
-extern void *memset(void *s, int c, size_t n);
-extern uint32_t mouse_get_x(void);
-extern uint32_t mouse_get_y(void);
-extern uint8_t mouse_get_buttons(void);
-extern void wm_register_window(Window *win);
-extern void wm_raise_window(Window *win);
-extern void comp_mark_dirty(void);
-extern uint32_t comp_get_width(void);
-extern uint32_t *comp_get_backbuffer(void);
+void serial_write_string(const char *str);
+void uint_to_str(uint64_t val, char *buf);
+void uint_to_hex(uint64_t val, char *buf);
+void *memcpy(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+uint32_t mouse_get_x(void);
+uint32_t mouse_get_y(void);
+uint8_t mouse_get_buttons(void);
+void wm_register_window(Window *win);
+void wm_raise_window(Window *win);
+void comp_mark_dirty(void);
+uint32_t comp_get_width(void);
+uint32_t *comp_get_backbuffer(void);
+}
 
 #define VM_MAGIC 0x57594E56 /* "WYNV" */
 
@@ -169,7 +172,7 @@ static int find_symbol(const char *name) {
  * TWO-PASS ASSEMBLER (WynASM)
  * ============================================================ */
 
-bool wynvm_assemble(const char *src_path, const char *dest_path)
+extern "C" bool wynvm_assemble(const char *src_path, const char *dest_path)
 {
     VfsFile *sf = vfs_open(src_path);
     if (!sf) {
@@ -485,29 +488,25 @@ static void execute_syscall(uint32_t sys_num, uint32_t *regs, char *data_base)
                 regs[0] = 0;
                 break;
             }
-            Window *win = (Window *)kmalloc(sizeof(Window));
-            memset(win, 0, sizeof(Window));
-
-            /* Use arbitrary distinct ID sequence */
+            /* Construct Window using C++ new operator */
             static uint32_t g_vm_win_ids = 100;
-            win->id = g_vm_win_ids++;
-            win->x = regs[1];
-            win->y = regs[2];
-            win->w = regs[3];
-            win->h = regs[4];
+            uint32_t win_id = g_vm_win_ids++;
             
             char *title = data_base + regs[5];
+            char clean_title[64];
             uint32_t ti = 0;
-            while (title[ti] && ti < MAX_TITLE_LEN - 1) {
-                win->title[ti] = title[ti];
+            while (title[ti] && ti < 63) {
+                clean_title[ti] = title[ti];
                 ti++;
             }
-            win->title[ti] = '\0';
+            clean_title[ti] = '\0';
+
+            Window *win = new Window(win_id, regs[1], regs[2], regs[3], regs[4], clean_title);
             win->is_visible = true;
             win->is_focused = true;
             win->draw_content = draw_vm_window_content;
-            win->handle_mouse = handle_vm_mouse;
-            win->handle_key = handle_vm_key;
+            win->handle_mouse_cb = handle_vm_mouse;
+            win->handle_key_cb = handle_vm_key;
 
             /* Allocate backing store for client area */
             uint32_t cw = win->w - 2;
@@ -760,7 +759,7 @@ vm_finished:
     thread_exit();
 }
 
-bool wynvm_run(const char *bin_path)
+extern "C" bool wynvm_run(const char *bin_path)
 {
     VfsFile *bf = vfs_open(bin_path);
     if (!bf) {

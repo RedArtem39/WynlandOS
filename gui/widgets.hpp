@@ -22,7 +22,7 @@ public:
             i++;
         }
         m_text[i] = '\0';
-        m_w = i * 9; /* Each character is 9 pixels wide */
+        w = i * 9; /* Each character is 9 pixels wide */
     }
     
     void paint() override {
@@ -55,14 +55,14 @@ public:
         
         /* Button theme background */
         uint32_t bg_color = m_pressed ? NORD3 : NORD1;
-        comp_draw_rounded_rect(ax, ay, m_w, m_h, 6, bg_color & 0x00FFFFFF);
-        comp_draw_rounded_rect_border(ax, ay, m_w, m_h, 6, 0x40FFFFFF);
+        comp_draw_rounded_rect(ax, ay, w, h, 6, bg_color & 0x00FFFFFF);
+        comp_draw_rounded_rect_border(ax, ay, w, h, 6, 0x40FFFFFF);
         
         /* Centered text */
         uint32_t text_len = 0;
         while (m_text[text_len]) text_len++;
-        int32_t tx = ax + (int32_t)(m_w - text_len * 9) / 2;
-        int32_t ty = ay + (int32_t)(m_h - 16) / 2;
+        int32_t tx = ax + (int32_t)(w - text_len * 9) / 2;
+        int32_t ty = ay + (int32_t)(h - 16) / 2;
         comp_draw_string(tx, ty, m_text, NORD6 & 0x00FFFFFF, 0);
     }
 
@@ -102,12 +102,12 @@ public:
         get_absolute_pos(ax, ay);
 
         /* Track */
-        comp_draw_rounded_rect(ax, ay, m_w, m_h, 6, NORD1 & 0x00FFFFFF);
+        comp_draw_rounded_rect(ax, ay, w, h, 6, NORD1 & 0x00FFFFFF);
         
         /* Fill progress */
-        int32_t fill_w = (m_w * m_val) / 100;
+        int32_t fill_w = (w * m_val) / 100;
         if (fill_w > 0) {
-            comp_draw_rounded_rect(ax, ay, fill_w, m_h, 6, NORD8 & 0x00FFFFFF);
+            comp_draw_rounded_rect(ax, ay, fill_w, h, 6, NORD8 & 0x00FFFFFF);
         }
     }
 
@@ -117,7 +117,7 @@ public:
             int32_t ax, ay;
             get_absolute_pos(ax, ay);
             int32_t offset_x = mx - ax;
-            m_val = (offset_x * 100) / (int32_t)m_w;
+            m_val = (offset_x * 100) / (int32_t)w;
             if (m_val < 0) m_val = 0;
             if (m_val > 100) m_val = 100;
             

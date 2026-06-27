@@ -3,10 +3,12 @@
  * ============================================================
  */
 #include "window.h"
+extern "C" {
 #include "compositor.h"
 #include "theme.h"
+}
 
-void draw_window_decorations(Window *win)
+extern "C" void draw_window_decorations(Window *win)
 {
     if (!win->is_visible) return;
 

@@ -3,14 +3,22 @@
  * ============================================================
  */
 #include "forge.h"
+#include <wynland/types.h>
+
+extern "C" {
 #include "compositor.h"
 #include "theme.h"
-#include <wynland/types.h>
 #include <wynland/vfs.h>
 #include <wynland/heap.h>
 #include <wynland/irq.h>
+}
 
 #define FORGE_MAX_ITEMS 128
+
+extern "C" {
+void uint_to_str(uint64_t val, char *buf);
+bool wynvm_run(const char *bin_path);
+}
 
 typedef struct {
     char name[MAX_FILENAME];
@@ -113,7 +121,6 @@ static void forge_create_untitled_file(void)
             str_append_local(path, "untitled.txt");
         } else {
             char num_str[16];
-            extern void uint_to_str(uint64_t val, char *buf);
             str_append_local(path, "untitled_");
             uint_to_str(count, num_str);
             str_append_local(path, num_str);
@@ -142,7 +149,6 @@ static void forge_create_untitled_dir(void)
             str_append_local(path, "untitled_dir");
         } else {
             char num_str[16];
-            extern void uint_to_str(uint64_t val, char *buf);
             str_append_local(path, "untitled_dir_");
             uint_to_str(count, num_str);
             str_append_local(path, num_str);
@@ -441,7 +447,6 @@ void draw_forge_content(Window *self)
         /* Draw size information for file entries */
         if (!item->is_dir) {
             char size_str[32];
-            extern void uint_to_str(uint64_t val, char *buf);
             uint_to_str(item->size, size_str);
             str_append_local(size_str, " B");
             
@@ -458,7 +463,6 @@ void draw_forge_content(Window *self)
     if (selected_index == -1) {
         char status_str[32];
         char count_str[16];
-        extern void uint_to_str(uint64_t val, char *buf);
         uint_to_str(forge_item_count, count_str);
         str_copy_local(status_str, count_str);
         str_append_local(status_str, " items");
@@ -642,7 +646,6 @@ void handle_forge_key(Window *self, uint8_t scancode, char ascii)
                     }
                     str_append_local(full_path, item->name);
                     
-                    extern bool wynvm_run(const char *bin_path);
                     wynvm_run(full_path);
                 } else {
                     forge_view_selected();
@@ -792,7 +795,6 @@ void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons)
                         }
                         str_append_local(full_path, item->name);
                         
-                        extern bool wynvm_run(const char *bin_path);
                         wynvm_run(full_path);
                     } else {
                         /* Non-executable file double click -> view in reader! */

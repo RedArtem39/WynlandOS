@@ -7,6 +7,10 @@
 #include "window.h"
 #include <wynland/boot_info.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void wm_init(void);
 void wm_main_loop(BootInfo *info);
 
@@ -20,4 +24,8 @@ void wm_handle_key(uint8_t scancode, char ascii);
 bool wm_is_gui_active(void);
 bool wm_is_terminal_focused(void);
 void wm_exit_gui(void);
+
+#ifdef __cplusplus
+}
+#endif
 

@@ -3,6 +3,8 @@
  * ============================================================
  */
 #include "wm.h"
+
+extern "C" {
 #include "compositor.h"
 #include "theme.h"
 #include <wynland/heap.h>
@@ -11,10 +13,21 @@
 #include <wynland/net.h>
 #include <wynland/http.h>
 
-extern void serial_write_string(const char *str);
-extern void uint_to_str(uint64_t val, char *buf);
-extern void *memcpy(void *dest, const void *src, size_t n);
-extern void *memset(void *s, int c, size_t n);
+void serial_write_string(const char *str);
+void uint_to_str(uint64_t val, char *buf);
+void *memcpy(void *dest, const void *src, size_t n);
+void *memset(void *s, int c, size_t n);
+
+void beep(uint32_t freq, uint32_t duration_ms);
+void nosound(void);
+void play_startup_chime(void);
+void sys_reboot(void);
+void sys_poweroff(void);
+
+void wm_paint_cpp_widgets(void* root);
+void wm_set_widgets_root_pos(void* root, int32_t x, int32_t y);
+void wm_init_settings_widgets(void* settings_win_ptr);
+}
 
 /* Globally accessible console dimensions from main.c */
 extern uint32_t console_start_x;
@@ -24,6 +37,10 @@ extern uint32_t console_end_y;
 extern uint32_t cursor_x;
 extern uint32_t cursor_y;
 extern uint32_t term_bg_color;
+
+void draw_forge_content(Window *self);
+void handle_forge_key(Window *self, uint8_t scancode, char ascii);
+void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
 
 /* Stacking window list */
 static Window *g_windows_head = NULL; /* Top-most / Focused window */
@@ -106,6 +123,7 @@ static void draw_dock_icon(int i, int32_t cx, int32_t cy, int32_t r)
     }
 }
 
+extern "C" {
 bool wm_is_gui_active(void)
 {
     return g_gui_active;
@@ -120,7 +138,6 @@ bool wm_is_terminal_focused(void)
 {
     return (g_windows_head == g_term_window);
 }
-
 
 void wm_mark_dirty(void)
 {
@@ -193,6 +210,7 @@ void wm_term_clear(void)
     cursor_y = 0;
     comp_mark_dirty();
 }
+}
 
 /* Add window to the top of Z-order */
 void wm_register_window(Window *win)
@@ -261,6 +279,7 @@ void wm_raise_window(Window *win)
     comp_mark_dirty();
 }
 
+extern "C" {
 int32_t wm_get_browser_x(void) { return g_browser_window ? g_browser_window->x : 0; }
 int32_t wm_get_browser_y(void) { return g_browser_window ? g_browser_window->y : 0; }
 int32_t wm_get_browser_w(void) { return g_browser_window ? g_browser_window->w : 0; }
@@ -283,6 +302,7 @@ void handle_browser_mouse_wlang(Window *self, int32_t mx, int32_t my, uint8_t bu
     extern void wlang_call_on_mouse(int32_t mx, int32_t my, uint8_t buttons);
     wlang_call_on_mouse(mx, my, buttons);
 }
+}
 
 static void handle_term_key(Window *self, uint8_t scancode, char ascii)
 {
@@ -303,7 +323,7 @@ static void handle_term_key(Window *self, uint8_t scancode, char ascii)
     }
 }
 
-void wm_init(void)
+extern "C" void wm_init(void)
 {
     serial_write_string("WM: Initializing Stacking Window Manager...\r\n");
 
@@ -312,77 +332,44 @@ void wm_init(void)
     g_gui_active = true;
 
     /* Create Terminal Window (ID 1) */
-    Window *term = (Window *)kmalloc(sizeof(Window));
-    memset(term, 0, sizeof(Window));
-    term->id = 1;
-    term->x = 60;
-    term->y = 80;
-    term->w = 580;
-    term->h = 420;
-    memcpy(term->title, "WynlandOS Terminal", 19);
+    Window *term = new Window(1, 60, 80, 580, 420, "WynlandOS Terminal");
     term->is_visible = true;
     term->is_focused = true;
     term->draw_content = draw_terminal_content;
-    term->handle_key = handle_term_key;
+    term->handle_key_cb = handle_term_key;
     g_term_window = term;
     wm_register_window(term);
 
     /* Create Settings Window (ID 2) */
-    Window *settings = (Window *)kmalloc(sizeof(Window));
-    memset(settings, 0, sizeof(Window));
-    settings->id = 2;
-    settings->x = 420;
-    settings->y = 140;
-    settings->w = 340;
-    settings->h = 260;
-    memcpy(settings->title, "System Settings", 16);
+    Window *settings = new Window(2, 420, 140, 340, 260, "System Settings");
     settings->is_visible = true;
     settings->is_focused = false;
     settings->draw_content = draw_settings_content;
     
     /* Initialize C++ Widgets container for Settings window */
-    extern void wm_init_settings_widgets(void *settings_win_ptr);
     wm_init_settings_widgets(settings);
 
     g_settings_window = settings;
     wm_register_window(settings);
 
     /* Create Browser Window (ID 3) */
-    Window *browser = (Window *)kmalloc(sizeof(Window));
-    memset(browser, 0, sizeof(Window));
-    browser->id = 3;
-    browser->x = 100;
-    browser->y = 120;
-    browser->w = 540;
-    browser->h = 360;
-    memcpy(browser->title, "WynlandOS Browser", 18);
+    Window *browser = new Window(3, 100, 120, 540, 360, "WynlandOS Browser");
     browser->is_visible = false; /* Starts hidden, open from Dock */
     browser->is_focused = false;
     browser->draw_content = draw_browser_content_wlang;
-    browser->handle_key = handle_browser_key_wlang;
-    browser->handle_mouse = handle_browser_mouse_wlang;
+    browser->handle_key_cb = handle_browser_key_wlang;
+    browser->handle_mouse_cb = handle_browser_mouse_wlang;
     g_browser_window = browser;
     wm_register_window(browser);
 
     /* Create Forge Window (ID 4) */
-    Window *forge = (Window *)kmalloc(sizeof(Window));
-    memset(forge, 0, sizeof(Window));
-    forge->id = 4;
-    forge->x = 180;
-    forge->y = 100;
-    forge->w = 500;
-    forge->h = 340;
-    memcpy(forge->title, "Forge File Explorer", 20);
+    Window *forge = new Window(4, 180, 100, 500, 340, "Forge File Explorer");
     forge->is_visible = false; /* Starts hidden, open from Dock */
     forge->is_focused = false;
 
-    extern void draw_forge_content(Window *self);
-    extern void handle_forge_key(Window *self, uint8_t scancode, char ascii);
-    extern void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
-
     forge->draw_content = draw_forge_content;
-    forge->handle_key = handle_forge_key;
-    forge->handle_mouse = handle_forge_mouse;
+    forge->handle_key_cb = handle_forge_key;
+    forge->handle_mouse_cb = handle_forge_mouse;
     g_forge_window = forge;
     wm_register_window(forge);
 
@@ -462,8 +449,6 @@ static void draw_settings_content(Window *self)
     }
 
     if (self->cpp_widgets_root) {
-        extern void wm_set_widgets_root_pos(void *root, int32_t x, int32_t y);
-        extern void wm_paint_cpp_widgets(void *root);
         wm_set_widgets_root_pos(self->cpp_widgets_root, cx, cy);
         wm_paint_cpp_widgets(self->cpp_widgets_root);
     }
@@ -653,7 +638,7 @@ static void wm_draw_control_panel(uint32_t sw, uint32_t sh)
     comp_draw_string(px + 185, py + 323, "Reboot", NORD6 & 0x00FFFFFF, 0);
 }
 
-void wm_draw_desktop(void)
+extern "C" void wm_draw_desktop(void)
 {
     static uint64_t last_sec = 999999;
     uint64_t total_sec = timer_get_ticks() / 100;
@@ -1367,15 +1352,11 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                             g_resize_start_my = my;
                         } else {
                             /* 4. Custom window mouse event */
-                            if (win->handle_mouse) {
-                                win->handle_mouse(win, mx, my, buttons);
-                            }
+                            win->handle_mouse(mx, my, buttons);
                         }
                     } else {
                         /* Maximized: only custom mouse, no resize */
-                        if (win->handle_mouse) {
-                            win->handle_mouse(win, mx, my, buttons);
-                        }
+                        win->handle_mouse(mx, my, buttons);
                     }
 
                     break; /* Found clicked window, skip others underneath */
@@ -1482,13 +1463,11 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
     }
 }
 
-void wm_handle_key(uint8_t scancode, char ascii)
+extern "C" void wm_handle_key(uint8_t scancode, char ascii)
 {
     /* Deliver key presses only to focused window */
     if (g_windows_head && g_windows_head->is_focused && g_windows_head->is_visible) {
-        if (g_windows_head->handle_key) {
-            g_windows_head->handle_key(g_windows_head, scancode, ascii);
-        }
+        g_windows_head->handle_key(scancode, ascii);
     }
 }
 

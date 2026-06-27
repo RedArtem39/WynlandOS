@@ -55,13 +55,7 @@ extern "C" {
         Container(int32_t x, int32_t y, uint32_t w, uint32_t h)
             : ui::Widget(x, y, w, h) {}
         void paint() override {
-            ui::Widget* child = m_first_child;
-            while (child) {
-                if (child->visible()) {
-                    child->paint();
-                }
-                child = child->next_sibling();
-            }
+            paint_children();
         }
     };
 
@@ -86,6 +80,6 @@ extern "C" {
 
         /* Save to Window */
         win->cpp_widgets_root = root;
-        win->handle_mouse = wm_handle_mouse_cpp_widgets;
+        win->handle_mouse_cb = wm_handle_mouse_cpp_widgets;
     }
 }
