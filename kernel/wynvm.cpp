@@ -462,9 +462,12 @@ static void vm_draw_char(Window *win, int32_t x, int32_t y, char c, uint32_t col
 
 static void handle_vm_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons)
 {
-    (void)self; (void)mx; (void)my; (void)buttons;
-    /* Redraw window when mouse clicked */
-    comp_mark_dirty();
+    (void)self; (void)mx; (void)my;
+    static uint8_t prev_buttons = 0;
+    if (buttons != prev_buttons) {
+        prev_buttons = buttons;
+        comp_mark_dirty();
+    }
 }
 
 static void handle_vm_key(Window *self, uint8_t scancode, char ascii)
