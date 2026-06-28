@@ -9,6 +9,7 @@
 #include <wynland/ahci.h>
 #include <wynland/heap.h>
 #include <wynland/types.h>
+#include <wynland/boot_info.h>
 
 extern void serial_write_string(const char *str);
 extern int sata_port_num;
@@ -556,6 +557,44 @@ VfsFile *vfs_open(const char *path) {
 }
 
 VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
+    if (str_compare(path, "/dev/fb0") == 0) {
+        VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
+        if (!file) return NULL;
+        extern BootInfo *g_boot_info;
+        str_copy(file->node.name, "fb0");
+        file->node.size = g_boot_info ? (g_boot_info->fb_pitch * g_boot_info->fb_height) : 0;
+        file->node.is_dir = false;
+        file->node.first_cluster = 0xFFFFFFF0; // DEV_FB0
+        file->offset = 0;
+        file->flags = flags;
+        file->dirty = false;
+        return file;
+    }
+    if (str_compare(path, "/dev/input/mice") == 0) {
+        VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
+        if (!file) return NULL;
+        str_copy(file->node.name, "mice");
+        file->node.size = 0;
+        file->node.is_dir = false;
+        file->node.first_cluster = 0xFFFFFFF1; // DEV_MICE
+        file->offset = 0;
+        file->flags = flags;
+        file->dirty = false;
+        return file;
+    }
+    if (str_compare(path, "/dev/tty") == 0) {
+        VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
+        if (!file) return NULL;
+        str_copy(file->node.name, "tty");
+        file->node.size = 0;
+        file->node.is_dir = false;
+        file->node.first_cluster = 0xFFFFFFF2; // DEV_TTY
+        file->offset = 0;
+        file->flags = flags;
+        file->dirty = false;
+        return file;
+    }
+
     VfsNode node;
     uint32_t entry_sector = 0, entry_offset = 0;
     bool found = vfs_lookup_path(path, &node, &entry_sector, &entry_offset);
@@ -643,7 +682,65 @@ void vfs_close(VfsFile *file) {
  * ============================================================ */
 
 int vfs_read(VfsFile *file, void *buf, uint32_t size) {
-    if (!file || file->offset >= file->node.size) return 0;
+    if (!file) return -1;
+
+    if (file->node.first_cluster >= 0xFFFFFFF0) {
+        if (file->node.first_cluster == 0xFFFFFFF0) { // DEV_FB0
+            extern BootInfo *g_boot_info;
+            if (!g_boot_info) return 0;
+            uint32_t fb_size = g_boot_info->fb_pitch * g_boot_info->fb_height;
+            if (file->offset >= fb_size) return 0;
+            if (file->offset + size > fb_size) {
+                size = fb_size - file->offset;
+            }
+            uint8_t *fb = (uint8_t *)(uintptr_t)g_boot_info->fb_addr;
+            for (uint32_t i = 0; i < size; i++) {
+                ((uint8_t *)buf)[i] = fb[file->offset + i];
+            }
+            file->offset += size;
+            return size;
+        }
+        if (file->node.first_cluster == 0xFFFFFFF1) { // DEV_MICE
+            extern int mouse_read_queue(uint8_t *buf, int size);
+            return mouse_read_queue((uint8_t *)buf, size);
+        }
+        if (file->node.first_cluster == 0xFFFFFFF2) { // DEV_TTY
+            uint32_t read_bytes = 0;
+            char *cbuf = (char *)buf;
+            while (read_bytes < size) {
+                extern bool keyboard_has_scancode(void);
+                extern uint8_t keyboard_pop_scancode(void);
+                extern bool serial_received(void);
+                extern char serial_read_char(void);
+                
+                if (keyboard_has_scancode()) {
+                    uint8_t sc = keyboard_pop_scancode();
+                    if (!(sc & 0x80)) {
+                        extern const char scancode_to_ascii_lower[59];
+                        if (sc < 59) {
+                            char ch = scancode_to_ascii_lower[sc];
+                            if (ch != 0) {
+                                cbuf[read_bytes++] = ch;
+                                if (ch == '\n' || ch == '\r') break;
+                            }
+                        }
+                    }
+                } else if (serial_received()) {
+                    char ch = serial_read_char();
+                    if (ch == '\r') ch = '\n';
+                    cbuf[read_bytes++] = ch;
+                    if (ch == '\n') break;
+                } else {
+                    extern void sched_yield(void);
+                    sched_yield();
+                }
+            }
+            return read_bytes;
+        }
+        return 0;
+    }
+
+    if (file->offset >= file->node.size) return 0;
 
     if (file->offset + size > file->node.size) {
         size = file->node.size - file->offset;
@@ -700,7 +797,45 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
  * ============================================================ */
 
 int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
-    if (!file || !(file->flags & VFS_O_WRITE)) return -1;
+    if (!file) return -1;
+
+    if (file->node.first_cluster >= 0xFFFFFFF0) {
+        if (file->node.first_cluster == 0xFFFFFFF0) { // DEV_FB0
+            extern BootInfo *g_boot_info;
+            if (!g_boot_info) return 0;
+            uint32_t fb_size = g_boot_info->fb_pitch * g_boot_info->fb_height;
+            if (file->offset >= fb_size) return 0;
+            if (file->offset + size > fb_size) {
+                size = fb_size - file->offset;
+            }
+            uint8_t *fb = (uint8_t *)(uintptr_t)g_boot_info->fb_addr;
+            for (uint32_t i = 0; i < size; i++) {
+                fb[file->offset + i] = ((const uint8_t *)buf)[i];
+            }
+            file->offset += size;
+            return size;
+        }
+        if (file->node.first_cluster == 0xFFFFFFF2) { // DEV_TTY
+            extern BootInfo *g_boot_info;
+            extern uint32_t term_bg_color;
+            extern void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg);
+            extern void serial_write_string(const char *str);
+            
+            const char *cbuf = (const char *)buf;
+            for (uint32_t i = 0; i < size; i++) {
+                char ch = cbuf[i];
+                char single[2] = {ch, '\0'};
+                serial_write_string(single);
+                if (g_boot_info) {
+                    console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
+                }
+            }
+            return size;
+        }
+        return -1; // Write not supported on stream devices like mice
+    }
+
+    if (!(file->flags & VFS_O_WRITE)) return -1;
     if (size == 0) return 0;
 
     uint32_t bytes_written = 0;
@@ -777,6 +912,25 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
 
 int vfs_seek(VfsFile *file, int32_t offset, int whence) {
     if (!file) return -1;
+
+    if (file->node.first_cluster >= 0xFFFFFFF0) {
+        if (file->node.first_cluster == 0xFFFFFFF0) { // DEV_FB0
+            int32_t new_offset;
+            switch (whence) {
+                case VFS_SEEK_SET: new_offset = offset; break;
+                case VFS_SEEK_CUR: new_offset = (int32_t)file->offset + offset; break;
+                case VFS_SEEK_END: new_offset = (int32_t)file->node.size + offset; break;
+                default: return -1;
+            }
+            if (new_offset < 0) new_offset = 0;
+            if ((uint32_t)new_offset > file->node.size) {
+                new_offset = (int32_t)file->node.size;
+            }
+            file->offset = (uint32_t)new_offset;
+            return 0;
+        }
+        return -1; // SEEK not supported on stream devices like mice or tty
+    }
 
     int32_t new_offset;
     switch (whence) {

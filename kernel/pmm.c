@@ -163,6 +163,7 @@ cleanup:
     if (rflags & 0x200) {
         __asm__ volatile("sti");
     }
+    /*
     if (result) {
         serial_write_string("PMM Alloc: ");
         char buf[32];
@@ -171,6 +172,7 @@ cleanup:
         serial_write_string(buf);
         serial_write_string("\r\n");
     }
+    */
     return result;
 }
 

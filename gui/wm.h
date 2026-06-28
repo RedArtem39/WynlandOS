@@ -16,7 +16,7 @@ void wm_main_loop(BootInfo *info);
 
 void wm_register_window(Window *win);
 void wm_raise_window(Window *win);
-void wm_draw_desktop(void);
+bool wm_draw_desktop(void);
 
 void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons);
 void wm_handle_key(uint8_t scancode, char ascii);

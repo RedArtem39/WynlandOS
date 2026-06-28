@@ -86,6 +86,23 @@ public:
         }
     }
 
+    virtual uint8_t get_hover_cursor(int32_t mx, int32_t my) {
+        Widget* child = first_child;
+        while (child) {
+            if (child->visible) {
+                int32_t ax, ay;
+                child->get_absolute_pos(ax, ay);
+                if (mx >= ax && mx < ax + (int32_t)child->w &&
+                    my >= ay && my < ay + (int32_t)child->h) {
+                    uint8_t c = child->get_hover_cursor(mx, my);
+                    if (c != 0) return c;
+                }
+            }
+            child = child->next_sibling;
+        }
+        return 0;
+    }
+
     virtual void handle_key(uint8_t scancode, char ascii) {
         Widget* child = first_child;
         while (child) {

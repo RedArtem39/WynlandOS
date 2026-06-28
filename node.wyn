@@ -1,0 +1,146 @@
+# Node.wyn — JavaScript Engine & Runtime for WynlandOS Command Line
+# ==============================================================================
+# Usage: run /node.wyn /script.js
+
+print("WynNode v1.0.0 (JavaScript Runtime)")
+print("====================================")
+
+# Read JS file passed as argument or run default
+js_file = "/script.js"
+if exists(js_file):
+    print("Running " + js_file + "...")
+else:
+    write(js_file, "var port = 8080;\nconsole.log('Server started on port ' + port);\n")
+    print("Created mock " + js_file + "...")
+end
+
+code = read(js_file)
+
+# A simple tokenizer and execution parser for JS script
+pos = 0
+code_len = len(code)
+
+# Scope variables
+var_names = ["port"]
+var_vals = [8080]
+
+fn set_var(name, val):
+    found = -1
+    for i in range(len(var_names)):
+        if var_names[i] == name:
+            found = i
+        end
+    end
+    
+    if found >= 0:
+        var_vals[found] = val
+    else:
+        var_names = var_names + [name]
+        var_vals = var_vals + [val]
+    end
+end
+
+fn get_var(name):
+    for i in range(len(var_names)):
+        if var_names[i] == name:
+            return var_vals[i]
+        end
+    end
+    return nil
+end
+
+# Simple line processor
+lines_pos = 0
+while lines_pos < code_len:
+    line_rest = str_slice(code, lines_pos, code_len - lines_pos)
+    line_end = str_find(line_rest, "\n")
+    if line_end < 0:
+        line_end = code_len - lines_pos
+    end
+    
+    line = str_slice(line_rest, 0, line_end)
+    lines_pos = lines_pos + line_end + 1
+    
+    # Process statement: console.log
+    p_log = str_find(line, "console.log(")
+    if p_log >= 0:
+        arg_start = p_log + 12
+        rest_line = str_slice(line, arg_start, len(line) - arg_start)
+        p_paren = str_find(rest_line, ")")
+        if p_paren >= 0:
+            arg = str_slice(rest_line, 0, p_paren)
+            
+            p_quote1 = str_find(arg, "'")
+            p_quote2 = str_find(arg, "\"")
+            
+            if p_quote1 >= 0 or p_quote2 >= 0:
+                p_plus = str_find(arg, "+")
+                if p_plus >= 0:
+                    str_part = ""
+                    if p_quote1 >= 0:
+                        first_q = p_quote1
+                        second_q = str_find(str_slice(arg, first_q + 1, len(arg) - first_q - 1), "'") + first_q + 1
+                        str_part = str_slice(arg, first_q + 1, second_q - first_q - 1)
+                    else:
+                        first_q = p_quote2
+                        second_q = str_find(str_slice(arg, first_q + 1, len(arg) - first_q - 1), "\"") + first_q + 1
+                        str_part = str_slice(arg, first_q + 1, second_q - first_q - 1)
+                    end
+                    
+                    var_part_raw = str_slice(arg, p_plus + 1, len(arg) - p_plus - 1)
+                    var_name = ""
+                    for j in range(len(var_part_raw)):
+                        c = str_slice(var_part_raw, j, 1)
+                        if c != " " and c != ";" and c != "\r":
+                            var_name = var_name + c
+                        end
+                    end
+                    
+                    var_val = get_var(var_name)
+                    print("JS Log: " + str_part + str(var_val))
+                else:
+                    print("JS Log: " + arg)
+                end
+            else:
+                var_val = get_var(arg)
+                if var_val != nil:
+                    print("JS Log: " + str(var_val))
+                else:
+                    print("JS Log: " + arg)
+                end
+            end
+        end
+    end
+    
+    # var declaration
+    p_var = str_find(line, "var ")
+    if p_var >= 0:
+        rest = str_slice(line, p_var + 4, len(line) - p_var - 4)
+        p_eq = str_find(rest, "=")
+        if p_eq >= 0:
+            var_name_raw = str_slice(rest, 0, p_eq)
+            val_raw = str_slice(rest, p_eq + 1, len(rest) - p_eq - 1)
+            
+            name = ""
+            for j in range(len(var_name_raw)):
+                c = str_slice(var_name_raw, j, 1)
+                if c != " ":
+                    name = name + c
+                end
+            end
+            
+            val_str = ""
+            for j in range(len(val_raw)):
+                c = str_slice(val_raw, j, 1)
+                if c != " " and c != ";" and c != "\r":
+                    val_str = val_str + c
+                end
+            end
+            
+            val = int(val_str)
+            set_var(name, val)
+        end
+    end
+end
+
+print("WynNode execution complete.")

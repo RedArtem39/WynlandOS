@@ -61,7 +61,7 @@ extern void irq15();
 /* IDT and IDTR pointer */
 static IdtEntry idt[IDT_ENTRIES];
 static IdtPtr   idt_ptr;
-static BootInfo *g_boot_info = NULL;
+BootInfo *g_boot_info = NULL;
 
 /* Non-static helper declarations from main.c */
 extern void console_print_string(BootInfo *info, const char *str, uint32_t fg, uint32_t bg);
@@ -207,6 +207,48 @@ static void print_reg(BootInfo *info, const char *name, uint64_t val)
 
 void exception_handler(InterruptRegisters *regs)
 {
+    /* Check if the exception happened in user mode (Ring 3) */
+    if ((regs->cs & 0x03) == 3) {
+        serial_write_string("\r\n======================================\r\n");
+        serial_write_string("!!! USER MODE PROCESS CRASHED !!!\r\n");
+        serial_write_string("Exception: ");
+        if (regs->int_no < 32) {
+            serial_write_string(exception_messages[regs->int_no]);
+        } else {
+            serial_write_string("Unknown");
+        }
+        serial_write_string("\r\nRIP: 0x");
+        char buf[64];
+        uint_to_hex(regs->rip, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
+        
+        if (regs->int_no == 14) {
+            uint64_t cr2;
+            __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+            serial_write_string("CR2: 0x");
+            uint_to_hex(cr2, buf);
+            serial_write_string(buf);
+            serial_write_string("\r\n");
+        }
+        serial_write_string("Terminating user thread...\r\n");
+        serial_write_string("======================================\r\n");
+
+        if (g_boot_info) {
+            console_print_string(g_boot_info, "\n[Process Crash] Exception ", 0x00FF3333, 0x000F0F1A);
+            if (regs->int_no < 32) {
+                console_print_string(g_boot_info, exception_messages[regs->int_no], 0x00FF3333, 0x000F0F1A);
+            }
+            console_print_string(g_boot_info, " at RIP: 0x", 0x00FFFFFF, 0x000F0F1A);
+            console_print_string(g_boot_info, buf, 0x00FFFFFF, 0x000F0F1A);
+            console_print_string(g_boot_info, ". Thread terminated.\n", 0x00FFFFFF, 0x000F0F1A);
+        }
+
+        extern void thread_exit(void);
+        thread_exit();
+        return;
+    }
+
     /* Write emergency info to serial port COM1 first */
     serial_write_string("\r\n======================================\r\n");
     serial_write_string("!!! KERNEL PANIC: CPU EXCEPTION !!!\r\n");

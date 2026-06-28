@@ -3,11 +3,22 @@
  * ============================================================
  */
 #include "wm.h"
+#include "opengl.h"
+#define DOCK_ICON_COUNT 6
+
+typedef struct {
+    char name[16];
+    uint32_t color;
+    int32_t cx, cy;
+    uint32_t base_radius;
+    uint32_t current_radius;
+} DockIcon;
 
 extern "C" {
 #include "compositor.h"
 #include "theme.h"
 #include <wynland/heap.h>
+#include <wynland/sched.h>
 #include <wynland/irq.h>
 #include <wynland/mouse.h>
 #include <wynland/net.h>
@@ -15,6 +26,7 @@ extern "C" {
 
 void serial_write_string(const char *str);
 void uint_to_str(uint64_t val, char *buf);
+void uint_to_hex(uint64_t val, char *buf);
 void *memcpy(void *dest, const void *src, size_t n);
 void *memset(void *s, int c, size_t n);
 
@@ -27,6 +39,46 @@ void sys_poweroff(void);
 void wm_paint_cpp_widgets(void* root);
 void wm_set_widgets_root_pos(void* root, int32_t x, int32_t y);
 void wm_init_settings_widgets(void* settings_win_ptr);
+
+void wm_init_shell_widgets(void);
+void wm_paint_shell_panel(void);
+void wm_paint_shell_dock(void);
+void wm_paint_shell_control_center(void);
+void wm_paint_shell_notification_center(void);
+bool wm_is_control_center_active(void);
+bool wm_is_notification_center_active(void);
+void wm_handle_shell_mouse(int32_t mx, int32_t my, uint8_t buttons);
+
+void desktop_widgets_draw(void);
+bool desktop_widgets_check_hover(int32_t mx, int32_t my);
+bool desktop_widgets_handle_mouse(int32_t mx, int32_t my, uint8_t buttons);
+bool desktop_widgets_is_dragging(void);
+
+void draw_dock_icon(int i, int32_t cx, int32_t cy, int32_t r);
+void wm_str_cat(char *dest, const char *src);
+void wm_show_window(Window *win);
+
+Window *g_windows_head = NULL; /* Top-most / Focused window */
+Window *g_windows_tail = NULL; /* Bottom-most window */
+
+Window *g_term_window = NULL;
+Window *g_settings_window = NULL;
+Window *g_browser_window = NULL;
+Window *g_forge_window = NULL;
+Window *g_opengl_window = NULL;
+Window *g_monitor_window = NULL;
+
+DockIcon g_dock_icons[DOCK_ICON_COUNT] = {
+    { "Terminal", 0x88C0D0, 0, 0, 16, 16 },
+    { "Settings", 0xB48EAD, 0, 0, 16, 16 },
+    { "Browser",  0xD08770, 0, 0, 16, 16 },
+    { "Forge",    0xA3BE8C, 0, 0, 16, 16 },
+    { "MiniGL",   0xEBCB8B, 0, 0, 16, 16 },
+    { "Monitor",  0xBF616A, 0, 0, 16, 16 }
+};
+
+bool g_control_panel_visible = false;
+bool g_notification_panel_visible = false;
 }
 
 /* Globally accessible console dimensions from main.c */
@@ -41,10 +93,9 @@ extern uint32_t term_bg_color;
 void draw_forge_content(Window *self);
 void handle_forge_key(Window *self, uint8_t scancode, char ascii);
 void handle_forge_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
+static void draw_opengl_content(Window *self);
 
-/* Stacking window list */
-static Window *g_windows_head = NULL; /* Top-most / Focused window */
-static Window *g_windows_tail = NULL; /* Bottom-most window */
+
 
 Window *g_dragged_window = NULL;
 static int32_t g_drag_offset_x = 0;
@@ -62,10 +113,7 @@ Window *g_mouse_captured_window = NULL;
 static bool g_gui_active = false;
 static bool g_wm_needs_redraw = true;
 static uint8_t g_prev_buttons = 0;
-static Window *g_term_window = NULL;
-static Window *g_settings_window = NULL;
-static Window *g_browser_window = NULL;
-static Window *g_forge_window = NULL;
+
 /*
 static char g_browser_url[256] = "10.0.2.2:8000";
 static char g_browser_content_buf[4096] = {0};
@@ -80,26 +128,13 @@ static uint32_t g_term_bg_grid[TERM_ROWS][TERM_COLS];
 static int32_t g_term_view_offset = 0;
 static int32_t g_term_user_scroll = 0;
 
-/* Dock configurations */
-#define DOCK_ICON_COUNT 4
-typedef struct {
-    char name[16];
-    uint32_t color;
-    int32_t cx, cy;
-    uint32_t base_radius;
-    uint32_t current_radius;
-} DockIcon;
 
-static DockIcon g_dock_icons[DOCK_ICON_COUNT] = {
-    { "Terminal", 0x88C0D0, 0, 0, 16, 16 },
-    { "Settings", 0xB48EAD, 0, 0, 16, 16 },
-    { "Browser",  0xD08770, 0, 0, 16, 16 },
-    { "Forge",    0xA3BE8C, 0, 0, 16, 16 }
-};
 
 /* Forward declarations */
 static void draw_terminal_content(Window *self);
 static void draw_settings_content(Window *self);
+static void draw_monitor_content(Window *self);
+static void handle_monitor_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons);
 /*
 static void draw_browser_content(Window *self);
 static void handle_browser_key(Window *self, uint8_t scancode, char ascii);
@@ -109,7 +144,7 @@ static void browser_load_page(void);
 
 extern void comp_draw_icon_forge(int32_t cx, int32_t cy, int32_t r);
 
-static void draw_dock_icon(int i, int32_t cx, int32_t cy, int32_t r)
+extern "C" void draw_dock_icon(int i, int32_t cx, int32_t cy, int32_t r)
 {
     if (i == 0) {
         comp_draw_icon_terminal(cx, cy, r);
@@ -119,7 +154,7 @@ static void draw_dock_icon(int i, int32_t cx, int32_t cy, int32_t r)
         comp_draw_icon_browser(cx, cy, r);
     } else if (i == 3) {
         comp_draw_icon_forge(cx, cy, r);
-    } else {
+    } else if (i >= 0 && i < DOCK_ICON_COUNT) {
         comp_draw_circle(cx, cy, r, g_dock_icons[i].color);
     }
 }
@@ -243,6 +278,7 @@ void wm_register_window(Window *win)
     win->anim_direction = 0;
 
     comp_mark_dirty();
+    wm_mark_dirty();
 }
 
 /* Raise window to the top (focused) */
@@ -278,6 +314,7 @@ void wm_raise_window(Window *win)
     }
 
     comp_mark_dirty();
+    wm_mark_dirty();
 }
 
 extern "C" {
@@ -324,12 +361,30 @@ static void handle_term_key(Window *self, uint8_t scancode, char ascii)
     }
 }
 
+extern "C" {
+void kfree(void *ptr);
+void *kmalloc(size_t size);
+}
+
+void wm_resize_backing_store(Window *win) {
+    if (!win || !win->backing_store) return;
+    kfree(win->backing_store);
+    
+    uint32_t cw = win->w - 2;
+    uint32_t ch = win->h - THEME_TITLEBAR_HEIGHT - 2;
+    win->backing_store = (uint32_t *)kmalloc(cw * ch * 4);
+    if (win->backing_store) {
+        memset(win->backing_store, 0, cw * ch * 4);
+    }
+}
+
 extern "C" void wm_init(void)
 {
     serial_write_string("WM: Initializing Stacking Window Manager...\r\n");
 
     g_windows_head = NULL;
     g_windows_tail = NULL;
+    extern bool g_gui_active;
     g_gui_active = true;
 
     /* Create Terminal Window (ID 1) */
@@ -342,7 +397,7 @@ extern "C" void wm_init(void)
     wm_register_window(term);
 
     /* Create Settings Window (ID 2) */
-    Window *settings = new Window(2, 420, 140, 340, 260, "System Settings");
+    Window *settings = new Window(2, 420, 140, 340, 330, "System Settings");
     settings->is_visible = true;
     settings->is_focused = false;
     settings->draw_content = draw_settings_content;
@@ -360,6 +415,13 @@ extern "C" void wm_init(void)
     browser->draw_content = draw_browser_content_wlang;
     browser->handle_key_cb = handle_browser_key_wlang;
     browser->handle_mouse_cb = handle_browser_mouse_wlang;
+    
+    /* Allocate browser backing store for interpreted draw speedups */
+    browser->backing_store = (uint32_t *)kmalloc((540 - 2) * (360 - THEME_TITLEBAR_HEIGHT - 2) * 4);
+    if (browser->backing_store) {
+        memset(browser->backing_store, 0, (540 - 2) * (360 - THEME_TITLEBAR_HEIGHT - 2) * 4);
+    }
+    
     g_browser_window = browser;
     wm_register_window(browser);
 
@@ -374,6 +436,23 @@ extern "C" void wm_init(void)
     g_forge_window = forge;
     wm_register_window(forge);
 
+    /* Create MiniGL Window (ID 5) */
+    Window *opengl = new Window(5, 220, 160, 360, 360, "MiniGL 3D Cube Demo");
+    opengl->is_visible = false; /* Starts hidden, open from Dock */
+    opengl->is_focused = false;
+    opengl->draw_content = draw_opengl_content;
+    g_opengl_window = opengl;
+    wm_register_window(opengl);
+
+    /* Create System Monitor Window (ID 6) */
+    Window *monitor = new Window(6, 150, 150, 480, 280 + THEME_TITLEBAR_HEIGHT, "System Monitor");
+    monitor->is_visible = false; /* Starts hidden, open from Dock */
+    monitor->is_focused = false;
+    monitor->draw_content = draw_monitor_content;
+    monitor->handle_mouse_cb = handle_monitor_mouse;
+    g_monitor_window = monitor;
+    wm_register_window(monitor);
+
     /* Set up terminal buffer character step mapping */
     console_start_x = term->x + 15;
     console_start_y = term->y + 40;
@@ -386,6 +465,9 @@ extern "C" void wm_init(void)
 
     extern void wlang_browser_init(void);
     wlang_browser_init();
+
+    /* Initialize Qt C++ shell widgets */
+    wm_init_shell_widgets();
 
     serial_write_string("WM: Initialized successfully.\r\n");
 
@@ -455,6 +537,94 @@ static void draw_settings_content(Window *self)
     }
 }
 
+static void draw_opengl_content(Window *self)
+{
+    int32_t cx = self->x + 1;
+    int32_t cy = self->y + THEME_TITLEBAR_HEIGHT + 1;
+    uint32_t cw = self->w - 2;
+    uint32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
+
+    uint32_t *bb = comp_get_backbuffer();
+    uint32_t sw = comp_get_width();
+    uint32_t sh = comp_get_height();
+
+    glInit(sw, sh, bb);
+    glViewport(cx, cy, cw, ch);
+
+    glEnable(GL_DEPTH_TEST);
+    glClear(GL_DEPTH_BUFFER_BIT);
+
+    if (self->is_maximized) {
+        comp_fill_rect(cx, cy, cw, ch, 0x00000000); /* solid black */
+    } else {
+        comp_fill_rect_alpha(cx, cy, cw, ch, 0x80000000); /* 50% translucent black */
+    }
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45.0f, (float)cw / (float)ch, 0.1f, 10.0f);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(0.0f, 0.0f, -3.0f);
+
+    static float angle = 0.0f;
+    angle += 3.0f;
+    if (angle > 360.0f) angle -= 360.0f;
+
+    glRotatef(angle, 1.0f, 1.0f, 0.0f);
+
+    glBegin(GL_QUADS);
+
+    /* Front face (Red) */
+    glColor3f(1.0f, 0.0f, 0.0f);
+    glVertex3f(-0.5f, -0.5f,  0.5f);
+    glVertex3f( 0.5f, -0.5f,  0.5f);
+    glVertex3f( 0.5f,  0.5f,  0.5f);
+    glVertex3f(-0.5f,  0.5f,  0.5f);
+
+    /* Back face (Green) */
+    glColor3f(0.0f, 1.0f, 0.0f);
+    glVertex3f(-0.5f, -0.5f, -0.5f);
+    glVertex3f(-0.5f,  0.5f, -0.5f);
+    glVertex3f( 0.5f,  0.5f, -0.5f);
+    glVertex3f( 0.5f, -0.5f, -0.5f);
+
+    /* Top face (Blue) */
+    glColor3f(0.0f, 0.0f, 1.0f);
+    glVertex3f(-0.5f,  0.5f, -0.5f);
+    glVertex3f(-0.5f,  0.5f,  0.5f);
+    glVertex3f( 0.5f,  0.5f,  0.5f);
+    glVertex3f( 0.5f,  0.5f, -0.5f);
+
+    /* Bottom face (Yellow) */
+    glColor3f(1.0f, 1.0f, 0.0f);
+    glVertex3f(-0.5f, -0.5f, -0.5f);
+    glVertex3f( 0.5f, -0.5f, -0.5f);
+    glVertex3f( 0.5f, -0.5f,  0.5f);
+    glVertex3f(-0.5f, -0.5f,  0.5f);
+
+    /* Right face (Magenta) */
+    glColor3f(1.0f, 0.0f, 1.0f);
+    glVertex3f( 0.5f, -0.5f, -0.5f);
+    glVertex3f( 0.5f,  0.5f, -0.5f);
+    glVertex3f( 0.5f,  0.5f,  0.5f);
+    glVertex3f( 0.5f, -0.5f,  0.5f);
+
+    /* Left face (Cyan) */
+    glColor3f(0.0f, 1.0f, 1.0f);
+    glVertex3f(-0.5f, -0.5f, -0.5f);
+    glVertex3f(-0.5f, -0.5f,  0.5f);
+    glVertex3f(-0.5f,  0.5f,  0.5f);
+    glVertex3f(-0.5f,  0.5f, -0.5f);
+
+    glEnd();
+
+    glDeinit();
+
+    comp_mark_dirty();
+}
+
 /* ============================================================
  * Desktop Render and Events
  * ============================================================ */
@@ -473,7 +643,7 @@ static inline void restore_irq(uint64_t rflags)
     }
 }
 
-static void wm_str_cat(char *dest, const char *src)
+extern "C" void wm_str_cat(char *dest, const char *src)
 {
     while (*dest) dest++;
     while (*src) {
@@ -484,162 +654,35 @@ static void wm_str_cat(char *dest, const char *src)
 
 static void wm_draw_panel_contents(uint32_t sw, uint32_t total_sec)
 {
-    /* Restore wallpaper under the entire panel to prevent alpha accumulation */
-    extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
-    comp_draw_wallpaper_rect(0, 0, sw, THEME_PANEL_HEIGHT);
-
-    /* Draw base panel background and separator border */
-    comp_draw_panel();
-
-    uint32_t fg = THEME_TEXT_PRIMARY & 0x00FFFFFF;
-    uint32_t pipe_fg = NORD3 & 0x00FFFFFF;
-
-    /* 1. Left side: WynlandOS Logo & Name */
-    comp_draw_string(10, 4, "W", THEME_ACCENT & 0x00FFFFFF, 0);
-    comp_draw_string(19, 4, "ynlandOS", fg, 0);
-
-    /* 2. Active application / window title */
-    extern Window *g_windows_head;
-    const char *active_title = "Desktop";
-    if (g_windows_head && g_windows_head->is_visible && g_windows_head->scale_spring.target == 256) {
-        active_title = g_windows_head->title;
-    }
-    comp_draw_string(110, 4, "|", pipe_fg, 0);
-    comp_draw_string(125, 4, active_title, NORD8 & 0x00FFFFFF, 0);
-
-    /* 3. Keyboard Layout Indicator */
-    extern bool layout_ru;
-    comp_draw_string(sw - 130, 4, "|", pipe_fg, 0);
-    comp_draw_string(sw - 110, 4, layout_ru ? "RU" : "EN", THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
-
-    /* 4. RAM / Heap memory stats */
-    extern size_t heap_get_used_memory(void);
-    size_t used_kb = heap_get_used_memory() / 1024;
-    char ram_str[32] = "RAM: ";
-    char used_str[16];
-    extern void uint_to_str(uint64_t val, char *buf);
-    uint_to_str((uint64_t)used_kb, used_str);
-    wm_str_cat(ram_str, used_str);
-    wm_str_cat(ram_str, " KB");
-    comp_draw_string(sw - 230, 4, ram_str, NORD7 & 0x00FFFFFF, 0);
-    comp_draw_string(sw - 245, 4, "|", pipe_fg, 0);
-
-    /* 5. Right side: Clock time */
-    uint32_t sec = total_sec % 60;
-    uint32_t min = (total_sec / 60) % 60;
-    uint32_t hr  = (total_sec / 3600) % 24;
-
-    char time_str[9];
-    time_str[0] = '0' + (hr / 10);
-    time_str[1] = '0' + (hr % 10);
-    time_str[2] = ':';
-    time_str[3] = '0' + (min / 10);
-    time_str[4] = '0' + (min % 10);
-    time_str[5] = ':';
-    time_str[6] = '0' + (sec / 10);
-    time_str[7] = '0' + (sec % 10);
-    time_str[8] = '\0';
-    comp_draw_string(sw - 75, 4, time_str, fg, 0);
+    (void)sw; (void)total_sec;
+    wm_paint_shell_panel();
 }
 
-static bool g_control_panel_visible = false;
+
 
 static void wm_draw_control_panel(uint32_t sw, uint32_t sh)
 {
-    (void)sh;
-    int32_t px = sw - 290;
-    int32_t py = THEME_PANEL_HEIGHT + 5;
-    int32_t pw = 280;
-    int32_t ph = 360;
-
-    /* Shadow */
-    comp_fill_rect_alpha(px + 4, py + 4, pw, ph, 0x30000000);
-
-    /* Background panel */
-    comp_draw_rounded_rect(px, py, pw, ph, 12, 0xE520242C); /* Nord dark with 90% alpha */
-    comp_draw_rounded_rect_border(px, py, pw, ph, 12, NORD3 & 0x00FFFFFF);
-
-    /* Header */
-    comp_draw_string(px + 15, py + 15, "Control Center", NORD6 & 0x00FFFFFF, 0);
-    comp_fill_rect(px + 15, py + 32, pw - 30, 1, NORD3 & 0x00FFFFFF);
-
-    /* --- SECTION 1: CALENDAR (June 2026) --- */
-    comp_draw_string(px + 15, py + 42, "June 2026", NORD8 & 0x00FFFFFF, 0);
-    
-    /* Weekdays header */
-    comp_draw_string(px + 15, py + 62, "Mo Tu We Th Fr Sa Su", NORD4 & 0x00FFFFFF, 0);
-
-    /* Days grid */
-    const char *days[] = {
-        " 1  2  3  4  5  6  7",
-        " 8  9 10 11 12 13 14",
-        "15 16 17 18 19 20 21",
-        "22 23 24 25 26 27 28", /* 27 is Saturday */
-        "29 30"
-    };
-
-    for (int i = 0; i < 5; i++) {
-        comp_draw_string(px + 15, py + 82 + i * 16, days[i], NORD6 & 0x00FFFFFF, 0);
-    }
-
-    /* Highlight Saturday 27th */
-    comp_fill_rect_alpha(px + 15 + 15 * 9 - 2, py + 82 + 3 * 16 - 1, 19, 14, 0x8088C0D0); /* Nord8 highlight */
-    comp_draw_string(px + 15 + 15 * 9, py + 82 + 3 * 16, "27", 0x002E3440, 0); /* dark text */
-
-    comp_fill_rect(px + 15, py + 172, pw - 30, 1, NORD3 & 0x00FFFFFF);
-
-    /* --- SECTION 2: AUDIO VOLUME SLIDER --- */
-    comp_draw_string(px + 15, py + 182, "Volume Control", NORD4 & 0x00FFFFFF, 0);
-
-    /* Progress bar track */
-    int32_t sx = px + 15;
-    int32_t sy = py + 204;
-    int32_t sw_slider = pw - 30;
-    int32_t sh_slider = 12;
-    comp_draw_rounded_rect(sx, sy, sw_slider, sh_slider, 6, NORD1 & 0x00FFFFFF);
-
-    /* Volume level (0 to 100) */
-    extern int g_sys_volume;
-    int32_t fill_w = (sw_slider * g_sys_volume) / 100;
-    if (fill_w > 0) {
-        comp_draw_rounded_rect(sx, sy, fill_w, sh_slider, 6, NORD8 & 0x00FFFFFF);
-    }
-    
-    /* Display text */
-    char vol_str[16] = "Vol: ";
-    char vol_num[8];
-    extern void uint_to_str(uint64_t val, char *buf);
-    uint_to_str((uint64_t)g_sys_volume, vol_num);
-    wm_str_cat(vol_str, vol_num);
-    wm_str_cat(vol_str, "%");
-    comp_draw_string(px + 190, py + 182, vol_str, NORD6 & 0x00FFFFFF, 0);
-
-    comp_fill_rect(px + 15, py + 232, pw - 30, 1, NORD3 & 0x00FFFFFF);
-
-    /* --- SECTION 3: SOUND MELODIES --- */
-    comp_draw_string(px + 15, py + 242, "Sound Test", NORD4 & 0x00FFFFFF, 0);
-
-    /* Buttons */
-    comp_draw_rounded_rect(px + 15, py + 264, 75, 24, 4, NORD2 & 0x00FFFFFF);
-    comp_draw_string(px + 28, py + 268, "Chime", NORD6 & 0x00FFFFFF, 0);
-
-    comp_draw_rounded_rect(px + 100, py + 264, 75, 24, 4, NORD2 & 0x00FFFFFF);
-    comp_draw_string(px + 118, py + 268, "Beep", NORD6 & 0x00FFFFFF, 0);
-
-    comp_draw_rounded_rect(px + 185, py + 264, 80, 24, 4, NORD2 & 0x00FFFFFF);
-    comp_draw_string(px + 208, py + 268, "Mute", NORD6 & 0x00FFFFFF, 0);
-
-    comp_fill_rect(px + 15, py + 304, pw - 30, 1, NORD3 & 0x00FFFFFF);
-
-    /* --- SECTION 4: POWER OPTIONS --- */
-    comp_draw_rounded_rect(px + 15, py + 318, 120, 26, 4, 0x80BF616A); /* red */
-    comp_draw_string(px + 40, py + 323, "Shut Down", NORD6 & 0x00FFFFFF, 0);
-
-    comp_draw_rounded_rect(px + 145, py + 318, 120, 26, 4, 0x80D08770); /* orange */
-    comp_draw_string(px + 185, py + 323, "Reboot", NORD6 & 0x00FFFFFF, 0);
+    (void)sw; (void)sh;
+    wm_paint_shell_control_center();
 }
 
-extern "C" void wm_draw_desktop(void)
+static void wm_draw_snap_preview_if_needed(int32_t mx, int32_t my, bool left_pressed)
+{
+    if (g_dragged_window && left_pressed) {
+        uint32_t scr_w = comp_get_width();
+        uint32_t scr_h = comp_get_height();
+        if (mx < 25) {
+            comp_draw_glass_surface(4, THEME_PANEL_HEIGHT + 4, scr_w / 2 - 8, scr_h - THEME_PANEL_HEIGHT - THEME_DOCK_HEIGHT - 35, 12, 0x300088FF, 0, 0x800088FF);
+        } else if (mx > (int32_t)scr_w - 25) {
+            comp_draw_glass_surface(scr_w / 2 + 4, THEME_PANEL_HEIGHT + 4, scr_w / 2 - 8, scr_h - THEME_PANEL_HEIGHT - THEME_DOCK_HEIGHT - 35, 12, 0x300088FF, 0, 0x800088FF);
+        } else if (my < (int32_t)THEME_PANEL_HEIGHT + 25) {
+            comp_draw_glass_surface(4, THEME_PANEL_HEIGHT + 4, scr_w - 8, scr_h - THEME_PANEL_HEIGHT - 8, 12, 0x300088FF, 0, 0x800088FF);
+        }
+    }
+}
+
+
+extern "C" bool wm_draw_desktop(void)
 {
     static uint64_t last_sec = 999999;
     uint64_t total_sec = timer_get_ticks() / 100;
@@ -647,15 +690,15 @@ extern "C" void wm_draw_desktop(void)
     int32_t mx = mouse_get_x();
     int32_t my = mouse_get_y();
     uint8_t buttons = mouse_get_buttons();
+    bool left_pressed = (buttons & 1) != 0;
 
     static int32_t last_mx = -1;
     static int32_t last_my = -1;
     static uint8_t last_buttons = 0;
 
-    bool dragging = (g_dragged_window != NULL || g_resizing_window != NULL);
-
-    /* Tick window scale animations using Spring Physics */
+    /* Tick window scale animations using Spring Physics under brief interrupt lock */
     bool any_animating = false;
+    uint64_t rflags_anim = save_irq_disable();
     Window *curr = g_windows_head;
     while (curr) {
         /* Spring Constants: stiffness = 40, damping = 12 (scaled by 256) */
@@ -689,327 +732,68 @@ extern "C" void wm_draw_desktop(void)
         }
         curr = curr->next;
     }
+    restore_irq(rflags_anim);
+
     if (any_animating) {
         g_wm_needs_redraw = true;
     }
 
-    /* Lock interrupts to make desktop drawing and mouse updates atomic and prevent races */
-    uint64_t rflags = save_irq_disable();
+    bool clock_changed = false;
+    if (total_sec != last_sec) {
+        last_sec = total_sec;
+        clock_changed = true;
+    }
 
-    if (!g_wm_needs_redraw) {
-        /* Update only the clock area in back buffer if second changed */
-        bool clock_changed = false;
-        if (total_sec != last_sec) {
-            last_sec = total_sec;
-            clock_changed = true;
+    extern bool comp_is_dirty(void);
+    bool desktop_changed = (g_wm_needs_redraw || comp_is_dirty() || clock_changed);
+    bool mouse_changed = (mx != last_mx || my != last_my || buttons != last_buttons);
 
-            uint32_t sw = comp_get_width();
-            wm_draw_panel_contents(sw, total_sec);
-        }
+    if (desktop_changed) {
+        g_wm_needs_redraw = false;
 
-        /* If only the mouse moved, buttons changed, or compositor is dirty, do flip */
-        extern bool comp_is_dirty(void);
-        if (mx != last_mx || my != last_my || buttons != last_buttons || comp_is_dirty() || clock_changed) {
-            bool near_dock = (my >= 650) || (last_my >= 650);
-            static bool g_prev_control_panel_visible = false;
-            bool ctrl_panel_active = g_control_panel_visible || g_prev_control_panel_visible;
+        uint32_t sw = comp_get_width();
+        uint32_t sh = comp_get_height();
 
-            if (dragging || near_dock || ctrl_panel_active) {
-                /* Localized Redraw Path for window dragging/resizing and dock magnification */
-                uint32_t sw = comp_get_width();
-                uint32_t sh = comp_get_height();
+        comp_clear_saved_cursor();
 
-                int32_t ux1 = 999999;
-                int32_t uy1 = 999999;
-                int32_t ux2 = -999999;
-                int32_t uy2 = -999999;
-
-                /* Include Control Center bounds if it was or is active */
-                if (ctrl_panel_active) {
-                    int32_t cpx = sw - 290;
-                    int32_t cpy = THEME_PANEL_HEIGHT + 5;
-                    int32_t cpw = 280;
-                    int32_t cph = 360;
-
-                    if (cpx < ux1) ux1 = cpx;
-                    if (cpy < uy1) uy1 = cpy;
-                    if (cpx + cpw > ux2) ux2 = cpx + cpw;
-                    if (cpy + cph > uy2) uy2 = cpy + cph;
+        /* 1. Wallpaper and Desktop Widgets */
+        bool top_maximized = false;
+        uint64_t rflags_max = save_irq_disable();
+        {
+            Window *tw = g_windows_head;
+            while (tw) {
+                if (tw->is_visible) {
+                    if (tw->is_maximized) top_maximized = true;
+                    break;
                 }
-                g_prev_control_panel_visible = g_control_panel_visible;
-
-                /* Include moving/dragged/resized window's old and new bounds in dirty rect */
-                if (dragging) {
-                    Window *aw = g_dragged_window ? g_dragged_window : g_resizing_window;
-                    if (aw) {
-                        int32_t px = aw->prev_x;
-                        int32_t py = aw->prev_y;
-                        uint32_t pw = aw->prev_w;
-                        uint32_t ph = aw->prev_h;
-
-                        if (px - 8 < ux1) ux1 = px - 8;
-                        if (py - 8 < uy1) uy1 = py - 8;
-                        if (px + (int32_t)pw + 16 > ux2) ux2 = px + (int32_t)pw + 16;
-                        if (py + (int32_t)ph + 16 > uy2) uy2 = py + (int32_t)ph + 16;
-
-                        int32_t cx = aw->x;
-                        int32_t cy = aw->y;
-                        uint32_t cw = aw->w;
-                        uint32_t ch = aw->h;
-
-                        if (cx - 8 < ux1) ux1 = cx - 8;
-                        if (cy - 8 < uy1) uy1 = cy - 8;
-                        if (cx + (int32_t)cw + 16 > ux2) ux2 = cx + (int32_t)cw + 16;
-                        if (cy + (int32_t)ch + 16 > uy2) uy2 = cy + (int32_t)ch + 16;
-                    }
-                }
-
-                /* Include dock bounds */
-                uint32_t dock_w = 220;
-                uint32_t dock_h = THEME_DOCK_HEIGHT;
-                int32_t dock_x = (sw - dock_w) / 2;
-                int32_t dock_y = sh - dock_h - 15;
-
-                if (near_dock || dragging) {
-                    int32_t dx1 = dock_x - 40;
-                    int32_t dy1 = dock_y - 60;
-                    int32_t dx2 = dock_x + (int32_t)dock_w + 40;
-                    int32_t dy2 = dock_y + (int32_t)dock_h + 20;
-
-                    if (dx1 < ux1) ux1 = dx1;
-                    if (dy1 < uy1) uy1 = dy1;
-                    if (dx2 > ux2) ux2 = dx2;
-                    if (dy2 > uy2) uy2 = dy2;
-                }
-
-                /* Include old cursor bounds */
-                int32_t sc_x = -1, sc_y = -1;
-                bool has_cursor = false;
-                extern void comp_get_cursor_save_info(int32_t *x, int32_t *y, bool *has_cursor);
-                comp_get_cursor_save_info(&sc_x, &sc_y, &has_cursor);
-                if (has_cursor) {
-                    if (sc_x < ux1) ux1 = sc_x;
-                    if (sc_y < uy1) uy1 = sc_y;
-                    if (sc_x + 18 > ux2) ux2 = sc_x + 18;
-                    if (sc_y + 19 > uy2) uy2 = sc_y + 19;
-                }
-
-                /* Include new cursor bounds */
-                if (mx < ux1) ux1 = mx;
-                if (my < uy1) uy1 = my;
-                if (mx + 18 > ux2) ux2 = mx + 18;
-                if (my + 19 > uy2) uy2 = my + 19;
-
-                /* Clamp union to screen */
-                if (ux1 < 0) ux1 = 0;
-                if (uy1 < 0) uy1 = 0;
-                if (ux2 > (int32_t)sw) ux2 = (int32_t)sw;
-                if (uy2 > (int32_t)sh) uy2 = (int32_t)sh;
-
-                if (ux1 < ux2 && uy1 < uy2) {
-                    /* Restore old background under cursor */
-                    comp_restore_cursor_back();
-
-                    /* Restore wallpaper inside the union rect (skip if top window is maximized) */
-                    extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
-                    bool loc_top_max = false;
-                    {
-                        Window *tw = g_windows_head;
-                        while (tw) {
-                            if (tw->is_visible) {
-                                if (tw->is_maximized) loc_top_max = true;
-                                break;
-                            }
-                            tw = tw->next;
-                        }
-                    }
-                    if (!loc_top_max) {
-                        comp_draw_wallpaper_rect(ux1, uy1, ux2 - ux1, uy2 - uy1);
-                    }
-
-                    /* Redraw all windows from bottom to top, but only if they intersect the dirty bounds */
-                    Window *win = g_windows_tail;
-                    while (win) {
-                        if (win->is_visible) {
-                            int32_t wx1 = win->x;
-                            int32_t wy1 = win->y;
-                            int32_t wx2 = win->x + (int32_t)win->w;
-                            int32_t wy2 = win->y + (int32_t)win->h;
-
-                            /* Include shadow (+4px bottom-right) in intersection check */
-                            if (wx1 < ux2 && (wx2 + 4) > ux1 &&
-                                wy1 < uy2 && (wy2 + 4) > uy1) {
-                                
-                                int32_t orig_x = win->x;
-                                int32_t orig_y = win->y;
-                                uint32_t orig_w = win->w;
-                                uint32_t orig_h = win->h;
-                                int32_t scale = win->scale_spring.current;
-
-                                 if (scale != 256 || win->scale_spring.velocity != 0) {
-                                    win->w = (orig_w * scale) / 256;
-                                    win->h = (orig_h * scale) / 256;
-                                    win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
-                                    win->y = orig_y + (int32_t)(orig_h - win->h) / 2;
-                                    if (win->w < 1) win->w = 1;
-                                    if (win->h < 1) win->h = 1;
-                                }
-
-                                draw_window_decorations(win);
-                                if (win->draw_content && scale > 96) {
-                                    win->draw_content(win);
-                                }
-                                if (win->is_focused && !win->is_maximized && scale == 256) {
-                                    int32_t rx = win->x + win->w - 12;
-                                    int32_t ry = win->y + win->h - 12;
-                                    comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
-                                }
-
-                                win->x = orig_x;
-                                win->y = orig_y;
-                                win->w = orig_w;
-                                win->h = orig_h;
-                            }
-                        }
-                        win = win->prev;
-                    }
-
-                    /* Wireframe outline rendering removed for real-time dragging */
-
-                    /* Redraw top panel if it overlaps the union rect */
-                    if (uy1 < (int32_t)THEME_PANEL_HEIGHT) {
-                        wm_draw_panel_contents(sw, total_sec);
-                    }
-
-                    /* Redraw dock if near dock or dragging */
-                    if (near_dock || dragging) {
-                        comp_fill_rect_alpha(dock_x, dock_y, dock_w, dock_h, THEME_DOCK_BG);
-                        comp_draw_rounded_rect(dock_x, dock_y, dock_w, dock_h, 12, THEME_DOCK_BG);
-                        comp_draw_rounded_rect_border(dock_x, dock_y, dock_w, dock_h, 12, 0x40FFFFFF);
-
-                        int spacing = dock_w / (DOCK_ICON_COUNT + 1);
-                        for (int i = 0; i < DOCK_ICON_COUNT; i++) {
-                            g_dock_icons[i].cx = dock_x + spacing * (i + 1);
-                            g_dock_icons[i].cy = dock_y + dock_h / 2;
-
-                            int32_t dx = mx - g_dock_icons[i].cx;
-                            int32_t dy = my - g_dock_icons[i].cy;
-                            int32_t dist_sq = dx * dx + dy * dy;
-
-                            if (dist_sq < 80 * 80) {
-                                uint32_t zoom = (80 * 80 - dist_sq) / 400;
-                                g_dock_icons[i].current_radius = g_dock_icons[i].base_radius + zoom;
-                            } else {
-                                g_dock_icons[i].current_radius = g_dock_icons[i].base_radius;
-                            }
-
-                            draw_dock_icon(i, g_dock_icons[i].cx, g_dock_icons[i].cy, g_dock_icons[i].current_radius);
-                            if (i == 0 && g_term_window && g_term_window->is_visible) {
-                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-                            }
-                            if (i == 1 && g_settings_window && g_settings_window->is_visible) {
-                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-                            }
-                            if (i == 2 && g_browser_window && g_browser_window->is_visible) {
-                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-                            }
-                            if (i == 3 && g_forge_window && g_forge_window->is_visible) {
-                                comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-                            }
-                        }
-
-                        /* Hover Tooltip in Localized Path */
-                        int32_t hovered_idx = -1;
-                        int32_t min_dist_sq = 999999;
-                        for (int k = 0; k < DOCK_ICON_COUNT; k++) {
-                            int32_t dx = mx - g_dock_icons[k].cx;
-                            int32_t dy = my - g_dock_icons[k].cy;
-                            int32_t dist_sq = dx*dx + dy*dy;
-                            if (dist_sq < 35 * 35 && dist_sq < min_dist_sq) {
-                                min_dist_sq = dist_sq;
-                                hovered_idx = k;
-                            }
-                        }
-
-                        if (hovered_idx != -1) {
-                            int k = hovered_idx;
-                            int32_t rad = g_dock_icons[k].current_radius;
-                            const char *name = g_dock_icons[k].name;
-                            uint32_t name_len = 0;
-                            while (name[name_len]) name_len++;
-                            
-                            uint32_t box_w = name_len * 9 + 16;
-                            uint32_t box_h = 20;
-                            int32_t box_x = g_dock_icons[k].cx - (int32_t)box_w / 2;
-                            int32_t box_y = g_dock_icons[k].cy - rad - 24;
-
-                            comp_draw_rounded_rect(box_x, box_y, box_w, box_h, 6, 0xD52E3440);
-                            comp_draw_string(box_x + 8, box_y + 2, name, 0xFFECEFF4, 0);
-                        }
-                    }
-
-                    /* Draw Control Center overlay in localized path if visible */
-                    if (g_control_panel_visible) {
-                        wm_draw_control_panel(sw, sh);
-                    }
-
-                    /* Set compositor dirty region to the union rect */
-                    extern void comp_set_dirty_rect(int32_t x1, int32_t y1, int32_t x2, int32_t y2);
-                    comp_set_dirty_rect(ux1, uy1, ux2 - 1, uy2 - 1);
-
-                    /* Draw cursor at new position */
-                    comp_draw_cursor(mx, my, buttons);
-
-                    /* Flip! */
-                    compositor_flip();
-
-                    /* Update previous outline bounds */
-                    /* previous outline bounds updates removed */
-                }
-            } else {
-                /* Cursor-only fast path */
-                comp_restore_cursor_back();
-                comp_draw_cursor(mx, my, buttons);
-                compositor_flip();
+                tw = tw->next;
             }
-
-            last_mx = mx;
-            last_my = my;
-            last_buttons = buttons;
         }
-        restore_irq(rflags);
-        return;
-    }
+        restore_irq(rflags_max);
 
-    /* Full desktop redraw */
-    g_wm_needs_redraw = false;
+        if (!top_maximized) {
+            comp_draw_wallpaper();
+            desktop_widgets_draw();
+        }
 
-    uint32_t sw = comp_get_width();
-    uint32_t sh = comp_get_height();
+        /* 2. Snapshot the visible windows under a brief interrupt lock to prevent list modification races */
+        #define MAX_WINDOWS_SNAP 32
+        Window *draw_list[MAX_WINDOWS_SNAP];
+        int draw_count = 0;
 
-    /* 1. Wallpaper (clears any saved cursor state since we reconstruct from scratch) */
-    comp_clear_saved_cursor();
-
-    /* Check if the top-most visible window is maximized — skip wallpaper entirely */
-    bool top_maximized = false;
-    {
-        Window *tw = g_windows_head;
-        while (tw) {
-            if (tw->is_visible) {
-                if (tw->is_maximized) top_maximized = true;
-                break;
+        uint64_t rflags_snap = save_irq_disable();
+        Window *win_curr = g_windows_tail;
+        while (win_curr && draw_count < MAX_WINDOWS_SNAP) {
+            if (win_curr->is_visible) {
+                draw_list[draw_count++] = win_curr;
             }
-            tw = tw->next;
+            win_curr = win_curr->prev;
         }
-    }
-    if (!top_maximized) {
-        comp_draw_wallpaper();
-    }
+        restore_irq(rflags_snap);
 
-    /* 2. Draw all windows in reverse Z-order (bottom-most to top-most) */
-    Window *win = g_windows_tail;
-    while (win) {
-        if (win->is_visible) {
+        /* 3. Windows in Z-order (bottom to top) with interrupts enabled */
+        for (int i = 0; i < draw_count; i++) {
+            Window *win = draw_list[i];
             int32_t orig_x = win->x;
             int32_t orig_y = win->y;
             uint32_t orig_w = win->w;
@@ -1027,9 +811,20 @@ extern "C" void wm_draw_desktop(void)
 
             draw_window_decorations(win);
             if (win->draw_content && scale > 96) {
-                win->draw_content(win);
+                if (win->backing_store) {
+                    uint32_t cx = win->x + 1;
+                    uint32_t cy = win->y + THEME_TITLEBAR_HEIGHT + 1;
+                    uint32_t cw = win->w - 2;
+                    uint32_t ch = win->h - THEME_TITLEBAR_HEIGHT - 2;
+                    uint32_t bw = comp_get_width();
+                    uint32_t *back_buffer = comp_get_backbuffer();
+                    for (uint32_t row = 0; row < ch; row++) {
+                        memcpy(&back_buffer[(cy + row) * bw + cx], &win->backing_store[row * cw], cw * 4);
+                    }
+                } else {
+                    win->draw_content(win);
+                }
             }
-            /* Draw a resize handle in bottom-right corner of window (skip if maximized) */
             if (win->is_focused && !win->is_maximized && scale == 256) {
                 int32_t rx = win->x + win->w - 12;
                 int32_t ry = win->y + win->h - 12;
@@ -1041,133 +836,71 @@ extern "C" void wm_draw_desktop(void)
             win->w = orig_w;
             win->h = orig_h;
         }
-        win = win->prev;
+
+        /* 4. Panel, Dock & overlays */
+        wm_paint_shell_panel();
+        wm_draw_panel_contents(sw, total_sec);
+        wm_paint_shell_dock();
+
+        if (wm_is_control_center_active()) {
+            wm_draw_control_panel(sw, sh);
+        }
+        if (wm_is_notification_center_active()) {
+            wm_paint_shell_notification_center();
+        }
+
+        /* 5. Snap preview if needed */
+        wm_draw_snap_preview_if_needed(mx, my, left_pressed);
+
+        /* 6. Draw cursor (software) and update hardware cursor */
+        extern bool virtio_gpu_is_active(void);
+        extern void virtio_gpu_update_cursor(uint32_t resource_id, uint32_t x, uint32_t y);
+        
+        comp_draw_cursor(mx, my, buttons);
+        if (virtio_gpu_is_active()) {
+            virtio_gpu_update_cursor(2, mx, my);
+        }
+
+        /* 7. Mark full screen dirty and flip */
+        comp_set_dirty_rect(0, 0, sw - 1, sh - 1);
+        compositor_flip();
+
+        last_mx = mx;
+        last_my = my;
+        last_buttons = buttons;
     }
-
-    /* Wireframe outline rendering removed for real-time dragging */
-
-    /* 3. Top panel */
-    wm_draw_panel_contents(sw, total_sec);
-
-    /* 4. Draw Dock Panel with Magnification */
-    uint32_t dock_w = 220;
-    uint32_t dock_h = THEME_DOCK_HEIGHT;
-    int32_t dock_x = (sw - dock_w) / 2;
-    int32_t dock_y = sh - dock_h - 15;
-
-    /* Blur under Dock bypassed for performance */
-
-    /* Draw semi-transparent dock background */
-    comp_fill_rect_alpha(dock_x, dock_y, dock_w, dock_h, THEME_DOCK_BG);
-    comp_draw_rounded_rect(dock_x, dock_y, dock_w, dock_h, 12, THEME_DOCK_BG);
-    comp_draw_rounded_rect_border(dock_x, dock_y, dock_w, dock_h, 12, 0x40FFFFFF);
-
-    /* Draw dock icons with magnification effect */
-    int spacing = dock_w / (DOCK_ICON_COUNT + 1);
-    for (int i = 0; i < DOCK_ICON_COUNT; i++) {
-        g_dock_icons[i].cx = dock_x + spacing * (i + 1);
-        g_dock_icons[i].cy = dock_y + dock_h / 2;
-
-        /* Calculate distance from mouse to icon center */
-        int32_t dx = mx - g_dock_icons[i].cx;
-        int32_t dy = my - g_dock_icons[i].cy;
-        int32_t dist_sq = dx * dx + dy * dy;
-
-        /* Magnification logic: icons get larger if mouse is near */
-        if (dist_sq < 80 * 80) {
-            /* Linear scale factor based on proximity */
-            uint32_t zoom = (80 * 80 - dist_sq) / 400; /* up to +16px */
-            g_dock_icons[i].current_radius = g_dock_icons[i].base_radius + zoom;
+    else if (mouse_changed) {
+        extern bool virtio_gpu_is_active(void);
+        if (virtio_gpu_is_active()) {
+            extern void virtio_gpu_update_cursor(uint32_t resource_id, uint32_t x, uint32_t y);
+            virtio_gpu_update_cursor(2, mx, my);
         } else {
-            g_dock_icons[i].current_radius = g_dock_icons[i].base_radius;
+            /* Optimize: screen content is identical, only cursor moved!
+               Simply restore background, draw new cursor, and flip the tiny changed areas. */
+            extern void comp_restore_cursor_back(void);
+            comp_restore_cursor_back();
+            comp_draw_cursor(mx, my, buttons);
+            compositor_flip();
         }
 
-        /* Draw icon circle */
-        draw_dock_icon(i, g_dock_icons[i].cx, g_dock_icons[i].cy, g_dock_icons[i].current_radius);
-        
-        /* Draw little dot under active app */
-        if (i == 0 && g_term_window && g_term_window->is_visible) {
-            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-        }
-        if (i == 1 && g_settings_window && g_settings_window->is_visible) {
-            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-        }
-        if (i == 2 && g_browser_window && g_browser_window->is_visible) {
-            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-        }
-        if (i == 3 && g_forge_window && g_forge_window->is_visible) {
-            comp_draw_circle(g_dock_icons[i].cx, dock_y + dock_h - 4, 2, THEME_ACCENT & 0x00FFFFFF);
-        }
+        last_mx = mx;
+        last_my = my;
+        last_buttons = buttons;
     }
 
-    /* Hover Tooltip in Full Redraw Path */
-    int32_t hovered_idx = -1;
-    int32_t min_dist_sq = 999999;
-    for (int k = 0; k < DOCK_ICON_COUNT; k++) {
-        int32_t dx = mx - g_dock_icons[k].cx;
-        int32_t dy = my - g_dock_icons[k].cy;
-        int32_t dist_sq = dx*dx + dy*dy;
-        if (dist_sq < 35 * 35 && dist_sq < min_dist_sq) {
-            min_dist_sq = dist_sq;
-            hovered_idx = k;
-        }
-    }
-
-    if (hovered_idx != -1) {
-        int k = hovered_idx;
-        int32_t rad = g_dock_icons[k].current_radius;
-        const char *name = g_dock_icons[k].name;
-        uint32_t name_len = 0;
-        while (name[name_len]) name_len++;
-        
-        uint32_t box_w = name_len * 9 + 16;
-        uint32_t box_h = 20;
-        int32_t box_x = g_dock_icons[k].cx - (int32_t)box_w / 2;
-        int32_t box_y = g_dock_icons[k].cy - rad - 24;
-
-        comp_draw_rounded_rect(box_x, box_y, box_w, box_h, 6, 0xD52E3440);
-        comp_draw_string(box_x + 8, box_y + 2, name, 0xFFECEFF4, 0);
-    }
-
-    /* Draw Control Center overlay if visible */
-    if (g_control_panel_visible) {
-        wm_draw_control_panel(sw, sh);
-    }
-
-    /* 5. Draw cursor on the back-buffer right before flipping */
-    comp_draw_cursor(mx, my, buttons);
-
-    /* Flip onto screen */
-    compositor_flip();
-
-    /* Make sure windows have correct initial previous bounds */
-    Window *w_curr = g_windows_tail;
-    while (w_curr) {
-        w_curr->prev_x = w_curr->x;
-        w_curr->prev_y = w_curr->y;
-        w_curr->prev_w = w_curr->w;
-        w_curr->prev_h = w_curr->h;
-        w_curr = w_curr->prev;
-    }
-
-    last_mx = mx;
-    last_my = my;
-    last_buttons = buttons;
-
-    restore_irq(rflags);
+    return (desktop_changed || mouse_changed);
 }
 
-static void wm_show_window(Window *win)
+extern "C" void wm_show_window(Window *win)
 {
     if (win) {
-        if (!win->is_visible || win->scale_spring.current < 256) {
-            win->is_visible = true;
-            win->anim_direction = 1;
-            win->scale_spring.target = 256;
-            if (win->scale_spring.current == 0) {
-                win->scale_spring.velocity = 0;
-            }
+        if (!win->is_visible) {
+            win->scale_spring.current = 0;
+            win->scale_spring.velocity = 0;
         }
+        win->is_visible = true;
+        win->anim_direction = 0;
+        win->scale_spring.target = 256;
         wm_raise_window(win);
         comp_mark_dirty();
     }
@@ -1179,6 +912,86 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
     bool prev_left     = (g_prev_buttons & 1) != 0;
     bool clicked_down  = left_pressed && !prev_left;
     bool clicked_up    = !left_pressed && prev_left;
+
+    uint32_t sw = comp_get_width();
+    uint32_t sh = comp_get_height();
+
+    /* 1. Update cursor type */
+    g_current_cursor_type = CURSOR_ARROW; // Default arrow
+
+    if (g_resizing_window != NULL) {
+        g_current_cursor_type = CURSOR_RESIZE_NWSE;
+    } else if (g_dragged_window != NULL) {
+        g_current_cursor_type = CURSOR_POINTER;
+    } else {
+        /* Check if hovering over shell panel or dock */
+        bool over_panel = (my < (int32_t)THEME_PANEL_HEIGHT);
+        bool over_dock = (my >= (int32_t)(sh - THEME_DOCK_HEIGHT - 15) && 
+                          mx >= (int32_t)(sw - 220) / 2 && 
+                          mx < (int32_t)(sw + 220) / 2);
+        bool over_ctrl = g_control_panel_visible && 
+                         (mx >= (int32_t)sw - 290 && mx < (int32_t)sw - 10 && 
+                          my >= (int32_t)THEME_PANEL_HEIGHT + 5 && 
+                          my < (int32_t)THEME_PANEL_HEIGHT + 365);
+        bool over_notif = g_notification_panel_visible && 
+                          (mx >= (int32_t)sw - 290 && mx < (int32_t)sw - 10 && 
+                           my >= (int32_t)THEME_PANEL_HEIGHT + 5 && 
+                           my < (int32_t)sh - 10);
+
+        if (over_panel || over_dock || over_ctrl || over_notif) {
+            g_current_cursor_type = CURSOR_POINTER;
+        } else {
+            /* Check window hover */
+            Window *win = g_windows_head;
+            while (win) {
+                if (win->is_visible && win->scale_spring.target == 256) {
+                    if (mx >= win->x && mx < win->x + (int32_t)win->w &&
+                        my >= win->y && my < win->y + (int32_t)win->h) {
+                        
+                        /* Hovering over window */
+                        if (my < win->y + (int32_t)THEME_TITLEBAR_HEIGHT) {
+                            /* Traffic light close/min/max buttons hover */
+                            if (mx >= win->x + 12 && mx <= win->x + 64 && 
+                                my >= win->y + 8 && my <= win->y + 20) {
+                                g_current_cursor_type = CURSOR_POINTER;
+                            }
+                        } else if (win->is_focused && !win->is_maximized &&
+                                   mx >= win->x + (int32_t)win->w - 12 &&
+                                   my >= win->y + (int32_t)win->h - 12) {
+                            /* Resize handle hover */
+                            g_current_cursor_type = CURSOR_RESIZE_NWSE;
+                        } else if (win->cpp_widgets_root) {
+                            uint8_t c = static_cast<ui::Widget*>(win->cpp_widgets_root)->get_hover_cursor(mx, my);
+                            if (c != 0) {
+                                g_current_cursor_type = c;
+                            }
+                        } else if (win->id == 3) {
+                            /* Web Browser URL input field and client areas */
+                            int32_t cx = win->x + 1;
+                            int32_t cy = win->y + THEME_TITLEBAR_HEIGHT + 1;
+                            uint32_t cw = win->w - 2;
+                            if (mx >= cx + 10 && mx <= cx + (int32_t)cw - 70 && 
+                                my >= cy + 5 && my <= cy + 25) {
+                                g_current_cursor_type = CURSOR_TEXT;
+                            }
+                        } else if (win->id == 1) {
+                            /* Terminal window client area */
+                            g_current_cursor_type = CURSOR_TEXT;
+                        }
+                        break;
+                    }
+                }
+                win = win->next;
+            }
+            
+            /* Check desktop widget hover if we didn't hover over any window */
+            if (g_current_cursor_type == CURSOR_ARROW) {
+                if (desktop_widgets_check_hover(mx, my)) {
+                    g_current_cursor_type = CURSOR_POINTER;
+                }
+            }
+        }
+    }
 
     /* If we have a captured window, forward all mouse events to it first */
     extern Window *g_mouse_captured_window;
@@ -1194,84 +1007,44 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
         return;
     }
 
+    /* If we are dragging a desktop widget, forward events directly to it */
+    if (desktop_widgets_is_dragging()) {
+        desktop_widgets_handle_mouse(mx, my, buttons);
+        g_prev_buttons = buttons;
+        comp_mark_dirty();
+        return;
+    }
+
     if (clicked_down) {
         bool handled = false;
 
-        /* 1. Control Center Interactivity */
-        if (g_control_panel_visible) {
-            uint32_t sw = comp_get_width();
-            int32_t px = sw - 290;
-            int32_t py = THEME_PANEL_HEIGHT + 5;
-            int32_t pw = 280;
-            int32_t ph = 360;
-
-            if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
-                handled = true;
-
-                /* Volume Slider click: y = py + 204 to py + 216 */
-                if (mx >= px + 15 && mx < px + pw - 15 && my >= py + 204 && my < py + 216) {
-                    int32_t offset_x = mx - (px + 15);
-                    extern int g_sys_volume;
-                    g_sys_volume = (offset_x * 100) / 250;
-                    if (g_sys_volume < 0) g_sys_volume = 0;
-                    if (g_sys_volume > 100) g_sys_volume = 100;
-                    
-                    /* Feedback beep */
-                    extern void beep(uint32_t freq, uint32_t duration_ms);
-                    beep(440 + g_sys_volume * 4, 40);
-                    comp_mark_dirty();
-                }
-
-                /* Chime button click */
-                if (mx >= px + 15 && mx < px + 90 && my >= py + 264 && my < py + 288) {
-                    extern void play_startup_chime(void);
-                    play_startup_chime();
-                }
-
-                /* Beep button click */
-                if (mx >= px + 100 && mx < px + 175 && my >= py + 264 && my < py + 288) {
-                    extern void beep(uint32_t freq, uint32_t duration_ms);
-                    beep(800, 100);
-                }
-
-                /* Mute button click */
-                if (mx >= px + 185 && mx < px + 265 && my >= py + 264 && my < py + 288) {
-                    extern void nosound(void);
-                    nosound();
-                }
-
-                /* Shut Down button click */
-                if (mx >= px + 15 && mx < px + 135 && my >= py + 318 && my < py + 344) {
-                    extern void sys_poweroff(void);
-                    sys_poweroff();
-                }
-
-                /* Reboot button click */
-                if (mx >= px + 145 && mx < px + 265 && my >= py + 318 && my < py + 344) {
-                    extern void sys_reboot(void);
-                    sys_reboot();
-                }
-            } else {
-                /* Clicked outside Control Center: close it! */
-                g_control_panel_visible = false;
-                comp_mark_dirty();
-                handled = true; /* consume click */
-            }
+        /* Forward mouse events to the C++ shell widgets */
+        uint32_t sw = comp_get_width();
+        uint32_t sh = comp_get_height();
+        bool click_in_panel = (my < (int32_t)THEME_PANEL_HEIGHT);
+        bool click_in_dock = (my >= (int32_t)(sh - THEME_DOCK_HEIGHT - 15) && mx >= (int32_t)(sw - 220) / 2 && mx < (int32_t)(sw + 220) / 2);
+        bool click_in_ctrl = g_control_panel_visible && (mx >= (int32_t)sw - 290 && mx < (int32_t)sw - 10 && my >= (int32_t)THEME_PANEL_HEIGHT + 5 && my < (int32_t)THEME_PANEL_HEIGHT + 365);
+        bool click_in_notif = g_notification_panel_visible && (mx >= (int32_t)sw - 290 && mx < (int32_t)sw - 10 && my >= (int32_t)THEME_PANEL_HEIGHT + 5 && my < (int32_t)sh - 10);
+ 
+        if (click_in_panel || click_in_dock || click_in_ctrl || click_in_notif) {
+            wm_handle_shell_mouse(mx, my, buttons);
+            handled = true;
+        } else if (g_control_panel_visible) {
+            /* Clicked outside Control Center: close it! */
+            g_control_panel_visible = false;
+            comp_mark_dirty();
+            handled = true;
+        } else if (g_notification_panel_visible) {
+            /* Clicked outside Notification Center: close it! */
+            g_notification_panel_visible = false;
+            comp_mark_dirty();
+            handled = true;
         }
 
-        /* 2. Check if clicked on top-right clock/status area to open Control Center */
-        if (!handled && my < (int32_t)THEME_PANEL_HEIGHT) {
-            uint32_t sw = comp_get_width();
-            if (mx >= (int32_t)sw - 120) {
-                g_control_panel_visible = true;
-                comp_mark_dirty();
-                handled = true;
-            }
-        }
-
-        /* 3. Check if clicked on a window */
-        Window *win = g_windows_head;
-        while (win) {
+        /* Check if clicked on a window */
+        if (!handled) {
+            Window *win = g_windows_head;
+            while (win) {
             if (win->is_visible && win->scale_spring.target == 256) { /* Only interact if open */
                 /* Check boundary */
                 if (mx >= win->x && mx < (int32_t)(win->x + win->w) &&
@@ -1290,7 +1063,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                                 /* Exit GUI mode if terminal is closed */
                                 wm_exit_gui();
                             } else {
-                                win->anim_direction = -1; /* Close zoom-out animation */
                                 win->scale_spring.target = 0;
                                 comp_mark_dirty();
                             }
@@ -1301,7 +1073,6 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                         int32_t min_dx = mx - (win->x + 38);
                         int32_t min_dy = my - (win->y + 14);
                         if (min_dx * min_dx + min_dy * min_dy <= 6 * 6) {
-                            win->anim_direction = -1; /* Minimize zoom-out animation */
                             win->scale_spring.target = 0;
                             comp_mark_dirty();
                             break;
@@ -1333,6 +1104,9 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
                                 win->h = win->normal_h;
                                 win->is_maximized = false;
                             }
+                            /* Reallocate backing store for the new window size */
+                            wm_resize_backing_store(win);
+
                             /* Sync terminal console boundaries if terminal */
                             if (win->id == 1) {
                                 console_start_x = win->x + 15;
@@ -1381,31 +1155,9 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
             }
             win = win->next;
         }
-
-        /* If clicked outside windows, check Dock Icons click */
         if (!handled) {
-            uint32_t sh = comp_get_height();
-            uint32_t dock_h = THEME_DOCK_HEIGHT;
-            int32_t dock_y = sh - dock_h - 15;
-            if (my >= dock_y && my < (int32_t)(dock_y + dock_h)) {
-                for (int i = 0; i < DOCK_ICON_COUNT; i++) {
-                    int32_t dx = mx - g_dock_icons[i].cx;
-                    int32_t dy = my - g_dock_icons[i].cy;
-                    if (dx*dx + dy*dy <= (int32_t)(g_dock_icons[i].current_radius * g_dock_icons[i].current_radius)) {
-                        /* Action! Launch/Focus window */
-                        if (i == 0 && g_term_window) {
-                            wm_show_window(g_term_window);
-                        } else if (i == 1 && g_settings_window) {
-                            wm_show_window(g_settings_window);
-                        } else if (i == 2 && g_browser_window) {
-                            wm_show_window(g_browser_window);
-                        } else if (i == 3 && g_forge_window) {
-                            wm_show_window(g_forge_window);
-                        }
-                        break;
-                    }
-                }
-            }
+            desktop_widgets_handle_mouse(mx, my, buttons);
+        }
         }
     }
 
@@ -1463,10 +1215,61 @@ void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons)
     /* Release drag/resize locks */
     if (clicked_up) {
         if (g_dragged_window) {
+            uint32_t scr_w = comp_get_width();
+            uint32_t scr_h = comp_get_height();
+            if (mx < 25) {
+                /* Snap Left */
+                g_dragged_window->normal_x = g_dragged_window->x;
+                g_dragged_window->normal_y = g_dragged_window->y;
+                g_dragged_window->normal_w = g_dragged_window->w;
+                g_dragged_window->normal_h = g_dragged_window->h;
+                
+                g_dragged_window->x = 4;
+                g_dragged_window->y = THEME_PANEL_HEIGHT + 4;
+                g_dragged_window->w = scr_w / 2 - 8;
+                g_dragged_window->h = scr_h - THEME_PANEL_HEIGHT - THEME_DOCK_HEIGHT - 35;
+                g_dragged_window->is_maximized = false;
+                wm_resize_backing_store(g_dragged_window);
+            } else if (mx > (int32_t)scr_w - 25) {
+                /* Snap Right */
+                g_dragged_window->normal_x = g_dragged_window->x;
+                g_dragged_window->normal_y = g_dragged_window->y;
+                g_dragged_window->normal_w = g_dragged_window->w;
+                g_dragged_window->normal_h = g_dragged_window->h;
+                
+                g_dragged_window->x = scr_w / 2 + 4;
+                g_dragged_window->y = THEME_PANEL_HEIGHT + 4;
+                g_dragged_window->w = scr_w / 2 - 8;
+                g_dragged_window->h = scr_h - THEME_PANEL_HEIGHT - THEME_DOCK_HEIGHT - 35;
+                g_dragged_window->is_maximized = false;
+                wm_resize_backing_store(g_dragged_window);
+            } else if (my < (int32_t)THEME_PANEL_HEIGHT + 25) {
+                /* Maximize */
+                g_dragged_window->normal_x = g_dragged_window->x;
+                g_dragged_window->normal_y = g_dragged_window->y;
+                g_dragged_window->normal_w = g_dragged_window->w;
+                g_dragged_window->normal_h = g_dragged_window->h;
+                
+                g_dragged_window->x = 0;
+                g_dragged_window->y = THEME_PANEL_HEIGHT;
+                g_dragged_window->w = scr_w;
+                g_dragged_window->h = scr_h - THEME_PANEL_HEIGHT;
+                g_dragged_window->is_maximized = true;
+                wm_resize_backing_store(g_dragged_window);
+            }
+            
+            /* Synchronize console text boundaries in real time */
+            if (g_dragged_window->id == 1) {
+                console_start_x = g_dragged_window->x + 15;
+                console_start_y = g_dragged_window->y + 40;
+                console_end_x = g_dragged_window->x + g_dragged_window->w - 15;
+                console_end_y = g_dragged_window->y + g_dragged_window->h - 15;
+            }
             g_dragged_window = NULL;
             comp_mark_dirty();
         }
         if (g_resizing_window) {
+            wm_resize_backing_store(g_resizing_window);
             g_resizing_window = NULL;
             comp_mark_dirty();
         }
@@ -1779,3 +1582,239 @@ static void browser_load_page(void)
     comp_mark_dirty();
 }
 #endif
+
+/* System Monitor implementation */
+static int32_t monitor_selected_tid = -1;
+static int cpu_history[50] = {0};
+static int history_count = 0;
+static int update_tick = 0;
+
+static void str_copy_local(char *dst, const char *src)
+{
+    while (*src) {
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+static void str_append_local(char *dst, const char *src)
+{
+    while (*dst) dst++;
+    str_copy_local(dst, src);
+}
+
+static void draw_monitor_content(Window *self)
+{
+    int32_t cx = self->x + 1;
+    int32_t cy = self->y + THEME_TITLEBAR_HEIGHT + 1;
+    uint32_t cw = self->w - 2;
+    uint32_t ch = self->h - THEME_TITLEBAR_HEIGHT - 2;
+
+    comp_fill_rect_alpha(cx, cy, cw, ch, THEME_WINDOW_BG);
+
+    update_tick++;
+    if (update_tick >= 10) {
+        update_tick = 0;
+        int active_threads = 0;
+        Thread *t = sched_get_thread_list();
+        if (t) {
+            Thread *curr = t;
+            do {
+                if (curr->state == THREAD_STATE_RUNNING || curr->state == THREAD_STATE_READY) {
+                    active_threads++;
+                }
+                curr = curr->next;
+            } while (curr != t);
+        }
+        int load = active_threads * 12;
+        if (load < 3) load = 3;
+        static uint32_t rand_state = 12345;
+        rand_state = rand_state * 1103515245 + 12345;
+        int noise = (rand_state / 65536) % 5;
+        load += noise;
+        if (load > 100) load = 99;
+        
+        for (int i = 0; i < 49; i++) {
+            cpu_history[i] = cpu_history[i + 1];
+        }
+        cpu_history[49] = load;
+        if (history_count < 50) history_count++;
+    }
+
+    int32_t gx = cx + 15;
+    int32_t gy = cy + 15;
+    int32_t gw = 210;
+    int32_t gh = 70;
+    
+    comp_fill_rect(gx, gy, gw, gh, NORD0 & 0x00FFFFFF);
+    comp_draw_rounded_rect_border(gx, gy, gw, gh, 0, 0x30FFFFFF);
+    
+    for (int y_line = 14; y_line < gh; y_line += 14) {
+        comp_draw_line(gx, gy + y_line, gx + gw - 1, gy + y_line, 0x15D8DEE9);
+    }
+    for (int x_line = 35; x_line < gw; x_line += 35) {
+        comp_draw_line(gx + x_line, gy, gx + x_line, gy + gh - 1, 0x15D8DEE9);
+    }
+    
+    int current_load = cpu_history[49];
+    for (int i = 50 - history_count; i < 49; i++) {
+        int x1 = gx + (i * gw / 50);
+        int y1 = gy + gh - (cpu_history[i] * gh / 100);
+        int x2 = gx + ((i + 1) * gw / 50);
+        int y2 = gy + gh - (cpu_history[i + 1] * gh / 100);
+        comp_draw_line(x1, y1, x2, y2, 0xFFA3BE8C);
+    }
+    
+    comp_draw_string(gx + 5, gy + 5, "CPU History", 0xFFD8DEE9, 0);
+    char cpu_str[32];
+    uint_to_str(current_load, cpu_str);
+    wm_str_cat(cpu_str, "%");
+    comp_draw_string(gx + gw - 40, gy + 5, cpu_str, 0xFFA3BE8C, 0);
+
+    int32_t mx = cx + 245;
+    int32_t my = cy + 15;
+    
+    size_t used = heap_get_used_memory();
+    size_t free_mem = heap_get_free_memory();
+    size_t total = used + free_mem;
+    
+    comp_draw_string(mx, my, "System Memory", 0xFFD8DEE9, 0);
+    comp_fill_rect(mx, my + 18, 210, 14, NORD0 & 0x00FFFFFF);
+    comp_draw_rounded_rect_border(mx, my + 18, 210, 14, 0, 0x30FFFFFF);
+    if (total > 0) {
+        int bar_w = (int)((used * 208) / total);
+        if (bar_w > 208) bar_w = 208;
+        comp_fill_rect(mx + 1, my + 19, bar_w, 12, 0xFF81A1C1);
+    }
+    
+    char mem_legend[128];
+    char val_buf[32];
+    uint_to_str(used / 1024, val_buf);
+    str_copy_local(mem_legend, "Used: ");
+    str_append_local(mem_legend, val_buf);
+    str_append_local(mem_legend, " KB / ");
+    uint_to_str(total / 1024, val_buf);
+    str_append_local(mem_legend, val_buf);
+    str_append_local(mem_legend, " KB");
+    comp_draw_string(mx, my + 38, mem_legend, 0xFFE5E9F0, 0);
+
+    int32_t tx = cx + 15;
+    int32_t ty = cy + 105;
+    int32_t tw = 450;
+    int32_t th = 130;
+    
+    comp_draw_rounded_rect_border(tx, ty, tw, th, 0, 0x30FFFFFF);
+    comp_fill_rect(tx + 1, ty + 1, tw - 2, 20, NORD0 & 0x00FFFFFF);
+    comp_draw_string(tx + 8, ty + 4, "PID", 0xFF88C0D0, 0);
+    comp_draw_string(tx + 60, ty + 4, "STATE", 0xFF88C0D0, 0);
+    comp_draw_string(tx + 160, ty + 4, "STACK RSP", 0xFF88C0D0, 0);
+    
+    Thread *t_list = sched_get_thread_list();
+    if (t_list) {
+        Thread *curr = t_list;
+        int row = 0;
+        do {
+            int32_t row_y = ty + 21 + row * 18;
+            if (row_y + 18 > ty + th) break;
+            
+            bool is_selected = (monitor_selected_tid == (int32_t)curr->id);
+            if (is_selected) {
+                comp_fill_rect(tx + 1, row_y, tw - 2, 17, 0xFF434C5E & 0x00FFFFFF);
+            } else if (row % 2 == 1) {
+                comp_fill_rect(tx + 1, row_y, tw - 2, 17, 0xFF2E3440 & 0x00FFFFFF);
+            }
+            
+            char pid_str[32];
+            uint_to_str(curr->id, pid_str);
+            comp_draw_string(tx + 8, row_y + 2, pid_str, 0xFFECEFF4, 0);
+            
+            const char *state_name = "UNKNOWN";
+            uint32_t state_color = 0xFFECEFF4;
+            switch (curr->state) {
+                case THREAD_STATE_READY:
+                    state_name = "READY";
+                    state_color = 0xFFEBCB8B;
+                    break;
+                case THREAD_STATE_RUNNING:
+                    state_name = "RUNNING";
+                    state_color = 0xFFA3BE8C;
+                    break;
+                case THREAD_STATE_BLOCKED:
+                    state_name = "BLOCKED";
+                    state_color = 0xFFD08770;
+                    break;
+                case THREAD_STATE_TERMINATED:
+                    state_name = "KILLED";
+                    state_color = 0xFFBF616A;
+                    break;
+            }
+            comp_draw_string(tx + 60, row_y + 2, state_name, state_color, 0);
+            
+            char rsp_str[32];
+            uint_to_hex(curr->rsp, rsp_str);
+            comp_draw_string(tx + 160, row_y + 2, rsp_str, 0xFFD8DEE9, 0);
+            
+            row++;
+            curr = curr->next;
+        } while (curr != t_list);
+    }
+
+    int32_t btn_x = cx + 335;
+    int32_t btn_y = cy + 245;
+    int32_t btn_w = 130;
+    int32_t btn_h = 24;
+    
+    comp_fill_rect(btn_x, btn_y, btn_w, btn_h, 0xFFBF616A & 0x00FFFFFF);
+    comp_draw_rounded_rect_border(btn_x, btn_y, btn_w, btn_h, 0, 0xFFECEFF4);
+    comp_draw_string(btn_x + 25, btn_y + 5, "KILL TASK", 0xFFECEFF4, 0);
+}
+
+static void handle_monitor_mouse(Window *self, int32_t mx, int32_t my, uint8_t buttons)
+{
+    bool left_pressed = (buttons & 1) != 0;
+    static bool prev_left = false;
+    bool clicked = left_pressed && !prev_left;
+    prev_left = left_pressed;
+
+    if (!clicked) return;
+
+    int32_t cx = self->x + 1;
+    int32_t cy = self->y + THEME_TITLEBAR_HEIGHT + 1;
+
+    int32_t tx = cx + 15;
+    int32_t ty = cy + 105;
+    int32_t tw = 450;
+    int32_t th = 130;
+
+    if (mx >= tx && mx < tx + tw && my >= ty + 21 && my < ty + th) {
+        int row_index = (my - (ty + 21)) / 18;
+        
+        Thread *t_list = sched_get_thread_list();
+        if (t_list) {
+            Thread *curr = t_list;
+            int r = 0;
+            do {
+                if (r == row_index) {
+                    monitor_selected_tid = (int32_t)curr->id;
+                    break;
+                }
+                r++;
+                curr = curr->next;
+            } while (curr != t_list);
+        }
+        comp_mark_dirty();
+    }
+
+    int32_t btn_x = cx + 335;
+    int32_t btn_y = cy + 245;
+    int32_t btn_w = 130;
+    int32_t btn_h = 24;
+
+    if (mx >= btn_x && mx < btn_x + btn_w && my >= btn_y && my < btn_y + btn_h) {
+        if (monitor_selected_tid >= 1) {
+            sched_kill_thread(monitor_selected_tid);
+            monitor_selected_tid = -1;
+            comp_mark_dirty();
+        }
+    }
+}

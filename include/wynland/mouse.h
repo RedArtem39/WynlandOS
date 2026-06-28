@@ -16,3 +16,4 @@ void mouse_show(void);
 int32_t mouse_get_x(void);
 int32_t mouse_get_y(void);
 uint8_t mouse_get_buttons(void);
+int     mouse_read_queue(uint8_t *buf, int size);

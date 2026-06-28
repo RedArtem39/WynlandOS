@@ -25,6 +25,16 @@ public:
         w = i * 9; /* Each character is 9 pixels wide */
     }
     
+    void setText(const char* text) {
+        uint32_t i = 0;
+        while (text[i] && i < 63) {
+            m_text[i] = text[i];
+            i++;
+        }
+        m_text[i] = '\0';
+        w = i * 9;
+    }
+    
     void paint() override {
         int32_t ax, ay;
         get_absolute_pos(ax, ay);
@@ -41,6 +51,15 @@ private:
 public:
     Button(int32_t x, int32_t y, uint32_t w, uint32_t h, const char* text, void (*on_click)())
         : Widget(x, y, w, h), m_on_click(on_click), m_pressed(false) {
+        uint32_t i = 0;
+        while (text[i] && i < 31) {
+            m_text[i] = text[i];
+            i++;
+        }
+        m_text[i] = '\0';
+    }
+
+    void setText(const char* text) {
         uint32_t i = 0;
         while (text[i] && i < 31) {
             m_text[i] = text[i];
@@ -85,6 +104,11 @@ public:
         
         /* Propagate to child widgets if any */
         Widget::handle_mouse(mx, my, buttons);
+    }
+
+    uint8_t get_hover_cursor(int32_t mx, int32_t my) override {
+        (void)mx; (void)my;
+        return 1; // CURSOR_POINTER
     }
 };
 
@@ -134,6 +158,10 @@ public:
         }
         Widget::handle_mouse(mx, my, buttons);
     }
-};
 
+    uint8_t get_hover_cursor(int32_t mx, int32_t my) override {
+        (void)mx; (void)my;
+        return 1; // CURSOR_POINTER
+    }
+};
 } // namespace ui

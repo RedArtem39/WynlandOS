@@ -12,6 +12,7 @@
 #define PAGE_USER     (1ULL << 2)
 #define PAGE_WRITE_THROUGH (1ULL << 3)  /* PWT bit */
 #define PAGE_CACHE_DISABLE (1ULL << 4)  /* PCD bit */
+#define PAGE_PAT      (1ULL << 7)  /* PAT bit */
 #define PAGE_NX       0ULL         /* Disabled to prevent hypervisor crashes when EFER.NXE is not enabled */
 #define PAGE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
@@ -38,6 +39,9 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt);
 
 /* Get the current PML4 page table root */
 PageTable *vmm_get_current_pml4(void);
+
+/* Get physical address of a virtual address by traversing page tables */
+uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt);
 
 /* Map a memory-mapped I/O (MMIO) region */
 void vmm_map_mmio(uint64_t phys_addr, uint64_t size);

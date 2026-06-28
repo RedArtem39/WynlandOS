@@ -14,6 +14,7 @@
 #include <wynland/wlang.h>
 #include <wynland/types.h>
 #include <wynland/vfs.h>
+#include <wynland/http.h>
 
 extern void *kmalloc(size_t size);
 extern void  kfree(void *ptr);
@@ -57,6 +58,17 @@ static void wl_strncpy(char *d, const char *s, uint32_t n) {
 static int wl_strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return *(const unsigned char *)a - *(const unsigned char *)b;
+}
+
+static int wl_strncmp(const char *a, const char *b, size_t n) {
+    if (n == 0) return 0;
+    while (n-- > 0) {
+        if (*a != *b) return (int)(*(const unsigned char *)a - *(const unsigned char *)b);
+        if (*a == '\0') return 0;
+        a++;
+        b++;
+    }
+    return 0;
 }
 
 static void wl_strcat(char *d, const char *s) {
@@ -925,6 +937,121 @@ static void wlang_ls_callback(VfsNode *node) {
     wlang_print_output("\n");
 }
 
+static void sanitize_html(const char *html, char *out, uint32_t max_len)
+{
+    uint32_t in_pos = 0;
+    uint32_t out_pos = 0;
+    bool in_script = false;
+    bool in_style = false;
+    bool in_head = false;
+    bool last_was_space = false;
+    
+    while (html[in_pos] && out_pos < max_len - 1) {
+        if (html[in_pos] == '<') {
+            bool keep = false;
+            
+            if (wl_strncmp(html + in_pos, "<a ", 3) == 0 ||
+                wl_strncmp(html + in_pos, "<a>", 3) == 0 ||
+                wl_strncmp(html + in_pos, "</a>", 4) == 0 ||
+                wl_strncmp(html + in_pos, "<h1>", 4) == 0 ||
+                wl_strncmp(html + in_pos, "</h1>", 5) == 0 ||
+                wl_strncmp(html + in_pos, "<h2>", 4) == 0 ||
+                wl_strncmp(html + in_pos, "</h2>", 5) == 0 ||
+                wl_strncmp(html + in_pos, "<p>", 3) == 0 ||
+                wl_strncmp(html + in_pos, "<p ", 3) == 0 ||
+                wl_strncmp(html + in_pos, "</p>", 4) == 0 ||
+                wl_strncmp(html + in_pos, "<br>", 4) == 0 ||
+                wl_strncmp(html + in_pos, "<br/>", 5) == 0 ||
+                wl_strncmp(html + in_pos, "<br ", 4) == 0) {
+                keep = true;
+            }
+            
+            if (wl_strncmp(html + in_pos, "<script", 7) == 0) {
+                in_script = true;
+            } else if (wl_strncmp(html + in_pos, "<style", 6) == 0) {
+                in_style = true;
+            } else if (wl_strncmp(html + in_pos, "<head", 5) == 0) {
+                in_head = true;
+            } else if (wl_strncmp(html + in_pos, "</script>", 9) == 0) {
+                in_script = false;
+                in_pos += 9;
+                continue;
+            } else if (wl_strncmp(html + in_pos, "</style>", 8) == 0) {
+                in_style = false;
+                in_pos += 8;
+                continue;
+            } else if (wl_strncmp(html + in_pos, "</head>", 7) == 0) {
+                in_head = false;
+                in_pos += 7;
+                continue;
+            }
+            
+            if (keep) {
+                while (html[in_pos] && html[in_pos] != '>') {
+                    if (out_pos < max_len - 1) {
+                        out[out_pos++] = html[in_pos++];
+                    } else {
+                        break;
+                    }
+                }
+                if (html[in_pos] == '>') {
+                    if (out_pos < max_len - 1) {
+                        out[out_pos++] = html[in_pos++];
+                    }
+                }
+                continue;
+            } else {
+                if (wl_strncmp(html + in_pos, "<div", 4) == 0 ||
+                    wl_strncmp(html + in_pos, "</div", 5) == 0 ||
+                    wl_strncmp(html + in_pos, "<tr", 3) == 0 ||
+                    wl_strncmp(html + in_pos, "<li", 3) == 0 ||
+                    wl_strncmp(html + in_pos, "<ul", 3) == 0) {
+                    if (out_pos > 0 && out[out_pos - 1] != '\n') {
+                        out[out_pos++] = '\n';
+                    }
+                }
+                
+                while (html[in_pos] && html[in_pos] != '>') {
+                    in_pos++;
+                }
+                if (html[in_pos] == '>') {
+                    in_pos++;
+                }
+                continue;
+            }
+        } else {
+            char c = html[in_pos];
+            if (in_script || in_style || in_head) {
+                in_pos++;
+                continue;
+            }
+            
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                if (!last_was_space) {
+                    out[out_pos++] = (c == '\n' || c == '\r') ? '\n' : ' ';
+                    last_was_space = true;
+                }
+            } else {
+                out[out_pos++] = c;
+                last_was_space = false;
+            }
+            in_pos++;
+        }
+    }
+    out[out_pos] = '\0';
+}
+
+static void sanitize_buf(int len) {
+    if (len < 0) return;
+    wl_http_buf[len] = '\0';
+    char *temp_html = (char *)kmalloc(16384);
+    if (temp_html) {
+        wl_strcpy(temp_html, wl_http_buf);
+        sanitize_html(temp_html, wl_http_buf, sizeof(wl_http_buf));
+        kfree(temp_html);
+    }
+}
+
 /* Built-in function dispatch */
 static bool call_builtin(const char *name, Val *args, int nargs, Val *out) {
 
@@ -1241,12 +1368,11 @@ static bool call_builtin(const char *name, Val *args, int nargs, Val *out) {
             uint16_t port = (uint16_t)args[1].ival;
             const char *path = args[2].sval ? args[2].sval : "";
 
-            #include <wynland/http.h>
             HttpResponse resp;
             memset(wl_http_buf, 0, sizeof(wl_http_buf));
             int ret = http_get(host, port, path, wl_http_buf, sizeof(wl_http_buf) - 1, &resp);
             if (ret >= 0) {
-                wl_http_buf[ret] = '\0';
+                sanitize_buf(ret);
                 *out = val_str(wl_http_buf);
             } else {
                 extern uint32_t net_str_to_ip(const char *str);
@@ -1255,7 +1381,7 @@ static bool call_builtin(const char *name, Val *args, int nargs, Val *out) {
                     ret = http_get_ip(ip, port, host, path, wl_http_buf, sizeof(wl_http_buf) - 1, &resp);
                 }
                 if (ret >= 0) {
-                    wl_http_buf[ret] = '\0';
+                    sanitize_buf(ret);
                     *out = val_str(wl_http_buf);
                 } else {
                     *out = val_str("<html><h1>Connection Error</h1><p>Could not connect to host.</p></html>");
@@ -1263,6 +1389,68 @@ static bool call_builtin(const char *name, Val *args, int nargs, Val *out) {
             }
         } else {
             *out = val_str("");
+        }
+        return true;
+    }
+
+    if (wl_strcmp(name, "https_get") == 0 && nargs == 3) {
+        if (args[0].type == V_STR && args[1].type == V_INT && args[2].type == V_STR) {
+            const char *host = args[0].sval ? args[0].sval : "";
+            uint16_t port = (uint16_t)args[1].ival;
+            const char *path = args[2].sval ? args[2].sval : "";
+
+            HttpResponse resp;
+            memset(wl_http_buf, 0, sizeof(wl_http_buf));
+            int ret = https_get(host, port, path, wl_http_buf, sizeof(wl_http_buf) - 1, &resp);
+            if (ret >= 0) {
+                sanitize_buf(ret);
+                *out = val_str(wl_http_buf);
+            } else {
+                extern uint32_t net_str_to_ip(const char *str);
+                uint32_t ip = net_str_to_ip(host);
+                if (ip != 0) {
+                    ret = https_get_ip(ip, port, host, path, wl_http_buf, sizeof(wl_http_buf) - 1, &resp);
+                }
+                if (ret >= 0) {
+                    sanitize_buf(ret);
+                    *out = val_str(wl_http_buf);
+                } else {
+                    *out = val_str("<html><h1>Connection Error</h1><p>Could not connect to secure host.</p></html>");
+                }
+            }
+        } else {
+            *out = val_str("");
+        }
+        return true;
+    }
+
+    if (wl_strcmp(name, "js_init") == 0 && nargs == 0) {
+        extern void js_engine_init(void);
+        js_engine_init();
+        *out = val_nil();
+        return true;
+    }
+
+    if (wl_strcmp(name, "js_eval") == 0 && nargs == 1) {
+        if (args[0].type == V_STR) {
+            extern const char *js_engine_eval(const char *code);
+            const char *code = args[0].sval ? args[0].sval : "";
+            const char *res = js_engine_eval(code);
+            *out = val_str(res ? res : "");
+        } else {
+            *out = val_str("Error: js_eval expects string");
+        }
+        return true;
+    }
+
+    if (wl_strcmp(name, "js_get_state") == 0 && nargs == 1) {
+        if (args[0].type == V_STR) {
+            extern int js_engine_get_state(const char *name);
+            const char *state_name = args[0].sval ? args[0].sval : "";
+            int val = js_engine_get_state(state_name);
+            *out = val_int(val);
+        } else {
+            *out = val_int(-1);
         }
         return true;
     }

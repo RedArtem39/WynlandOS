@@ -32,27 +32,53 @@
 #define NORD14  0xFFA3BE8C   /* Green  - maximize button  */
 #define NORD15  0xFFB48EAD   /* Purple                    */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+extern uint32_t g_theme_desktop_top;
+extern uint32_t g_theme_desktop_bot;
+extern uint32_t g_theme_panel_bg;
+extern uint32_t g_theme_titlebar_bg;
+extern uint32_t g_theme_titlebar_fg;
+extern uint32_t g_theme_window_bg;
+extern uint32_t g_theme_window_border;
+extern uint32_t g_theme_text_primary;
+extern uint32_t g_theme_text_secondary;
+extern uint32_t g_theme_accent;
+extern uint32_t g_theme_term_bg;
+extern uint32_t g_theme_btn_close;
+extern uint32_t g_theme_btn_minimize;
+extern uint32_t g_theme_btn_maximize;
+extern uint32_t g_theme_dock_bg;
+extern bool g_dark_mode;
+void theme_set_dark_mode(bool dark);
+
+#ifdef __cplusplus
+}
+#endif
+
 /* ---- Derived Theme Colors ---- */
-#define THEME_DESKTOP_TOP      NORD0
-#define THEME_DESKTOP_BOT      0xFF232831   /* slightly darker than NORD0  */
-#define THEME_PANEL_BG         0xC03B4252   /* NORD1 with 75% alpha        */
+#define THEME_DESKTOP_TOP      g_theme_desktop_top
+#define THEME_DESKTOP_BOT      g_theme_desktop_bot
+#define THEME_PANEL_BG         g_theme_panel_bg
 #define THEME_PANEL_HEIGHT     24
-#define THEME_TITLEBAR_BG      0xD53B4252   /* NORD1 with 83% alpha        */
+#define THEME_TITLEBAR_BG      g_theme_titlebar_bg
 #define THEME_TITLEBAR_HEIGHT  28
-#define THEME_TITLEBAR_FG      NORD6
-#define THEME_WINDOW_BG        0xD52E3440   /* NORD0 with 83% alpha */
-#define THEME_WINDOW_BORDER    NORD3
-#define THEME_TEXT_PRIMARY     NORD6
-#define THEME_TEXT_SECONDARY   NORD4
-#define THEME_ACCENT           NORD8
-#define THEME_TERM_BG          0xC00F0F1A   /* Catppuccin dark with 75% alpha */
+#define THEME_TITLEBAR_FG      g_theme_titlebar_fg
+#define THEME_WINDOW_BG        g_theme_window_bg
+#define THEME_WINDOW_BORDER    g_theme_window_border
+#define THEME_TEXT_PRIMARY     g_theme_text_primary
+#define THEME_TEXT_SECONDARY   g_theme_text_secondary
+#define THEME_ACCENT           g_theme_accent
+#define THEME_TERM_BG          g_theme_term_bg
 
 /* ---- Close / Minimize / Maximize (traffic light) ---- */
-#define THEME_BTN_CLOSE        NORD11
-#define THEME_BTN_MINIMIZE     NORD13
-#define THEME_BTN_MAXIMIZE     NORD14
+#define THEME_BTN_CLOSE        g_theme_btn_close
+#define THEME_BTN_MINIMIZE     g_theme_btn_minimize
+#define THEME_BTN_MAXIMIZE     g_theme_btn_maximize
 
 /* ---- Dock ---- */
-#define THEME_DOCK_BG          0xB03B4252   /* NORD1 with 69% alpha */
+#define THEME_DOCK_BG          g_theme_dock_bg
 #define THEME_DOCK_HEIGHT      48
 #define THEME_DOCK_ICON_SIZE   32

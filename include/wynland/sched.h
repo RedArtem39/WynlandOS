@@ -32,3 +32,5 @@ void sched_schedule(void);
 Thread *sched_current(void);
 void sched_preempt_tick(void);
 void sched_print_tasks(BootInfo *info, uint32_t bg_color);
+Thread *sched_get_thread_list(void);
+bool sched_kill_thread(uint64_t id);

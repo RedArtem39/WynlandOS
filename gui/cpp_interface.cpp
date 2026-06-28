@@ -1,6 +1,7 @@
 #include "window.h"
 #include "widget.hpp"
 #include "widgets.hpp"
+#include "qt.hpp"
 
 extern "C" {
     void wm_paint_cpp_widgets(void* root) {
@@ -49,37 +50,81 @@ extern "C" {
         g_sys_volume = val;
     }
 
-    /* Helper container widget that holds children */
-    class Container : public ui::Widget {
-    public:
-        Container(int32_t x, int32_t y, uint32_t w, uint32_t h)
-            : ui::Widget(x, y, w, h) {}
-        void paint() override {
-            paint_children();
-        }
-    };
+    extern void comp_set_live_wallpaper(bool active, uint32_t style);
+
+    static void on_wallpaper_default_clicked() {
+        comp_set_live_wallpaper(false, 0);
+    }
+
+    static void on_wallpaper_aurora_clicked() {
+        comp_set_live_wallpaper(true, 1);
+    }
+
+    static void on_wallpaper_snow_clicked() {
+        comp_set_live_wallpaper(true, 2);
+    }
 
     void wm_init_settings_widgets(void* settings_win_ptr) {
         Window* win = static_cast<Window*>(settings_win_ptr);
 
-        /* Construct root container */
-        Container* root = new Container(win->x + 1, win->y + THEME_TITLEBAR_HEIGHT + 1, win->w - 2, win->h - THEME_TITLEBAR_HEIGHT - 2);
+        /* Construct central Qt widget representing window client area */
+        QWidget* central = new QWidget(win->x + 1, win->y + THEME_TITLEBAR_HEIGHT + 1, win->w - 2, win->h - THEME_TITLEBAR_HEIGHT - 2);
 
-        /* Add Title Label */
-        root->add_child(new ui::Label(20, 20, "System Settings (C++)"));
+        /* Main vertical layout */
+        QVBoxLayout* main_layout = new QVBoxLayout(central);
 
-        /* Add Volume Control section */
-        root->add_child(new ui::Label(20, 55, "Volume Control"));
+        /* 1. Header label */
+        QLabel* header = new QLabel("System Configuration (Qt C++)", central);
+        main_layout->addWidget(header);
+
+        /* 2. Volume control section */
+        QLabel* vol_label = new QLabel("Volume Control", central);
+        main_layout->addWidget(vol_label);
+
         extern int g_sys_volume;
-        root->add_child(new ui::Slider(20, 75, 200, g_sys_volume, on_volume_changed));
+        QSlider* vol_slider = new QSlider(Qt::Horizontal, g_sys_volume, on_volume_changed, central);
+        main_layout->addWidget(vol_slider);
 
-        /* Add Buttons section */
-        root->add_child(new ui::Label(20, 105, "Quick Actions"));
-        root->add_child(new ui::Button(20, 130, 110, 28, "Play Chime", on_chime_clicked));
-        root->add_child(new ui::Button(140, 130, 90, 28, "Reboot", on_reboot_clicked));
+        /* 3. Action buttons section */
+        QLabel* act_label = new QLabel("Quick Actions", central);
+        main_layout->addWidget(act_label);
 
-        /* Save to Window */
-        win->cpp_widgets_root = root;
+        QWidget* button_container = new QWidget(central);
+        QHBoxLayout* button_layout = new QHBoxLayout(button_container);
+
+        QPushButton* chime_btn = new QPushButton("Play Chime", button_container);
+        chime_btn->setCallback(on_chime_clicked);
+        button_layout->addWidget(chime_btn);
+
+        QPushButton* reboot_btn = new QPushButton("Reboot System", button_container);
+        reboot_btn->setCallback(on_reboot_clicked);
+        button_layout->addWidget(reboot_btn);
+
+        main_layout->addWidget(button_container);
+
+        /* 4. Desktop Wallpaper section */
+        QLabel* wp_label = new QLabel("Desktop Wallpaper", central);
+        main_layout->addWidget(wp_label);
+
+        QWidget* wp_container = new QWidget(central);
+        QHBoxLayout* wp_layout = new QHBoxLayout(wp_container);
+
+        QPushButton* wp_def_btn = new QPushButton("Default", wp_container);
+        wp_def_btn->setCallback(on_wallpaper_default_clicked);
+        wp_layout->addWidget(wp_def_btn);
+
+        QPushButton* wp_aur_btn = new QPushButton("Aurora", wp_container);
+        wp_aur_btn->setCallback(on_wallpaper_aurora_clicked);
+        wp_layout->addWidget(wp_aur_btn);
+
+        QPushButton* wp_snow_btn = new QPushButton("Starfield", wp_container);
+        wp_snow_btn->setCallback(on_wallpaper_snow_clicked);
+        wp_layout->addWidget(wp_snow_btn);
+
+        main_layout->addWidget(wp_container);
+
+        /* Save C++ Widgets root container to window */
+        win->cpp_widgets_root = central;
         win->handle_mouse_cb = wm_handle_mouse_cpp_widgets;
     }
 }

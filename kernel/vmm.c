@@ -69,6 +69,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     /* 4. Map the physical address in the Page Table */
     pt->entries[pt_idx] = phys | flags | PAGE_PRESENT;
 
+    /*
     if (virt >= 0x10000000 && virt < 0x11000000) {
         serial_write_string("VMM Map: ");
         char buf[32];
@@ -79,6 +80,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
         uint_to_hex((uint64_t)(uintptr_t)pt, buf); serial_write_string(buf); serial_write_string(" idx=");
         uint_to_str(pt_idx, buf); serial_write_string(buf); serial_write_string(")\r\n");
     }
+    */
 
     /* 5. Invalidate TLB for this virtual address */
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
@@ -122,6 +124,43 @@ cleanup:
     if (rflags & 0x200) {
         __asm__ volatile("sti");
     }
+}
+
+uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
+{
+    uint64_t pml4_idx = PML4_INDEX(virt);
+    uint64_t pdpt_idx = PDPT_INDEX(virt);
+    uint64_t pd_idx   = PD_INDEX(virt);
+    uint64_t pt_idx   = PT_INDEX(virt);
+
+    PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
+    if (!(*pml4_entry & PAGE_PRESENT)) return 0;
+    
+    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
+    if (!(*pdpt_entry & PAGE_PRESENT)) return 0;
+
+    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pd_entry = &pd->entries[pd_idx];
+    if (!(*pd_entry & PAGE_PRESENT)) return 0;
+
+    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pt_entry = &pt->entries[pt_idx];
+    if (!(*pt_entry & PAGE_PRESENT)) return 0;
+
+    return (*pt_entry & PAGE_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
+}
+
+static inline uint64_t read_msr(uint32_t msr) {
+    uint32_t low, high;
+    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
+    return ((uint64_t)high << 32) | low;
+}
+
+static inline void write_msr(uint32_t msr, uint64_t val) {
+    uint32_t low = (uint32_t)val;
+    uint32_t high = (uint32_t)(val >> 32);
+    __asm__ volatile("wrmsr" :: "a"(low), "d"(high), "c"(msr));
 }
 
 void vmm_init(BootInfo *boot_info)
@@ -170,13 +209,19 @@ void vmm_init(BootInfo *boot_info)
         }
     }
 
+    /* Configure PAT4 as Write-Combining (01h) in PAT MSR 0x277 */
+    uint64_t pat = read_msr(0x277);
+    pat &= ~(0xFFULL << 32); /* Clear PAT4 (bits 32..39) */
+    pat |= (0x01ULL << 32);  /* Set PAT4 to WC (01h) */
+    write_msr(0x277, pat);
+
     /* 3. Identity map the Graphics Output Protocol (GOP) Framebuffer */
     uint64_t fb_start = boot_info->fb_addr;
     uint64_t fb_size = boot_info->fb_pitch * boot_info->fb_height;
     fb_size = (fb_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (uint64_t offset = 0; offset < fb_size; offset += PAGE_SIZE) {
-        vmm_map_page(pml4, fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH);
+        vmm_map_page(pml4, fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX | PAGE_PAT);
     }
 
     /* 4. Switch to our new PML4 page table by loading it into CR3 */

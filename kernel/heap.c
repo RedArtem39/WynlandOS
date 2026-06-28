@@ -16,7 +16,7 @@ typedef struct HeapHeader {
 } HeapHeader;
 
 static HeapHeader *heap_first = NULL;
-static uint64_t heap_end_addr = HEAP_START;
+uint64_t heap_end_addr = HEAP_START;
 static uint64_t heap_max_limit = HEAP_START + (HEAP_MAX_PAGES * PAGE_SIZE);
 
 /* Alignment helper (aligns to 16 bytes) */
@@ -114,6 +114,7 @@ void *kmalloc(size_t size)
     void *result = NULL;
     size_t aligned_size = align_up(size);
 
+    /*
     serial_write_string("kmalloc: size=0x");
     char buf[32];
     uint_to_hex((uint64_t)size, buf); serial_write_string(buf);
@@ -122,6 +123,7 @@ void *kmalloc(size_t size)
     serial_write_string(" end=0x");
     uint_to_hex(heap_end_addr, buf); serial_write_string(buf);
     serial_write_string("\r\n");
+    */
 
     /* Search for first free block that fits */
     HeapHeader *curr = heap_first;
@@ -221,4 +223,13 @@ size_t heap_get_free_memory(void)
         curr = curr->next;
     }
     return free_mem;
+}
+
+size_t heap_get_block_size(void *ptr)
+{
+    if (ptr == NULL) {
+        return 0;
+    }
+    HeapHeader *block = (HeapHeader *)((uintptr_t)ptr - sizeof(HeapHeader));
+    return block->size;
 }

@@ -140,6 +140,19 @@ void sched_schedule(void) {
     next_thread->state = THREAD_STATE_RUNNING;
     current_thread = next_thread;
 
+    // Update TSS interrupt stack pointer for the new thread
+    {
+        uint64_t next_rsp0;
+        if (next_thread->stack_orig) {
+            next_rsp0 = ((uint64_t)next_thread->stack_orig + THREAD_STACK_SIZE) & ~0xFULL;
+        } else {
+            extern uint64_t gdt_original_tss_rsp0;
+            next_rsp0 = gdt_original_tss_rsp0;
+        }
+        extern void gdt_update_tss_rsp0(uint64_t rsp0);
+        gdt_update_tss_rsp0(next_rsp0);
+    }
+
     context_switch(&prev_thread->rsp, next_thread->rsp);
 }
 
@@ -220,4 +233,33 @@ void sched_print_tasks(BootInfo *info, uint32_t bg_color) {
     if (rflags & 0x200) {
         __asm__ volatile("sti");
     }
+}
+
+Thread *sched_get_thread_list(void) {
+    return thread_list;
+}
+
+bool sched_kill_thread(uint64_t id) {
+    if (id == 0) return false;
+    
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    
+    Thread *t = thread_list;
+    bool found = false;
+    if (t) {
+        do {
+            if (t->id == id) {
+                t->state = THREAD_STATE_TERMINATED;
+                found = true;
+                break;
+            }
+            t = t->next;
+        } while (t != thread_list);
+    }
+    
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+    return found;
 }

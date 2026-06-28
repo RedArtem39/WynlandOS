@@ -15,6 +15,7 @@
 #include <wynland/heap.h>
 #include <wynland/font.h>
 #include <wynland/irq.h>
+#include <wynland/vfs.h>
 
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
@@ -24,6 +25,10 @@ extern void *memset(void *s, int c, size_t n);
 /* ---- Global compositor instance ---- */
 static Compositor g_comp;
 static uint32_t *g_wallpaper_cache = NULL;
+static bool g_live_wallpaper_active = false;
+static uint32_t g_live_wallpaper_style = 0;
+static uint32_t *g_blur_temp = NULL;
+static uint32_t  g_blur_temp_size = 0;
 
 /* ---- Bounded Dirty Rectangle tracking ---- */
 static int32_t g_dirty_x1 = 999999;
@@ -221,6 +226,13 @@ void compositor_init(BootInfo *info)
         return;
     }
 
+    /* Allocate blur temp buffer to avoid allocations inside drawing loop */
+    g_blur_temp_size = g_comp.fb_width * g_comp.fb_height;
+    g_blur_temp = (uint32_t *)kmalloc(g_blur_temp_size * 4);
+    if (!g_blur_temp) {
+        serial_write_string("Compositor: ERROR - failed to allocate blur temp buffer!\r\n");
+    }
+
     /* Precompute wallpaper cache */
     comp_precompute_wallpaper();
 
@@ -324,8 +336,8 @@ void comp_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t col
 
     /* Clamp */
     if (x >= bw || y >= bh) return;
-    if (x + w > bw) w = bw - x;
-    if (y + h > bh) h = bh - y;
+    if (x + w < x || x + w > bw) w = bw - x;
+    if (y + h < y || y + h > bh) h = bh - y;
 
     for (uint32_t row = 0; row < h; row++) {
         uint32_t *dst = &g_comp.back_buffer[(y + row) * bw + x];
@@ -345,8 +357,8 @@ void comp_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     uint32_t bh = g_comp.fb_height;
 
     if (x >= bw || y >= bh) return;
-    if (x + w > bw) w = bw - x;
-    if (y + h > bh) h = bh - y;
+    if (x + w < x || x + w > bw) w = bw - x;
+    if (y + h < y || y + h > bh) h = bh - y;
 
     uint32_t alpha = (argb >> 24) & 0xFF;
     if (alpha == 0) return;
@@ -359,6 +371,9 @@ void comp_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
     uint32_t src_g = (argb >>  8) & 0xFF;
     uint32_t src_b = (argb      ) & 0xFF;
 
+    uint32_t src_r_a = src_r * alpha;
+    uint32_t src_g_a = src_g * alpha;
+    uint32_t src_b_a = src_b * alpha;
     uint32_t inv_alpha = 255 - alpha;
 
     for (uint32_t row = 0; row < h; row++) {
@@ -369,9 +384,9 @@ void comp_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32
             uint32_t bg_g = (bg >>  8) & 0xFF;
             uint32_t bg_b = (bg      ) & 0xFF;
 
-            uint32_t r_sum = src_r * alpha + bg_r * inv_alpha;
-            uint32_t g_sum = src_g * alpha + bg_g * inv_alpha;
-            uint32_t b_sum = src_b * alpha + bg_b * inv_alpha;
+            uint32_t r_sum = src_r_a + bg_r * inv_alpha;
+            uint32_t g_sum = src_g_a + bg_g * inv_alpha;
+            uint32_t b_sum = src_b_a + bg_b * inv_alpha;
 
             uint32_t out_r = (r_sum + 1 + (r_sum >> 8)) >> 8;
             uint32_t out_g = (g_sum + 1 + (g_sum >> 8)) >> 8;
@@ -390,16 +405,17 @@ void comp_box_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radi
     uint32_t *buf = g_comp.back_buffer;
 
     if (x >= bw || y >= bh) return;
-    if (x + w > bw) w = bw - x;
-    if (y + h > bh) h = bh - y;
+    if (x + w < x || x + w > bw) w = bw - x;
+    if (y + h < y || y + h > bh) h = bh - y;
     if (w == 0 || h == 0) return;
     if (radius == 0) return;
 
-    /* Separable sliding-window fast box blur */
-    uint32_t *temp = (uint32_t *)kmalloc(w * h * sizeof(uint32_t));
-    if (!temp) return;
+    /* Separable sliding-window fast box blur using static buffer */
+    uint32_t *temp = g_blur_temp;
+    if (!temp || w * h > g_blur_temp_size) return;
 
     int32_t div = 2 * radius + 1;
+    uint32_t inv_div = (1u << 16) / (uint32_t)div;
 
     /* Pass 1: Horizontal Blur */
     for (uint32_t row = 0; row < h; row++) {
@@ -418,7 +434,10 @@ void comp_box_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radi
         }
 
         for (uint32_t col = 0; col < w; col++) {
-            temp[row * w + col] = ((r_sum / div) << 16) | ((g_sum / div) << 8) | (b_sum / div);
+            uint32_t out_r = (uint32_t)(((uint64_t)r_sum * inv_div) >> 16);
+            uint32_t out_g = (uint32_t)(((uint64_t)g_sum * inv_div) >> 16);
+            uint32_t out_b = (uint32_t)(((uint64_t)b_sum * inv_div) >> 16);
+            temp[row * w + col] = (out_r << 16) | (out_g << 8) | out_b;
 
             int32_t out_idx = (int32_t)col - radius;
             if (out_idx < 0) out_idx = 0;
@@ -454,7 +473,10 @@ void comp_box_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radi
         }
 
         for (uint32_t row = 0; row < h; row++) {
-            buf[(y + row) * bw + (x + col)] = ((r_sum / div) << 16) | ((g_sum / div) << 8) | (b_sum / div);
+            uint32_t out_r = (uint32_t)(((uint64_t)r_sum * inv_div) >> 16);
+            uint32_t out_g = (uint32_t)(((uint64_t)g_sum * inv_div) >> 16);
+            uint32_t out_b = (uint32_t)(((uint64_t)b_sum * inv_div) >> 16);
+            buf[(y + row) * bw + (x + col)] = (out_r << 16) | (out_g << 8) | out_b;
 
             int32_t out_idx = (int32_t)row - radius;
             if (out_idx < 0) out_idx = 0;
@@ -473,8 +495,56 @@ void comp_box_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radi
         }
     }
 
-    kfree(temp);
     comp_mark_area_dirty(x, y, x + w - 1, y + h - 1);
+}
+
+void comp_gaussian_blur(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t sigma)
+{
+    /* Stacked box blur: 3 passes with radius = sigma/3 approximates Gaussian blur */
+    uint32_t r = sigma / 3;
+    if (r < 1) r = 1;
+    comp_box_blur(x, y, w, h, r);
+    comp_box_blur(x, y, w, h, r);
+    comp_box_blur(x, y, w, h, r);
+}
+
+void comp_draw_glass_surface(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t corner_radius,
+                             uint32_t tint_color,
+                             uint32_t blur_radius,
+                             uint32_t border_color)
+{
+    if (w < 2 * corner_radius) corner_radius = w / 2;
+    if (h < 2 * corner_radius) corner_radius = h / 2;
+
+    /* 1. Blur the background region under the surface */
+    comp_gaussian_blur(x, y, w, h, blur_radius);
+
+    /* 2. Draw the glass tint */
+    if (corner_radius == 0) {
+        comp_fill_rect_alpha(x, y, w, h, tint_color);
+        /* Top highlight / bottom shadow */
+        comp_fill_rect_alpha(x, y, w, 1, 0x30FFFFFF);
+        comp_fill_rect_alpha(x, y + h - 1, w, 1, 0x15000000);
+        /* Border */
+        if ((border_color >> 24) & 0xFF) {
+            comp_fill_rect_alpha(x, y, w, 1, border_color);
+            comp_fill_rect_alpha(x, y + h - 1, w, 1, border_color);
+            comp_fill_rect_alpha(x, y + 1, 1, h - 2, border_color);
+            comp_fill_rect_alpha(x + w - 1, y + 1, 1, h - 2, border_color);
+        }
+    } else {
+        comp_draw_rounded_rect(x, y, w, h, corner_radius, tint_color);
+        /* Top highlight / bottom shadow */
+        if (w > 2 * corner_radius) {
+            comp_fill_rect_alpha(x + corner_radius, y, w - 2 * corner_radius, 1, 0x30FFFFFF);
+            comp_fill_rect_alpha(x + corner_radius, y + h - 1, w - 2 * corner_radius, 1, 0x15000000);
+        }
+        /* Border */
+        if ((border_color >> 24) & 0xFF) {
+            comp_draw_rounded_rect_border(x, y, w, h, corner_radius, border_color);
+        }
+    }
 }
 
 static void get_braille_glyph(uint8_t mask, uint8_t *glyph)
@@ -504,25 +574,53 @@ static void get_braille_glyph(uint8_t mask, uint8_t *glyph)
     if (mask & 0x80) { glyph[14] |= 0x04; glyph[15] |= 0x04; }
 }
 
+static inline uint16_t unicode_to_cp866(uint16_t c) {
+    if (c >= 0x0410 && c <= 0x042F) {
+        return c - 0x0410 + 0x80;
+    }
+    if (c >= 0x0430 && c <= 0x043F) {
+        return c - 0x0430 + 0xA0;
+    }
+    if (c >= 0x0440 && c <= 0x044F) {
+        return c - 0x0440 + 0xE0;
+    }
+    if (c == 0x0401) return 0xF0; // Ё
+    if (c == 0x0451) return 0xF1; // ё
+    return c;
+}
+
 void comp_draw_char(uint32_t x, uint32_t y, uint16_t c, uint32_t fg, uint32_t bg)
 {
     uint8_t braille_buf[16];
     const uint8_t *glyph;
 
-    if (c >= 0x2800 && c <= 0x28FF) {
-        get_braille_glyph((uint8_t)(c - 0x2800), braille_buf);
+    uint16_t mapped_c = unicode_to_cp866(c);
+    if (mapped_c >= 0x2800 && mapped_c <= 0x28FF) {
+        get_braille_glyph((uint8_t)(mapped_c - 0x2800), braille_buf);
         glyph = braille_buf;
-    } else if (c < 256) {
-        glyph = font_8x16[c];
+    } else if (mapped_c < 256) {
+        glyph = font_8x16[mapped_c];
     } else {
         glyph = font_8x16['?'];
     }
 
     for (uint32_t row = 0; row < 16; row++) {
-        uint8_t bits = glyph[row];
         for (uint32_t col = 0; col < 8; col++) {
-            if (bits & (0x80 >> col)) {
-                comp_draw_pixel_raw(x + col, y + row, fg & 0x00FFFFFF);
+            uint32_t sum = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                int r = (int)row + dy;
+                uint8_t bits = (r >= 0 && r < 16) ? glyph[r] : 0;
+                for (int dx = -1; dx <= 1; dx++) {
+                    int c = (int)col + dx;
+                    uint8_t val = (c >= 0 && c < 8 && (bits & (0x80 >> c))) ? 255 : 0;
+                    uint32_t weight = (dy == 0 && dx == 0) ? 4 :
+                                      (dy == 0 || dx == 0) ? 2 : 1;
+                    sum += val * weight;
+                }
+            }
+            uint8_t alpha = (uint8_t)(sum / 16);
+            if (alpha > 0) {
+                comp_draw_pixel_alpha(x + col, y + row, ((uint32_t)alpha << 24) | (fg & 0x00FFFFFF));
             } else if (bg != 0) {
                 comp_draw_pixel_raw(x + col, y + row, bg & 0x00FFFFFF);
             }
@@ -747,7 +845,7 @@ void comp_draw_icon_forge(int32_t cx, int32_t cy, int32_t r)
     comp_mark_area_dirty(cx - r, cy - r, cx + r, cy + r);
 }
 
-static void comp_draw_pixel_alpha(uint32_t x, uint32_t y, uint32_t argb)
+void comp_draw_pixel_alpha(uint32_t x, uint32_t y, uint32_t argb)
 {
     if (x >= g_comp.fb_width || y >= g_comp.fb_height) return;
     uint32_t alpha = (argb >> 24) & 0xFF;
@@ -780,6 +878,9 @@ static void comp_draw_pixel_alpha(uint32_t x, uint32_t y, uint32_t argb)
 void comp_draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                             uint32_t r, uint32_t color)
 {
+    if (w < 2 * r) r = w / 2;
+    if (h < 2 * r) r = h / 2;
+
     uint32_t alpha = (color >> 24) & 0xFF;
     uint32_t c = color & 0x00FFFFFF;
 
@@ -824,6 +925,9 @@ void comp_draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 void comp_draw_rounded_rect_border(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                    uint32_t r, uint32_t color)
 {
+    if (w < 2 * r) r = w / 2;
+    if (h < 2 * r) r = h / 2;
+
     /* Horizontal borders */
     for (uint32_t px = x + r; px < x + w - r; px++) {
         comp_draw_pixel_alpha(px, y, color);
@@ -874,8 +978,202 @@ bool comp_is_dirty(void)
  * Desktop Wallpaper (Nord gradient)
  * ============================================================ */
 
+static int32_t sin_approx(int32_t x)
+{
+    x = x % 360;
+    if (x < 0) x += 360;
+    if (x <= 90) return (x * 128) / 90;
+    if (x <= 180) return ((180 - x) * 128) / 90;
+    if (x <= 270) return -((x - 180) * 128) / 90;
+    return -((360 - x) * 128) / 90;
+}
+
+static int32_t cos_approx(int32_t x)
+{
+    return sin_approx(x + 90);
+}
+
+static void comp_update_live_wallpaper(void)
+{
+    extern uint64_t timer_get_ticks(void);
+    uint64_t ticks = timer_get_ticks();
+    uint32_t w = g_comp.fb_width;
+    uint32_t h = g_comp.fb_height;
+
+    if (g_live_wallpaper_style == 1) {
+        int32_t phase = (int32_t)(ticks / 3);
+        uint32_t top_r = 0x2A + (cos_approx(phase) * 15 / 128);
+        uint32_t top_g = 0x3F + (sin_approx(phase) * 20 / 128);
+        uint32_t top_b = 0x55 + (cos_approx(phase + 45) * 15 / 128);
+
+        uint32_t bot_r = 0x1A + (sin_approx(phase + 90) * 10 / 128);
+        uint32_t bot_g = 0x1E + (cos_approx(phase) * 10 / 128);
+        uint32_t bot_b = 0x27 + (sin_approx(phase) * 12 / 128);
+
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t r = top_r - (top_r - bot_r) * y / h;
+            uint32_t g = top_g - (top_g - bot_g) * y / h;
+            uint32_t b = top_b - (top_b - bot_b) * y / h;
+
+            uint32_t *row = &g_wallpaper_cache[y * w];
+            for (uint32_t x = 0; x < w; x++) {
+                int32_t cx = (int32_t)x - (int32_t)(w / 2) + (cos_approx(phase / 2) * 50 / 128);
+                int32_t cy = (int32_t)y - (int32_t)(h / 2) + (sin_approx(phase / 2) * 40 / 128);
+                int32_t dist_sq = cx * cx + cy * cy;
+                int32_t max_dist = (int32_t)((w/2) * (w/2) + (h/2) * (h/2));
+
+                int32_t darken = (dist_sq * 30) / max_dist;
+                if (darken > 35) darken = 35;
+
+                int32_t pr = (int32_t)r - darken;
+                int32_t pg = (int32_t)g - darken;
+                int32_t pb = (int32_t)b - darken;
+
+                if (pr < 0) pr = 0;
+                if (pg < 0) pg = 0;
+                if (pb < 0) pb = 0;
+
+                row[x] = (pr << 16) | (pg << 8) | pb;
+            }
+        }
+    } 
+    else if (g_live_wallpaper_style == 2) {
+        typedef struct {
+            int32_t x, y;
+            int32_t speed;
+            int32_t size;
+        } Star;
+        static Star stars[80];
+        static bool stars_init = false;
+        if (!stars_init) {
+            for (int i = 0; i < 80; i++) {
+                stars[i].x = (ticks * (i + 7)) % w;
+                stars[i].y = (ticks * (i + 13)) % h;
+                stars[i].speed = 1 + (i % 3);
+                stars[i].size = 1 + (i % 2);
+            }
+            stars_init = true;
+        }
+
+        uint32_t top_r = 0x1A, top_g = 0x1C, top_b = 0x2A;
+        uint32_t bot_r = 0x0C, bot_g = 0x0D, bot_b = 0x14;
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t r = top_r - (top_r - bot_r) * y / h;
+            uint32_t g = top_g - (top_g - bot_g) * y / h;
+            uint32_t b = top_b - (top_b - bot_b) * y / h;
+            uint32_t *row = &g_wallpaper_cache[y * w];
+            for (uint32_t x = 0; x < w; x++) {
+                row[x] = (r << 16) | (g << 8) | b;
+            }
+        }
+
+        for (int i = 0; i < 80; i++) {
+            stars[i].y += stars[i].speed;
+            if (stars[i].y >= (int32_t)h) {
+                stars[i].y = 0;
+                stars[i].x = (stars[i].x + ticks) % w;
+            }
+            int32_t sx = stars[i].x;
+            int32_t sy = stars[i].y;
+            int32_t sz = stars[i].size;
+            for (int dy = 0; dy < sz; dy++) {
+                if (sy + dy >= (int32_t)h) continue;
+                uint32_t *row = &g_wallpaper_cache[(sy + dy) * w];
+                for (int dx = 0; dx < sz; dx++) {
+                    if (sx + dx >= (int32_t)w) continue;
+                    row[sx + dx] = 0x00FFFFFF;
+                }
+            }
+        }
+    }
+}
+
+void comp_set_live_wallpaper(bool active, uint32_t style)
+{
+    g_live_wallpaper_active = active;
+    g_live_wallpaper_style = style;
+    if (!active) {
+        comp_precompute_wallpaper();
+    }
+    comp_mark_dirty();
+}
+
+bool comp_load_wallpaper_bmp(const char *path)
+{
+    VfsFile *file = vfs_open(path);
+    if (!file) {
+        serial_write_string("Compositor: failed to open BMP wallpaper file\n");
+        return false;
+    }
+
+    uint8_t header[54];
+    if (vfs_read(file, header, 54) != 54) {
+        vfs_close(file);
+        return false;
+    }
+
+    if (header[0] != 'B' || header[1] != 'M') {
+        vfs_close(file);
+        return false;
+    }
+
+    int32_t width = *(int32_t*)&header[18];
+    int32_t height = *(int32_t*)&header[22];
+    uint16_t bpp = *(uint16_t*)&header[28];
+
+    uint32_t w = g_comp.fb_width;
+    uint32_t h = g_comp.fb_height;
+    uint32_t buf_size = w * h * 4;
+
+    if (!g_wallpaper_cache) {
+        g_wallpaper_cache = (uint32_t *)kmalloc(buf_size);
+        if (!g_wallpaper_cache) {
+            vfs_close(file);
+            return false;
+        }
+    }
+
+    g_live_wallpaper_active = false;
+    g_live_wallpaper_style = 0;
+
+    uint32_t data_offset = *(uint32_t*)&header[10];
+    vfs_seek(file, data_offset, VFS_SEEK_SET);
+
+    if (width == (int32_t)w && height == (int32_t)h) {
+        for (int32_t y = (int32_t)h - 1; y >= 0; y--) {
+            uint32_t *row = &g_wallpaper_cache[y * w];
+            if (bpp == 24) {
+                for (uint32_t x = 0; x < w; x++) {
+                    uint8_t rgb[3];
+                    vfs_read(file, rgb, 3);
+                    row[x] = (rgb[2] << 16) | (rgb[1] << 8) | rgb[0];
+                }
+                uint32_t row_bytes = w * 3;
+                uint32_t padding = (4 - (row_bytes % 4)) % 4;
+                if (padding > 0) {
+                    uint8_t dummy[4];
+                    vfs_read(file, dummy, padding);
+                }
+            } else if (bpp == 32) {
+                vfs_read(file, row, w * 4);
+            }
+        }
+    } else {
+        serial_write_string("Compositor: BMP dimensions mismatch screen size\n");
+    }
+
+    vfs_close(file);
+    comp_mark_dirty();
+    return true;
+}
+
 void comp_draw_wallpaper(void)
 {
+    if (g_live_wallpaper_active) {
+        comp_update_live_wallpaper();
+        comp_mark_dirty();
+    }
+
     if (g_wallpaper_cache) {
         uint32_t w = g_comp.fb_width;
         uint32_t h = g_comp.fb_height;
@@ -910,15 +1208,88 @@ void comp_draw_panel(void)
     uint32_t w = g_comp.fb_width;
     uint32_t panel_h = THEME_PANEL_HEIGHT;
 
-    /* Draw semi-transparent panel background */
-    comp_fill_rect_alpha(0, 0, w, panel_h, THEME_PANEL_BG);
+    /* Draw frosted glass panel background */
+    comp_draw_glass_surface(0, 0, w, panel_h, 0, THEME_PANEL_BG, 20, 0);
 
     /* Draw subtle bottom separator line */
-    comp_fill_rect(0, panel_h - 1, w, 1, NORD3 & 0x00FFFFFF);
+    comp_fill_rect_alpha(0, panel_h - 1, w, 1, 0x40D8DEE9); // Snow storm highlight/separator
 }
+
+uint8_t g_current_cursor_type = 0; // Standard CURSOR_ARROW
+
+static const uint8_t hand_mask[19][18] = {
+    { 0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,1,1,1,0,0,0,0 },
+    { 0,0,0,1,1,1,2,2,2,1,1,2,2,2,1,0,0,0 },
+    { 0,0,1,2,2,2,1,2,2,2,2,2,2,2,2,1,0,0 },
+    { 0,1,2,2,2,2,2,1,2,2,2,2,2,2,2,2,1,0 },
+    { 0,1,2,2,2,2,2,2,1,2,2,2,2,2,2,2,1,0 },
+    { 1,2,2,2,2,2,2,2,2,1,2,2,2,2,2,2,1,0 },
+    { 1,2,2,2,2,2,2,2,2,2,1,2,2,2,2,2,1,0 },
+    { 1,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,0,0 },
+    { 1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,0,0 },
+    { 0,1,2,2,2,2,2,2,2,2,2,2,2,2,2,1,0,0 },
+    { 0,0,1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0 },
+    { 0,0,0,1,2,2,2,2,2,2,2,2,2,1,0,0,0,0 },
+    { 0,0,0,0,1,1,2,2,2,2,2,2,1,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 }
+};
+
+static const uint8_t text_mask[19][18] = {
+    { 0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0 },
+    { 0,0,1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0 },
+    { 0,0,0,1,1,1,1,2,2,2,1,1,1,1,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,1,1,1,1,2,2,2,1,1,1,1,0,0,0,0 },
+    { 0,0,1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0 },
+    { 0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 }
+};
+
+static const uint8_t resize_mask[19][18] = {
+    { 1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,1,2,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,1,0,1,2,1,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,1,0,0,0,1,2,1,0,0,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,1,0,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,1,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,1,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,1,2,1,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,1,2,1,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,1,2,1,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,1,2,1,0,0,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,1,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 }
+};
 
 void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)
 {
+    extern bool virtio_gpu_is_active(void);
+    if (virtio_gpu_is_active()) {
+        return;
+    }
+
     /* 1. Save background under cursor */
     comp_save_cursor_back(mx, my);
 
@@ -927,7 +1298,7 @@ void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)
     uint32_t bh = g_comp.fb_height;
     uint32_t *buf = g_comp.back_buffer;
 
-    static const uint8_t cursor_mask[19][18] = {
+    static const uint8_t default_cursor_mask[19][18] = {
         { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -949,6 +1320,15 @@ void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)
         { 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
     };
 
+    const uint8_t (*selected_mask)[18] = default_cursor_mask;
+    if (g_current_cursor_type == 1) {
+        selected_mask = hand_mask;
+    } else if (g_current_cursor_type == 2) {
+        selected_mask = text_mask;
+    } else if (g_current_cursor_type == 3) {
+        selected_mask = resize_mask;
+    }
+
     for (int y = 0; y < 19; y++) {
         int32_t screen_y = my + y;
         if (screen_y >= (int32_t)bh) break;
@@ -956,7 +1336,7 @@ void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)
             int32_t screen_x = mx + x;
             if (screen_x >= (int32_t)bw) break;
 
-            uint8_t pixel_type = cursor_mask[y][x];
+            uint8_t pixel_type = selected_mask[y][x];
             if (pixel_type == 1) {
                 buf[screen_y * bw + screen_x] = 0x00000000; /* Black outline */
             } else if (pixel_type == 2) {

@@ -270,6 +270,31 @@ static bool virtio_gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_
     return false;
 }
 
+static uint32_t cursor_pixels[64 * 64];
+
+/* Beautiful hardware cursor shape: classic arrow with white fill and black outline */
+static const uint8_t default_hw_cursor[32][32] = {
+    { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 2, 1, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 1, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 1, 0, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+    { 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+};
+
 /* ============================================================
  * Public Driver Interface
  * ============================================================ */
@@ -367,9 +392,139 @@ bool virtio_gpu_init(void)
     }
     log_str("VIRTIO-GPU: Scanout set to Resource 1\r\n");
 
+    /* Initialize Hardware Cursor Resource (Resource 2, Size 64x64) */
+    memset(cursor_pixels, 0, sizeof(cursor_pixels));
+    for (int cy_mask = 0; cy_mask < 32; cy_mask++) {
+        for (int cx_mask = 0; cx_mask < 32; cx_mask++) {
+            uint8_t t = default_hw_cursor[cy_mask][cx_mask];
+            if (t == 1) {
+                cursor_pixels[cy_mask * 64 + cx_mask] = 0xFF000000; /* Black outline */
+            } else if (t == 2) {
+                cursor_pixels[cy_mask * 64 + cx_mask] = 0xFFFFFFFF; /* White fill */
+            }
+        }
+    }
+
+    /* Reuse cmd_create, cmd_attach, cmd_transfer statically */
+    memset(&cmd_create, 0, sizeof(cmd_create));
+    cmd_create.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    cmd_create.resource_id = 2;
+    cmd_create.format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+    cmd_create.width = 64;
+    cmd_create.height = 64;
+
+    if (!virtio_gpu_send_cmd(&cmd_create, sizeof(cmd_create), &resp_create, sizeof(resp_create)) ||
+        resp_create.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        log_str("VIRTIO-GPU: ERROR - RESOURCE_CREATE_2D for Cursor failed!\r\n");
+        return false;
+    }
+
+    memset(&cmd_attach, 0, sizeof(cmd_attach));
+    cmd_attach.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    cmd_attach.resource_id = 2;
+    cmd_attach.num_entries = 1;
+    cmd_attach.entries[0].addr = (uint64_t)(uintptr_t)cursor_pixels;
+    cmd_attach.entries[0].length = 64 * 64 * 4;
+
+    if (!virtio_gpu_send_cmd(&cmd_attach, sizeof(cmd_attach), &resp_attach, sizeof(resp_attach)) ||
+        resp_attach.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        log_str("VIRTIO-GPU: ERROR - RESOURCE_ATTACH_BACKING for Cursor failed!\r\n");
+        return false;
+    }
+
+    memset(&cmd_transfer, 0, sizeof(cmd_transfer));
+    cmd_transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    cmd_transfer.resource_id = 2;
+    cmd_transfer.rxx = 0;
+    cmd_transfer.ryy = 0;
+    cmd_transfer.rww = 64;
+    cmd_transfer.rhh = 64;
+    cmd_transfer.offset = 0;
+
+    if (!virtio_gpu_send_cmd(&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer)) ||
+        resp_transfer.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        log_str("VIRTIO-GPU: ERROR - TRANSFER_TO_HOST_2D for Cursor failed!\r\n");
+        return false;
+    }
+
+    /* Move cursor initially off-screen or top-left */
     initialized = true;
-    log_str("VIRTIO-GPU: Initialization completed successfully!\r\n");
+    virtio_gpu_update_cursor(2, 0, 0);
+
+    log_str("VIRTIO-GPU: Initialization and Hardware Cursor completed successfully!\r\n");
     return true;
+}
+
+static bool virtio_gpu_send_chained_cmds(
+    void *cmd1, uint32_t len1, void *resp1, uint32_t len2,
+    void *cmd2, uint32_t len3, void *resp2, uint32_t len4)
+{
+    uint16_t d1 = vq_alloc_desc(&ctrl_q);
+    uint16_t d2 = vq_alloc_desc(&ctrl_q);
+    uint16_t d3 = vq_alloc_desc(&ctrl_q);
+    uint16_t d4 = vq_alloc_desc(&ctrl_q);
+
+    if (d1 == 0xFFFF || d2 == 0xFFFF || d3 == 0xFFFF || d4 == 0xFFFF) {
+        if (d1 != 0xFFFF) vq_free_desc(&ctrl_q, d1);
+        if (d2 != 0xFFFF) vq_free_desc(&ctrl_q, d2);
+        if (d3 != 0xFFFF) vq_free_desc(&ctrl_q, d3);
+        if (d4 != 0xFFFF) vq_free_desc(&ctrl_q, d4);
+        return false;
+    }
+
+    /* desc1: cmd1 */
+    ctrl_q.desc[d1].addr  = (uint64_t)(uintptr_t)cmd1;
+    ctrl_q.desc[d1].len   = len1;
+    ctrl_q.desc[d1].flags = VIRTQ_DESC_F_NEXT;
+    ctrl_q.desc[d1].next  = d2;
+
+    /* desc2: resp1 */
+    ctrl_q.desc[d2].addr  = (uint64_t)(uintptr_t)resp1;
+    ctrl_q.desc[d2].len   = len2;
+    ctrl_q.desc[d2].flags = VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT;
+    ctrl_q.desc[d2].next  = d3;
+
+    /* desc3: cmd2 */
+    ctrl_q.desc[d3].addr  = (uint64_t)(uintptr_t)cmd2;
+    ctrl_q.desc[d3].len   = len3;
+    ctrl_q.desc[d3].flags = VIRTQ_DESC_F_NEXT;
+    ctrl_q.desc[d3].next  = d4;
+
+    /* desc4: resp2 */
+    ctrl_q.desc[d4].addr  = (uint64_t)(uintptr_t)resp2;
+    ctrl_q.desc[d4].len   = len4;
+    ctrl_q.desc[d4].flags = VIRTQ_DESC_F_WRITE;
+    ctrl_q.desc[d4].next  = 0;
+
+    /* Add head of chain to available ring */
+    uint16_t avail_idx = ctrl_q.avail->idx % ctrl_q.size;
+    ctrl_q.avail->ring[avail_idx] = d1;
+
+    __asm__ volatile("mfence" ::: "memory");
+    ctrl_q.avail->idx++;
+
+    /* Notify control queue (queue index 0) */
+    outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, CTRL_QUEUE);
+
+    /* Poll for completion of the entire chain */
+    for (uint32_t i = 0; i < 4000000; i++) {
+        if (ctrl_q.used->idx != ctrl_q.last_used) {
+            ctrl_q.last_used++;
+            vq_free_desc(&ctrl_q, d1);
+            vq_free_desc(&ctrl_q, d2);
+            vq_free_desc(&ctrl_q, d3);
+            vq_free_desc(&ctrl_q, d4);
+            return true;
+        }
+        __asm__ volatile("pause");
+    }
+
+    log_str("VIRTIO-GPU: Chained command timeout!\r\n");
+    vq_free_desc(&ctrl_q, d1);
+    vq_free_desc(&ctrl_q, d2);
+    vq_free_desc(&ctrl_q, d3);
+    vq_free_desc(&ctrl_q, d4);
+    return false;
 }
 
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -377,6 +532,7 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     if (!initialized) return;
 
     /* 1. Transfer dirty rect back-buffer contents to Host Resource 1 */
+    uint32_t scr_w = comp_get_width();
     memset(&cmd_transfer, 0, sizeof(cmd_transfer));
     cmd_transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     cmd_transfer.resource_id = 1;
@@ -384,9 +540,7 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_transfer.ryy = y;
     cmd_transfer.rww = w;
     cmd_transfer.rhh = h;
-    cmd_transfer.offset = 0;
-
-    virtio_gpu_send_cmd(&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer));
+    cmd_transfer.offset = (uint64_t)(y * scr_w + x) * 4;
 
     /* 2. Flush updated host VRAM resource contents onto host scanout display window */
     memset(&cmd_flush, 0, sizeof(cmd_flush));
@@ -397,10 +551,52 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_flush.rww = w;
     cmd_flush.rhh = h;
 
-    virtio_gpu_send_cmd(&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
+    virtio_gpu_send_chained_cmds(
+        &cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer),
+        &cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
 }
 
 bool virtio_gpu_is_active(void)
 {
     return initialized;
+}
+
+static VirtioGpuUpdateCursor cmd_cursor;
+
+void virtio_gpu_update_cursor(uint32_t resource_id, uint32_t x, uint32_t y)
+{
+    if (!initialized) return;
+
+    /* Reclaim completed descriptors lazily */
+    while (cursor_q.used->idx != cursor_q.last_used) {
+        uint16_t used_idx = cursor_q.last_used % cursor_q.size;
+        uint32_t desc_idx = cursor_q.used->ring[used_idx].id;
+        vq_free_desc(&cursor_q, (uint16_t)desc_idx);
+        cursor_q.last_used++;
+    }
+
+    memset(&cmd_cursor, 0, sizeof(cmd_cursor));
+    cmd_cursor.hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
+    cmd_cursor.pos.x = x;
+    cmd_cursor.pos.y = y;
+    cmd_cursor.resource_id = resource_id;
+    cmd_cursor.hot_x = 0;
+    cmd_cursor.hot_y = 0;
+
+    uint16_t desc = vq_alloc_desc(&cursor_q);
+    if (desc == 0xFFFF) return;
+
+    cursor_q.desc[desc].addr  = (uint64_t)(uintptr_t)&cmd_cursor;
+    cursor_q.desc[desc].len   = sizeof(cmd_cursor);
+    cursor_q.desc[desc].flags = 0;
+    cursor_q.desc[desc].next  = 0;
+
+    uint16_t avail_idx = cursor_q.avail->idx % cursor_q.size;
+    cursor_q.avail->ring[avail_idx] = desc;
+
+    __asm__ volatile("mfence" ::: "memory");
+    cursor_q.avail->idx++;
+
+    /* Notify cursor queue (queue index 1) */
+    outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, CURSOR_QUEUE);
 }

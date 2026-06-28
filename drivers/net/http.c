@@ -13,6 +13,7 @@
 #include <wynland/http.h>
 #include <wynland/tcp.h>
 #include <wynland/net.h>
+#include <wynland/tls.h>
 #include <wynland/types.h>
 
 /* ============================================================
@@ -398,4 +399,88 @@ int http_get(const char *hostname, uint16_t port, const char *path,
 
     /* --- Delegate to http_get_ip --- */
     return http_get_ip(ip, port, hostname, path, resp_buf, buf_size, resp);
+}
+
+int https_get_ip(uint32_t ip, uint16_t port, const char *hostname,
+                 const char *path, char *resp_buf, uint32_t buf_size,
+                 HttpResponse *resp)
+{
+    (void)ip;
+    /* --- Build the HTTP request --- */
+    char req_buf[512];
+    uint32_t req_len = build_request(req_buf, sizeof(req_buf), hostname, path);
+
+    serial_write_string("[HTTPS] Connecting to ");
+    serial_write_string(hostname);
+    serial_write_string(path);
+    serial_write_string("...\n");
+
+    /* --- TLS connect --- */
+    TlsSocket *sock = tls_connect(hostname, port);
+    if (!sock) {
+        serial_write_string("[HTTPS] Error: TLS connect failed\n");
+        return -1;
+    }
+
+    /* --- Send the request --- */
+    int sent = tls_send(sock, req_buf, req_len);
+    if (sent < 0) {
+        serial_write_string("[HTTPS] Error: TLS send failed\n");
+        tls_close(sock);
+        return -1;
+    }
+
+    /* --- Receive the response in a loop --- */
+    static char raw_buf[HTTP_MAX_RESPONSE];
+    uint32_t raw_len = 0;
+
+    while (raw_len < sizeof(raw_buf)) {
+        int n = tls_recv(sock, raw_buf + raw_len, sizeof(raw_buf) - raw_len);
+        if (n <= 0) {
+            break;
+        }
+        raw_len += (uint32_t)n;
+    }
+
+    /* --- Close connection --- */
+    tls_close(sock);
+
+    if (raw_len == 0) {
+        serial_write_string("[HTTPS] Error: empty response\n");
+        return -1;
+    }
+
+    /* --- Parse and return --- */
+    return parse_response(raw_buf, raw_len, resp_buf, buf_size, resp);
+}
+
+int https_get(const char *hostname, uint16_t port, const char *path,
+              char *resp_buf, uint32_t buf_size, HttpResponse *resp)
+{
+    if (!net_is_up()) {
+        serial_write_string("[HTTPS] Error: network is not up\n");
+        return -1;
+    }
+
+    uint32_t ip;
+    serial_write_string("[HTTPS] Resolving ");
+    serial_write_string(hostname);
+    serial_write_string("...\n");
+
+    if (!net_dns_resolve(hostname, &ip)) {
+        serial_write_string("[HTTPS] Error: DNS resolution failed for ");
+        serial_write_string(hostname);
+        serial_write_string("\n");
+        return -1;
+    }
+
+    {
+        char ip_str[20];
+        net_ip_to_str(ip, ip_str);
+        serial_write_string("[HTTPS] Resolved to ");
+        serial_write_string(ip_str);
+        serial_write_string("\n");
+    }
+
+    return https_get_ip(ip, port, hostname, path, resp_buf, buf_size, resp);
 }

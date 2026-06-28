@@ -15,6 +15,8 @@
 #define VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING   0x0105
 #define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D       0x0106
 #define VIRTIO_GPU_CMD_RESOURCE_FLUSH            0x0107
+#define VIRTIO_GPU_CMD_UPDATE_CURSOR             0x0300
+#define VIRTIO_GPU_CMD_MOVE_CURSOR               0x0301
 
 /* Virtio-GPU response types */
 #define VIRTIO_GPU_RESP_OK_NODATA                0x1100
@@ -40,6 +42,21 @@ typedef struct PACKED {
     uint32_t ctx_id;
     uint32_t padding;
 } VirtioGpuCtrlResponse;
+
+/* Pos for cursor update */
+typedef struct PACKED {
+    uint32_t x;
+    uint32_t y;
+} VirtioGpuPos;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    VirtioGpuPos pos;
+    uint32_t resource_id;
+    uint32_t hot_x;
+    uint32_t hot_y;
+    uint32_t padding;
+} VirtioGpuUpdateCursor;
 
 /* Command specific payloads */
 typedef struct PACKED {
@@ -88,4 +105,5 @@ typedef struct PACKED {
 /* API functions */
 bool virtio_gpu_init(void);
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void virtio_gpu_update_cursor(uint32_t resource_id, uint32_t x, uint32_t y);
 bool virtio_gpu_is_active(void);

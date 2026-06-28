@@ -141,8 +141,19 @@ GUI_CPP_SRC    = $(wildcard $(SRC_GUI)/*.cpp)
 GUI_OBJ        = $(patsubst $(SRC_GUI)/%.c, $(BUILD_GUI)/%.o, $(GUI_C_SRC))
 GUI_CPP_OBJ    = $(patsubst $(SRC_GUI)/%.cpp, $(BUILD_GUI)/%.o, $(GUI_CPP_SRC))
 
+# QuickJS sources
+QUICKJS_DIR    = pkg/quickjs
+QUICKJS_SRC    = $(QUICKJS_DIR)/quickjs.c \
+                 $(QUICKJS_DIR)/dtoa.c \
+                 $(QUICKJS_DIR)/libregexp.c \
+                 $(QUICKJS_DIR)/libunicode.c \
+                 $(QUICKJS_DIR)/cutils.c \
+                 $(QUICKJS_DIR)/compat.c \
+                 $(QUICKJS_DIR)/quickjs_binding.c
+QUICKJS_OBJ    = $(patsubst $(QUICKJS_DIR)/%.c, $(BUILD_GUI)/quickjs_%.o, $(QUICKJS_SRC))
+
 # All kernel-side objects
-KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ) $(GUI_CPP_OBJ)
+KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ) $(GUI_CPP_OBJ) $(QUICKJS_OBJ)
 
 # ============================================================================
 # Output Files
@@ -243,16 +254,39 @@ $(BUILD_GUI)/%.o: $(SRC_GUI)/%.cpp
 	@echo "  CXX(GUI)   $<"
 	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
 
+$(BUILD_GUI)/quickjs_%.o: $(QUICKJS_DIR)/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC(QJS)    $<"
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -Ipkg/quickjs/compat/include -Ipkg/quickjs -include pkg/quickjs/compat.h -DCONFIG_VERSION=\"2024-01-13\" -DCONFIG_BIGNUM=0 -Wno-unused-parameter -Wno-unused-variable -Wno-implicit-fallthrough -Wno-return-type -Wno-sign-compare -Wno-unused-function -Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-format -Wno-int-conversion -c $< -o $@
+
 $(KERNEL_ELF): $(KERNEL_ALL_OBJ)
 	@echo "  LD(KERN)   $@"
 	@$(LD_KERNEL) $(LDFLAGS_KERNEL) -o $@ $^
 	@echo "  => kernel.elf created"
 
+$(BUILD)/test.bin: test.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(USER)   $<"
+	@gcc -nostdlib -nostartfiles -nodefaultlibs -fno-pie -fno-pic -fno-stack-protector -mno-red-zone -no-pie -Ttext 0x40000000 -o $(BUILD)/test.elf $<
+	@objcopy -j .text -j .rodata -j .data -O binary $(BUILD)/test.elf $@
+
+$(BUILD)/test_cpp.bin: test_cpp.cpp
+	@mkdir -p $(BUILD)
+	@echo "  CXX(USER)  $<"
+	@g++ -I$(INC_DIR) -nostdlib -nostartfiles -nodefaultlibs -fno-rtti -fno-exceptions -fno-pie -fno-pic -fno-stack-protector -mno-red-zone -no-pie -Ttext 0x40000000 -std=c++17 -o $(BUILD)/test_cpp.elf $<
+	@objcopy -j .text -j .rodata -j .data -O binary $(BUILD)/test_cpp.elf $@
+
+$(BUILD)/test_dev.bin: test_dev.cpp
+	@mkdir -p $(BUILD)
+	@echo "  CXX(USER)  $<"
+	@g++ -I$(INC_DIR) -nostdlib -nostartfiles -nodefaultlibs -fno-rtti -fno-exceptions -fno-pie -fno-pic -fno-stack-protector -mno-red-zone -no-pie -Ttext 0x40000000 -std=c++17 -o $(BUILD)/test_dev.elf $<
+	@objcopy -j .text -j .rodata -j .data -O binary $(BUILD)/test_dev.elf $@
+
 # ---------- Disk Image ----------
 
-image: bootloader kernel $(DISK_IMAGE)
+image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(DISK_IMAGE)
 
-$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF)
+$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin
 	@echo "  IMG        Creating FAT32 disk image..."
 	@dd if=/dev/zero of=$@ bs=1M count=64 status=none
 	@mformat -i $@ -F -v WYNLAND ::
@@ -260,6 +294,9 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF)
 	@mmd -i $@ ::/EFI/BOOT
 	@mcopy -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -i $@ $(KERNEL_ELF) ::/kernel.elf
+	@mcopy -i $@ $(BUILD)/test.bin ::/test.bin
+	@mcopy -i $@ $(BUILD)/test_cpp.bin ::/test_cpp.bin
+	@mcopy -i $@ $(BUILD)/test_dev.bin ::/test_dev.bin
 	@mcopy -i $@ app.wasm ::/app.was
 	@mcopy -i $@ hello.wyn ::/hello.wyn
 	@mcopy -i $@ browser.wyn ::/browser.wyn
@@ -272,12 +309,16 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF)
 
 run: all
 	@echo ""
-	@echo "  Launching WynlandOS in QEMU..."
-	@echo ""
+	@echo "  Starting transparent HTTPS proxy on host..."
+	@python3 tools/proxy.py & PROXY_PID=$$! ; \
+	trap 'kill $$PROXY_PID 2>/dev/null || true' EXIT; \
+	echo ""; \
+	echo "  Launching WynlandOS in QEMU..."; \
+	echo ""; \
 	qemu-system-x86_64                                    \
 		-machine q35                                      \
 		-cpu qemu64                                       \
-		-m 256M                                           \
+		-m 1024M                                          \
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-net-pci,netdev=net0                \
@@ -294,7 +335,7 @@ debug: all
 	qemu-system-x86_64                                    \
 		-machine q35                                      \
 		-cpu qemu64                                       \
-		-m 256M                                           \
+		-m 1024M                                          \
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-net-pci,netdev=net0                \

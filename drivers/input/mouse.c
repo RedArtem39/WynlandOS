@@ -235,6 +235,33 @@ void mouse_init(BootInfo *info)
     serial_write_string("Mouse: PS/2 Mouse initialized successfully.\r\n");
 }
 
+#define MOUSE_QUEUE_SIZE 1024
+static uint8_t mouse_queue[MOUSE_QUEUE_SIZE];
+static uint32_t mouse_queue_head = 0;
+static uint32_t mouse_queue_tail = 0;
+
+static void mouse_queue_push(uint8_t val)
+{
+    uint32_t next = (mouse_queue_head + 1) % MOUSE_QUEUE_SIZE;
+    if (next != mouse_queue_tail) {
+        mouse_queue[mouse_queue_head] = val;
+        mouse_queue_head = next;
+    }
+}
+
+int mouse_read_queue(uint8_t *buf, int size)
+{
+    int read_bytes = 0;
+    while (read_bytes < size) {
+        if (mouse_queue_head == mouse_queue_tail) {
+            break;
+        }
+        buf[read_bytes++] = mouse_queue[mouse_queue_tail];
+        mouse_queue_tail = (mouse_queue_tail + 1) % MOUSE_QUEUE_SIZE;
+    }
+    return read_bytes;
+}
+
 static uint8_t mouse_cycle = 0;
 static uint8_t mouse_packet[3];
 
@@ -295,6 +322,9 @@ void mouse_handle_interrupt(uint8_t data)
                     mouse_show();
                 }
             }
+            mouse_queue_push(mouse_packet[0]);
+            mouse_queue_push(mouse_packet[1]);
+            mouse_queue_push(mouse_packet[2]);
             break;
     }
 }

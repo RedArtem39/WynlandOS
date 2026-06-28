@@ -45,10 +45,19 @@ typedef struct {
 int http_get(const char *hostname, uint16_t port, const char *path,
              char *resp_buf, uint32_t buf_size, HttpResponse *resp);
 
-/*
- * http_get_ip — Same as http_get but takes an IP address directly
- *               (skips DNS resolution)
- */
 int http_get_ip(uint32_t ip, uint16_t port, const char *hostname,
-                const char *path, char *resp_buf, uint32_t buf_size,
-                HttpResponse *resp);
+                 const char *path, char *resp_buf, uint32_t buf_size,
+                 HttpResponse *resp);
+
+/*
+ * https_get — Perform an HTTPS GET request using TLS
+ */
+int https_get(const char *hostname, uint16_t port, const char *path,
+              char *resp_buf, uint32_t buf_size, HttpResponse *resp);
+
+/*
+ * https_get_ip — Perform an HTTPS GET request to a specific IP using TLS
+ */
+int https_get_ip(uint32_t ip, uint16_t port, const char *hostname,
+                 const char *path, char *resp_buf, uint32_t buf_size,
+                 HttpResponse *resp);
