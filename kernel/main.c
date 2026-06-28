@@ -27,6 +27,7 @@
 #include <wynland/tcp.h>
 #include <wynland/http.h>
 #include <wynland/wynpkg.h>
+#include <wynland/elf.h>
 
 /* GUI Compositor */
 extern void compositor_init(BootInfo *info);
@@ -1598,112 +1599,41 @@ static void execute_command(BootInfo *info, const char *cmd)
         char resolved[512];
         resolve_path(arg, resolved);
 
-        VfsFile *f = vfs_open(resolved);
-        if (!f) {
-            console_print_string(info, "exec: file not found: ", 0x00FF0000, term_bg_color);
+        PageTable *pml4 = vmm_get_current_pml4();
+        LoadedPages *lp = kmalloc(sizeof(LoadedPages));
+        uint64_t entry_point = 0;
+        uint64_t stack_top = 0;
+
+        if (!elf_load(resolved, &entry_point, &stack_top, pml4, lp)) {
+            console_print_string(info, "exec: failed to load ELF file: ", 0x00FF0000, term_bg_color);
             console_print_string(info, resolved, 0x00FFFFFF, term_bg_color);
             console_print_string(info, "\n", 0, term_bg_color);
+            kfree(lp);
         } else {
-            uint64_t load_addr = 0x40000000;
-            uint64_t stack_addr = 0x50000000;
-            PageTable *pml4 = vmm_get_current_pml4();
+            typedef struct {
+                void *entry;
+                void *stack;
+            } ExecArg;
 
-            void *code_phys_pages[256] = {0};
-            int page_count = 0;
-            bool read_err = false;
+            extern void user_exec_wrapper(void *arg);
+            ExecArg *earg = kmalloc(sizeof(ExecArg));
+            earg->entry = (void *)entry_point;
+            earg->stack = (void *)stack_top;
 
-            while (page_count < 256) {
-                void *phys = pmm_alloc_page();
-                if (!phys) {
-                    console_print_string(info, "exec: out of physical memory for code\n", 0x00FF0000, term_bg_color);
-                    read_err = true;
-                    break;
-                }
-                code_phys_pages[page_count] = phys;
+            console_print_string(info, "Launching user ELF binary in Ring 3...\n", 0x0000FF00, term_bg_color);
+            Thread *t = thread_create(user_exec_wrapper, earg);
 
-                vmm_map_page(pml4, load_addr + page_count * PAGE_SIZE, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
-                memset((void *)(load_addr + page_count * PAGE_SIZE), 0, PAGE_SIZE);
-
-                int bytes = vfs_read(f, (void *)(load_addr + page_count * PAGE_SIZE), PAGE_SIZE);
-                if (bytes < 0) {
-                    read_err = true;
-                    break;
-                }
-                page_count++;
-                if (bytes < (int)PAGE_SIZE) {
-                    break; // EOF
-                }
-            }
-            vfs_close(f);
-
-            // Map 8 extra zero-initialized pages for BSS/safety
-            for (int extra = 0; extra < 8 && page_count < 256; extra++) {
-                void *phys = pmm_alloc_page();
-                if (!phys) {
-                    read_err = true;
-                    break;
-                }
-                code_phys_pages[page_count] = phys;
-                vmm_map_page(pml4, load_addr + page_count * PAGE_SIZE, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
-                memset((void *)(load_addr + page_count * PAGE_SIZE), 0, PAGE_SIZE);
-                page_count++;
+            while (t->state != THREAD_STATE_TERMINATED) {
+                sched_yield();
             }
 
-            void *stack_phys_pages[4] = {0};
-            bool stack_err = false;
-            for (int i = 0; i < 4; i++) {
-                void *phys = pmm_alloc_page();
-                if (!phys) {
-                    stack_err = true;
-                    break;
-                }
-                stack_phys_pages[i] = phys;
-                vmm_map_page(pml4, stack_addr + i * PAGE_SIZE, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
+            // Clean up mapped user pages and physical pages
+            for (int i = 0; i < lp->count; i++) {
+                vmm_unmap_page(pml4, lp->virt_addrs[i]);
+                pmm_free_page(lp->phys_pages[i]);
             }
-
-            if (read_err || stack_err) {
-                console_print_string(info, "exec: load failed, cleaning up...\n", 0x00FF0000, term_bg_color);
-                for (int i = 0; i < 4; i++) {
-                    if (stack_phys_pages[i]) {
-                        vmm_unmap_page(pml4, stack_addr + i * PAGE_SIZE);
-                        pmm_free_page(stack_phys_pages[i]);
-                    }
-                }
-                for (int i = 0; i < page_count; i++) {
-                    if (code_phys_pages[i]) {
-                        vmm_unmap_page(pml4, load_addr + i * PAGE_SIZE);
-                        pmm_free_page(code_phys_pages[i]);
-                    }
-                }
-            } else {
-                typedef struct {
-                    void *entry;
-                    void *stack;
-                } ExecArg;
-
-                extern void user_exec_wrapper(void *arg);
-                ExecArg *earg = kmalloc(sizeof(ExecArg));
-                earg->entry = (void *)load_addr;
-                earg->stack = (void *)(stack_addr + 16384);
-
-                console_print_string(info, "Launching user binary in Ring 3...\n", 0x0000FF00, term_bg_color);
-                Thread *t = thread_create(user_exec_wrapper, earg);
-
-                while (t->state != THREAD_STATE_TERMINATED) {
-                    sched_yield();
-                }
-
-                // Clean up mapped user pages and physical pages
-                for (int i = 0; i < 4; i++) {
-                    vmm_unmap_page(pml4, stack_addr + i * PAGE_SIZE);
-                    pmm_free_page(stack_phys_pages[i]);
-                }
-                for (int i = 0; i < page_count; i++) {
-                    vmm_unmap_page(pml4, load_addr + i * PAGE_SIZE);
-                    pmm_free_page(code_phys_pages[i]);
-                }
-                console_print_string(info, "Process exited.\n", 0x0000FF00, term_bg_color);
-            }
+            kfree(lp);
+            console_print_string(info, "Process exited.\n", 0x0000FF00, term_bg_color);
         }
     } else if (str_compare(cmd, "clear") == 0) {
         for (uint32_t y = console_start_y; y < console_end_y; y++) {

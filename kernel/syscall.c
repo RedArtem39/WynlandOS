@@ -154,10 +154,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 const char *cbuf = (const char *)a2;
                 for (uint64_t i = 0; i < a3; i++) {
                     char ch = cbuf[i];
-                    char single[2] = {ch, '\0'};
-                    serial_write_string(single);
                     if (g_boot_info) {
                         console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
+                    } else {
+                        char single[2] = {ch, '\0'};
+                        extern void serial_write_string(const char *str);
+                        serial_write_string(single);
                     }
                 }
                 return a3;

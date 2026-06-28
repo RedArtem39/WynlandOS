@@ -304,6 +304,10 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_c
 	@mcopy -i $@ $(BUILD)/test_cpp.bin ::/test_cpp.bin
 	@mcopy -i $@ $(BUILD)/test_dev.bin ::/test_dev.bin
 	@mcopy -i $@ $(BUILD)/test_qt.bin ::/test_qt.bin
+	@mcopy -i $@ $(BUILD)/test.elf ::/test.elf
+	@mcopy -i $@ $(BUILD)/test_cpp.elf ::/test_cpp.elf
+	@mcopy -i $@ $(BUILD)/test_dev.elf ::/test_dev.elf
+	@mcopy -i $@ $(BUILD)/test_qt.elf ::/test_qt.elf
 	@mcopy -i $@ app.wasm ::/app.was
 	@mcopy -i $@ hello.wyn ::/hello.wyn
 	@mcopy -i $@ browser.wyn ::/browser.wyn
