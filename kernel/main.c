@@ -1620,6 +1620,13 @@ static void execute_command(BootInfo *info, const char *cmd)
             earg->entry = (void *)entry_point;
             earg->stack = (void *)stack_top;
 
+            // Flush serial FIFO to prevent leftover input from leaking into the child process
+            extern bool serial_received(void);
+            extern char serial_read_char(void);
+            while (serial_received()) {
+                serial_read_char();
+            }
+
             console_print_string(info, "Launching user ELF binary in Ring 3...\n", 0x0000FF00, term_bg_color);
             Thread *t = thread_create(user_exec_wrapper, earg);
 

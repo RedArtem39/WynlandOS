@@ -2,6 +2,7 @@
 #include <wynland/sched.h>
 #include <wynland/vfs.h>
 #include <wynland/vmm.h>
+#include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 
 #define MSR_EFER       0xC0000080
@@ -53,57 +54,7 @@ static int get_free_fd(void) {
 // C-level Syscall Handler
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     switch (num) {
-        case 0: // Yield CPU
-            sched_yield();
-            return 0;
-            
-        case 1: // Print string to serial/logging
-            if (a1) {
-                serial_write_string((const char *)a1);
-            }
-            return 0;
-            
-        case 2: // Exit thread
-            thread_exit();
-            return 0;
-
-        case 3: // Malloc (a1 = size)
-            return (uint64_t)kmalloc(a1);
-
-        case 4: // Free (a1 = ptr)
-            if (a1) {
-                kfree((void *)a1);
-            }
-            return 0;
-
-        case 5: // Draw Rect (a1 = x, a2 = y, a3 = w, a4 = h, a5 = color)
-            comp_fill_rect((uint32_t)a1, (uint32_t)a2, (uint32_t)a3, (uint32_t)a4, (uint32_t)a5);
-            return 0;
-
-        case 6: // Mark screen dirty
-            comp_mark_dirty();
-            return 0;
-
-        case 10: // open(const char *path, uint64_t flags)
-            if (!a1) return (uint64_t)-1;
-            {
-                int fd = get_free_fd();
-                if (fd == -1) return (uint64_t)-1;
-                VfsFile *file = vfs_open_flags((const char *)a1, (uint32_t)a2);
-                if (!file) return (uint64_t)-1;
-                fd_table[fd] = file;
-                return fd;
-            }
-            
-        case 11: // close(uint64_t fd)
-            if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
-                return (uint64_t)-1;
-            }
-            vfs_close(fd_table[a1]);
-            fd_table[a1] = NULL;
-            return 0;
-            
-        case 12: // read(uint64_t fd, void *buf, uint64_t size)
+        case 0: // SYS_read (Linux standard)
             if (a1 == 0) { // stdin
                 if (a3 == 0 || !a2) return 0;
                 char *cbuf = (char *)a2;
@@ -148,7 +99,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             return vfs_read(fd_table[a1], (void *)a2, (uint32_t)a3);
             
-        case 13: // write(uint64_t fd, const void *buf, uint64_t size)
+        case 1: // SYS_write (Linux standard)
             if (a1 == 1 || a1 == 2) { // stdout/stderr
                 if (a3 == 0 || !a2) return 0;
                 const char *cbuf = (const char *)a2;
@@ -169,13 +120,32 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             return vfs_write(fd_table[a1], (const void *)a2, (uint32_t)a3);
             
-        case 14: // lseek(uint64_t fd, int32_t offset, int whence)
+        case 2: // SYS_open (Linux standard)
+            if (!a1) return (uint64_t)-1;
+            {
+                int fd = get_free_fd();
+                if (fd == -1) return (uint64_t)-1;
+                VfsFile *file = vfs_open_flags((const char *)a1, (uint32_t)a2);
+                if (!file) return (uint64_t)-1;
+                fd_table[fd] = file;
+                return fd;
+            }
+            
+        case 3: // SYS_close (Linux standard)
+            if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
+                return (uint64_t)-1;
+            }
+            vfs_close(fd_table[a1]);
+            fd_table[a1] = NULL;
+            return 0;
+            
+        case 8: // SYS_lseek (Linux standard)
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
             }
             return vfs_seek(fd_table[a1], (int32_t)a2, (int)a3);
             
-        case 15: // mmap(uint64_t addr, uint64_t length, uint64_t prot, uint64_t flags, uint64_t fd)
+        case 9: // SYS_mmap (Linux standard)
             if (a2 == 0) return 0;
             {
                 uint64_t pages = (a2 + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -212,6 +182,60 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 return aligned_addr;
             }
+
+        case 12: // SYS_brk (Linux standard)
+            {
+                static uint64_t current_brk = 0x60000000;
+                if (a1 == 0) {
+                    return current_brk;
+                }
+                if (a1 > current_brk) {
+                    uint64_t start = (current_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    uint64_t end = (a1 + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    PageTable *pml4 = vmm_get_current_pml4();
+                    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+                        void *phys = pmm_alloc_page();
+                        if (phys) {
+                            vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
+                            memset(phys, 0, PAGE_SIZE);
+                        }
+                    }
+                    current_brk = a1;
+                }
+                return current_brk;
+            }
+
+        case 24: // SYS_sched_yield (Linux standard)
+            sched_yield();
+            return 0;
+
+        case 39: // SYS_getpid (Linux standard)
+            return 1;
+
+        case 60: // SYS_exit (Linux standard)
+            thread_exit();
+            return 0;
+
+        case 202: // SYS_futex (Linux standard)
+            return 0;
+
+        case 218: // SYS_set_tid_address (Linux standard)
+            return 1;
+
+        /* Custom / Extended Syscalls */
+        case 400: // SYS_draw_rect
+            comp_fill_rect((uint32_t)a1, (uint32_t)a2, (uint32_t)a3, (uint32_t)a4, (uint32_t)a5);
+            return 0;
+
+        case 401: // SYS_mark_dirty
+            comp_mark_dirty();
+            return 0;
+
+        case 404: // SYS_kfree
+            if (a1) {
+                kfree((void *)a1);
+            }
+            return 0;
             
         default:
             {

@@ -1,7 +1,7 @@
-#define SYS_yield   0
-#define SYS_exit    2
-#define SYS_read    12
-#define SYS_write   13
+#define SYS_read    0
+#define SYS_write   1
+#define SYS_yield   24
+#define SYS_exit    60
 
 /* Forward declarations */
 void _start(void);

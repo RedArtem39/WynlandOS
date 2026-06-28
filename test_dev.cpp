@@ -1,8 +1,12 @@
 #include <wynland/types.h>
 
-#define SYS_exit 2
-#define SYS_write 13
-#define SYS_mmap 15
+#define SYS_read 0
+#define SYS_write 1
+#define SYS_open 2
+#define SYS_close 3
+#define SYS_mmap 9
+#define SYS_exit 60
+#define SYS_mark_dirty 401
 
 /* Helper declarations */
 long syscall_raw(long num, long a1, long a2, long a3, long a4, long a5);
@@ -35,7 +39,7 @@ extern "C" void _start() {
     // 3. Map /dev/fb0
     print_string("mmap'ing /dev/fb0...\n");
     uint32_t fb_size = 1920 * 1080 * 4; // 1920x1080 resolution
-    uint32_t *fb = (uint32_t*)syscall_raw(15, 0, fb_size, 0, 0, fb_fd);
+    uint32_t *fb = (uint32_t*)syscall_raw(SYS_mmap, 0, fb_size, 0, 0, fb_fd);
     if (!fb) {
         print_string("Failed to mmap /dev/fb0!\n");
         sys_close(fb_fd);
@@ -86,8 +90,8 @@ extern "C" void _start() {
                         fb[py * 1920 + px] = 0x00FF0000; // Red pixel
                     }
                 }
-                // Mark compositor screen as dirty (syscall 6)
-                syscall_raw(6, 0, 0, 0, 0, 0);
+                // Mark compositor screen as dirty (syscall 401)
+                syscall_raw(SYS_mark_dirty, 0, 0, 0, 0, 0);
             }
         }
     }
@@ -117,19 +121,19 @@ long syscall_raw(long num, long a1, long a2, long a3, long a4, long a5) {
 }
 
 int sys_open(const char *path, uint64_t flags) {
-    return (int)syscall_raw(10, (long)path, flags, 0, 0, 0);
+    return (int)syscall_raw(SYS_open, (long)path, flags, 0, 0, 0);
 }
 
 void sys_close(int fd) {
-    syscall_raw(11, fd, 0, 0, 0, 0);
+    syscall_raw(SYS_close, fd, 0, 0, 0, 0);
 }
 
 int sys_read(int fd, void *buf, uint64_t size) {
-    return (int)syscall_raw(12, fd, (long)buf, size, 0, 0);
+    return (int)syscall_raw(SYS_read, fd, (long)buf, size, 0, 0);
 }
 
 int sys_write(int fd, const void *buf, uint64_t size) {
-    return (int)syscall_raw(13, fd, (long)buf, size, 0, 0);
+    return (int)syscall_raw(SYS_write, fd, (long)buf, size, 0, 0);
 }
 
 void sys_exit(int code) {
