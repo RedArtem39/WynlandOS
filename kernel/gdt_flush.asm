@@ -26,6 +26,15 @@ thread_enter_user_mode:
     ; RDI = user_entry
     ; RSI = user_stack
     cli
+    
+    ; Reload data segment registers with User Data selector (0x18 | RPL 3 = 0x1B)
+    ; This is required to satisfy hardware virtualization checks (DPL must match CPL) on WHPX/VT-x.
+    mov ax, 0x1B
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
     push 0x1B                ; SS (User Data 0x18 | RPL 3)
     push rsi                 ; RSP
     push 0x3202              ; RFLAGS (Interrupts enabled, IOPL = 3)
