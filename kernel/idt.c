@@ -222,6 +222,40 @@ void exception_handler(InterruptRegisters *regs)
         uint_to_hex(regs->rip, buf);
         serial_write_string(buf);
         serial_write_string("\r\n");
+
+        serial_write_string("RSP: 0x");
+        uint_to_hex(regs->rsp, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
+
+        serial_write_string("RBP: 0x");
+        uint_to_hex(regs->rbp, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
+
+        serial_write_string("RAX: 0x");
+        uint_to_hex(regs->rax, buf);
+        serial_write_string(buf);
+        serial_write_string("  RBX: 0x");
+        uint_to_hex(regs->rbx, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
+
+        serial_write_string("RCX: 0x");
+        uint_to_hex(regs->rcx, buf);
+        serial_write_string(buf);
+        serial_write_string("  RDX: 0x");
+        uint_to_hex(regs->rdx, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
+
+        serial_write_string("RSI: 0x");
+        uint_to_hex(regs->rsi, buf);
+        serial_write_string(buf);
+        serial_write_string("  RDI: 0x");
+        uint_to_hex(regs->rdi, buf);
+        serial_write_string(buf);
+        serial_write_string("\r\n");
         
         if (regs->int_no == 14) {
             uint64_t cr2;

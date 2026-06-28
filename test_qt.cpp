@@ -1,0 +1,302 @@
+#include <wynland/types.h>
+#include <wynland/font.h>
+
+#define SYS_exit 2
+#define SYS_write 13
+#define SYS_mmap 15
+
+/* Globals */
+uint32_t *g_fb_ptr = (uint32_t*)1;
+void *g_status_label = (void*)1;
+bool g_btn_state = true;
+
+/* Helper declarations */
+long syscall_raw(long num, long a1, long a2, long a3, long a4, long a5);
+int sys_open(const char *path, uint64_t flags);
+void sys_close(int fd);
+int sys_read(int fd, void *buf, uint64_t size);
+int sys_write(int fd, const void *buf, uint64_t size);
+void sys_exit(int code);
+void print_string(const char *msg);
+
+/* Compositor drawing functions declarations */
+extern "C" {
+    void comp_draw_string(uint32_t x, uint32_t y, const char *str, uint32_t fg, uint32_t bg);
+    void comp_draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius, uint32_t color);
+    void comp_draw_rounded_rect_border(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius, uint32_t color);
+    void comp_mark_dirty(void);
+}
+
+/* C++ memory operator declarations */
+void* operator new(unsigned long size);
+void* operator new[](unsigned long size);
+void operator delete(void* ptr) noexcept;
+void operator delete[](void* ptr) noexcept;
+void operator delete(void* ptr, unsigned long) noexcept;
+void operator delete[](void* ptr, unsigned long) noexcept;
+
+/* Include mock Qt headers */
+#include "gui/qt.hpp"
+
+/* Forward declarations of callbacks */
+QLabel *get_status_label();
+void on_button_click();
+
+/* Program entry point MUST be at the very top of code output to align with 0x40000000 */
+extern "C" void _start() {
+    g_fb_ptr = nullptr;
+    g_status_label = nullptr;
+    g_btn_state = false;
+
+    print_string("========================================\n");
+    print_string("  WynlandOS userspace Qt test starting  \n");
+    print_string("========================================\n");
+
+    // 1. Open /dev/fb0
+    print_string("Opening /dev/fb0...\n");
+    int fb_fd = sys_open("/dev/fb0", 3); // O_RDWR
+    if (fb_fd < 0) {
+        print_string("Failed to open /dev/fb0!\n");
+        sys_exit(1);
+    }
+
+    // 2. Map /dev/fb0
+    print_string("mmap'ing /dev/fb0...\n");
+    uint32_t fb_size = 1920 * 1080 * 4;
+    g_fb_ptr = (uint32_t*)syscall_raw(15, 0, fb_size, 0, 0, fb_fd);
+    if (!g_fb_ptr) {
+        print_string("Failed to mmap /dev/fb0!\n");
+        sys_close(fb_fd);
+        sys_exit(1);
+    }
+
+    // 3. Open /dev/input/mice
+    print_string("Opening /dev/input/mice...\n");
+    int mouse_fd = sys_open("/dev/input/mice", 1); // O_RDONLY
+    if (mouse_fd < 0) {
+        print_string("Failed to open /dev/input/mice!\n");
+        sys_close(fb_fd);
+        sys_exit(1);
+    }
+
+    print_string("Initializing Qt Window layout...\n");
+
+    // 4. Construct widget layout
+    int32_t win_x = (1920 - 500) / 2;
+    int32_t win_y = (1080 - 350) / 2;
+    QWidget mainWindow(win_x, win_y, 500, 350);
+
+    QVBoxLayout layout(&mainWindow);
+
+    QLabel titleLabel(" WynlandOS - C++ Qt Port Validation ");
+    g_status_label = new QLabel("State: INACTIVE - Click to enable!");
+    
+    QPushButton actionButton("Toggle State");
+    actionButton.setCallback(on_button_click);
+
+    layout.addWidget(&titleLabel);
+    layout.addWidget(get_status_label());
+    layout.addWidget(&actionButton);
+
+    mainWindow.show();
+
+    // Render initial layout
+    comp_draw_rounded_rect(win_x - 4, win_y - 4, 508, 358, 8, 0x002E3440); // Window shadow/border
+    comp_draw_rounded_rect(win_x, win_y, 500, 350, 8, 0x003B4252);        // Window body
+    mainWindow.paint();
+    comp_mark_dirty();
+
+    print_string("Running Qt app event loop! Click the button or Right Click to exit.\n");
+
+    uint8_t packet[3];
+    int32_t cursor_x = 960;
+    int32_t cursor_y = 540;
+
+    while (1) {
+        if (sys_read(mouse_fd, packet, 3) == 3) {
+            // Exit on Right Click
+            if (packet[0] & 2) {
+                print_string("Right click detected. Exiting Qt event loop!\n");
+                break;
+            }
+
+            int8_t rel_x = (int8_t)packet[1];
+            int8_t rel_y = (int8_t)packet[2];
+            cursor_x += rel_x;
+            cursor_y -= rel_y;
+
+            if (cursor_x < 0) cursor_x = 0;
+            if (cursor_x >= 1920) cursor_x = 1919;
+            if (cursor_y < 0) cursor_y = 0;
+            if (cursor_y >= 1080) cursor_y = 1079;
+
+            // Route mouse events to Qt widgets
+            mainWindow.handle_mouse(cursor_x, cursor_y, packet[0]);
+
+            // Redraw window and widgets
+            comp_draw_rounded_rect(win_x, win_y, 500, 350, 8, 0x003B4252);
+            mainWindow.paint();
+            comp_mark_dirty();
+        }
+    }
+
+    // Clean up
+    delete get_status_label();
+    sys_close(mouse_fd);
+    sys_close(fb_fd);
+
+    print_string("Qt test application closed successfully!\n");
+    sys_exit(0);
+}
+
+/* Callback implementations */
+QLabel *get_status_label() {
+    return (QLabel*)g_status_label;
+}
+
+void on_button_click() {
+    g_btn_state = !g_btn_state;
+    if (g_btn_state) {
+        get_status_label()->setText("State: ACTIVE  -  Click to disable!");
+    } else {
+        get_status_label()->setText("State: INACTIVE - Click to enable!");
+    }
+}
+
+/* Compositor drawing functions implementation */
+extern "C" {
+    void comp_draw_string(uint32_t x, uint32_t y, const char *str, uint32_t fg, uint32_t bg) {
+        if (!g_fb_ptr) return;
+        uint32_t cx = x;
+        while (*str) {
+            char c = *str;
+            const uint8_t *glyph = font_8x16[(uint8_t)c];
+            for (uint32_t gy = 0; gy < 16; gy++) {
+                uint8_t row = glyph[gy];
+                uint32_t py = y + gy;
+                if (py >= 1080) continue;
+                for (uint32_t gx = 0; gx < 8; gx++) {
+                    uint32_t px = cx + gx;
+                    if (px >= 1920) continue;
+                    if (row & (1 << (7 - gx))) {
+                        g_fb_ptr[py * 1920 + px] = fg;
+                    } else if (bg != 0) {
+                        g_fb_ptr[py * 1920 + px] = bg;
+                    }
+                }
+            }
+            cx += 8;
+            str++;
+        }
+    }
+
+    void comp_draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius, uint32_t color) {
+        if (!g_fb_ptr) return;
+        for (uint32_t dy = 0; dy < h; dy++) {
+            uint32_t py = y + dy;
+            if (py >= 1080) continue;
+            for (uint32_t dx = 0; dx < w; dx++) {
+                uint32_t px = x + dx;
+                if (px >= 1920) continue;
+                g_fb_ptr[py * 1920 + px] = color;
+            }
+        }
+    }
+
+    void comp_draw_rounded_rect_border(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius, uint32_t color) {
+        if (!g_fb_ptr) return;
+        for (uint32_t dy = 0; dy < h; dy++) {
+            uint32_t py = y + dy;
+            if (py >= 1080) continue;
+            for (uint32_t dx = 0; dx < w; dx++) {
+                uint32_t px = x + dx;
+                if (px >= 1920) continue;
+                if (dy == 0 || dy == h - 1 || dx == 0 || dx == w - 1) {
+                    g_fb_ptr[py * 1920 + px] = color;
+                }
+            }
+        }
+    }
+
+    void comp_mark_dirty(void) {
+        syscall_raw(6, 0, 0, 0, 0, 0);
+    }
+}
+
+/* Helper implementations */
+long syscall_raw(long num, long a1, long a2, long a3, long a4, long a5) {
+    long ret;
+    __asm__ volatile(
+        "movq %1, %%rax\n"
+        "movq %2, %%rdi\n"
+        "movq %3, %%rsi\n"
+        "movq %4, %%rdx\n"
+        "movq %5, %%r10\n"
+        "movq %6, %%r8\n"
+        "syscall\n"
+        : "=a"(ret)
+        : "g"(num), "g"(a1), "g"(a2), "g"(a3), "g"(a4), "g"(a5)
+        : "rdi", "rsi", "rdx", "rcx", "r11", "r10", "r8", "memory"
+    );
+    return ret;
+}
+
+int sys_open(const char *path, uint64_t flags) {
+    return (int)syscall_raw(10, (long)path, flags, 0, 0, 0);
+}
+
+void sys_close(int fd) {
+    syscall_raw(11, fd, 0, 0, 0, 0);
+}
+
+int sys_read(int fd, void *buf, uint64_t size) {
+    return (int)syscall_raw(12, fd, (long)buf, size, 0, 0);
+}
+
+int sys_write(int fd, const void *buf, uint64_t size) {
+    return (int)syscall_raw(13, fd, (long)buf, size, 0, 0);
+}
+
+void sys_exit(int code) {
+    syscall_raw(SYS_exit, code, 0, 0, 0, 0);
+    while (1) {
+        __asm__ volatile("hlt");
+    }
+}
+
+void print_string(const char *msg) {
+    int len = 0;
+    while (msg[len]) len++;
+    sys_write(1, msg, len);
+}
+
+/* C++ memory operators implementation */
+void* operator new(unsigned long size) {
+    return (void*)syscall_raw(15, 0, size, 0, 0, 0);
+}
+
+void* operator new[](unsigned long size) {
+    return (void*)syscall_raw(15, 0, size, 0, 0, 0);
+}
+
+void operator delete(void* ptr) noexcept {
+    syscall_raw(4, (long)ptr, 0, 0, 0, 0);
+}
+
+void operator delete[](void* ptr) noexcept {
+    syscall_raw(4, (long)ptr, 0, 0, 0, 0);
+}
+
+void operator delete(void* ptr, unsigned long) noexcept {
+    syscall_raw(4, (long)ptr, 0, 0, 0, 0);
+}
+
+void operator delete[](void* ptr, unsigned long) noexcept {
+    syscall_raw(4, (long)ptr, 0, 0, 0, 0);
+}
+
+/* Pure virtual function handler */
+extern "C" void __cxa_pure_virtual() {
+    print_string("CRITICAL: Pure virtual function call!\n");
+    sys_exit(1);
+}

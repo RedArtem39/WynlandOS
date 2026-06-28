@@ -1629,6 +1629,19 @@ static void execute_command(BootInfo *info, const char *cmd)
             }
             vfs_close(f);
 
+            // Map 8 extra zero-initialized pages for BSS/safety
+            for (int extra = 0; extra < 8 && page_count < 256; extra++) {
+                void *phys = pmm_alloc_page();
+                if (!phys) {
+                    read_err = true;
+                    break;
+                }
+                code_phys_pages[page_count] = phys;
+                vmm_map_page(pml4, load_addr + page_count * PAGE_SIZE, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
+                memset((void *)(load_addr + page_count * PAGE_SIZE), 0, PAGE_SIZE);
+                page_count++;
+            }
+
             void *stack_phys_pages[4] = {0};
             bool stack_err = false;
             for (int i = 0; i < 4; i++) {
