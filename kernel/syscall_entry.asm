@@ -39,7 +39,9 @@ syscall_entry:
     mov rsi, rdi       ; a1 (User RDI -> RSI)
     mov rdi, rax       ; num (User RAX -> RDI)
     
+    push rsp           ; 7th argument: SyscallRegs* (on stack)
     call syscall_dispatcher
+    add rsp, 8         ; Clean up 7th argument
     
     ; 4. Restore all registers
     pop r15

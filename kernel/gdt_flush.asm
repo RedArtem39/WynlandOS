@@ -42,3 +42,24 @@ thread_enter_user_mode:
     push rdi                 ; RIP
     iretq
 
+global thread_enter_user_mode_clone
+thread_enter_user_mode_clone:
+    ; RDI = user_entry
+    ; RSI = user_stack
+    cli
+    mov ax, 0x1B
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    
+    ; Clear RAX so clone returns 0 to the child thread
+    xor rax, rax
+
+    push 0x1B                ; SS (User Data 0x18 | RPL 3)
+    push rsi                 ; RSP
+    push 0x3202              ; RFLAGS (Interrupts enabled, IOPL = 3)
+    push 0x23                ; CS (User Code 0x20 | RPL 3)
+    push rdi                 ; RIP
+    iretq
+

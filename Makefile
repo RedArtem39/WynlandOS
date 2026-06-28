@@ -288,11 +288,17 @@ $(BUILD)/test_qt.bin: test_qt.cpp
 	@g++ -I$(INC_DIR) -nostdlib -nostartfiles -nodefaultlibs -fno-rtti -fno-exceptions -fno-pie -fno-pic -fno-stack-protector -mno-red-zone -no-pie -Ttext 0x40000000 -std=c++17 -o $(BUILD)/test_qt.elf $<
 	@objcopy -j .text -j .rodata -j .data -O binary $(BUILD)/test_qt.elf $@
 
+$(BUILD)/t_clone.bin: t_clone.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(USER)   $<"
+	@gcc -nostdlib -nostartfiles -nodefaultlibs -fno-pie -fno-pic -fno-stack-protector -mno-red-zone -no-pie -Ttext 0x40000000 -o $(BUILD)/t_clone.elf $<
+	@objcopy -j .text -j .rodata -j .data -O binary $(BUILD)/t_clone.elf $@
+
 # ---------- Disk Image ----------
 
-image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(DISK_IMAGE)
+image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(DISK_IMAGE)
 
-$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin
+$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin
 	@echo "  IMG        Creating FAT32 disk image..."
 	@dd if=/dev/zero of=$@ bs=1M count=64 status=none
 	@mformat -i $@ -F -v WYNLAND ::
@@ -304,10 +310,12 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_c
 	@mcopy -i $@ $(BUILD)/test_cpp.bin ::/test_cpp.bin
 	@mcopy -i $@ $(BUILD)/test_dev.bin ::/test_dev.bin
 	@mcopy -i $@ $(BUILD)/test_qt.bin ::/test_qt.bin
+	@mcopy -i $@ $(BUILD)/t_clone.bin ::/t_clone.bin
 	@mcopy -i $@ $(BUILD)/test.elf ::/test.elf
 	@mcopy -i $@ $(BUILD)/test_cpp.elf ::/test_cpp.elf
 	@mcopy -i $@ $(BUILD)/test_dev.elf ::/test_dev.elf
 	@mcopy -i $@ $(BUILD)/test_qt.elf ::/test_qt.elf
+	@mcopy -i $@ $(BUILD)/t_clone.elf ::/t_clone.elf
 	@mcopy -i $@ app.wasm ::/app.was
 	@mcopy -i $@ hello.wyn ::/hello.wyn
 	@mcopy -i $@ browser.wyn ::/browser.wyn

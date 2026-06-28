@@ -43,6 +43,7 @@ Thread *thread_create(void (*entry)(void*), void *arg) {
     Thread *t = (Thread *)kmalloc(sizeof(Thread));
     t->id = next_thread_id++;
     t->state = THREAD_STATE_READY;
+    t->tls_base = 0;
 
     // Allocate stack
     t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
@@ -139,6 +140,15 @@ void sched_schedule(void) {
     }
     next_thread->state = THREAD_STATE_RUNNING;
     current_thread = next_thread;
+
+    // Context switch the Thread-Local Storage (TLS) FS Base
+    {
+        uint32_t msr = 0xC0000100; // IA32_FS_BASE
+        uint64_t val = next_thread->tls_base;
+        uint32_t low = val & 0xFFFFFFFF;
+        uint32_t high = val >> 32;
+        __asm__ volatile("wrmsr" :: "c"(msr), "a"(low), "d"(high));
+    }
 
     // Update TSS interrupt stack pointer for the new thread
     {

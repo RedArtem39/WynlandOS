@@ -21,6 +21,7 @@ typedef struct Thread {
     uint64_t rsp;             // Saved stack pointer (RSP)
     uint64_t *stack_orig;     // Pointer returned by kmalloc (for freeing)
     ThreadState state;
+    uint64_t tls_base;        // Thread-Local Storage base address (FS segment base)
     struct Thread *next;
 } Thread;
 

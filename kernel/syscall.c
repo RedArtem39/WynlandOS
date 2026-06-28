@@ -4,6 +4,26 @@
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
+#include <wynland/heap.h>
+
+typedef struct {
+    uint64_t r15;
+    uint64_t r14;
+    uint64_t r13;
+    uint64_t r12;
+    uint64_t r11;
+    uint64_t r10;
+    uint64_t r9;
+    uint64_t r8;
+    uint64_t rdx;
+    uint64_t rsi;
+    uint64_t rdi;
+    uint64_t rbx;
+    uint64_t rbp;
+    uint64_t rip;
+    uint64_t rflags;
+    uint64_t rsp;
+} SyscallRegs;
 
 #define MSR_EFER       0xC0000080
 #define MSR_STAR       0xC0000081
@@ -51,8 +71,23 @@ static int get_free_fd(void) {
     return -1;
 }
 
+void clone_child_entry(void *arg) {
+    typedef struct {
+        uint64_t rip;
+        uint64_t rsp;
+        uint64_t tls;
+    } CloneArg;
+    CloneArg *ca = (CloneArg *)arg;
+    uint64_t rip = ca->rip;
+    uint64_t rsp = ca->rsp;
+    kfree(ca);
+
+    extern void thread_enter_user_mode_clone(void *rip, void *rsp);
+    thread_enter_user_mode_clone((void *)rip, (void *)rsp);
+}
+
 // C-level Syscall Handler
-uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     switch (num) {
         case 0: // SYS_read (Linux standard)
             if (a1 == 0) { // stdin
@@ -211,6 +246,39 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 39: // SYS_getpid (Linux standard)
             return 1;
+
+        case 56: // SYS_clone (Linux standard)
+            {
+                typedef struct {
+                    uint64_t rip;
+                    uint64_t rsp;
+                    uint64_t tls;
+                } CloneArg;
+
+                CloneArg *ca = (CloneArg *)kmalloc(sizeof(CloneArg));
+                ca->rip = regs->rip;
+                ca->rsp = a2;
+                ca->tls = a5;
+
+                extern Thread *thread_create(void (*entry)(void*), void *arg);
+                Thread *t = thread_create(clone_child_entry, ca);
+                t->tls_base = a5;
+
+                if (a1 & 0x00000100) { // CLONE_PARENT_SETTID
+                    int *parent_tid = (int *)a3;
+                    if (parent_tid) {
+                        *parent_tid = (int)t->id;
+                    }
+                }
+                if (a1 & 0x01000000) { // CLONE_CHILD_SETTID
+                    int *child_tid = (int *)a4;
+                    if (child_tid) {
+                        *child_tid = (int)t->id;
+                    }
+                }
+
+                return t->id;
+            }
 
         case 60: // SYS_exit (Linux standard)
             thread_exit();
