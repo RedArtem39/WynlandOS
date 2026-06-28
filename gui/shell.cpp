@@ -18,6 +18,7 @@ typedef struct {
 extern DockIcon g_dock_icons[DOCK_ICON_COUNT];
 extern bool g_control_panel_visible;
 extern bool g_notification_panel_visible;
+extern int g_sys_brightness;
 
 extern Window *g_windows_head;
 extern Window *g_term_window;
@@ -267,6 +268,8 @@ private:
     QLabel* heading;
     QLabel* vol_label;
     QSlider* vol_slider;
+    QLabel* bright_label;
+    QSlider* bright_slider;
     QWidget* row1;
     QWidget* row2;
     QPushButton* chime_btn;
@@ -288,19 +291,27 @@ public:
         this->y = m_current_y;
         
         QVBoxLayout* layout = new QVBoxLayout(this);
-
+ 
         heading = new QLabel("Control Center (Qt C++)", this);
         layout->addWidget(heading);
-
+ 
         vol_label = new QLabel("Volume Level", this);
         layout->addWidget(vol_label);
-
+ 
         extern int g_sys_volume;
         vol_slider = new QSlider(Qt::Horizontal, g_sys_volume, [](int32_t val) {
             extern int g_sys_volume;
             g_sys_volume = val;
         }, this);
         layout->addWidget(vol_slider);
+
+        bright_label = new QLabel("Screen Brightness", this);
+        layout->addWidget(bright_label);
+
+        bright_slider = new QSlider(Qt::Horizontal, g_sys_brightness, [](int32_t val) {
+            g_sys_brightness = val;
+        }, this);
+        layout->addWidget(bright_slider);
 
         /* Row 1: sound tests layout */
         row1 = new QWidget(this);

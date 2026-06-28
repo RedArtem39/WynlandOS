@@ -801,10 +801,34 @@ extern "C" bool wm_draw_desktop(void)
             int32_t scale = win->scale_spring.current;
 
             if (scale != 256 || win->scale_spring.velocity != 0) {
+                /* Genie minimization animation: slide towards corresponding dock icon */
+                int32_t target_cx = orig_x + (int32_t)orig_w / 2;
+                int32_t target_cy = orig_y + (int32_t)orig_h / 2;
+                
+                int dock_idx = -1;
+                if (win == g_term_window) dock_idx = 0;
+                else if (win == g_settings_window) dock_idx = 1;
+                else if (win == g_browser_window) dock_idx = 2;
+                else if (win == g_forge_window) dock_idx = 3;
+                else if (win == g_opengl_window) dock_idx = 4;
+                else if (win == g_monitor_window) dock_idx = 5;
+                
+                if (dock_idx >= 0 && g_dock_icons[dock_idx].cx > 0) {
+                    target_cx = g_dock_icons[dock_idx].cx;
+                    target_cy = g_dock_icons[dock_idx].cy;
+                }
+                
+                int32_t start_cx = orig_x + (int32_t)orig_w / 2;
+                int32_t start_cy = orig_y + (int32_t)orig_h / 2;
+                
+                int32_t curr_cx = start_cx + (target_cx - start_cx) * (256 - scale) / 256;
+                int32_t curr_cy = start_cy + (target_cy - start_cy) * (256 - scale) / 256;
+                
                 win->w = (orig_w * scale) / 256;
                 win->h = (orig_h * scale) / 256;
-                win->x = orig_x + (int32_t)(orig_w - win->w) / 2;
-                win->y = orig_y + (int32_t)(orig_h - win->h) / 2;
+                win->x = curr_cx - (int32_t)win->w / 2;
+                win->y = curr_cy - (int32_t)win->h / 2;
+                
                 if (win->w < 1) win->w = 1;
                 if (win->h < 1) win->h = 1;
             }

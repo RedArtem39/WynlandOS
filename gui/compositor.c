@@ -24,6 +24,7 @@ extern void *memset(void *s, int c, size_t n);
 
 /* ---- Global compositor instance ---- */
 static Compositor g_comp;
+int g_sys_brightness = 100;
 static uint32_t *g_wallpaper_cache = NULL;
 static bool g_live_wallpaper_active = false;
 static uint32_t g_live_wallpaper_style = 0;
@@ -283,16 +284,30 @@ void compositor_flip(void)
         uint32_t w = g_comp.fb_width;
         uint32_t copy_width_bytes = (x2 - x1 + 1) * 4;
 
-        if (x1 == 0 && x2 == (int32_t)w - 1 && pitch_pixels == w) {
-            /* Fast continuous block memory copy (speeds up full screen redraws) */
-            memcpy(&g_comp.front_buffer[y1 * w],
-                   &g_comp.back_buffer[y1 * w],
-                   (y2 - y1 + 1) * w * 4);
+        if (g_sys_brightness >= 100) {
+            if (x1 == 0 && x2 == (int32_t)w - 1 && pitch_pixels == w) {
+                /* Fast continuous block memory copy (speeds up full screen redraws) */
+                memcpy(&g_comp.front_buffer[y1 * w],
+                       &g_comp.back_buffer[y1 * w],
+                       (y2 - y1 + 1) * w * 4);
+            } else {
+                for (int32_t y = y1; y <= y2; y++) {
+                    memcpy(&g_comp.front_buffer[y * pitch_pixels + x1],
+                           &g_comp.back_buffer[y * w + x1],
+                           copy_width_bytes);
+                }
+            }
         } else {
+            uint32_t factor = g_sys_brightness;
+            if (factor < 10) factor = 10; // clamp min brightness to 10%
             for (int32_t y = y1; y <= y2; y++) {
-                memcpy(&g_comp.front_buffer[y * pitch_pixels + x1],
-                       &g_comp.back_buffer[y * w + x1],
-                       copy_width_bytes);
+                for (int32_t x = x1; x <= x2; x++) {
+                    uint32_t pixel = g_comp.back_buffer[y * w + x];
+                    uint32_t r = (((pixel >> 16) & 0xFF) * factor) / 100;
+                    uint32_t g = (((pixel >> 8) & 0xFF) * factor) / 100;
+                    uint32_t b = ((pixel & 0xFF) * factor) / 100;
+                    g_comp.front_buffer[y * pitch_pixels + x] = (r << 16) | (g << 8) | b;
+                }
             }
         }
 

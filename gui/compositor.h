@@ -102,6 +102,7 @@ typedef enum {
 extern "C" {
 #endif
 extern uint8_t g_current_cursor_type;
+extern int g_sys_brightness;
 #ifdef __cplusplus
 }
 #endif
