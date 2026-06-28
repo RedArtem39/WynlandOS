@@ -1085,6 +1085,7 @@ static void gui_ring3_main_loop(void)
 void gui_user_thread_entry(void *arg)
 {
     BootInfo *info = (BootInfo *)arg;
+    __asm__ volatile("cli" ::: "memory"); // Disable interrupts during mass page mapping to prevent WHPX emulation exits
     serial_write_string("GUI-Ring3: Mapping pages for User Mode GUI...\r\n");
 
     PageTable *pml4 = vmm_get_current_pml4();
@@ -1099,7 +1100,13 @@ void gui_user_thread_entry(void *arg)
 
     // 2. Map kernel heap pages with User privileges
     extern uint64_t heap_end_addr;
+    uint64_t current_rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(current_rsp));
+    uint64_t skip_stack_page = current_rsp & ~(PAGE_SIZE - 1);
     for (uint64_t addr = HEAP_START; addr < heap_end_addr; addr += PAGE_SIZE) {
+        if (addr >= skip_stack_page - 2 * PAGE_SIZE && addr <= skip_stack_page + 2 * PAGE_SIZE) {
+            continue; // Skip current active kernel stack pages to prevent invalidating our own active stack TLB
+        }
         vmm_map_page(pml4, addr, addr, PAGE_WRITE | PAGE_USER);
     }
 

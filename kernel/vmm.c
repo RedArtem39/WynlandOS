@@ -86,7 +86,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
 
     if (rflags & 0x200) {
-        __asm__ volatile("sti");
+        __asm__ volatile("sti\n\tnop" ::: "memory");
     }
 }
 
@@ -122,7 +122,7 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
 
 cleanup:
     if (rflags & 0x200) {
-        __asm__ volatile("sti");
+        __asm__ volatile("sti\n\tnop" ::: "memory");
     }
 }
 
