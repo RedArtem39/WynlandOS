@@ -22,6 +22,9 @@ void print_string(const char *msg);
 /* Compositor drawing functions declarations */
 extern "C" {
     void comp_draw_string(uint32_t x, uint32_t y, const char *str, uint32_t fg, uint32_t bg);
+    void comp_draw_char_aa(uint32_t x, uint32_t y, uint32_t c, uint32_t fg, int size);
+    void comp_draw_string_aa(uint32_t x, uint32_t y, const char *str, uint32_t fg, int size);
+    uint32_t comp_string_width_aa(const char *str, int size);
     void comp_draw_rounded_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius, uint32_t color);
     void comp_draw_rounded_rect_border(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t radius, uint32_t color);
     void comp_mark_dirty(void);
@@ -164,7 +167,122 @@ void on_button_click() {
 }
 
 /* Compositor drawing functions implementation */
+#include <wynland/font_aa_13.h>
+#include <wynland/font_aa_16.h>
+
 extern "C" {
+    void comp_draw_pixel_alpha(uint32_t x, uint32_t y, uint32_t argb) {
+        if (!g_fb_ptr) return;
+        uint32_t alpha = (argb >> 24) & 0xFF;
+        if (alpha == 0) return;
+        if (alpha == 255) {
+            g_fb_ptr[y * 1920 + x] = argb & 0xFFFFFF;
+            return;
+        }
+        uint32_t bg = g_fb_ptr[y * 1920 + x];
+        uint32_t r = (((argb >> 16) & 0xFF) * alpha + ((bg >> 16) & 0xFF) * (255 - alpha)) / 255;
+        uint32_t g = (((argb >> 8) & 0xFF) * alpha + ((bg >> 8) & 0xFF) * (255 - alpha)) / 255;
+        uint32_t b = (((argb) & 0xFF) * alpha + ((bg) & 0xFF) * (255 - alpha)) / 255;
+        g_fb_ptr[y * 1920 + x] = (r << 16) | (g << 8) | b;
+    }
+
+    void comp_draw_char_aa(uint32_t x, uint32_t y, uint32_t c, uint32_t fg, int size) {
+        if (size == 16) {
+            int idx = get_glyph_index_16(c);
+            if (idx < 0) idx = get_glyph_index_16('?');
+            if (idx < 0) return;
+            
+            const GlyphAA_16 *g = &glyphs_16[idx];
+            if (g->width == 0 || g->height == 0) return;
+            
+            for (uint32_t gy = 0; gy < g->height; gy++) {
+                uint32_t py = y + g->top + gy;
+                if (py >= 1080) continue;
+                for (uint32_t gx = 0; gx < g->width; gx++) {
+                    uint32_t px = x + g->left + gx;
+                    if (px >= 1920) continue;
+                    uint8_t alpha = bitmaps_16[g->offset + gy * g->width + gx];
+                    if (alpha > 0) {
+                        comp_draw_pixel_alpha(px, py, ((uint32_t)alpha << 24) | (fg & 0x00FFFFFF));
+                    }
+                }
+            }
+        } else {
+            int idx = get_glyph_index_13(c);
+            if (idx < 0) idx = get_glyph_index_13('?');
+            if (idx < 0) return;
+            
+            const GlyphAA_13 *g = &glyphs_13[idx];
+            if (g->width == 0 || g->height == 0) return;
+            
+            for (uint32_t gy = 0; gy < g->height; gy++) {
+                uint32_t py = y + g->top + gy;
+                if (py >= 1080) continue;
+                for (uint32_t gx = 0; gx < g->width; gx++) {
+                    uint32_t px = x + g->left + gx;
+                    if (px >= 1920) continue;
+                    uint8_t alpha = bitmaps_13[g->offset + gy * g->width + gx];
+                    if (alpha > 0) {
+                        comp_draw_pixel_alpha(px, py, ((uint32_t)alpha << 24) | (fg & 0x00FFFFFF));
+                    }
+                }
+            }
+        }
+    }
+
+    void comp_draw_string_aa(uint32_t x, uint32_t y, const char *str, uint32_t fg, int size) {
+        uint32_t cur_x = x;
+        while (*str) {
+            uint32_t c = (uint8_t)*str;
+            
+            if (c >= 0xC0) {
+                uint8_t b1 = c;
+                uint8_t b2 = (uint8_t)*(str + 1);
+                if (b2) {
+                    c = ((b1 & 0x1F) << 6) | (b2 & 0x3F);
+                    str++;
+                }
+            }
+            
+            if (c == '\n') {
+                cur_x = x;
+                y += (size == 16) ? 20 : 16;
+            } else {
+                int idx = (size == 16) ? get_glyph_index_16(c) : get_glyph_index_13(c);
+                uint32_t adv = 8;
+                if (idx >= 0) {
+                    adv = (size == 16) ? glyphs_16[idx].advance : glyphs_13[idx].advance;
+                    comp_draw_char_aa(cur_x, y, c, fg, size);
+                }
+                cur_x += adv;
+            }
+            str++;
+        }
+    }
+
+    uint32_t comp_string_width_aa(const char *str, int size) {
+        uint32_t width = 0;
+        while (*str) {
+            uint32_t c = (uint8_t)*str;
+            if (c >= 0xC0) {
+                uint8_t b1 = c;
+                uint8_t b2 = (uint8_t)*(str + 1);
+                if (b2) {
+                    c = ((b1 & 0x1F) << 6) | (b2 & 0x3F);
+                    str++;
+                }
+            }
+            int idx = (size == 16) ? get_glyph_index_16(c) : get_glyph_index_13(c);
+            if (idx >= 0) {
+                width += (size == 16) ? glyphs_16[idx].advance : glyphs_13[idx].advance;
+            } else {
+                width += 8;
+            }
+            str++;
+        }
+        return width;
+    }
+
     void comp_draw_string(uint32_t x, uint32_t y, const char *str, uint32_t fg, uint32_t bg) {
         if (!g_fb_ptr) return;
         uint32_t cx = x;

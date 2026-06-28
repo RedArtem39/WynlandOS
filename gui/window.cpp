@@ -110,10 +110,7 @@ extern "C" void draw_window_decorations(Window *win)
     comp_draw_circle(tx + 58, ty + 14, 6, max_c);
 
     /* Centered title text */
-    uint32_t title_len = 0;
-    const char *tmp = win->title;
-    while (*tmp++) title_len++;
-    
-    uint32_t title_sx = tx + (tw - title_len * 9) / 2;
-    comp_draw_string(title_sx, ty + 6, win->title, text_fg, 0);
+    uint32_t text_width = comp_string_width_aa(win->title, 16);
+    uint32_t title_sx = tx + (tw - text_width) / 2;
+    comp_draw_string_aa(title_sx, ty + 22, win->title, text_fg, 16);
 }

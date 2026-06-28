@@ -22,7 +22,7 @@ public:
             i++;
         }
         m_text[i] = '\0';
-        w = i * 9; /* Each character is 9 pixels wide */
+        w = comp_string_width_aa(m_text, 13);
     }
     
     void setText(const char* text) {
@@ -32,13 +32,13 @@ public:
             i++;
         }
         m_text[i] = '\0';
-        w = i * 9;
+        w = comp_string_width_aa(m_text, 13);
     }
     
     void paint() override {
         int32_t ax, ay;
         get_absolute_pos(ax, ay);
-        comp_draw_string(ax, ay, m_text, m_color & 0x00FFFFFF, 0);
+        comp_draw_string_aa(ax, ay + 12, m_text, m_color & 0x00FFFFFF, 13);
     }
 };
 
@@ -78,11 +78,10 @@ public:
         comp_draw_rounded_rect_border(ax, ay, w, h, 6, 0x40FFFFFF);
         
         /* Centered text */
-        uint32_t text_len = 0;
-        while (m_text[text_len]) text_len++;
-        int32_t tx = ax + (int32_t)(w - text_len * 9) / 2;
-        int32_t ty = ay + (int32_t)(h - 16) / 2;
-        comp_draw_string(tx, ty, m_text, NORD6 & 0x00FFFFFF, 0);
+        uint32_t text_width = comp_string_width_aa(m_text, 13);
+        int32_t tx = ax + (int32_t)(w - text_width) / 2;
+        int32_t ty = ay + h / 2 + 5;
+        comp_draw_string_aa(tx, ty, m_text, NORD6 & 0x00FFFFFF, 13);
     }
 
     void handle_mouse(int32_t mx, int32_t my, uint8_t buttons) override {

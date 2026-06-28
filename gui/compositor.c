@@ -1354,3 +1354,113 @@ void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)
     /* 3. Mark the new cursor area as dirty */
     comp_mark_area_dirty(mx, my, mx + 17, my + 18);
 }
+
+/* Anti-aliased font engine headers */
+#include <wynland/font_aa_13.h>
+#include <wynland/font_aa_16.h>
+
+void comp_draw_char_aa(uint32_t x, uint32_t y, uint32_t c, uint32_t fg, int size) {
+    if (size == 16) {
+        int idx = get_glyph_index_16(c);
+        if (idx < 0) idx = get_glyph_index_16('?');
+        if (idx < 0) return;
+        
+        const GlyphAA_16 *g = &glyphs_16[idx];
+        if (g->width == 0 || g->height == 0) return;
+        
+        for (uint32_t gy = 0; gy < g->height; gy++) {
+            uint32_t py = y + g->top + gy;
+            if (py >= 1080) continue;
+            for (uint32_t gx = 0; gx < g->width; gx++) {
+                uint32_t px = x + g->left + gx;
+                if (px >= 1920) continue;
+                uint8_t alpha = bitmaps_16[g->offset + gy * g->width + gx];
+                if (alpha > 0) {
+                    comp_draw_pixel_alpha(px, py, ((uint32_t)alpha << 24) | (fg & 0x00FFFFFF));
+                }
+            }
+        }
+    } else {
+        int idx = get_glyph_index_13(c);
+        if (idx < 0) idx = get_glyph_index_13('?');
+        if (idx < 0) return;
+        
+        const GlyphAA_13 *g = &glyphs_13[idx];
+        if (g->width == 0 || g->height == 0) return;
+        
+        for (uint32_t gy = 0; gy < g->height; gy++) {
+            uint32_t py = y + g->top + gy;
+            if (py >= 1080) continue;
+            for (uint32_t gx = 0; gx < g->width; gx++) {
+                uint32_t px = x + g->left + gx;
+                if (px >= 1920) continue;
+                uint8_t alpha = bitmaps_13[g->offset + gy * g->width + gx];
+                if (alpha > 0) {
+                    comp_draw_pixel_alpha(px, py, ((uint32_t)alpha << 24) | (fg & 0x00FFFFFF));
+                }
+            }
+        }
+    }
+}
+
+void comp_draw_string_aa(uint32_t x, uint32_t y, const char *str, uint32_t fg, int size) {
+    uint32_t cur_x = x;
+    uint32_t max_x = x;
+    uint32_t start_y = y;
+    
+    while (*str) {
+        uint32_t c = (uint8_t)*str;
+        
+        // UTF-8 multi-byte decoding
+        if (c >= 0xC0) {
+            uint8_t b1 = c;
+            uint8_t b2 = (uint8_t)*(str + 1);
+            if (b2) {
+                c = ((b1 & 0x1F) << 6) | (b2 & 0x3F);
+                str++;
+            }
+        }
+        
+        if (c == '\n') {
+            cur_x = x;
+            y += (size == 16) ? 20 : 16;
+        } else {
+            int idx = (size == 16) ? get_glyph_index_16(c) : get_glyph_index_13(c);
+            uint32_t adv = 8;
+            if (idx >= 0) {
+                adv = (size == 16) ? glyphs_16[idx].advance : glyphs_13[idx].advance;
+                comp_draw_char_aa(cur_x, y, c, fg, size);
+            }
+            cur_x += adv;
+            if (cur_x > max_x) max_x = cur_x;
+        }
+        str++;
+    }
+    
+    // Mark rendering area as dirty
+    uint32_t h = (size == 16) ? 22 : 18;
+    comp_mark_area_dirty(x, start_y - 2, max_x + 2, y + h);
+}
+
+uint32_t comp_string_width_aa(const char *str, int size) {
+    uint32_t width = 0;
+    while (*str) {
+        uint32_t c = (uint8_t)*str;
+        if (c >= 0xC0) {
+            uint8_t b1 = c;
+            uint8_t b2 = (uint8_t)*(str + 1);
+            if (b2) {
+                c = ((b1 & 0x1F) << 6) | (b2 & 0x3F);
+                str++;
+            }
+        }
+        int idx = (size == 16) ? get_glyph_index_16(c) : get_glyph_index_13(c);
+        if (idx >= 0) {
+            width += (size == 16) ? glyphs_16[idx].advance : glyphs_13[idx].advance;
+        } else {
+            width += 8;
+        }
+        str++;
+    }
+    return width;
+}

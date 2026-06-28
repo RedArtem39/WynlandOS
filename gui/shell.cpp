@@ -67,8 +67,8 @@ public:
         uint32_t pipe_fg = NORD3 & 0x00FFFFFF;
 
         /* 3. Draw WynlandOS Logo & Name */
-        comp_draw_string(x + 10, y + 4, "W", THEME_ACCENT & 0x00FFFFFF, 0);
-        comp_draw_string(x + 19, y + 4, "ynlandOS", fg, 0);
+        comp_draw_string_aa(x + 10, y + 21, "W", THEME_ACCENT & 0x00FFFFFF, 13);
+        comp_draw_string_aa(x + 23, y + 21, "ynlandOS", fg, 13);
 
         /* 4. Active window title */
         extern Window *g_windows_head;
@@ -76,13 +76,13 @@ public:
         if (g_windows_head && g_windows_head->is_visible && g_windows_head->scale_spring.target == 256) {
             active_title = g_windows_head->title;
         }
-        comp_draw_string(x + 110, y + 4, "|", pipe_fg, 0);
-        comp_draw_string(x + 125, y + 4, active_title, NORD8 & 0x00FFFFFF, 0);
+        comp_draw_string_aa(x + 115, y + 21, "|", pipe_fg, 13);
+        comp_draw_string_aa(x + 130, y + 21, active_title, NORD8 & 0x00FFFFFF, 13);
 
         /* 5. Keyboard Layout Indicator */
         extern bool layout_ru;
-        comp_draw_string(x + w - 130, y + 4, "|", pipe_fg, 0);
-        comp_draw_string(x + w - 110, y + 4, layout_ru ? "RU" : "EN", THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
+        comp_draw_string_aa(x + w - 130, y + 21, "|", pipe_fg, 13);
+        comp_draw_string_aa(x + w - 110, y + 21, layout_ru ? "RU" : "EN", THEME_TEXT_SECONDARY & 0x00FFFFFF, 13);
 
         /* 6. RAM / Heap memory stats */
         extern size_t heap_get_used_memory(void);
@@ -101,7 +101,7 @@ public:
         wm_str_cat(mem_str, num_buf);
         wm_str_cat(mem_str, "M");
 
-        comp_draw_string(x + w - 240, y + 4, mem_str, THEME_TEXT_SECONDARY & 0x00FFFFFF, 0);
+        comp_draw_string_aa(x + w - 240, y + 21, mem_str, THEME_TEXT_SECONDARY & 0x00FFFFFF, 13);
 
         /* 7. Current Clock Time */
         extern uint64_t timer_get_ticks(void);
@@ -121,7 +121,7 @@ public:
         time_str[7] = '0' + (sec % 10);
         time_str[8] = '\0';
 
-        comp_draw_string(x + w - 75, y + 4, time_str, fg, 0);
+        comp_draw_string_aa(x + w - 75, y + 21, time_str, fg, 13);
     }
 
     void handle_mouse(int32_t mx, int32_t my, uint8_t buttons) override {
@@ -212,9 +212,8 @@ public:
             int32_t rad = (int32_t)g_dock_icons[k].current_radius;
             if (dx * dx + dy * dy <= rad * rad) {
                 const char *name = g_dock_icons[k].name;
-                uint32_t text_len = 0;
-                while (name[text_len]) text_len++;
-                uint32_t box_w = text_len * 9 + 16;
+                uint32_t text_width = comp_string_width_aa(name, 13);
+                uint32_t box_w = text_width + 16;
                 uint32_t box_h = 20;
 
                 int32_t box_x = g_dock_icons[k].cx - (int32_t)box_w / 2;
@@ -222,7 +221,7 @@ public:
 
                 comp_draw_rounded_rect(box_x, box_y, box_w, box_h, 4, NORD0 & 0x00FFFFFF);
                 comp_draw_rounded_rect_border(box_x, box_y, box_w, box_h, 4, 0x30FFFFFF);
-                comp_draw_string(box_x + 8, box_y + 2, name, 0xFFECEFF4, 0);
+                comp_draw_string_aa(box_x + 8, box_y + 15, name, 0xFFECEFF4, 13);
             }
         }
     }
