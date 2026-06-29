@@ -457,6 +457,58 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 return t->id;
             }
+        case 59: // SYS_execve (Linux standard)
+            {
+                const char *user_path = (const char *)a1;
+                if (!user_path) return (uint64_t)-14; /* -EFAULT */
+                
+                // Copy path from user space
+                char kernel_path[256];
+                uint32_t len = 0;
+                while (user_path[len] != '\0' && len < 255) {
+                    kernel_path[len] = user_path[len];
+                    len++;
+                }
+                kernel_path[len] = '\0';
+
+                serial_write_string("SYS_execve: Loading target: ");
+                serial_write_string(kernel_path);
+                serial_write_string("\r\n");
+
+                uint64_t entry_point = 0;
+                uint64_t stack_top = 0;
+                PageTable *pml4 = vmm_get_current_pml4();
+                
+                extern bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, void *out_pages);
+                
+                // We allocate a temporary LoadedPages structure on stack
+                typedef struct {
+                    void *phys_pages[512];
+                    uint64_t virt_addrs[512];
+                    uint32_t count;
+                } LoadedPagesTemp;
+                LoadedPagesTemp lp;
+                
+                if (!elf_load(kernel_path, &entry_point, &stack_top, pml4, &lp)) {
+                    serial_write_string("SYS_execve: elf_load failed!\r\n");
+                    return (uint64_t)-2; /* -ENOENT */
+                }
+
+                // Update syscall regs to jump to the new entry point on return
+                regs->rip = entry_point;
+                regs->rsp = stack_top;
+                
+                serial_write_string("SYS_execve: Successfully loaded ELF. Entry = ");
+                char buf[32];
+                uint_to_hex(entry_point, buf);
+                serial_write_string(buf);
+                serial_write_string(", Stack = ");
+                uint_to_hex(stack_top, buf);
+                serial_write_string(buf);
+                serial_write_string("\r\n");
+
+                return 0; // Will transition to Ring 3 entry point on syscall return
+            }
 
         case 60: // SYS_exit (Linux standard)
             thread_exit();
