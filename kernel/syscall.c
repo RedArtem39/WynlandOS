@@ -299,43 +299,102 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 9: // SYS_mmap (Linux standard)
             if (a2 == 0) return 0;
             {
-                uint64_t pages = (a2 + PAGE_SIZE - 1) / PAGE_SIZE;
+                uint64_t addr = a1;
+                uint64_t len = a2;
+                uint64_t prot = a3;
+                (void)prot;
+                uint64_t flags = a4;
+                int fd = (int)a5;
+                uint64_t offset = regs->r9;
+
+                uint64_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
                 uint64_t size_aligned = pages * PAGE_SIZE;
-                
+
                 // Check if mapping the framebuffer character device /dev/fb0
-                if (a5 < MAX_OPEN_FILES && fd_table[a5] != NULL && fd_table[a5]->node.first_cluster == 0xFFFFFFF0) {
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL && fd_table[fd]->node.first_cluster == 0xFFFFFFF0) {
                     if (!g_boot_info) return 0;
                     uint64_t fb_phys = g_boot_info->fb_addr;
-                    // Allocate virtual space from heap
-                    void *ptr = kmalloc(size_aligned + PAGE_SIZE);
-                    if (!ptr) return 0;
-                    uint64_t aligned_addr = ((uint64_t)ptr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    
+                    uint64_t virt_addr = addr;
+                    if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                        static uint64_t mmap_fb_ptr = 0x820000000000;
+                        virt_addr = mmap_fb_ptr;
+                        mmap_fb_ptr += size_aligned;
+                    }
                     PageTable *pml4 = vmm_get_current_pml4();
                     for (uint64_t i = 0; i < pages; i++) {
-                        uint64_t page_addr = aligned_addr + i * PAGE_SIZE;
-                        uint64_t phys_addr = fb_phys + i * PAGE_SIZE;
-                        vmm_map_page(pml4, page_addr, phys_addr, PAGE_WRITE | PAGE_USER);
+                        vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, fb_phys + i * PAGE_SIZE, PAGE_WRITE | PAGE_USER);
                     }
-                    return aligned_addr;
+                    return virt_addr;
                 }
-                
-                // Normal heap memory mmap
-                void *ptr = kmalloc(size_aligned + PAGE_SIZE);
-                if (!ptr) return 0;
-                uint64_t aligned_addr = ((uint64_t)ptr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+                // Determine virtual address
+                uint64_t virt_addr = addr;
+                if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                    static uint64_t mmap_alloc_ptr = 0x800000000000;
+                    virt_addr = mmap_alloc_ptr;
+                    mmap_alloc_ptr += size_aligned;
+                } else {
+                    virt_addr &= ~(PAGE_SIZE - 1); // align down to page boundary
+                }
+
                 PageTable *pml4 = vmm_get_current_pml4();
+                
+                // Allocate physical pages
+                extern void *pmm_alloc_contiguous(uint32_t count);
+                void *phys_ptr = pmm_alloc_contiguous(pages);
+                if (!phys_ptr) {
+                    serial_write_string("SYS_mmap: pmm_alloc_contiguous failed\r\n");
+                    return (uint64_t)-1; // MAP_FAILED
+                }
+                uint64_t phys_start = (uint64_t)(uintptr_t)phys_ptr;
+
+                // Map pages
                 for (uint64_t i = 0; i < pages; i++) {
-                    uint64_t page_addr = aligned_addr + i * PAGE_SIZE;
-                    uint64_t phys_addr = vmm_get_phys(pml4, page_addr);
-                    if (phys_addr != 0) {
-                        vmm_map_page(pml4, page_addr, phys_addr, PAGE_WRITE | PAGE_USER);
+                    vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, phys_start + i * PAGE_SIZE, PAGE_WRITE | PAGE_USER);
+                    // Clear the page
+                    memset((void *)(uintptr_t)(virt_addr + i * PAGE_SIZE), 0, PAGE_SIZE);
+                }
+
+                // If not MAP_ANONYMOUS (0x20), load file contents
+                if (!(flags & 0x20)) {
+                    if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL) {
+                        VfsFile *file = fd_table[fd];
+                        uint32_t prev_pos = file->offset;
+                        vfs_seek(file, (int32_t)offset, 0); // SEEK_SET is 0
+                        uint32_t read_bytes = vfs_read(file, (void *)(uintptr_t)virt_addr, (uint32_t)len);
+                        vfs_seek(file, (int32_t)prev_pos, 0); // restore file position
+                        (void)read_bytes;
                     }
                 }
-                return aligned_addr;
+
+                return virt_addr;
             }
 
         case 10: // SYS_mprotect (Linux standard)
             return 0;
+
+        case 11: // SYS_munmap (Linux standard)
+            return 0;
+
+        case 13: // SYS_rt_sigaction (Linux standard)
+            return 0;
+
+        case 14: // SYS_rt_sigprocmask (Linux standard)
+            return 0;
+
+        case 17: // SYS_pread64 (Linux standard)
+            if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
+                return (uint64_t)-9; /* -EBADF */
+            }
+            {
+                VfsFile *file = fd_table[a1];
+                uint32_t prev_pos = file->offset;
+                vfs_seek(file, (int32_t)a4, 0); // SEEK_SET
+                uint32_t read_bytes = vfs_read(file, (void *)a2, (uint32_t)a3);
+                vfs_seek(file, (int32_t)prev_pos, 0); // restore pos
+                return read_bytes;
+            }
 
         case 12: // SYS_brk (Linux standard)
             {
@@ -650,6 +709,23 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 user_stat->st_blocks = (user_stat->st_size + 511) / 512;
                 return 0;
+            }
+
+        case 273: // SYS_set_robust_list (Linux standard)
+            return 0;
+
+        case 318: // SYS_getrandom (Linux standard)
+            {
+                uint8_t *buf = (uint8_t *)a1;
+                uint64_t len = a2;
+                uint64_t val = 0;
+                for (uint64_t i = 0; i < len; i++) {
+                    if ((i % 8) == 0) {
+                        __asm__ volatile("rdtsc" : "=a"(val));
+                    }
+                    buf[i] = (uint8_t)(val >> ((i % 8) * 8));
+                }
+                return len;
             }
 
         case 334: // SYS_rseq — restartable sequences (stub)
