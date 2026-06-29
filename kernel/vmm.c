@@ -69,9 +69,8 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     /* 4. Map the physical address in the Page Table */
     pt->entries[pt_idx] = phys | flags | PAGE_PRESENT;
 
-    /*
-    if (virt >= 0x10000000 && virt < 0x11000000) {
-        serial_write_string("VMM Map: ");
+    if (virt >= 0x380000000000ULL) {
+        serial_write_string("VMM Map debug: ");
         char buf[32];
         extern void uint_to_hex(uint64_t val, char *buf);
         extern void uint_to_str(uint64_t val, char *buf);
@@ -80,7 +79,6 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
         uint_to_hex((uint64_t)(uintptr_t)pt, buf); serial_write_string(buf); serial_write_string(" idx=");
         uint_to_str(pt_idx, buf); serial_write_string(buf); serial_write_string(")\r\n");
     }
-    */
 
     /* 5. Invalidate TLB for this virtual address */
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");

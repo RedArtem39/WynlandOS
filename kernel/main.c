@@ -278,7 +278,7 @@ void uint_to_str(uint64_t value, char *buf)
  */
 void uint_to_hex(uint64_t value, char *buf)
 {
-    const char hex_chars[] = "0123456789ABCDEF";
+    static const char hex_chars[] = "0123456789ABCDEF";
     buf[0] = '0';
     buf[1] = 'x';
 
@@ -1083,6 +1083,26 @@ static void gui_ring3_main_loop(void)
     );
 }
 
+void gui_kernel_thread_entry(void *arg)
+{
+    BootInfo *info = (BootInfo *)arg;
+    (void)info;
+    serial_write_string("GUI-Kernel: Starting Window Manager in Ring 0...\r\n");
+
+    extern void wm_init(void);
+    wm_init();
+
+    extern bool wm_is_gui_active(void);
+    extern bool wm_draw_desktop(void);
+
+    while (wm_is_gui_active()) {
+        wm_draw_desktop();
+        sched_yield();
+    }
+
+    serial_write_string("GUI-Kernel: GUI thread exiting...\r\n");
+}
+
 void gui_user_thread_entry(void *arg)
 {
     BootInfo *info = (BootInfo *)arg;
@@ -1123,18 +1143,18 @@ void gui_user_thread_entry(void *arg)
     uint64_t gui_loop_base = (uint64_t)gui_ring3_main_loop & ~(PAGE_SIZE - 1);
     vmm_map_page(pml4, gui_loop_base, gui_loop_base, PAGE_WRITE | PAGE_USER);
 
-    // 5. Allocate and map 64 KB user stack for GUI
-    void *user_stack = kmalloc(65536);
-    if (!user_stack) {
-        serial_write_string("GUI-Ring3: Failed to allocate GUI user stack!\r\n");
+    // 5. Allocate physical memory for 64 KB user stack for GUI
+    extern void *pmm_alloc_contiguous(uint32_t count);
+    uint64_t stack_phys = (uint64_t)pmm_alloc_contiguous(16);
+    if (stack_phys == 0) {
+        serial_write_string("GUI-Ring3: Failed to allocate physical pages for GUI user stack!\r\n");
         return;
     }
-    uint64_t stack_base = (uint64_t)user_stack & ~(PAGE_SIZE - 1);
-    for (uint64_t addr = stack_base; addr < stack_base + 65536; addr += PAGE_SIZE) {
-        vmm_map_page(pml4, addr, addr, PAGE_WRITE | PAGE_USER);
+    uint64_t stack_virt_base = 0x700000000000;
+    for (uint32_t i = 0; i < 16; i++) {
+        vmm_map_page(pml4, stack_virt_base + i * PAGE_SIZE, stack_phys + i * PAGE_SIZE, PAGE_WRITE | PAGE_USER);
     }
-
-    uint64_t user_stack_top = (uint64_t)user_stack + 65536;
+    uint64_t user_stack_top = stack_virt_base + 65536;
 
     serial_write_string("GUI-Ring3: Transitioning to Ring 3 desktop...\r\n");
     thread_enter_user_mode(gui_ring3_main_loop, (void *)user_stack_top);
@@ -2530,6 +2550,11 @@ void kernel_main(BootInfo *boot_info)
     
     /* Draw initial prompt */
     console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
+
+    /* Auto-start GUI desktop thread at boot */
+    console_print_string(boot_info, "Auto-launching WynlandDE Desktop in Ring 0 Kernel Space...\n", 0x0000FF00, term_bg_color);
+    extern void gui_kernel_thread_entry(void *arg);
+    thread_create(gui_kernel_thread_entry, boot_info);
 
     static bool was_gui_active = false;
     while (1) {

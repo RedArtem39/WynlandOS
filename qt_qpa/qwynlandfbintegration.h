@@ -22,6 +22,7 @@ public:
 
     QPlatformWindow *createPlatformWindow(QWindow *window) const override;
     QPlatformBackingStore *createPlatformBackingStore(QWindow *window) const override;
+    QAbstractEventDispatcher *createEventDispatcher() const override;
 
 private:
     QWynlandFbScreen *m_screen;

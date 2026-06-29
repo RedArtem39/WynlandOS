@@ -14,6 +14,7 @@ void pmm_init(BootInfo *boot_info);
 
 /* Allocate a single physical page (4KB). Returns physical address or NULL */
 void *pmm_alloc_page(void);
+void *pmm_alloc_contiguous(uint32_t count);
 
 /* Free a previously allocated physical page */
 void pmm_free_page(void *addr);

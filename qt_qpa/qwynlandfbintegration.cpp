@@ -1,10 +1,12 @@
 #include "qwynlandfbintegration.h"
 #include "qwynlandfbscreen.h"
 #include "qwynlandfbinput.h"
+#include <QtGui/QPainter>
 
 #include <qpa/qplatformbackingstore.h>
 #include <qpa/qplatformwindow.h>
 #include <qpa/qwindowsysteminterface.h>
+#include <QtGui/private/qgenericunixeventdispatcher_p.h>
 
 QT_BEGIN_NAMESPACE
 
@@ -74,7 +76,7 @@ void QWynlandFbIntegration::initialize()
 {
     m_screen = new QWynlandFbScreen();
     if (m_screen->initialize()) {
-        screenAdded(m_screen);
+        QWindowSystemInterface::handleScreenAdded(m_screen);
     }
 
     m_inputReader = new QWynlandFbInputReader();
@@ -94,5 +96,11 @@ QPlatformBackingStore *QWynlandFbIntegration::createPlatformBackingStore(QWindow
 {
     return new QWynlandFbBackingStore(window, m_screen);
 }
+
+QAbstractEventDispatcher *QWynlandFbIntegration::createEventDispatcher() const
+{
+    return createUnixEventDispatcher();
+}
+
 
 QT_END_NAMESPACE

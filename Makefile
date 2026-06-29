@@ -294,16 +294,33 @@ $(BUILD)/t_clone.bin: t_clone.c
 	@gcc -nostdlib -nostartfiles -nodefaultlibs -fno-pie -fno-pic -fno-stack-protector -mno-red-zone -no-pie -Ttext 0x40000000 -o $(BUILD)/t_clone.elf $<
 	@objcopy -j .text -j .rodata -j .data -O binary $(BUILD)/t_clone.elf $@
 
+$(BUILD)/interp.elf: interp.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(USER)   $< (Interpreter)"
+	@gcc -shared -fPIC -nostdlib -nostartfiles -nodefaultlibs -Wl,-e,_start -o $@ $<
+
+$(BUILD)/main_dynamic.elf: main_dynamic.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(USER)   $< (Dynamic Main)"
+	@gcc -nostdlib -nostartfiles -nodefaultlibs -fPIE -pie -Wl,-dynamic-linker,/lib/ld-dummy.so -o $@ $<
+
+$(BUILD)/test_qt_real.elf: test_qt_real.cpp
+	@mkdir -p $(BUILD)
+	@echo "  CXX(USER)  $< (Real Qt6 App)"
+	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-g++ -Ibuild_qt_headers/include -Iinclude -Lbuild/lib -lQt6Widgets -lQt6Gui -lQt6DBus -lQt6Core -Wl,-rpath,/lib -o $@ $<
+
 # ---------- Disk Image ----------
 
-image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(DISK_IMAGE)
+image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_qt_real.elf $(DISK_IMAGE)
 
-$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin
+$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_qt_real.elf
 	@echo "  IMG        Creating FAT32 disk image..."
-	@dd if=/dev/zero of=$@ bs=1M count=64 status=none
+	@dd if=/dev/zero of=$@ bs=1M count=256 status=none
 	@mformat -i $@ -F -v WYNLAND ::
 	@mmd -i $@ ::/EFI
 	@mmd -i $@ ::/EFI/BOOT
+	@mmd -i $@ ::/lib
+	@mmd -i $@ ::/lib/platforms
 	@mcopy -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -i $@ $(KERNEL_ELF) ::/kernel.elf
 	@mcopy -i $@ $(BUILD)/test.bin ::/test.bin
@@ -316,13 +333,29 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_c
 	@mcopy -i $@ $(BUILD)/test_dev.elf ::/test_dev.elf
 	@mcopy -i $@ $(BUILD)/test_qt.elf ::/test_qt.elf
 	@mcopy -i $@ $(BUILD)/t_clone.elf ::/t_clone.elf
+	@mcopy -i $@ $(BUILD)/test_qt_real.elf ::/qtreal.elf
+	@mcopy -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libc.so ::/lib/ld-musl-x86_64.so.1
+	@mcopy -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29 ::/lib/libstdc++.so.6
+	@mcopy -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29 ::/lib/libstdc++.so.6.0.29
+	@mcopy -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libgcc_s.so.1 ::/lib/libgcc_s.so.1
+	-@mcopy -i $@ build/lib/libQt6Core.so.6.5.2 ::/lib/libQt6Core.so.6
+	-@mcopy -i $@ build/lib/libQt6Core.so.6.5.2 ::/lib/libQt6Core.so.6.5.2
+	-@mcopy -i $@ build/lib/libQt6Gui.so.6.5.2 ::/lib/libQt6Gui.so.6
+	-@mcopy -i $@ build/lib/libQt6Gui.so.6.5.2 ::/lib/libQt6Gui.so.6.5.2
+	-@mcopy -i $@ build/lib/libQt6DBus.so.6.5.2 ::/lib/libQt6DBus.so.6
+	-@mcopy -i $@ build/lib/libQt6DBus.so.6.5.2 ::/lib/libQt6DBus.so.6.5.2
+	-@mcopy -i $@ build/lib/libQt6Widgets.so.6.5.2 ::/lib/libQt6Widgets.so.6
+	-@mcopy -i $@ build/lib/libQt6Widgets.so.6.5.2 ::/lib/libQt6Widgets.so.6.5.2
+	-@mcopy -i $@ build/plugins/platforms/libqwynlandfb.so ::/lib/platforms/libqwynlandfb.so
+	@mcopy -i $@ $(BUILD)/interp.elf ::/lib/ld-dummy.so
+	@mcopy -i $@ $(BUILD)/main_dynamic.elf ::/t_dyn.elf
 	@mcopy -i $@ app.wasm ::/app.was
 	@mcopy -i $@ hello.wyn ::/hello.wyn
 	@mcopy -i $@ browser.wyn ::/browser.wyn
 	@mcopy -i $@ wynui.wyn ::/wynui.wyn
 	@mcopy -i $@ node.wyn ::/node.wyn
 	@mcopy -i $@ script.js ::/script.js
-	@echo "  => wynland.img created (64 MB)"
+	@echo "  => wynland.img created (256 MB)"
 
 # ---------- Run in QEMU ----------
 

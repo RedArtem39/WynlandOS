@@ -176,6 +176,44 @@ cleanup:
     return result;
 }
 
+void *pmm_alloc_contiguous(uint32_t count)
+{
+    if (count == 0) return NULL;
+
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    void *result = NULL;
+    uint32_t run = 0;
+    uint64_t start_idx = 0;
+
+    for (uint64_t idx = 0; idx < total_pages; idx++) {
+        if (!bitmap_test(idx)) {
+            if (run == 0) {
+                start_idx = idx;
+            }
+            run++;
+            if (run == count) {
+                /* Found contiguous range! Mark all as allocated */
+                for (uint64_t j = start_idx; j < start_idx + count; j++) {
+                    bitmap_set(j);
+                }
+                free_pages -= count;
+                result = (void *)(start_idx * PAGE_SIZE);
+                goto cleanup;
+            }
+        } else {
+            run = 0;
+        }
+    }
+
+cleanup:
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+    return result;
+}
+
 void pmm_free_page(void *addr)
 {
     uint64_t rflags;

@@ -54,8 +54,25 @@ void QWynlandFbInputReader::run()
             if (packet[0] & 2) newButtons |= Qt::RightButton;
             if (packet[0] & 4) newButtons |= Qt::MiddleButton;
 
-            // 3. Dispatch mouse event to Qt Window System Interface
-            QWindowSystemInterface::handleMouseEvent(nullptr, m_cursorPos, m_cursorPos, newButtons, buttons, Qt::NoModifier);
+            // 3. Determine changed buttons, event type, and target button
+            Qt::MouseButton button = Qt::NoButton;
+            QEvent::Type type = QEvent::MouseMove;
+
+            if (newButtons != buttons) {
+                Qt::MouseButtons changed = newButtons ^ buttons;
+                if (changed & Qt::LeftButton) button = Qt::LeftButton;
+                else if (changed & Qt::RightButton) button = Qt::RightButton;
+                else if (changed & Qt::MiddleButton) button = Qt::MiddleButton;
+
+                if (newButtons & button) {
+                    type = QEvent::MouseButtonPress;
+                } else {
+                    type = QEvent::MouseButtonRelease;
+                }
+            }
+
+            // 4. Dispatch mouse event to Qt Window System Interface
+            QWindowSystemInterface::handleMouseEvent(nullptr, m_cursorPos, m_cursorPos, newButtons, button, type);
             buttons = newButtons;
         } else if (bytes < 0) {
             // Read error or interface closed, yield thread

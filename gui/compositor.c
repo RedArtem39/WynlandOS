@@ -16,6 +16,8 @@
 #include <wynland/font.h>
 #include <wynland/irq.h>
 #include <wynland/vfs.h>
+#include <wynland/vmm.h>
+#include <wynland/pmm.h>
 
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
@@ -157,11 +159,22 @@ static void comp_precompute_wallpaper(void)
     uint32_t h = g_comp.fb_height;
     uint32_t buf_size = w * h * 4;
 
-    g_wallpaper_cache = (uint32_t *)kmalloc(buf_size);
-    if (!g_wallpaper_cache) {
-        serial_write_string("Compositor: ERROR - failed to allocate wallpaper cache!\r\n");
+    uint32_t page_count = (buf_size + 4095) / 4096;
+    uint64_t wall_virt = 0x92000000ULL;
+    PageTable *pml4 = vmm_get_current_pml4();
+
+    uint8_t *phys_start = (uint8_t *)pmm_alloc_contiguous(page_count);
+    if (!phys_start) {
+        serial_write_string("Compositor: ERROR - failed to allocate physical page for wallpaper cache Contiguous!\r\n");
         return;
     }
+
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t virt = wall_virt + (uint64_t)i * 4096;
+        uint64_t phys = (uint64_t)(uintptr_t)phys_start + (uint64_t)i * 4096;
+        vmm_map_page(pml4, virt, phys, PAGE_WRITE | PAGE_NX);
+    }
+    g_wallpaper_cache = (uint32_t *)(uintptr_t)wall_virt;
 
     /* Nord gradient: NORD1 (#3B4252) at top → deep dark Nord at bottom */
     uint32_t top_r = 0x3B, top_g = 0x42, top_b = 0x52;
@@ -220,19 +233,36 @@ void compositor_init(BootInfo *info)
 
     /* Allocate back-buffer */
     uint32_t buf_size = g_comp.fb_width * g_comp.fb_height * 4;
-    g_comp.back_buffer = (uint32_t *)kmalloc(buf_size);
+    uint32_t page_count = (buf_size + 4095) / 4096;
+    uint64_t start_virt = 0x90000000ULL;
+    PageTable *pml4 = vmm_get_current_pml4();
 
-    if (!g_comp.back_buffer) {
-        serial_write_string("Compositor: ERROR - failed to allocate back-buffer!\r\n");
+    uint8_t *fb_phys_start = (uint8_t *)pmm_alloc_contiguous(page_count);
+    if (!fb_phys_start) {
+        serial_write_string("Compositor: ERROR - failedContig to allocate physical page for back-buffer!\r\n");
         return;
     }
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t virt = start_virt + (uint64_t)i * 4096;
+        uint64_t phys = (uint64_t)(uintptr_t)fb_phys_start + (uint64_t)i * 4096;
+        vmm_map_page(pml4, virt, phys, PAGE_WRITE | PAGE_NX);
+    }
+    g_comp.back_buffer = (uint32_t *)(uintptr_t)start_virt;
 
     /* Allocate blur temp buffer to avoid allocations inside drawing loop */
     g_blur_temp_size = g_comp.fb_width * g_comp.fb_height;
-    g_blur_temp = (uint32_t *)kmalloc(g_blur_temp_size * 4);
-    if (!g_blur_temp) {
-        serial_write_string("Compositor: ERROR - failed to allocate blur temp buffer!\r\n");
+    uint64_t blur_virt = 0x91000000ULL;
+    uint8_t *blur_phys_start = (uint8_t *)pmm_alloc_contiguous(page_count);
+    if (!blur_phys_start) {
+        serial_write_string("Compositor: ERROR - failedContig to allocate physical page for blur buffer!\r\n");
+        return;
     }
+    for (uint32_t i = 0; i < page_count; i++) {
+        uint64_t virt = blur_virt + (uint64_t)i * 4096;
+        uint64_t phys = (uint64_t)(uintptr_t)blur_phys_start + (uint64_t)i * 4096;
+        vmm_map_page(pml4, virt, phys, PAGE_WRITE | PAGE_NX);
+    }
+    g_blur_temp = (uint32_t *)(uintptr_t)blur_virt;
 
     /* Precompute wallpaper cache */
     comp_precompute_wallpaper();

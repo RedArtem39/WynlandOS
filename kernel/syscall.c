@@ -6,6 +6,48 @@
 #include <wynland/boot_info.h>
 #include <wynland/heap.h>
 
+/*
+ * Linux x86_64 stat structure (from asm-generic/stat.h)
+ * Must match the exact layout that musl / glibc expects.
+ */
+struct linux_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint64_t st_nlink;
+    uint32_t st_mode;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint32_t __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size;
+    int64_t  st_blksize;
+    int64_t  st_blocks;
+    uint64_t st_atime_sec;
+    uint64_t st_atime_nsec;
+    uint64_t st_mtime_sec;
+    uint64_t st_mtime_nsec;
+    uint64_t st_ctime_sec;
+    uint64_t st_ctime_nsec;
+    int64_t  __unused[3];
+};
+
+/* Linux file mode constants */
+#define S_IFREG  0100000
+#define S_IFDIR  0040000
+#define S_IFCHR  0020000
+
+/* fcntl commands */
+#define F_DUPFD   0
+#define F_GETFD   1
+#define F_SETFD   2
+#define F_GETFL   3
+#define F_SETFL   4
+
+/* Linux O_flags for fcntl */
+#define LINUX_O_RDONLY    0
+#define LINUX_O_WRONLY    1
+#define LINUX_O_RDWR      2
+
 typedef struct {
     uint64_t r15;
     uint64_t r14;
@@ -61,6 +103,8 @@ extern void kfree(void *ptr);
 
 #define MAX_OPEN_FILES 128
 static VfsFile *fd_table[MAX_OPEN_FILES] = {0};
+static uint32_t fd_flags[MAX_OPEN_FILES] = {0};   /* Per-fd flags (FD_CLOEXEC etc.) */
+static uint32_t fd_oflags[MAX_OPEN_FILES] = {0};   /* Per-fd open status flags */
 
 static int get_free_fd(void) {
     for (int i = 3; i < MAX_OPEN_FILES; i++) {
@@ -69,6 +113,32 @@ static int get_free_fd(void) {
         }
     }
     return -1;
+}
+
+/* Helper: fill a linux_stat structure from a VFS file descriptor */
+static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
+    memset(st, 0, sizeof(*st));
+    st->st_dev     = 1;          /* Synthetic device number */
+    st->st_ino     = (uint64_t)file->node.first_cluster;
+    st->st_nlink   = 1;
+    st->st_uid     = 0;
+    st->st_gid     = 0;
+    st->st_blksize = 4096;
+
+    if (file->node.is_dir) {
+        st->st_mode = S_IFDIR | 0755;
+        st->st_size = 0;
+    } else {
+        st->st_mode = S_IFREG | 0644;
+        st->st_size = (int64_t)file->node.size;
+    }
+    st->st_blocks = (st->st_size + 511) / 512;
+
+    /* Special device: framebuffer /dev/fb0 */
+    if (file->node.first_cluster == 0xFFFFFFF0) {
+        st->st_mode = S_IFCHR | 0666;
+        st->st_rdev = ((uint64_t)29 << 8) | 0; /* major 29, minor 0 */
+    }
 }
 
 void clone_child_entry(void *arg) {
@@ -154,14 +224,60 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return (uint64_t)-1;
             }
             return vfs_write(fd_table[a1], (const void *)a2, (uint32_t)a3);
+
+        case 20: // SYS_writev (Linux standard)
+            {
+                struct iovec {
+                    void  *iov_base;
+                    size_t iov_len;
+                } *iov = (struct iovec *)a2;
+                int iovcnt = (int)a3;
+                size_t total_written = 0;
+
+                if (a1 == 1 || a1 == 2) { // stdout/stderr
+                    for (int i = 0; i < iovcnt; i++) {
+                        if (iov[i].iov_base && iov[i].iov_len > 0) {
+                            const char *cbuf = (const char *)iov[i].iov_base;
+                            for (size_t j = 0; j < iov[i].iov_len; j++) {
+                                char ch = cbuf[j];
+                                if (g_boot_info) {
+                                    console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
+                                } else {
+                                    char single[2] = {ch, '\0'};
+                                    extern void serial_write_string(const char *str);
+                                    serial_write_string(single);
+                                }
+                            }
+                            total_written += iov[i].iov_len;
+                        }
+                    }
+                    return total_written;
+                }
+
+                if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
+                    return (uint64_t)-1;
+                }
+                for (int i = 0; i < iovcnt; i++) {
+                    if (iov[i].iov_base && iov[i].iov_len > 0) {
+                        int written = vfs_write(fd_table[a1], iov[i].iov_base, iov[i].iov_len);
+                        if (written < 0) return (uint64_t)-1;
+                        total_written += written;
+                    }
+                }
+                return total_written;
+            }
             
         case 2: // SYS_open (Linux standard)
-            if (!a1) return (uint64_t)-1;
+            if (!a1) return (uint64_t)-2;
             {
+                serial_write_string("Syscall: open path: ");
+                serial_write_string((const char *)a1);
+                serial_write_string("\r\n");
+
                 int fd = get_free_fd();
-                if (fd == -1) return (uint64_t)-1;
+                if (fd == -1) return (uint64_t)-2;
                 VfsFile *file = vfs_open_flags((const char *)a1, (uint32_t)a2);
-                if (!file) return (uint64_t)-1;
+                if (!file) return (uint64_t)-2;
                 fd_table[fd] = file;
                 return fd;
             }
@@ -217,6 +333,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 return aligned_addr;
             }
+
+        case 10: // SYS_mprotect (Linux standard)
+            return 0;
 
         case 12: // SYS_brk (Linux standard)
             {
@@ -284,6 +403,27 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             thread_exit();
             return 0;
 
+        case 158: // SYS_arch_prctl (Linux standard)
+            {
+                if (a1 == 0x1002) { // ARCH_SET_FS
+                    uint32_t msr = 0xC0000100; // IA32_FS_BASE
+                    uint32_t low = a2 & 0xFFFFFFFF;
+                    uint32_t high = a2 >> 32;
+                    __asm__ volatile("wrmsr" :: "c"(msr), "a"(low), "d"(high));
+                    
+                    Thread *curr = sched_current();
+                    if (curr) {
+                        curr->tls_base = a2;
+                    }
+                    return 0; // Success
+                }
+                return (uint64_t)-1;
+            }
+
+        case 231: // SYS_exit_group (Linux standard)
+            thread_exit();
+            return 0;
+
         case 202: // SYS_futex (Linux standard)
             return 0;
 
@@ -305,6 +445,216 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             return 0;
             
+        case 5: // SYS_fstat (Linux standard) — get file status by fd
+            {
+                uint64_t fd = a1;
+                struct linux_stat *user_stat = (struct linux_stat *)a2;
+                if (!user_stat) return (uint64_t)-14; /* -EFAULT */
+
+                /* Handle stdout/stderr/stdin */
+                if (fd <= 2) {
+                    memset(user_stat, 0, sizeof(*user_stat));
+                    user_stat->st_mode    = S_IFCHR | 0666;
+                    user_stat->st_blksize = 4096;
+                    user_stat->st_rdev    = ((uint64_t)5 << 8) | 0;
+                    return 0;
+                }
+
+                if (fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
+                    return (uint64_t)-9; /* -EBADF */
+                }
+                fill_stat_from_fd(user_stat, fd_table[fd]);
+                return 0;
+            }
+
+        case 16: // SYS_ioctl (Linux standard) — stub for terminal/device control
+            {
+                /* For ttys (fd 0/1/2), return -ENOTTY (25) for most ioctls */
+                if (a1 <= 2) {
+                    return (uint64_t)-25; /* -ENOTTY */
+                }
+                /* For regular files, also not supported */
+                return (uint64_t)-25;
+            }
+
+        case 19: // SYS_readv (Linux standard) — scatter read
+            {
+                struct iovec {
+                    void  *iov_base;
+                    size_t iov_len;
+                } *iov = (struct iovec *)a2;
+                int iovcnt = (int)a3;
+                size_t total_read = 0;
+
+                if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
+                    return (uint64_t)-9; /* -EBADF */
+                }
+                for (int i = 0; i < iovcnt; i++) {
+                    if (iov[i].iov_base && iov[i].iov_len > 0) {
+                        int nread = vfs_read(fd_table[a1], iov[i].iov_base, iov[i].iov_len);
+                        if (nread < 0) return (uint64_t)-1;
+                        total_read += nread;
+                        if ((size_t)nread < iov[i].iov_len) break; /* short read */
+                    }
+                }
+                return total_read;
+            }
+
+        case 21: // SYS_access (Linux standard) — check file accessibility
+            {
+                if (!a1) return (uint64_t)-14; /* -EFAULT */
+                VfsStat vst;
+                if (vfs_stat((const char *)a1, &vst)) {
+                    return 0; /* File exists and is accessible */
+                }
+                return (uint64_t)-2; /* -ENOENT */
+            }
+
+        case 72: // SYS_fcntl (Linux standard) — file descriptor control
+            {
+                uint64_t fd = a1;
+                int cmd = (int)a2;
+
+                /* stdin/stdout/stderr are always valid */
+                if (fd > 2 && (fd >= MAX_OPEN_FILES || fd_table[fd] == NULL)) {
+                    return (uint64_t)-9; /* -EBADF */
+                }
+
+                switch (cmd) {
+                    case F_GETFD:
+                        return (fd < MAX_OPEN_FILES) ? fd_flags[fd] : 0;
+                    case F_SETFD:
+                        if (fd < MAX_OPEN_FILES) fd_flags[fd] = (uint32_t)a3;
+                        return 0;
+                    case F_GETFL:
+                        return (fd < MAX_OPEN_FILES) ? fd_oflags[fd] : LINUX_O_RDONLY;
+                    case F_SETFL:
+                        if (fd < MAX_OPEN_FILES) fd_oflags[fd] = (uint32_t)a3;
+                        return 0;
+                    case F_DUPFD: {
+                        /* Find first free fd >= a3 */
+                        int min_fd = (int)a3;
+                        if (min_fd < 3) min_fd = 3;
+                        for (int i = min_fd; i < MAX_OPEN_FILES; i++) {
+                            if (fd_table[i] == NULL && i != (int)fd) {
+                                /* We don't actually dup the VfsFile handle, just alias it */
+                                fd_table[i] = fd_table[fd];
+                                fd_flags[i] = 0; /* F_DUPFD clears CLOEXEC */
+                                fd_oflags[i] = fd_oflags[fd];
+                                return i;
+                            }
+                        }
+                        return (uint64_t)-24; /* -EMFILE */
+                    }
+                    default:
+                        return 0; /* Stub: unknown fcntl commands succeed silently */
+                }
+            }
+
+        case 79: // SYS_getcwd (Linux standard) — get current working directory
+            {
+                char *buf = (char *)a1;
+                uint64_t size = a2;
+                if (!buf || size < 2) return (uint64_t)-34; /* -ERANGE */
+                buf[0] = '/';
+                buf[1] = '\0';
+                return (uint64_t)(uintptr_t)buf;
+            }
+
+        case 89: // SYS_readlink (Linux standard) — stub, no symlinks
+            return (uint64_t)-22; /* -EINVAL (no symlinks supported) */
+
+        case 97: // SYS_getrlimit (Linux standard) — stub
+        case 302: // SYS_prlimit64
+            {
+                /* Return generous defaults for RLIMIT queries */
+                struct rlimit64 {
+                    uint64_t rlim_cur;
+                    uint64_t rlim_max;
+                };
+                if (num == 302 && a3) {
+                    struct rlimit64 *out = (struct rlimit64 *)a3;
+                    out->rlim_cur = 0x100000; /* 1 MB stack */
+                    out->rlim_max = 0x100000;
+                }
+                return 0;
+            }
+
+        case 102: // SYS_getuid
+        case 104: // SYS_getgid
+        case 107: // SYS_geteuid
+        case 108: // SYS_getegid
+            return 0; /* root */
+
+        case 110: // SYS_getppid
+            return 1;
+
+        case 186: // SYS_gettid
+            {
+                Thread *curr = sched_current();
+                return curr ? curr->id : 1;
+            }
+
+        case 228: // SYS_clock_gettime
+            {
+                /* Stub: return zeroed timespec */
+                struct timespec {
+                    uint64_t tv_sec;
+                    uint64_t tv_nsec;
+                };
+                struct timespec *tp = (struct timespec *)a2;
+                if (tp) {
+                    tp->tv_sec = 0;
+                    tp->tv_nsec = 0;
+                }
+                return 0;
+            }
+
+        case 257: // SYS_openat (Linux standard) — open relative to dirfd
+            {
+                /* If dirfd == AT_FDCWD (-100), treat as regular open */
+                const char *path = (const char *)a2;
+                if (!path) return (uint64_t)-14;
+                serial_write_string("Syscall: openat path: ");
+                serial_write_string(path);
+                serial_write_string("\r\n");
+
+                int fd = get_free_fd();
+                if (fd == -1) return (uint64_t)-24; /* -EMFILE */
+                VfsFile *file = vfs_open_flags(path, (uint32_t)a3);
+                if (!file) return (uint64_t)-2; /* -ENOENT */
+                fd_table[fd] = file;
+                return fd;
+            }
+
+        case 262: // SYS_newfstatat (Linux standard) — fstat relative to dirfd
+            {
+                const char *path = (const char *)a2;
+                struct linux_stat *user_stat = (struct linux_stat *)a3;
+                if (!path || !user_stat) return (uint64_t)-14;
+
+                VfsStat vst;
+                if (!vfs_stat(path, &vst)) {
+                    return (uint64_t)-2; /* -ENOENT */
+                }
+                memset(user_stat, 0, sizeof(*user_stat));
+                user_stat->st_dev     = 1;
+                user_stat->st_ino     = (uint64_t)vst.first_cluster;
+                user_stat->st_nlink   = 1;
+                user_stat->st_blksize = 4096;
+                if (vst.is_dir) {
+                    user_stat->st_mode = S_IFDIR | 0755;
+                } else {
+                    user_stat->st_mode = S_IFREG | 0644;
+                    user_stat->st_size = (int64_t)vst.size;
+                }
+                user_stat->st_blocks = (user_stat->st_size + 511) / 512;
+                return 0;
+            }
+
+        case 334: // SYS_rseq — restartable sequences (stub)
+            return (uint64_t)-38; /* -ENOSYS */
+
         default:
             {
                 char num_str[32];
@@ -313,7 +663,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 serial_write_string(num_str);
                 serial_write_string("\r\n");
             }
-            return (uint64_t)-1;
+            return (uint64_t)-38; /* -ENOSYS instead of -1 for proper error reporting */
     }
 }
 

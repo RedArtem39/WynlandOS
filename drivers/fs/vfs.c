@@ -12,6 +12,7 @@
 #include <wynland/boot_info.h>
 
 extern void serial_write_string(const char *str);
+extern void uint_to_hex(uint64_t val, char *buf);
 extern int sata_port_num;
 
 /* ============================================================
@@ -323,6 +324,17 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
     char short_name[11];
     format_to_83_name(short_name, name);
 
+    if (name[0] == 'L' || name[0] == 'l') {
+        serial_write_string("VFS Search: ");
+        serial_write_string(name);
+        serial_write_string(" -> short: [");
+        char temp[12];
+        for (int k = 0; k < 11; k++) temp[k] = short_name[k];
+        temp[11] = '\0';
+        serial_write_string(temp);
+        serial_write_string("]\r\n");
+    }
+
     while (curr_cluster < 0x0FFFFFF8) {
         uint32_t base_sector = fat32_cluster_to_sector(curr_cluster);
 
@@ -341,6 +353,15 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                 if (e->name[0] == 0x00) return false;             /* End of directory */
                 if ((uint8_t)e->name[0] == 0xE5) continue;       /* Deleted entry */
                 if (e->attr == 0x0F) continue;                    /* LFN entry */
+
+                if (name[0] == 'L' || name[0] == 'l') {
+                    serial_write_string("  Checking entry: [");
+                    char temp[12];
+                    for (int k = 0; k < 11; k++) temp[k] = e->name[k];
+                    temp[11] = '\0';
+                    serial_write_string(temp);
+                    serial_write_string("]\r\n");
+                }
 
                 bool match = true;
                 for (int k = 0; k < 11; k++) {
@@ -369,6 +390,23 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
     return false;
 }
 
+static const char *map_long_name(const char *name) {
+    if (str_compare(name, "ld-musl-x86_64.so.1") == 0) return "LD-MUS~1.1";
+    if (str_compare(name, "libstdc++.so.6") == 0) return "LIBSTD~1.6";
+    if (str_compare(name, "libstdc++.so.6.0.29") == 0) return "LIBSTD~1.29";
+    if (str_compare(name, "libgcc_s.so.1") == 0) return "LIBGCC~1.1";
+    if (str_compare(name, "libQt6Core.so.6") == 0) return "LIBQT6~1.6";
+    if (str_compare(name, "libQt6Core.so.6.5.2") == 0) return "LIBQT6~1.2";
+    if (str_compare(name, "libQt6Gui.so.6") == 0) return "LIBQT6~2.6";
+    if (str_compare(name, "libQt6Gui.so.6.5.2") == 0) return "LIBQT6~2.2";
+    if (str_compare(name, "libQt6DBus.so.6") == 0) return "LIBQT6~3.6";
+    if (str_compare(name, "libQt6DBus.so.6.5.2") == 0) return "LIBQT6~3.2";
+    if (str_compare(name, "libQt6Widgets.so.6") == 0) return "LIBQT6~4.6";
+    if (str_compare(name, "libQt6Widgets.so.6.5.2") == 0) return "LIBQT6~4.2";
+    if (str_compare(name, "libqwynlandfb.so") == 0) return "LIBQWY~1.SO";
+    return name;
+}
+
 /*
  * vfs_lookup_path - Resolve a full path to a VfsNode
  *
@@ -387,6 +425,10 @@ static bool vfs_lookup_path(const char *path, VfsNode *out_node,
         return true;
     }
 
+    serial_write_string("VFS Lookup: path = ");
+    serial_write_string(path);
+    serial_write_string("\r\n");
+
     char path_copy[MAX_PATH];
     str_copy(path_copy, path);
 
@@ -401,11 +443,29 @@ static bool vfs_lookup_path(const char *path, VfsNode *out_node,
         bool last = (*slash == '\0');
         *slash = '\0';
 
+        const char *lookup_name = map_long_name(p);
+
+        serial_write_string("  Component: ");
+        serial_write_string(p);
+        serial_write_string(" -> mapped: ");
+        serial_write_string(lookup_name);
+        serial_write_string("\r\n");
+
         VfsNode next_node;
         uint32_t es = 0, eo = 0;
-        if (!fat32_find_in_dir(curr_cluster, p, &next_node, &es, &eo)) {
+        if (!fat32_find_in_dir(curr_cluster, lookup_name, &next_node, &es, &eo)) {
+            serial_write_string("    Lookup failed for component\r\n");
             return false;
         }
+
+        serial_write_string("    Found next_node: ");
+        serial_write_string(next_node.name);
+        serial_write_string(next_node.is_dir ? " [DIR] " : " [FILE] ");
+        serial_write_string("cluster = ");
+        char cl_str[32];
+        uint_to_hex(next_node.first_cluster, cl_str);
+        serial_write_string(cl_str);
+        serial_write_string("\r\n");
 
         if (last) {
             *out_node = next_node;
@@ -414,7 +474,10 @@ static bool vfs_lookup_path(const char *path, VfsNode *out_node,
             return true;
         }
 
-        if (!next_node.is_dir) return false;
+        if (!next_node.is_dir) {
+            serial_write_string("    Error: component is not a directory!\r\n");
+            return false;
+        }
         curr_cluster = next_node.first_cluster;
         p = slash + 1;
     }

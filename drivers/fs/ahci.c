@@ -132,6 +132,16 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
         }
     }
     
+    // Translate virtual buffer address to physical address for DMA
+    uint64_t phys_buf = (uint64_t)(uintptr_t)buf;
+    PageTable *pml4 = vmm_get_current_pml4();
+    if (pml4) {
+        uint64_t resolved = vmm_get_phys(pml4, (uint64_t)(uintptr_t)buf);
+        if (resolved != 0) {
+            phys_buf = resolved;
+        }
+    }
+
     HbaCmdHeader *cmd_headers = (HbaCmdHeader *)(uintptr_t)port->clb;
     HbaCmdHeader *hdr = &cmd_headers[slot];
     hdr->flags0 = 5; // CFL = 5 dwords, W = 0 (Read)
@@ -141,8 +151,8 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
     HbaCmdTable *tbl = (HbaCmdTable *)(uintptr_t)hdr->ctba;
     memset(tbl, 0, sizeof(HbaCmdTable) + sizeof(HbaPrdtEntry));
     
-    tbl->prdt_entry[0].dba = (uint32_t)(uintptr_t)buf;
-    tbl->prdt_entry[0].dbau = (uint32_t)((uint64_t)(uintptr_t)buf >> 32);
+    tbl->prdt_entry[0].dba = (uint32_t)phys_buf;
+    tbl->prdt_entry[0].dbau = (uint32_t)(phys_buf >> 32);
     tbl->prdt_entry[0].dbc = ((count * 512) - 1) | (1U << 31); // Size - 1, bit 31 = IOC
     
     FisRegH2D *fis = (FisRegH2D *)(tbl->cfis);
@@ -215,6 +225,16 @@ bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
         }
     }
     
+    // Translate virtual buffer address to physical address for DMA
+    uint64_t phys_buf = (uint64_t)(uintptr_t)buf;
+    PageTable *pml4 = vmm_get_current_pml4();
+    if (pml4) {
+        uint64_t resolved = vmm_get_phys(pml4, (uint64_t)(uintptr_t)buf);
+        if (resolved != 0) {
+            phys_buf = resolved;
+        }
+    }
+
     HbaCmdHeader *cmd_headers = (HbaCmdHeader *)(uintptr_t)port->clb;
     HbaCmdHeader *hdr = &cmd_headers[slot];
     hdr->flags0 = 5 | (1 << 6); // CFL = 5 dwords, W = 1 (Write)
@@ -224,8 +244,8 @@ bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
     HbaCmdTable *tbl = (HbaCmdTable *)(uintptr_t)hdr->ctba;
     memset(tbl, 0, sizeof(HbaCmdTable) + sizeof(HbaPrdtEntry));
     
-    tbl->prdt_entry[0].dba = (uint32_t)(uintptr_t)buf;
-    tbl->prdt_entry[0].dbau = (uint32_t)((uint64_t)(uintptr_t)buf >> 32);
+    tbl->prdt_entry[0].dba = (uint32_t)phys_buf;
+    tbl->prdt_entry[0].dbau = (uint32_t)(phys_buf >> 32);
     tbl->prdt_entry[0].dbc = ((count * 512) - 1) | (1U << 31); // Size - 1, bit 31 = IOC
     
     FisRegH2D *fis = (FisRegH2D *)(tbl->cfis);
