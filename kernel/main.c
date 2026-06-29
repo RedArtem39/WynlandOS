@@ -2551,10 +2551,26 @@ void kernel_main(BootInfo *boot_info)
     /* Draw initial prompt */
     console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
 
-    /* Auto-start GUI desktop thread at boot */
-    console_print_string(boot_info, "Auto-launching WynlandDE Desktop in Ring 0 Kernel Space...\n", 0x0000FF00, term_bg_color);
-    extern void gui_kernel_thread_entry(void *arg);
-    thread_create(gui_kernel_thread_entry, boot_info);
+    /* Auto-start Qt6 dynamic loading test at boot */
+    console_print_string(boot_info, "Auto-launching Qt6 dynamic demo /qtreal.elf in Ring 3...\n", 0x0000FF00, term_bg_color);
+    PageTable *pml4 = vmm_get_current_pml4();
+    /* Declaration already in elf.h */
+    static LoadedPages lp;
+    uint64_t entry_point = 0;
+    uint64_t stack_top = 0;
+    if (elf_load("/qtreal.elf", &entry_point, &stack_top, pml4, &lp)) {
+        typedef struct {
+            void *entry;
+            void *stack;
+        } ExecArg;
+        static ExecArg earg;
+        earg.entry = (void *)entry_point;
+        earg.stack = (void *)stack_top;
+        extern void user_exec_wrapper(void *arg);
+        thread_create(user_exec_wrapper, &earg);
+    } else {
+        console_print_string(boot_info, "Failed to load /qtreal.elf!\n", 0x00FF0000, term_bg_color);
+    }
 
     static bool was_gui_active = false;
     while (1) {

@@ -79,6 +79,60 @@ typedef struct {
 void syscall_entry(void);
 void serial_write_string(const char *str);
 void uint_to_hex(uint64_t val, char *buf);
+void uint_to_str(uint64_t val, char *buf);
+
+static void str_copy(char *dst, const char *src) {
+    while (*src) {
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
+static int __attribute__((unused)) str_compare(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(const unsigned char *)s1 - *(const unsigned char *)s2;
+}
+
+#define MAX_PIPES 256
+#define PIPE_BUF_SIZE 4096
+
+typedef struct {
+    uint8_t  buffer[PIPE_BUF_SIZE];
+    uint32_t head;
+    uint32_t tail;
+    uint32_t count;
+} KPipe;
+
+static KPipe *g_pipes[MAX_PIPES];
+
+static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
+    const uint8_t *src = (const uint8_t *)buf;
+    uint32_t written = 0;
+    while (written < size) {
+        if (pipe->count >= PIPE_BUF_SIZE) break;
+        pipe->buffer[pipe->tail] = src[written];
+        pipe->tail = (pipe->tail + 1) % PIPE_BUF_SIZE;
+        pipe->count++;
+        written++;
+    }
+    return written;
+}
+
+static uint32_t pipe_read(KPipe *pipe, void *buf, uint32_t size) {
+    uint8_t *dst = (uint8_t *)buf;
+    uint32_t read_bytes = 0;
+    while (read_bytes < size) {
+        if (pipe->count == 0) break;
+        dst[read_bytes] = pipe->buffer[pipe->head];
+        pipe->head = (pipe->head + 1) % PIPE_BUF_SIZE;
+        pipe->count--;
+        read_bytes++;
+    }
+    return read_bytes;
+}
 
 extern BootInfo *g_boot_info;
 extern uint32_t term_bg_color;
@@ -141,19 +195,14 @@ static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
     }
 }
 
-void clone_child_entry(void *arg) {
-    typedef struct {
-        uint64_t rip;
-        uint64_t rsp;
-        uint64_t tls;
-    } CloneArg;
-    CloneArg *ca = (CloneArg *)arg;
-    uint64_t rip = ca->rip;
-    uint64_t rsp = ca->rsp;
-    kfree(ca);
+typedef struct {
+    SyscallRegs regs;
+} CloneArg;
 
-    extern void thread_enter_user_mode_clone(void *rip, void *rsp);
-    thread_enter_user_mode_clone((void *)rip, (void *)rsp);
+void clone_child_entry(void *arg) {
+    CloneArg *ca = (CloneArg *)arg;
+    extern void thread_enter_user_mode_clone(void *regs);
+    thread_enter_user_mode_clone(&ca->regs);
 }
 
 // C-level Syscall Handler
@@ -202,6 +251,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
             }
+            if (fd_table[a1]->node.first_cluster == 0xFFFFFFFA || fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
+                uint32_t pipe_idx = fd_table[a1]->current_cluster;
+                if (pipe_idx < MAX_PIPES && g_pipes[pipe_idx] != NULL) {
+                    return pipe_read(g_pipes[pipe_idx], (void *)a2, (uint32_t)a3);
+                }
+                return (uint64_t)-1;
+            }
             return vfs_read(fd_table[a1], (void *)a2, (uint32_t)a3);
             
         case 1: // SYS_write (Linux standard)
@@ -221,6 +277,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return a3;
             }
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
+                return (uint64_t)-1;
+            }
+            if (fd_table[a1]->node.first_cluster == 0xFFFFFFFB || fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
+                uint32_t pipe_idx = fd_table[a1]->current_cluster;
+                if (pipe_idx < MAX_PIPES && g_pipes[pipe_idx] != NULL) {
+                    return pipe_write(g_pipes[pipe_idx], (const void *)a2, (uint32_t)a3);
+                }
                 return (uint64_t)-1;
             }
             return vfs_write(fd_table[a1], (const void *)a2, (uint32_t)a3);
@@ -286,6 +349,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
             }
+            if (fd_table[a1]->node.first_cluster == 0xFFFFFFFA ||
+                fd_table[a1]->node.first_cluster == 0xFFFFFFFB ||
+                fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
+                kfree(fd_table[a1]);
+                fd_table[a1] = NULL;
+                return 0;
+            }
             vfs_close(fd_table[a1]);
             fd_table[a1] = NULL;
             return 0;
@@ -317,7 +387,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     
                     uint64_t virt_addr = addr;
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                        static uint64_t mmap_fb_ptr = 0x820000000000;
+                        static uint64_t mmap_fb_ptr = 0x610000000000;
                         virt_addr = mmap_fb_ptr;
                         mmap_fb_ptr += size_aligned;
                     }
@@ -331,7 +401,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // Determine virtual address
                 uint64_t virt_addr = addr;
                 if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                    static uint64_t mmap_alloc_ptr = 0x800000000000;
+                    static uint64_t mmap_alloc_ptr = 0x600000000000;
                     virt_addr = mmap_alloc_ptr;
                     mmap_alloc_ptr += size_aligned;
                 } else {
@@ -370,6 +440,132 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 return virt_addr;
             }
+
+        case 22: // SYS_pipe (Linux standard)
+        case 293: // SYS_pipe2 (Linux standard)
+            {
+                serial_write_string("Syscall: pipe/pipe2 called\r\n");
+                int *pipefd = (int *)a1;
+                if (!pipefd) {
+                    serial_write_string("  Error: pipefd is NULL\r\n");
+                    return (uint64_t)-14; /* -EFAULT */
+                }
+
+                // Allocate a pipe structure
+                KPipe *p = (KPipe *)kmalloc(sizeof(KPipe));
+                if (!p) return (uint64_t)-12; /* -ENOMEM */
+                memset(p, 0, sizeof(KPipe));
+
+                // Register pipe
+                int p_idx = -1;
+                for (int i = 0; i < MAX_PIPES; i++) {
+                    if (g_pipes[i] == NULL) {
+                        g_pipes[i] = p;
+                        p_idx = i;
+                        break;
+                    }
+                }
+                if (p_idx == -1) {
+                    kfree(p);
+                    return (uint64_t)-23; /* -ENFILE */
+                }
+
+                // Get two free file descriptors
+                int fd_read = get_free_fd();
+                if (fd_read == -1) {
+                    g_pipes[p_idx] = NULL;
+                    kfree(p);
+                    return (uint64_t)-24; /* -EMFILE */
+                }
+                // Allocate read file structure
+                VfsFile *f_read = (VfsFile *)kmalloc(sizeof(VfsFile));
+                memset(f_read, 0, sizeof(VfsFile));
+                str_copy(f_read->node.name, "pipe_read");
+                f_read->node.is_dir = false;
+                f_read->node.first_cluster = 0xFFFFFFFA; // Pipe Read signature
+                f_read->current_cluster = p_idx; // Store pipe index
+                fd_table[fd_read] = f_read;
+
+                int fd_write = get_free_fd();
+                if (fd_write == -1) {
+                    fd_table[fd_read] = NULL;
+                    kfree(f_read);
+                    g_pipes[p_idx] = NULL;
+                    kfree(p);
+                    return (uint64_t)-24; /* -EMFILE */
+                }
+                // Allocate write file structure
+                VfsFile *f_write = (VfsFile *)kmalloc(sizeof(VfsFile));
+                memset(f_write, 0, sizeof(VfsFile));
+                str_copy(f_write->node.name, "pipe_write");
+                f_write->node.is_dir = false;
+                f_write->node.first_cluster = 0xFFFFFFFB; // Pipe Write signature
+                f_write->current_cluster = p_idx; // Store pipe index
+                fd_table[fd_write] = f_write;
+
+                pipefd[0] = fd_read;
+                pipefd[1] = fd_write;
+
+                serial_write_string("  Success: created read_fd=");
+                char fdbuf[16];
+                uint_to_str(fd_read, fdbuf); serial_write_string(fdbuf);
+                serial_write_string(", write_fd=");
+                uint_to_str(fd_write, fdbuf); serial_write_string(fdbuf);
+                serial_write_string("\r\n");
+
+                return 0; // Success
+            }
+
+        case 290: // SYS_eventfd2 (Linux standard)
+            {
+                serial_write_string("Syscall: eventfd2 called\r\n");
+                int initval = (int)a1;
+                // Allocate pipe for eventfd
+                KPipe *p = (KPipe *)kmalloc(sizeof(KPipe));
+                if (!p) return (uint64_t)-12; /* -ENOMEM */
+                memset(p, 0, sizeof(KPipe));
+                if (initval > 0) {
+                    uint64_t val = initval;
+                    pipe_write(p, &val, 8);
+                }
+
+                int p_idx = -1;
+                for (int i = 0; i < MAX_PIPES; i++) {
+                    if (g_pipes[i] == NULL) {
+                        g_pipes[i] = p;
+                        p_idx = i;
+                        break;
+                    }
+                }
+                if (p_idx == -1) {
+                    kfree(p);
+                    return (uint64_t)-23; /* -ENFILE */
+                }
+
+                int fd = get_free_fd();
+                if (fd == -1) {
+                    g_pipes[p_idx] = NULL;
+                    kfree(p);
+                    return (uint64_t)-24; /* -EMFILE */
+                }
+                // Allocate file descriptor supporting both read and write
+                VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
+                memset(file, 0, sizeof(VfsFile));
+                str_copy(file->node.name, "eventfd");
+                file->node.is_dir = false;
+                file->node.first_cluster = 0xFFFFFFFC; // Eventfd signature
+                file->current_cluster = p_idx;
+                fd_table[fd] = file;
+
+                serial_write_string("  Success: created eventfd fd=");
+                char fdbuf[16];
+                uint_to_str(fd, fdbuf); serial_write_string(fdbuf);
+                serial_write_string("\r\n");
+                return fd;
+            }
+
+        case 4: // SYS_stat (Linux standard)
+            return (uint64_t)-38; /* -ENOSYS */
 
         case 10: // SYS_mprotect (Linux standard)
             return 0;
@@ -427,16 +623,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 56: // SYS_clone (Linux standard)
             {
-                typedef struct {
-                    uint64_t rip;
-                    uint64_t rsp;
-                    uint64_t tls;
-                } CloneArg;
-
                 CloneArg *ca = (CloneArg *)kmalloc(sizeof(CloneArg));
-                ca->rip = regs->rip;
-                ca->rsp = a2;
-                ca->tls = a5;
+                ca->regs = *regs;
+                ca->regs.rsp = a2; // Child stack pointer
 
                 extern Thread *thread_create(void (*entry)(void*), void *arg);
                 Thread *t = thread_create(clone_child_entry, ca);
@@ -479,20 +668,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t stack_top = 0;
                 PageTable *pml4 = vmm_get_current_pml4();
                 
-                extern bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, void *out_pages);
+
                 
-                // We allocate a temporary LoadedPages structure on stack
-                typedef struct {
-                    void *phys_pages[512];
-                    uint64_t virt_addrs[512];
-                    uint32_t count;
-                } LoadedPagesTemp;
-                LoadedPagesTemp lp;
+                #include <wynland/elf.h>
+                LoadedPages *lp = kmalloc(sizeof(LoadedPages));
+                if (!lp) {
+                    serial_write_string("SYS_execve: out of memory for LoadedPages allocation!\r\n");
+                    return (uint64_t)-12; /* -ENOMEM */
+                }
                 
-                if (!elf_load(kernel_path, &entry_point, &stack_top, pml4, &lp)) {
+                if (!elf_load(kernel_path, &entry_point, &stack_top, pml4, lp)) {
                     serial_write_string("SYS_execve: elf_load failed!\r\n");
+                    kfree(lp);
                     return (uint64_t)-2; /* -ENOENT */
                 }
+                kfree(lp);
 
                 // Update syscall regs to jump to the new entry point on return
                 regs->rip = entry_point;
@@ -720,6 +910,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 return 0;
             }
+        case 217: // SYS_getdents64 (Linux standard)
+            {
+                int fd = (int)a1;
+                if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
+                    return (uint64_t)-9; /* -EBADF */
+                }
+                extern int vfs_getdents(void *file, void *dirp, uint32_t count);
+                return (uint64_t)vfs_getdents(fd_table[fd], (void *)a2, (uint32_t)a3);
+            }
 
         case 257: // SYS_openat (Linux standard) — open relative to dirfd
             {
@@ -763,8 +962,99 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return 0;
             }
 
+        case 200: // SYS_tkill (Linux standard)
+        case 234: // SYS_tgkill (Linux standard)
+            serial_write_string("Syscall: tkill/tgkill signal received. Aborting process.\r\n");
+            thread_exit();
+            return 0;
+
+        case 204: // SYS_sched_getparam (Linux standard)
+            return (uint64_t)-38; /* -ENOSYS */
+
+        case 324: // SYS_memfd_create (Linux standard)
+            return (uint64_t)-38; /* -ENOSYS */
+
+        case 229: // SYS_set_tid_address (Linux standard)
+            return 1; // Return main thread ID 1
+
         case 273: // SYS_set_robust_list (Linux standard)
             return 0;
+
+        case 157: // SYS_prctl (Linux standard)
+            return 0;
+
+        case 271: // SYS_ppoll (Linux standard)
+            {
+                struct pollfd {
+                    int fd;
+                    short events;
+                    short revents;
+                } *fds = (struct pollfd *)a1;
+                uint64_t nfds = a2;
+                struct linux_timespec {
+                    int64_t tv_sec;
+                    int64_t tv_nsec;
+                } *tmo = (struct linux_timespec *)a3;
+                (void)tmo;
+
+                // Set all revents to 0 initially
+                if (fds) {
+                    for (uint64_t i = 0; i < nfds; i++) {
+                        fds[i].revents = 0;
+                    }
+                }
+
+                int ready = 0;
+                for (uint64_t i = 0; i < nfds; i++) {
+                    int fd = fds[i].fd;
+                    if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
+                        if (fds) fds[i].revents = 0x0020; // POLLNVAL
+                        ready++;
+                        continue;
+                    }
+                    VfsFile *file = fd_table[fd];
+                    
+                    // Check if it's eventfd or pipe
+                    if (file->node.first_cluster == 0xFFFFFFFA || // Pipe Read
+                        file->node.first_cluster == 0xFFFFFFFC)   // Eventfd
+                    {
+                        int p_idx = file->current_cluster;
+                        if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
+                            KPipe *p = g_pipes[p_idx];
+                            // Check if readable (there are bytes in the buffer)
+                            if (p->head != p->tail) {
+                                if (fds && (fds[i].events & 0x0001)) { // POLLIN
+                                    fds[i].revents |= 0x0001;
+                                    ready++;
+                                }
+                            }
+                        }
+                    }
+                    else if (file->node.first_cluster == 0xFFFFFFFB) { // Pipe Write
+                        // Pipes are always writable in our simple buffer
+                        if (fds && (fds[i].events & 0x0004)) { // POLLOUT
+                            fds[i].revents |= 0x0004;
+                            ready++;
+                        }
+                    }
+                    else {
+                        // Regular files/devices are always readable/writable
+                        if (fds) {
+                            if (fds[i].events & 0x0001) fds[i].revents |= 0x0001;
+                            if (fds[i].events & 0x0004) fds[i].revents |= 0x0004;
+                        }
+                        ready++;
+                    }
+                }
+
+                if (ready > 0) {
+                    return (uint64_t)ready;
+                }
+
+                // If no file descriptors are ready, yield to prevent tight busy loop
+                sched_yield();
+                return 0; // Timeout
+            }
 
         case 318: // SYS_getrandom (Linux standard)
             {

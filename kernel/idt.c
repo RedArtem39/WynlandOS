@@ -264,6 +264,19 @@ void exception_handler(InterruptRegisters *regs)
             uint_to_hex(cr2, buf);
             serial_write_string(buf);
             serial_write_string("\r\n");
+
+            serial_write_string("User Stack Dump:\r\n");
+            uint64_t *stack_ptr = (uint64_t *)regs->rsp;
+            for (int i = 0; i < 8; i++) {
+                uint64_t val = stack_ptr[i];
+                serial_write_string("  +");
+                char offset_buf[16];
+                extern void uint_to_str(uint64_t val, char *buf);
+                uint_to_str(i * 8, offset_buf); serial_write_string(offset_buf);
+                serial_write_string(": ");
+                uint_to_hex(val, buf); serial_write_string(buf);
+                serial_write_string("\r\n");
+            }
         }
         serial_write_string("Terminating user thread...\r\n");
         serial_write_string("======================================\r\n");

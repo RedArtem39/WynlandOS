@@ -69,7 +69,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     /* 4. Map the physical address in the Page Table */
     pt->entries[pt_idx] = phys | flags | PAGE_PRESENT;
 
-    if (virt >= 0x380000000000ULL) {
+    if (virt >= 0x700000000000ULL) {
         serial_write_string("VMM Map debug: ");
         char buf[32];
         extern void uint_to_hex(uint64_t val, char *buf);

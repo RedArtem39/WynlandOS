@@ -404,6 +404,7 @@ static const char *map_long_name(const char *name) {
     if (str_compare(name, "libQt6Widgets.so.6") == 0) return "LIBQT6~4.6";
     if (str_compare(name, "libQt6Widgets.so.6.5.2") == 0) return "LIBQT6~4.2";
     if (str_compare(name, "libqwynlandfb.so") == 0) return "LIBQWY~1.SO";
+    if (str_compare(name, "platforms") == 0) return "PLATFO~1";
     return name;
 }
 
@@ -672,7 +673,11 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         }
     }
 
-    if (node.is_dir) return NULL;
+    if (node.is_dir) {
+        if ((flags & VFS_O_WRITE) || (flags & VFS_O_CREATE) || (flags & VFS_O_TRUNC)) {
+            return NULL; /* Directories can only be opened read-only */
+        }
+    }
 
     VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
     if (!file) return NULL;
@@ -1009,9 +1014,18 @@ int vfs_seek(VfsFile *file, int32_t offset, int whence) {
     }
 
     /* Navigate to the correct cluster */
-    file->offset = (uint32_t)new_offset;
     uint32_t cluster_size = sectors_per_cluster * 512;
     uint32_t cluster = file->node.first_cluster;
+    uint32_t remaining = (uint32_t)new_offset;
+
+    if (cluster >= 2 && (uint32_t)new_offset >= file->offset && file->current_cluster >= 2) {
+        // Fast seek forward: start from current cluster!
+        cluster = file->current_cluster;
+        uint32_t current_file_pos_aligned = file->offset - file->current_cluster_offset;
+        remaining = (uint32_t)new_offset - current_file_pos_aligned;
+    }
+
+    file->offset = (uint32_t)new_offset;
 
     if (cluster < 2 || new_offset == 0) {
         file->current_cluster = file->node.first_cluster;
@@ -1019,7 +1033,6 @@ int vfs_seek(VfsFile *file, int32_t offset, int whence) {
         return 0;
     }
 
-    uint32_t remaining = (uint32_t)new_offset;
     while (remaining >= cluster_size) {
         uint32_t next = fat32_get_next_cluster(cluster);
         if (next >= 0x0FFFFFF8) break;
@@ -1324,4 +1337,104 @@ bool vfs_readdir(const char *path, void (*callback)(VfsNode *node)) {
     }
 
     return true;
+}
+
+/*
+ * vfs_getdents - Read directory entries in Linux dirent64 format
+ */
+int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
+    if (!file || !file->node.is_dir) return -1;
+
+    uint32_t cluster_size = sectors_per_cluster * 512;
+    uint32_t entries_per_cluster = cluster_size / sizeof(Fat32DirEntry);
+    uint32_t entry_index = file->offset / sizeof(Fat32DirEntry);
+
+    uint8_t *buf = (uint8_t *)dirp;
+    uint64_t bytes_written = 0;
+
+    struct linux_dirent64 {
+        uint64_t        d_ino;
+        int64_t         d_off;
+        unsigned short  d_reclen;
+        unsigned char   d_type;
+        char            d_name[];
+    };
+
+    // Inline mapping helper
+    const char *map_short_to_long_local(const char *sname) {
+        if (str_compare(sname, "libqwy~1.so") == 0) return "libqwynlandfb.so";
+        if (str_compare(sname, "libqt6~4.6") == 0) return "libQt6Widgets.so.6";
+        if (str_compare(sname, "libqt6~2.6") == 0) return "libQt6Gui.so.6";
+        if (str_compare(sname, "libqt6~1.6") == 0) return "libQt6Core.so.6";
+        if (str_compare(sname, "libqt6~3.6") == 0) return "libQt6DBus.so.6";
+        if (str_compare(sname, "ld-mus~1.1") == 0) return "ld-musl-x86_64.so.1";
+        if (str_compare(sname, "libstd~1.6") == 0) return "libstdc++.so.6";
+        if (str_compare(sname, "libgcc~1.1") == 0) return "libgcc_s.so.1";
+        if (str_compare(sname, "platfo~1") == 0) return "platforms";
+        return sname;
+    }
+
+    while (1) {
+        // Navigate FAT-chain to find the cluster
+        uint32_t cluster = file->node.first_cluster;
+        uint32_t rem_idx = entry_index;
+        while (rem_idx >= entries_per_cluster) {
+            cluster = fat32_get_next_cluster(cluster);
+            if (cluster >= 0x0FFFFFF8) break;
+            rem_idx -= entries_per_cluster;
+        }
+
+        if (cluster >= 0x0FFFFFF8) {
+            break; // End of directory FAT-chain
+        }
+
+        // Read sector
+        uint32_t sector_in_cluster = (rem_idx * sizeof(Fat32DirEntry)) / 512;
+        uint32_t offset_in_sector = (rem_idx * sizeof(Fat32DirEntry)) % 512;
+        uint32_t cluster_sector = fat32_cluster_to_sector(cluster);
+
+        uint8_t sector_buf[512];
+        if (!ahci_read(cluster_sector + sector_in_cluster, 1, sector_buf)) {
+            break;
+        }
+
+        Fat32DirEntry *e = (Fat32DirEntry *)(sector_buf + offset_in_sector);
+        if (e->name[0] == 0x00) {
+            break; // End of directory entries on disk
+        }
+
+        if ((uint8_t)e->name[0] != 0xE5 && e->attr != 0x0F && (e->attr & 0x08) == 0) {
+            char sname[64];
+            format_short_name(sname, (const char *)e->name);
+            const char *lname = map_short_to_long_local(sname);
+
+            uint32_t name_len = 0;
+            while (lname[name_len] != '\0') name_len++;
+
+            uint32_t reclen = (24 + name_len + 1 + 7) & ~7; // align 8
+
+            if (bytes_written + reclen > count) {
+                break; // User buffer is full
+            }
+
+            struct linux_dirent64 *d = (struct linux_dirent64 *)(buf + bytes_written);
+            d->d_ino = e->first_cluster_low | ((uint32_t)e->first_cluster_high << 16);
+            d->d_off = (entry_index + 1) * sizeof(Fat32DirEntry);
+            d->d_reclen = reclen;
+            d->d_type = (e->attr & 0x10) ? 4 : 8; // DT_DIR is 4, DT_REG is 8
+
+            char *dst_name = d->d_name;
+            for (uint32_t k = 0; k < name_len; k++) {
+                dst_name[k] = lname[k];
+            }
+            dst_name[name_len] = '\0';
+
+            bytes_written += reclen;
+        }
+
+        entry_index++;
+        file->offset = entry_index * sizeof(Fat32DirEntry);
+    }
+
+    return bytes_written;
 }
