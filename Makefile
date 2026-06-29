@@ -83,6 +83,7 @@ CFLAGS_KERNEL  = $(COMMON_FLAGS)          \
                  -mcmodel=large           \
                  -fno-pie                 \
                  -fno-pic                 \
+                 -fno-jump-tables         \
                  -nostdlib                \
                  -nostdinc                \
                  -std=c11                 \
@@ -92,6 +93,7 @@ CXXFLAGS_KERNEL = $(COMMON_FLAGS)         \
                   -mcmodel=large          \
                   -fno-pie                \
                   -fno-pic                \
+                  -fno-jump-tables        \
                   -fno-rtti               \
                   -fno-exceptions         \
                   -nostdlib               \
@@ -307,7 +309,7 @@ $(BUILD)/main_dynamic.elf: main_dynamic.c
 $(BUILD)/test_qt_real.elf: test_qt_real.cpp
 	@mkdir -p $(BUILD)
 	@echo "  CXX(USER)  $< (Real Qt6 App)"
-	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-g++ -Ibuild_qt_headers/include -Iinclude -Lbuild/lib -lQt6Widgets -lQt6Gui -lQt6DBus -lQt6Core -Wl,-rpath,/lib -o $@ $<
+	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-g++ -O2 -DQT_NO_DEBUG -fPIE -pie -Ibuild_qt_headers/include -Iinclude -Lbuild/lib -lQt6Widgets -lQt6Gui -lQt6DBus -lQt6Core -Wl,-rpath,/lib -o $@ $<
 
 # ---------- Disk Image ----------
 

@@ -341,11 +341,31 @@ void exception_handler(InterruptRegisters *regs)
         console_print_string(g_boot_info, "====================================================\n", 0x00FFFFFF, bg_color);
         
         console_print_string(g_boot_info, "Exception: ", 0x00FFFFFF, bg_color);
-        if (regs->int_no < 32) {
-            console_print_string(g_boot_info, exception_messages[regs->int_no], 0x00FF3333, bg_color);
-        } else {
-            console_print_string(g_boot_info, "Unknown", 0x00FF3333, bg_color);
+        const char *msg = "Unknown Exception";
+        switch (regs->int_no) {
+            case 0: msg = "Division By Zero (#DE)"; break;
+            case 1: msg = "Debug (#DB)"; break;
+            case 2: msg = "Non Maskable Interrupt"; break;
+            case 3: msg = "Breakpoint (#BP)"; break;
+            case 4: msg = "Overflow (#OF)"; break;
+            case 5: msg = "Out of Bounds (#BR)"; break;
+            case 6: msg = "Invalid Opcode (#UD)"; break;
+            case 7: msg = "No Coprocessor (#NM)"; break;
+            case 8: msg = "Double Fault (#DF)"; break;
+            case 9: msg = "Coprocessor Segment Overrun"; break;
+            case 10: msg = "Bad TSS (#TS)"; break;
+            case 11: msg = "Segment Not Present (#NP)"; break;
+            case 12: msg = "Stack Fault (#SS)"; break;
+            case 13: msg = "General Protection Fault (#GP)"; break;
+            case 14: msg = "Page Fault (#PF)"; break;
+            case 16: msg = "Coprocessor Fault"; break;
+            case 17: msg = "Alignment Check (#AC)"; break;
+            case 18: msg = "Machine Check (#MC)"; break;
+            case 19: msg = "SIMD Floating-Point Exception (#XM)"; break;
+            case 20: msg = "Virtualization Exception (#VE)"; break;
+            case 21: msg = "Control Protection Exception (#CP)"; break;
         }
+        console_print_string(g_boot_info, msg, 0x00FF3333, bg_color);
         console_print_string(g_boot_info, "\n\nRegisters state:\n", 0x00E0E0E0, bg_color);
 
         if (regs->int_no == 14) { /* Page Fault */
