@@ -1,0 +1,4 @@
+/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/no_direct_extern_access/CMakeFiles/no_extern_access_lib.dir
+/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/no_direct_extern_access/CMakeFiles/no_extern_access_main.dir
+/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/no_direct_extern_access/CMakeFiles/edit_cache.dir
+/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/no_direct_extern_access/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,4 @@
+#ifndef QTCOREEXPORTS_H
+#define QTCOREEXPORTS_H
+#define Q_CORE_EXPORT
+#endif

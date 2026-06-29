@@ -1,0 +1,14 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/mnt/c/Users/User/Desktop/WynlandOs/qtbase/config.tests/no_direct_extern_access/lib.cpp
+lib.h
+/mnt/c/Users/User/Desktop/WynlandOs/qtbase/config.tests/no_direct_extern_access/lib.h
+
+/mnt/c/Users/User/Desktop/WynlandOs/qtbase/config.tests/no_direct_extern_access/lib.h
+

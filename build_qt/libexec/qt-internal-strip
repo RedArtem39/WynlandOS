@@ -1,0 +1,4 @@
+#!/bin/sh
+# echo the invoked command
+set -x
+/mnt/c/Users/User/Desktop/WynlandOs/tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-strip --keep-section=.gnu_debuglink "$@"

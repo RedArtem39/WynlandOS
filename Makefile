@@ -323,6 +323,7 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_c
 	@mmd -i $@ ::/EFI/BOOT
 	@mmd -i $@ ::/lib
 	@mmd -i $@ ::/lib/platforms
+	-@mmd -i $@ ::/lib/fonts
 	-@mmd -i $@ ::/plugins
 	-@mmd -i $@ ::/plugins/platforms
 	@mcopy -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
@@ -352,6 +353,7 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_c
 	-@mcopy -i $@ build/lib/libQt6Widgets.so.6.5.2 ::/lib/libQt6Widgets.so.6.5.2
 	-@mcopy -i $@ build/plugins/platforms/libqwynlandfb.so ::/lib/platforms/libqwynlandfb.so
 	-@mcopy -i $@ build/plugins/platforms/libqwynlandfb.so ::/plugins/platforms/libqwynlandfb.so
+	-@mcopy -i $@ build/lib/fonts/DejaVuSans.ttf ::/lib/fonts/DejaVuSans.ttf
 	@mcopy -i $@ $(BUILD)/interp.elf ::/lib/ld-dummy.so
 	@mcopy -i $@ $(BUILD)/main_dynamic.elf ::/t_dyn.elf
 	@mcopy -i $@ app.wasm ::/app.was

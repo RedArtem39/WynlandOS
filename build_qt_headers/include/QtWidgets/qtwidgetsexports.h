@@ -1,0 +1,4 @@
+#ifndef QTWIDGETSEXPORTS_H
+#define QTWIDGETSEXPORTS_H
+#define Q_WIDGETS_EXPORT
+#endif

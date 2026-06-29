@@ -1,0 +1,1 @@
+#include "../../../../../qtbase/src/gui/platform/unix/dbustray/qdbustrayicon_p.h"

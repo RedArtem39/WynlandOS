@@ -1,0 +1,18 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/precompile_header/CMakeFiles/precompile_header.dir/cmake_pch.hxx
+/mnt/c/Users/User/Desktop/WynlandOs/qtbase/config.tests/precompile_header/header.h
+-
+
+/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/precompile_header/CMakeFiles/precompile_header.dir/cmake_pch.hxx.cxx
+
+/mnt/c/Users/User/Desktop/WynlandOs/qtbase/config.tests/precompile_header/header.h
+
+/mnt/c/Users/User/Desktop/WynlandOs/qtbase/config.tests/precompile_header/main.cpp
+

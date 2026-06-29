@@ -278,7 +278,6 @@ void uint_to_str(uint64_t value, char *buf)
  */
 void uint_to_hex(uint64_t value, char *buf)
 {
-    static const char hex_chars[] = "0123456789ABCDEF";
     buf[0] = '0';
     buf[1] = 'x';
 
@@ -296,7 +295,12 @@ void uint_to_hex(uint64_t value, char *buf)
 
     int pos = 2;
     while (start >= 0) {
-        buf[pos++] = hex_chars[(value >> start) & 0xF];
+        uint8_t nibble = (value >> start) & 0xF;
+        if (nibble < 10) {
+            buf[pos++] = '0' + nibble;
+        } else {
+            buf[pos++] = 'A' + (nibble - 10);
+        }
         start -= 4;
     }
     buf[pos] = '\0';
@@ -2563,11 +2567,11 @@ void kernel_main(BootInfo *boot_info)
             void *entry;
             void *stack;
         } ExecArg;
-        static ExecArg earg;
-        earg.entry = (void *)entry_point;
-        earg.stack = (void *)stack_top;
+        ExecArg *earg = (ExecArg *)kmalloc(sizeof(ExecArg));
+        earg->entry = (void *)entry_point;
+        earg->stack = (void *)stack_top;
         extern void user_exec_wrapper(void *arg);
-        thread_create(user_exec_wrapper, &earg);
+        thread_create(user_exec_wrapper, earg);
     } else {
         console_print_string(boot_info, "Failed to load /qtreal.elf!\n", 0x00FF0000, term_bg_color);
     }

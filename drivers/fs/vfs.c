@@ -80,6 +80,18 @@ typedef struct {
     uint32_t file_size;
 } __attribute__((packed)) Fat32DirEntry;
 
+/* FAT32 Long File Name entry (attr == 0x0F) */
+typedef struct {
+    uint8_t  order;          /* Sequence number (0x40 = last) */
+    uint16_t name1[5];       /* Characters 1-5 */
+    uint8_t  attr;           /* Always 0x0F */
+    uint8_t  type;           /* Always 0 */
+    uint8_t  checksum;       /* Checksum of 8.3 name */
+    uint16_t name2[6];       /* Characters 6-11 */
+    uint16_t first_cluster;  /* Always 0 */
+    uint16_t name3[2];       /* Characters 12-13 */
+} __attribute__((packed)) Fat32LfnEntry;
+
 /* ============================================================
  * Local string helpers
  * ============================================================ */
@@ -315,34 +327,61 @@ static bool split_path(const char *path, char *parent, char *name) {
  * Optionally returns the sector/offset of the directory entry found,
  * so callers can modify/delete it later.
  */
+/* Case-insensitive character compare helper */
+static bool char_eq_ci(char a, char b) {
+    if (a >= 'A' && a <= 'Z') a += 32;
+    if (b >= 'A' && b <= 'Z') b += 32;
+    return a == b;
+}
+
+/* Compare null-terminated name against 8.3 short entry (case-insensitive) */
+static bool match_short_name(const char *short11, const char *name) {
+    /* Reconstruct readable name from 8.3 and compare */
+    char readable[13];
+    int pos = 0;
+    int name_end = 7;
+    while (name_end >= 0 && short11[name_end] == ' ') name_end--;
+    for (int i = 0; i <= name_end; i++) readable[pos++] = short11[i];
+    int ext_end = 10;
+    while (ext_end >= 8 && short11[ext_end] == ' ') ext_end--;
+    if (ext_end >= 8) {
+        readable[pos++] = '.';
+        for (int i = 8; i <= ext_end; i++) readable[pos++] = short11[i];
+    }
+    readable[pos] = '\0';
+    /* Compare case-insensitively */
+    int i = 0;
+    while (readable[i] && name[i]) {
+        if (!char_eq_ci(readable[i], name[i])) return false;
+        i++;
+    }
+    return readable[i] == '\0' && name[i] == '\0';
+}
+
+/* Extract one UTF-16LE character from LFN entry at given field position */
+static uint16_t lfn_get_u16(const Fat32LfnEntry *lfn, int pos) {
+    if (pos < 5)  return lfn->name1[pos];
+    if (pos < 11) return lfn->name2[pos - 5];
+    return lfn->name3[pos - 11];
+}
+
 static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                                VfsNode *out_node,
                                uint32_t *out_entry_sector,
                                uint32_t *out_entry_offset) {
     uint32_t curr_cluster = dir_cluster;
 
-    char short_name[11];
-    format_to_83_name(short_name, name);
-
-    if (name[0] == 'L' || name[0] == 'l') {
-        serial_write_string("VFS Search: ");
-        serial_write_string(name);
-        serial_write_string(" -> short: [");
-        char temp[12];
-        for (int k = 0; k < 11; k++) temp[k] = short_name[k];
-        temp[11] = '\0';
-        serial_write_string(temp);
-        serial_write_string("]\r\n");
-    }
+    /* LFN accumulator: up to 255 chars + NUL */
+    char lfn_buf[256];
+    int  lfn_len = 0;
+    bool have_lfn = false;
 
     while (curr_cluster < 0x0FFFFFF8) {
         uint32_t base_sector = fat32_cluster_to_sector(curr_cluster);
 
         for (uint32_t s = 0; s < sectors_per_cluster; s++) {
             uint8_t sector_buf[512];
-            if (!ahci_read(base_sector + s, 1, sector_buf)) {
-                return false;
-            }
+            if (!ahci_read(base_sector + s, 1, sector_buf)) return false;
 
             Fat32DirEntry *entries = (Fat32DirEntry *)sector_buf;
             uint32_t entries_per_sector = 512 / sizeof(Fat32DirEntry);
@@ -350,34 +389,73 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
             for (uint32_t i = 0; i < entries_per_sector; i++) {
                 Fat32DirEntry *e = &entries[i];
 
-                if (e->name[0] == 0x00) return false;             /* End of directory */
-                if ((uint8_t)e->name[0] == 0xE5) continue;       /* Deleted entry */
-                if (e->attr == 0x0F) continue;                    /* LFN entry */
-
-                if (name[0] == 'L' || name[0] == 'l') {
-                    serial_write_string("  Checking entry: [");
-                    char temp[12];
-                    for (int k = 0; k < 11; k++) temp[k] = e->name[k];
-                    temp[11] = '\0';
-                    serial_write_string(temp);
-                    serial_write_string("]\r\n");
+                if (e->name[0] == 0x00) return false;       /* End of directory */
+                if ((uint8_t)e->name[0] == 0xE5) {          /* Deleted – reset LFN */
+                    have_lfn = false; lfn_len = 0;
+                    continue;
                 }
 
-                bool match = true;
-                for (int k = 0; k < 11; k++) {
-                    if (e->name[k] != short_name[k]) {
-                        match = false;
-                        break;
+                if (e->attr == 0x0F) {
+                    /* LFN entry – extract UTF-16LE chars into lfn_buf */
+                    Fat32LfnEntry *lfn = (Fat32LfnEntry *)e;
+                    uint8_t seq = lfn->order & 0x3F;
+                    bool is_last = (lfn->order & 0x40) != 0;
+
+                    /* Characters for this entry go at position (seq-1)*13 */
+                    int base_pos = (seq - 1) * 13;
+
+                    for (int c = 0; c < 13; c++) {
+                        uint16_t uc = lfn_get_u16(lfn, c);
+                        if (uc == 0x0000 || uc == 0xFFFF) break;
+                        int idx = base_pos + c;
+                        if (idx < 255) {
+                            /* Convert to ASCII (drop high byte for Latin-1) */
+                            lfn_buf[idx] = (uc < 0x80) ? (char)uc : '?';
+                            if (idx + 1 > lfn_len) lfn_len = idx + 1;
+                        }
                     }
+                    if (is_last) have_lfn = true;
+                    continue;
                 }
+
+                /* Regular 8.3 entry */
+                bool match = false;
+
+                /* 1. Try LFN match first */
+                if (have_lfn && lfn_len > 0) {
+                    lfn_buf[lfn_len] = '\0';
+                    /* Case-insensitive compare */
+                    int ki = 0;
+                    while (lfn_buf[ki] && name[ki] && char_eq_ci(lfn_buf[ki], name[ki])) ki++;
+                    if (lfn_buf[ki] == '\0' && name[ki] == '\0') match = true;
+                }
+
+                /* 2. Fallback: 8.3 short name match */
+                if (!match) {
+                    match = match_short_name(e->name, name);
+                }
+
+                /* Reset LFN state for next entry */
+                have_lfn = false;
+                lfn_len  = 0;
 
                 if (match) {
-                    format_short_name(out_node->name, e->name);
-                    out_node->size = e->file_size;
-                    out_node->is_dir = (e->attr & 0x10) != 0;
+                    /* Use LFN name if available, else format short name */
+                    if (lfn_len > 0) {
+                        /* already in lfn_buf – copy to out_node->name */
+                        int ni = 0;
+                        while (ni < (int)lfn_len && ni < 255) {
+                            out_node->name[ni] = lfn_buf[ni];
+                            ni++;
+                        }
+                        out_node->name[ni] = '\0';
+                    } else {
+                        format_short_name(out_node->name, e->name);
+                    }
+                    out_node->size         = e->file_size;
+                    out_node->is_dir       = (e->attr & 0x10) != 0;
                     out_node->first_cluster = e->first_cluster_low |
-                                              ((uint32_t)e->first_cluster_high << 16);
-
+                                             ((uint32_t)e->first_cluster_high << 16);
                     if (out_entry_sector) *out_entry_sector = base_sector + s;
                     if (out_entry_offset) *out_entry_offset = i * sizeof(Fat32DirEntry);
                     return true;
@@ -386,27 +464,10 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
         }
         curr_cluster = fat32_get_next_cluster(curr_cluster);
     }
-
     return false;
 }
 
-static const char *map_long_name(const char *name) {
-    if (str_compare(name, "ld-musl-x86_64.so.1") == 0) return "LD-MUS~1.1";
-    if (str_compare(name, "libstdc++.so.6") == 0) return "LIBSTD~1.6";
-    if (str_compare(name, "libstdc++.so.6.0.29") == 0) return "LIBSTD~1.29";
-    if (str_compare(name, "libgcc_s.so.1") == 0) return "LIBGCC~1.1";
-    if (str_compare(name, "libQt6Core.so.6") == 0) return "LIBQT6~1.6";
-    if (str_compare(name, "libQt6Core.so.6.5.2") == 0) return "LIBQT6~1.2";
-    if (str_compare(name, "libQt6Gui.so.6") == 0) return "LIBQT6~2.6";
-    if (str_compare(name, "libQt6Gui.so.6.5.2") == 0) return "LIBQT6~2.2";
-    if (str_compare(name, "libQt6DBus.so.6") == 0) return "LIBQT6~3.6";
-    if (str_compare(name, "libQt6DBus.so.6.5.2") == 0) return "LIBQT6~3.2";
-    if (str_compare(name, "libQt6Widgets.so.6") == 0) return "LIBQT6~4.6";
-    if (str_compare(name, "libQt6Widgets.so.6.5.2") == 0) return "LIBQT6~4.2";
-    if (str_compare(name, "libqwynlandfb.so") == 0) return "LIBQWY~1.SO";
-    if (str_compare(name, "platforms") == 0) return "PLATFO~1";
-    return name;
-}
+/* map_long_name removed: LFN is now handled natively in fat32_find_in_dir */
 
 /*
  * vfs_lookup_path - Resolve a full path to a VfsNode
@@ -444,17 +505,13 @@ static bool vfs_lookup_path(const char *path, VfsNode *out_node,
         bool last = (*slash == '\0');
         *slash = '\0';
 
-        const char *lookup_name = map_long_name(p);
-
         serial_write_string("  Component: ");
         serial_write_string(p);
-        serial_write_string(" -> mapped: ");
-        serial_write_string(lookup_name);
         serial_write_string("\r\n");
 
         VfsNode next_node;
         uint32_t es = 0, eo = 0;
-        if (!fat32_find_in_dir(curr_cluster, lookup_name, &next_node, &es, &eo)) {
+        if (!fat32_find_in_dir(curr_cluster, p, &next_node, &es, &eo)) {
             serial_write_string("    Lookup failed for component\r\n");
             return false;
         }
@@ -620,8 +677,33 @@ VfsFile *vfs_open(const char *path) {
     return vfs_open_flags(path, VFS_O_READ);
 }
 
+/* Helper: check if path ends with suffix */
+static bool path_ends_with(const char *path, const char *suffix) {
+    uint32_t plen = str_len_local(path);
+    uint32_t slen = str_len_local(suffix);
+    if (plen < slen) return false;
+    const char *p = path + (plen - slen);
+    return str_compare(p, suffix) == 0;
+}
+
+/* Helper: check if path contains substring */
+static bool __attribute__((unused)) path_contains(const char *path, const char *needle) {
+    uint32_t plen = str_len_local(path);
+    uint32_t nlen = str_len_local(needle);
+    if (plen < nlen) return false;
+    for (uint32_t i = 0; i <= plen - nlen; i++) {
+        bool match = true;
+        for (uint32_t j = 0; j < nlen; j++) {
+            if (path[i+j] != needle[j]) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
-    if (str_compare(path, "/dev/fb0") == 0) {
+    /* Match /dev/fb0 — exact or suffix (handles relative paths) */
+    if (str_compare(path, "/dev/fb0") == 0 || path_ends_with(path, "/dev/fb0") || path_ends_with(path, "dev/fb0")) {
         VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
         if (!file) return NULL;
         extern BootInfo *g_boot_info;
@@ -634,7 +716,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         file->dirty = false;
         return file;
     }
-    if (str_compare(path, "/dev/input/mice") == 0) {
+    if (str_compare(path, "/dev/input/mice") == 0 || path_ends_with(path, "/dev/input/mice") || path_ends_with(path, "dev/input/mice")) {
         VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
         if (!file) return NULL;
         str_copy(file->node.name, "mice");
@@ -646,7 +728,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         file->dirty = false;
         return file;
     }
-    if (str_compare(path, "/dev/tty") == 0) {
+    if (str_compare(path, "/dev/tty") == 0 || path_ends_with(path, "/dev/tty") || path_ends_with(path, "dev/tty")) {
         VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
         if (!file) return NULL;
         str_copy(file->node.name, "tty");

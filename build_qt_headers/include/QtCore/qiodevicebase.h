@@ -1,0 +1,1 @@
+#include "../../../qtbase/src/corelib/io/qiodevicebase.h"

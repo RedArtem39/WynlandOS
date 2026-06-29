@@ -1,0 +1,1 @@
+#include "../../../qtbase/src/corelib/text/qlocale.h"
