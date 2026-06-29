@@ -99,4 +99,5 @@ typedef struct {
 
 void ahci_init(void);
 bool ahci_read(uint32_t lba, uint32_t count, void *buf);
+bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf);
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf);
