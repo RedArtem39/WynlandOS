@@ -163,22 +163,22 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         }
     }
 
-    if (found2560) {
-        bestMode = mode2560;
-        bestWidth = 2560;
-        bestHeight = 1440;
-    } else if (found1920) {
-        bestMode = mode1920;
-        bestWidth = 1920;
-        bestHeight = 1080;
+    if (found1024) {
+        bestMode = mode1024;
+        bestWidth = 1024;
+        bestHeight = 768;
     } else if (found1280) {
         bestMode = mode1280;
         bestWidth = 1280;
         bestHeight = 720;
-    } else if (found1024) {
-        bestMode = mode1024;
-        bestWidth = 1024;
-        bestHeight = 768;
+    } else if (found1920) {
+        bestMode = mode1920;
+        bestWidth = 1920;
+        bestHeight = 1080;
+    } else if (found2560) {
+        bestMode = mode2560;
+        bestWidth = 2560;
+        bestHeight = 1440;
     }
 
     /* Fallback if no moderate resolution mode is found */

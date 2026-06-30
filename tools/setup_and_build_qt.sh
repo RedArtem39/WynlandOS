@@ -46,9 +46,7 @@ cmake --build . --parallel $(nproc)
 
 echo "==> Step 6: Copying output libraries to WynlandOS workspace..."
 mkdir -p "${SDK_DIR}/build/lib"
-cp -d lib/libQt6Core.so* "${SDK_DIR}/build/lib/"
-cp -d lib/libQt6Gui.so* "${SDK_DIR}/build/lib/"
-cp -d lib/libQt6Widgets.so* "${SDK_DIR}/build/lib/"
+cp -d lib/libQt6*.so* "${SDK_DIR}/build/lib/"
 
 mkdir -p "${SDK_DIR}/build/plugins/platforms"
 cp plugins/platforms/libqwynlandfb.so "${SDK_DIR}/build/plugins/platforms/"
