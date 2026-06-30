@@ -205,7 +205,6 @@ void clone_child_entry(void *arg) {
     thread_enter_user_mode_clone(&ca->regs);
 }
 
-// C-level Syscall Handler
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     switch (num) {
         case 0: // SYS_read (Linux standard)
@@ -1069,6 +1068,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 return len;
             }
+
+        case 28: // SYS_madvise (stub - returning 0 is always safe)
+            return 0;
 
         case 334: // SYS_rseq — restartable sequences (stub)
             return (uint64_t)-38; /* -ENOSYS */

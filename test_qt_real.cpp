@@ -320,14 +320,13 @@ private:
     }
 };
 
-// 5. Tic-Tac-Toe Game Component
 class TicTacToe : public QWidget {
 public:
     TicTacToe(QWidget *parent = nullptr) : QWidget(parent) {
         setProperty("turn", 'X');
         setProperty("gameOver", false);
 
-        QGridLayout *layout = new QGridLayout(this);
+        QGridLayout *layout = new QGridLayout();
         layout->setObjectName("buttonsLayout");
         layout->setContentsMargins(10, 10, 10, 10);
         layout->setSpacing(8);
@@ -370,6 +369,7 @@ public:
         main->addLayout(layout);
         main->addWidget(reset);
     }
+
 private:
     void makeMove(int idx) {
         bool gameOver = property("gameOver").toBool();
@@ -608,19 +608,21 @@ int main(int argc, char *argv[])
     workspace->setGeometry(0, 30, 1920, 980);
     workspace->setAttribute(Qt::WA_TranslucentBackground);
 
+
+
     // Create desktop windows inside workspace
     WynWindow *winMonitor = new WynWindow("System Monitor", workspace);
     winMonitor->move(100, 100);
     QVBoxLayout *monLayout = new QVBoxLayout(winMonitor->contentArea());
     monLayout->setContentsMargins(0, 0, 0, 0);
-    monLayout->addWidget(new SystemMonitor(winMonitor));
+    monLayout->addWidget(new SystemMonitor(winMonitor->contentArea()));
     winMonitor->show();
 
     WynWindow *winText = new WynWindow("Notes / Todo List", workspace);
     winText->move(600, 100);
     QVBoxLayout *textLayout = new QVBoxLayout(winText->contentArea());
     textLayout->setContentsMargins(0, 0, 0, 0);
-    NotesWidget *notes = new NotesWidget(winText);
+    NotesWidget *notes = new NotesWidget(winText->contentArea());
     textLayout->addWidget(notes);
     winText->show();
 
@@ -628,7 +630,7 @@ int main(int argc, char *argv[])
     winExplorer->move(100, 500);
     QVBoxLayout *expLayout = new QVBoxLayout(winExplorer->contentArea());
     expLayout->setContentsMargins(0, 0, 0, 0);
-    expLayout->addWidget(new FileExplorer(winExplorer));
+    expLayout->addWidget(new FileExplorer(winExplorer->contentArea()));
     winExplorer->show();
 
     WynWindow *winGame = new WynWindow("Tic-Tac-Toe Game", workspace);
@@ -636,8 +638,10 @@ int main(int argc, char *argv[])
     winGame->resize(240, 320);
     QVBoxLayout *gameLayout = new QVBoxLayout(winGame->contentArea());
     gameLayout->setContentsMargins(0, 0, 0, 0);
-    gameLayout->addWidget(new TicTacToe(winGame));
+    gameLayout->addWidget(new TicTacToe(winGame->contentArea()));
     winGame->show();
+
+
 
     // Show workspace container to reveal all child windows
     workspace->show();

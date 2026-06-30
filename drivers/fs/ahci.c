@@ -115,56 +115,12 @@ void ahci_init(void) {
     serial_write_string("AHCI: Port initialized successfully.\r\n");
 }
 
-/* ============================================================
- * Sector Cache — 4096-slot direct-mapped cache (2 MB RAM)
- * Only caches single-sector reads (count == 1)
- * ============================================================ */
-#define SECTOR_CACHE_SIZE 4096
-
-typedef struct {
-    uint32_t lba;
-    bool     valid;
-    uint8_t  data[512];
-} SectorCacheEntry;
-
-static SectorCacheEntry sector_cache[SECTOR_CACHE_SIZE];
-
-static void __attribute__((unused)) cache_invalidate(void) {
-    for (int i = 0; i < SECTOR_CACHE_SIZE; i++) sector_cache[i].valid = false;
-}
-
-static bool __attribute__((unused)) ahci_read_one_cached(uint32_t lba, uint8_t *out_buf);
-
+/* ahci_read - read sectors from SATA disk via AHCI DMA */
 bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
-    /* Only use cache for single-sector reads (FAT table, directory entries) */
-    if (count == 1) {
-        uint32_t slot = lba % SECTOR_CACHE_SIZE;
-        if (sector_cache[slot].valid && sector_cache[slot].lba == lba) {
-            /* Cache hit */
-            uint8_t *dst = (uint8_t *)buf;
-            for (int b = 0; b < 512; b++) dst[b] = sector_cache[slot].data[b];
-            return true;
-        }
-        /* Cache miss - read from disk and cache */
-        bool result = ahci_read_hw(lba, 1, buf);
-        if (result) {
-            sector_cache[slot].lba   = lba;
-            sector_cache[slot].valid = true;
-            uint8_t *src = (uint8_t *)buf;
-            for (int b = 0; b < 512; b++) sector_cache[slot].data[b] = src[b];
-        }
-        return result;
-    }
-
-    /* Multi-sector reads go directly to hardware (large sequential reads) */
     return ahci_read_hw(lba, count, buf);
 }
 
-static bool __attribute__((unused)) ahci_read_one_cached(uint32_t lba, uint8_t *out_buf) {
-    return ahci_read(lba, 1, out_buf);
-}
-
-/* Hardware-level read (no cache) */
+/* Hardware-level read */
 bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
 
     if (sata_port_num == -1) return false;

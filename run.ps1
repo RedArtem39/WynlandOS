@@ -70,13 +70,14 @@ $QemuArgs = @(
     "-cpu", "qemu64",
     "-accel", "whpx",
     "-accel", "tcg",
-    "-m", "256M",
+    "-m", "512M",
     "-bios", $OvmfFw,
     "-drive", "file=$DiskImage,format=raw",
     "-vga", "virtio",
-    "-serial", "stdio",
+    "-serial", "file:$ScriptDir\serial.log",
     "-no-reboot",
-    "-no-shutdown"
+    "-no-shutdown",
+    "-D", "$ScriptDir\qemu.log"
 )
 
 if (-not $NoNet) {

@@ -248,6 +248,9 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     uint64_t entry_point = hdr.e_entry;
 
     if (has_interp) {
+        serial_write_string("ELF: opening interp=[");
+        serial_write_string(interp_path);
+        serial_write_string("]\r\n");
         VfsFile *interp_f = vfs_open(interp_path);
         if (!interp_f) {
             serial_write_string("ELF Loader Error: Dynamic linker not found: ");
@@ -267,7 +270,14 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             interp_hdr.e_ident[EI_MAG1] != 'E'  ||
             interp_hdr.e_ident[EI_MAG2] != 'L'  ||
             interp_hdr.e_ident[EI_MAG3] != 'F') {
-            serial_write_string("ELF Loader Error: Invalid interpreter ELF magic.\r\n");
+            /* Debug: print first 8 bytes */
+            serial_write_string("ELF Loader Error: Invalid interpreter ELF magic. Bytes: ");
+            char hx[4]; extern void uint_to_hex(uint64_t, char*);
+            for (int di = 0; di < 8; di++) {
+                uint_to_hex(interp_hdr.e_ident[di], hx);
+                serial_write_string(hx); serial_write_string(" ");
+            }
+            serial_write_string("\r\n");
             vfs_close(interp_f);
             goto error_cleanup_no_file;
         }

@@ -435,31 +435,36 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                     match = match_short_name(e->name, name);
                 }
 
-                /* Reset LFN state for next entry */
-                have_lfn = false;
-                lfn_len  = 0;
-
                 if (match) {
-                    /* Use LFN name if available, else format short name */
-                    if (lfn_len > 0) {
-                        /* already in lfn_buf – copy to out_node->name */
-                        int ni = 0;
-                        while (ni < (int)lfn_len && ni < 255) {
-                            out_node->name[ni] = lfn_buf[ni];
-                            ni++;
-                        }
-                        out_node->name[ni] = '\0';
-                    } else {
-                        format_short_name(out_node->name, e->name);
+                    /* Debug: print cluster for ld-musl */
+                    if (name[0] == 'l' || name[0] == 'L') {
+                        serial_write_string("VFS: found '");
+                        serial_write_string(name);
+                        serial_write_string("' cluster=0x");
+                        char cdbuf[16]; extern void uint_to_hex(uint64_t, char*);
+                        uint_to_hex(e->first_cluster_low | ((uint32_t)e->first_cluster_high << 16), cdbuf);
+                        serial_write_string(cdbuf);
+                        serial_write_string("\r\n");
                     }
+
+                    format_short_name(out_node->name, e->name);
                     out_node->size         = e->file_size;
                     out_node->is_dir       = (e->attr & 0x10) != 0;
                     out_node->first_cluster = e->first_cluster_low |
                                              ((uint32_t)e->first_cluster_high << 16);
                     if (out_entry_sector) *out_entry_sector = base_sector + s;
                     if (out_entry_offset) *out_entry_offset = i * sizeof(Fat32DirEntry);
+
+                    /* Reset LFN state */
+                    have_lfn = false;
+                    lfn_len  = 0;
                     return true;
                 }
+
+                /* Reset LFN state for next entry */
+                have_lfn = false;
+                lfn_len  = 0;
+
             }
         }
         curr_cluster = fat32_get_next_cluster(curr_cluster);
