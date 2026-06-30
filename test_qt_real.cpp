@@ -12,12 +12,21 @@
 #include <QtWidgets/qboxlayout.h>
 #include <QtWidgets/qgridlayout.h>
 #include <time.h>
+#include <QtCore/qdir.h>
+#include <QtCore/qfileinfo.h>
+#include <QtWidgets/qlistwidget.h>
+#include <QtGui/qfontdatabase.h>
+#include <QtGui/qcursor.h>
+
+
+
 
 // 1. Wallpaper Widget using safe Dynamic Properties (No custom fields to prevent ABI mismatch)
 class WallpaperWidget : public QWidget {
 public:
     WallpaperWidget(QWidget *parent = nullptr) : QWidget(parent) {
         setProperty("phase", 0.0);
+        setProperty("styleIndex", 0);
         QTimer *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, &WallpaperWidget::animate);
         timer->start(33); // ~30 FPS
@@ -27,6 +36,7 @@ protected:
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing);
 
+        int style = property("styleIndex").toInt();
         double p = property("phase").toDouble();
         double sin1 = p - (p*p*p)/6.0;
         double cos1 = 1.0 - (p*p)/2.0;
@@ -36,19 +46,60 @@ protected:
         int cx2 = width() * (0.4 + 0.2 * cos1);
         int cy2 = height() * (0.6 + 0.2 * sin1);
 
-        painter.fillRect(rect(), QColor(10, 10, 16));
+        if (style == 0) {
+            // 1. Dynamic Mesh Purple & Emerald (OLED Black base)
+            painter.fillRect(rect(), QColor(10, 10, 16));
+            QRadialGradient grad1(cx1, cy1, width() * 0.65);
+            grad1.setColorAt(0.0, QColor(138, 43, 226, 120));
+            grad1.setColorAt(0.5, QColor(75, 0, 130, 35));
+            grad1.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad1);
 
-        QRadialGradient grad1(cx1, cy1, width() * 0.65);
-        grad1.setColorAt(0.0, QColor(138, 43, 226, 120));
-        grad1.setColorAt(0.5, QColor(75, 0, 130, 35));
-        grad1.setColorAt(1.0, QColor(0, 0, 0, 0));
-        painter.fillRect(rect(), grad1);
+            QRadialGradient grad2(cx2, cy2, width() * 0.55);
+            grad2.setColorAt(0.0, QColor(0, 206, 209, 110));
+            grad2.setColorAt(0.6, QColor(0, 100, 80, 25));
+            grad2.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad2);
+        }
+        else if (style == 1) {
+            // 2. Sunset Gradient (Warm Sunset Glow)
+            painter.fillRect(rect(), QColor(24, 10, 26));
+            QRadialGradient grad1(cx1, cy1, width() * 0.7);
+            grad1.setColorAt(0.0, QColor(255, 69, 0, 130));
+            grad1.setColorAt(0.5, QColor(139, 0, 139, 40));
+            grad1.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad1);
 
-        QRadialGradient grad2(cx2, cy2, width() * 0.55);
-        grad2.setColorAt(0.0, QColor(0, 206, 209, 110));
-        grad2.setColorAt(0.6, QColor(0, 100, 80, 25));
-        grad2.setColorAt(1.0, QColor(0, 0, 0, 0));
-        painter.fillRect(rect(), grad2);
+            QRadialGradient grad2(cx2, cy2, width() * 0.6);
+            grad2.setColorAt(0.0, QColor(255, 20, 147, 100));
+            grad2.setColorAt(0.6, QColor(75, 0, 130, 30));
+            grad2.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad2);
+        }
+        else if (style == 2) {
+            // 3. Nordic Aurora (Cold Neon Green & Cyan)
+            painter.fillRect(rect(), QColor(6, 12, 18));
+            QRadialGradient grad1(cx1, cy1, width() * 0.7);
+            grad1.setColorAt(0.0, QColor(57, 255, 20, 90));
+            grad1.setColorAt(0.6, QColor(0, 128, 128, 25));
+            grad1.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad1);
+
+            QRadialGradient grad2(cx2, cy2, width() * 0.5);
+            grad2.setColorAt(0.0, QColor(0, 255, 255, 90));
+            grad2.setColorAt(0.5, QColor(0, 0, 128, 20));
+            grad2.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad2);
+        }
+        else {
+            // 4. OLED Midnight Minimalist (Subtle Slate Gray)
+            painter.fillRect(rect(), QColor(5, 5, 8));
+            QRadialGradient grad1(width() * 0.5, height() * 0.5, width() * 0.8);
+            grad1.setColorAt(0.0, QColor(255, 255, 255, 12));
+            grad1.setColorAt(0.5, QColor(255, 255, 255, 2));
+            grad1.setColorAt(1.0, QColor(0, 0, 0, 0));
+            painter.fillRect(rect(), grad1);
+        }
     }
 private:
     void animate() {
@@ -172,11 +223,13 @@ class SystemMonitor : public QWidget {
 public:
     SystemMonitor(QWidget *parent = nullptr) : QWidget(parent) {
         QVariantList emptyList;
-        for (int i = 0; i < 40; i++) {
+        for (int i = 0; i < 30; i++) {
             emptyList.append(0);
         }
         setProperty("cpuHistory", emptyList);
         setProperty("memHistory", emptyList);
+        setProperty("diskHistory", emptyList);
+        setProperty("netHistory", emptyList);
 
         QTimer *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, &SystemMonitor::updateStats);
@@ -187,61 +240,104 @@ protected:
         QPainter painter(this);
         painter.setRenderHint(QPainter::Antialiasing);
 
-        // Grid lines
-        painter.setPen(QPen(QColor(255, 255, 255, 15), 1, Qt::DashLine));
-        for (int i = 1; i < 4; i++) {
-            int y = height() * i / 4;
-            painter.drawLine(0, y, width(), y);
-        }
-
         QVariantList cpu = property("cpuHistory").toList();
         QVariantList mem = property("memHistory").toList();
+        QVariantList disk = property("diskHistory").toList();
+        QVariantList net = property("netHistory").toList();
 
-        drawGraph(painter, cpu, QColor(255, 0, 127), "CPU Load: " + QString::number(cpu.last().toInt()) + "%", 0);
-        drawGraph(painter, mem, QColor(0, 191, 255), "RAM Load: " + QString::number(mem.last().toInt()) + "%", 25);
+        int w = width() / 2;
+        int h = height() / 2;
+
+        drawQuadrant(painter, QRect(5, 5, w - 10, h - 10), cpu, QColor(255, 45, 85), "CPU LOAD", "%");
+        drawQuadrant(painter, QRect(w + 5, 5, w - 10, h - 10), mem, QColor(0, 122, 255), "RAM LOAD", "%");
+        drawQuadrant(painter, QRect(5, h + 5, w - 10, h - 10), disk, QColor(255, 204, 0), "DISK WRITE", " KB/s");
+        drawQuadrant(painter, QRect(w + 5, h + 5, w - 10, h - 10), net, QColor(52, 199, 89), "NET SPEED", " Mbps");
     }
 private:
-    void drawGraph(QPainter &painter, const QVariantList &history, QColor color, QString label, int yOffset) {
-        QPainterPath path;
-        int n = history.size();
-        for (int i = 0; i < n; i++) {
-            double x = width() * i / (n - 1);
-            double y = height() - (height() * history[i].toInt() / 100.0);
-            if (i == 0) path.moveTo(x, y);
-            else path.lineTo(x, y);
-        }
+    void drawQuadrant(QPainter &painter, QRect rect, const QVariantList &history, QColor color, QString label, QString unit) {
+        // Draw quadrant frame (Double-Bezel dark-glass panel)
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(255, 255, 255, 8));
+        painter.drawRoundedRect(rect, 10, 10);
+        painter.setPen(QPen(QColor(255, 255, 255, 20), 1));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawRoundedRect(rect, 10, 10);
 
-        painter.setPen(QPen(color, 2));
-        painter.drawPath(path);
-
-        QLinearGradient grad(0, 0, 0, height());
-        grad.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), 45));
-        grad.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0));
-        QPainterPath fillPath = path;
-        fillPath.lineTo(width(), height());
-        fillPath.lineTo(0, height());
-        fillPath.closeSubpath();
-        painter.fillPath(fillPath, grad);
+        // Header label & current value
+        int currentVal = history.isEmpty() ? 0 : history.last().toInt();
+        painter.setPen(QColor(255, 255, 255, 130));
+        QFont f = painter.font();
+        f.setPointSize(10);
+        f.setBold(true);
+        painter.setFont(f);
+        painter.drawText(rect.left() + 15, rect.top() + 25, label);
 
         painter.setPen(color);
-        painter.drawText(15, 25 + yOffset, label);
+        f.setPointSize(15);
+        painter.setFont(f);
+        painter.drawText(rect.right() - 85, rect.top() + 28, QString::number(currentVal) + unit);
+
+        // Grid lines inside graph area
+        int graphTop = rect.top() + 45;
+        int graphHeight = rect.height() - 60;
+        painter.setPen(QPen(QColor(255, 255, 255, 8), 1, Qt::DashLine));
+        for (int i = 1; i < 3; i++) {
+            int gy = graphTop + graphHeight * i / 3;
+            painter.drawLine(rect.left() + 15, gy, rect.right() - 15, gy);
+        }
+
+        // Draw graph path
+        QPainterPath path;
+        int n = history.size();
+        if (n > 1) {
+            double graphWidth = rect.width() - 30;
+            int maxVal = (label.contains("CPU") || label.contains("RAM")) ? 100 : 120;
+            for (int i = 0; i < n; i++) {
+                double x = rect.left() + 15 + graphWidth * i / (n - 1);
+                int val = history[i].toInt();
+                if (val > maxVal) val = maxVal;
+                double y = graphTop + graphHeight - (graphHeight * val / (double)maxVal);
+                if (i == 0) path.moveTo(x, y);
+                else path.lineTo(x, y);
+            }
+
+            // Draw line
+            painter.setPen(QPen(color, 2));
+            painter.drawPath(path);
+
+            // Draw gradient fill
+            QLinearGradient grad(0, graphTop, 0, graphTop + graphHeight);
+            grad.setColorAt(0.0, QColor(color.red(), color.green(), color.blue(), 45));
+            grad.setColorAt(1.0, QColor(color.red(), color.green(), color.blue(), 0));
+            QPainterPath fillPath = path;
+            fillPath.lineTo(rect.left() + 15 + graphWidth, graphTop + graphHeight);
+            fillPath.lineTo(rect.left() + 15, graphTop + graphHeight);
+            fillPath.closeSubpath();
+            painter.setPen(Qt::NoPen);
+            painter.fillPath(fillPath, grad);
+        }
     }
 
     void updateStats() {
         QVariantList cpu = property("cpuHistory").toList();
         QVariantList mem = property("memHistory").toList();
+        QVariantList disk = property("diskHistory").toList();
+        QVariantList net = property("netHistory").toList();
 
-        int cpuVal = 15 + (std::rand() % 30);
-        int memVal = 42 + (std::rand() % 3);
+        int cpuVal = 10 + (std::rand() % 35);
+        int memVal = 44 + (std::rand() % 2);
+        int diskVal = 5 + (std::rand() % 95);
+        int netVal = 10 + (std::rand() % 80);
 
-        cpu.removeFirst();
-        cpu.append(cpuVal);
-
-        mem.removeFirst();
-        mem.append(memVal);
+        cpu.removeFirst(); cpu.append(cpuVal);
+        mem.removeFirst(); mem.append(memVal);
+        disk.removeFirst(); disk.append(diskVal);
+        net.removeFirst(); net.append(netVal);
 
         setProperty("cpuHistory", cpu);
         setProperty("memHistory", mem);
+        setProperty("diskHistory", disk);
+        setProperty("netHistory", net);
         update();
     }
 };
@@ -254,29 +350,41 @@ public:
         setProperty("currentText", QString(""));
 
         QVBoxLayout *layout = new QVBoxLayout(this);
-        layout->setContentsMargins(15, 15, 15, 15);
+        layout->setContentsMargins(12, 12, 12, 12);
         layout->setSpacing(10);
 
-        QLabel *title = new QLabel("Quick Notes (Type directly, press Enter to add):", this);
-        title->setStyleSheet("color: white; font-weight: bold; font-size: 13px;");
+        QLabel *title = new QLabel("Quick Notes (Type and press Enter to save):", this);
+        title->setStyleSheet("color: rgba(255, 255, 255, 0.7); font-weight: bold; font-size: 12px;");
         layout->addWidget(title);
 
-        QWidget *notesContainer = new QWidget(this);
-        notesContainer->setObjectName("notesContainer");
-        notesContainer->setStyleSheet("background-color: rgba(0,0,0,0.2); border-radius: 8px;");
-        
-        QVBoxLayout *notesLayout = new QVBoxLayout(notesContainer);
-        notesLayout->setObjectName("notesLayout");
-        notesLayout->setContentsMargins(10, 10, 10, 10);
-        notesLayout->setSpacing(6);
-        notesLayout->addStretch();
-        layout->addWidget(notesContainer);
+        QListWidget *listWidget = new QListWidget(this);
+        listWidget->setObjectName("notesList");
+        listWidget->setStyleSheet(
+            "QListWidget {"
+            "  background-color: rgba(0, 0, 0, 0.2);"
+            "  border: 1px solid rgba(255, 255, 255, 0.1);"
+            "  border-radius: 8px;"
+            "  color: white;"
+            "  font-size: 13px;"
+            "  padding: 5px;"
+            "}"
+            "QListWidget::item {"
+            "  padding: 6px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.05);"
+            "}"
+        );
+        layout->addWidget(listWidget);
 
-        QLabel *inputLabel = new QLabel("Type note: ", this);
+        // Prepopulate with todo items
+        listWidget->addItem("• Build WynlandOS Kernel  ✅");
+        listWidget->addItem("• Run Real Qt6 Applications  ✅");
+        listWidget->addItem("• Implement macOS Tahoe Dock  🚀");
+
+        QLabel *inputLabel = new QLabel("Type: ", this);
         inputLabel->setObjectName("inputLabel");
         inputLabel->setStyleSheet(
-            "background-color: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15);"
-            "color: #a0a0ff; border-radius: 8px; padding: 8px; font-size: 13px; font-weight: bold;"
+            "background-color: rgba(255, 255, 255, 0.07);"
+            "border: 1px solid rgba(255, 255, 255, 0.15);"
+            "color: white; border-radius: 6px; padding: 8px; font-size: 12px;"
         );
         layout->addWidget(inputLabel);
     }
@@ -288,35 +396,27 @@ protected:
 
         if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
             if (!currentText.isEmpty()) {
-                addNote(currentText);
+                QListWidget *listWidget = findChild<QListWidget*>("notesList");
+                if (listWidget) {
+                    listWidget->addItem("• " + currentText);
+                }
                 currentText.clear();
-                if (inputLabel) inputLabel->setText("Type note: ");
+                if (inputLabel) inputLabel->setText("Type: ");
             }
         } else if (event->key() == Qt::Key_Backspace) {
             if (!currentText.isEmpty()) {
                 currentText.chop(1);
-                if (inputLabel) inputLabel->setText("Type note: " + currentText);
+                if (inputLabel) inputLabel->setText("Type: " + currentText);
             }
         } else {
             QString txt = event->text();
             if (!txt.isEmpty() && txt.at(0).isPrint()) {
                 currentText += txt;
-                if (inputLabel) inputLabel->setText("Type note: " + currentText);
+                if (inputLabel) inputLabel->setText("Type: " + currentText);
             }
         }
         setProperty("currentText", currentText);
         event->accept();
-    }
-
-private:
-    void addNote(const QString &text) {
-        QWidget *notesContainer = findChild<QWidget*>("notesContainer");
-        QVBoxLayout *notesLayout = findChild<QVBoxLayout*>("notesLayout");
-        if (notesContainer && notesLayout) {
-            QLabel *newNote = new QLabel("- " + text, notesContainer);
-            newNote->setStyleSheet("color: rgba(255,255,255,0.9); font-size: 13px;");
-            notesLayout->insertWidget(notesLayout->count() - 1, newNote);
-        }
     }
 };
 
@@ -452,35 +552,122 @@ private:
 class FileExplorer : public QWidget {
 public:
     FileExplorer(QWidget *parent = nullptr) : QWidget(parent) {
+        setProperty("currentPath", "/");
+        
         QVBoxLayout *layout = new QVBoxLayout(this);
         layout->setContentsMargins(10, 10, 10, 10);
         layout->setSpacing(8);
 
-        QLabel *pathLabel = new QLabel("Current Directory: /", this);
-        pathLabel->setStyleSheet("color: white; font-weight: bold; font-size: 13px;");
-        layout->addWidget(pathLabel);
-
-        QWidget *listContainer = new QWidget(this);
-        listContainer->setStyleSheet(
-            "background-color: rgba(0, 0, 0, 0.25);"
-            "border: 1px solid rgba(255, 255, 255, 0.15);"
-            "border-radius: 8px;"
+        QHBoxLayout *navLayout = new QHBoxLayout();
+        QPushButton *upBtn = new QPushButton("⬆", this);
+        upBtn->setFixedSize(28, 28);
+        upBtn->setStyleSheet(
+            "QPushButton {"
+            "  background-color: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2);"
+            "  color: white; border-radius: 6px; font-weight: bold;"
+            "}"
+            "QPushButton:hover { background-color: rgba(255, 255, 255, 0.15); }"
         );
-        QVBoxLayout *listLayout = new QVBoxLayout(listContainer);
-        listLayout->setContentsMargins(12, 12, 12, 12);
-        listLayout->setSpacing(8);
+        connect(upBtn, &QPushButton::clicked, [=]() { goUp(); });
+        navLayout->addWidget(upBtn);
 
-        const char *items[] = {
-            "[DIR] .", "[DIR] ..", "[DIR] plugins", "[DIR] lib", 
-            "[FILE] qtreal.elf", "[FILE] serial.log", "[FILE] qemu.log"
-        };
-        for (int i = 0; i < 7; i++) {
-            QLabel *lbl = new QLabel(items[i], listContainer);
-            lbl->setStyleSheet("color: rgba(255, 255, 255, 0.9); font-size: 13px; font-family: 'Plus Jakarta Sans', sans-serif;");
-            listLayout->addWidget(lbl);
+        QLabel *pathLabel = new QLabel("Current: /", this);
+        pathLabel->setObjectName("pathLabel");
+        pathLabel->setStyleSheet("color: rgba(255, 255, 255, 0.85); font-weight: bold; font-size: 12px;");
+        navLayout->addWidget(pathLabel);
+        navLayout->addStretch();
+        layout->addLayout(navLayout);
+
+        QListWidget *listWidget = new QListWidget(this);
+        listWidget->setObjectName("fileList");
+        listWidget->setStyleSheet(
+            "QListWidget {"
+            "  background-color: rgba(0, 0, 0, 0.25);"
+            "  border: 1px solid rgba(255, 255, 255, 0.15);"
+            "  border-radius: 8px;"
+            "  color: rgba(255, 255, 255, 0.95);"
+            "  font-size: 13px;"
+            "  padding: 5px;"
+            "}"
+            "QListWidget::item {"
+            "  padding: 6px 8px; border-radius: 4px;"
+            "}"
+            "QListWidget::item:hover {"
+            "  background-color: rgba(255, 255, 255, 0.1);"
+            "}"
+            "QListWidget::item:selected {"
+            "  background-color: rgba(0, 122, 255, 0.5); color: white;"
+            "}"
+        );
+        connect(listWidget, &QListWidget::itemDoubleClicked, [=](QListWidgetItem *item) { onItemDoubleClicked(item); });
+        connect(listWidget, &QListWidget::itemClicked, [=](QListWidgetItem *item) { onItemClicked(item); });
+        layout->addWidget(listWidget);
+
+        QLabel *statusLabel = new QLabel("Select a file or folder", this);
+        statusLabel->setObjectName("statusLabel");
+        statusLabel->setStyleSheet("color: rgba(255, 255, 255, 0.5); font-size: 11px;");
+        layout->addWidget(statusLabel);
+
+        refresh();
+    }
+
+    void goUp() {
+        QString path = property("currentPath").toString();
+        if (path == "/") return;
+        int idx = path.lastIndexOf('/');
+        if (idx == 0) path = "/";
+        else path = path.left(idx);
+        setProperty("currentPath", path);
+        refresh();
+    }
+
+    void onItemDoubleClicked(QListWidgetItem *item) {
+        QString name = item->text();
+        if (name.startsWith("📁 ")) {
+            name = name.mid(2);
+            QString path = property("currentPath").toString();
+            if (path == "/") path = "/" + name;
+            else path = path + "/" + name;
+            setProperty("currentPath", path);
+            refresh();
         }
-        listLayout->addStretch();
-        layout->addWidget(listContainer);
+    }
+
+    void onItemClicked(QListWidgetItem *item) {
+        QString name = item->text();
+        QLabel *statusLabel = findChild<QLabel*>("statusLabel");
+        if (!statusLabel) return;
+        if (name.startsWith("📁 ")) {
+            statusLabel->setText("Directory: " + name.mid(2));
+        } else if (name.startsWith("📄 ")) {
+            name = name.mid(2);
+            QString path = property("currentPath").toString();
+            QString fullPath = (path == "/") ? "/" + name : path + "/" + name;
+            QFileInfo info(fullPath);
+            statusLabel->setText(QString("File: %1 (%2 bytes)").arg(name).arg(info.size()));
+        }
+    }
+
+    void refresh() {
+        QString path = property("currentPath").toString();
+        QLabel *pathLabel = findChild<QLabel*>("pathLabel");
+        if (pathLabel) pathLabel->setText("Current: " + path);
+
+        QListWidget *listWidget = findChild<QListWidget*>("fileList");
+        if (!listWidget) return;
+        listWidget->clear();
+
+        QDir dir(path);
+        QFileInfoList list = dir.entryInfoList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::DirsFirst | QDir::Name);
+        for (const QFileInfo &info : list) {
+            QString displayName;
+            if (info.isDir()) {
+                displayName = "📁 " + info.fileName();
+            } else {
+                displayName = "📄 " + info.fileName();
+            }
+            listWidget->addItem(displayName);
+        }
     }
 };
 
@@ -541,10 +728,19 @@ private:
 int main(int argc, char *argv[])
 {
     qputenv("QT_QPA_PLATFORM", "qwynlandfb");
+    qputenv("QT_QPA_FONTDIR", "/lib/fonts");
     QApplication app(argc, argv);
 
-    // Set Default TTF Font loaded from /lib/fonts/DejaVuSans.ttf
-    app.setFont(QFont("DejaVu Sans", 11));
+    // Load DejaVu Sans font explicitly via QFontDatabase to bypass directory scanning issues
+    int fontId = QFontDatabase::addApplicationFont("/lib/fonts/DejaVuSans.ttf");
+    if (fontId != -1 && !QFontDatabase::applicationFontFamilies(fontId).isEmpty()) {
+        QString family = QFontDatabase::applicationFontFamilies(fontId).at(0);
+        app.setFont(QFont(family, 11));
+    } else {
+        app.setFont(QFont("DejaVu Sans", 11));
+    }
+
+    QCursor::setPos(960, 540);
 
     // Main desktop container
     QWidget desktop;
@@ -571,9 +767,14 @@ int main(int argc, char *argv[])
     QHBoxLayout *topLayout = new QHBoxLayout(topPanel);
     topLayout->setContentsMargins(20, 0, 20, 0);
     
-    QLabel *logoLabel = new QLabel(" WynlandOS", topPanel);
-    logoLabel->setStyleSheet("color: white; font-weight: bold; font-size: 13px;");
-    topLayout->addWidget(logoLabel);
+    QPushButton *logoBtn = new QPushButton(" WynlandOS", topPanel);
+    logoBtn->setStyleSheet("color: white; font-weight: bold; font-size: 13px; border: none; background: transparent; padding: 0px;");
+    QObject::connect(logoBtn, &QPushButton::clicked, [=]() {
+        int nextStyle = (wallpaper->property("styleIndex").toInt() + 1) % 4;
+        wallpaper->setProperty("styleIndex", nextStyle);
+        wallpaper->update();
+    });
+    topLayout->addWidget(logoBtn);
 
     topLayout->addStretch();
     QLabel *clockLabel = new QLabel(topPanel);

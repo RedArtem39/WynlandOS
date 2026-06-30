@@ -9,15 +9,16 @@ SDK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_TMP_DIR="/tmp/qt_build_tmp"
 
 echo "==> Step 1: Setting up native WSL build directory..."
-rm -rf "${BUILD_TMP_DIR}"
 mkdir -p "${BUILD_TMP_DIR}"
 
 echo "==> Step 2: Copying qtbase into native WSL filesystem..."
-cp -r "${SDK_DIR}/qtbase" "${BUILD_TMP_DIR}/qtbase"
+if [ ! -d "${BUILD_TMP_DIR}/qtbase" ]; then
+    cp -r "${SDK_DIR}/qtbase" "${BUILD_TMP_DIR}/qtbase"
+fi
 
 echo "==> Step 3: Integrating QWynlandFb platform plugin..."
 mkdir -p "${BUILD_TMP_DIR}/qtbase/src/plugins/platforms/qwynlandfb"
-cp -r "${SDK_DIR}/qt_qpa"/* "${BUILD_TMP_DIR}/qtbase/src/plugins/platforms/qwynlandfb/"
+cp -f "${SDK_DIR}/qt_qpa"/* "${BUILD_TMP_DIR}/qtbase/src/plugins/platforms/qwynlandfb/"
 
 # Add QPA subdirectory to CMake
 CMAKE_PLUGINS_FILE="${BUILD_TMP_DIR}/qtbase/src/plugins/platforms/CMakeLists.txt"

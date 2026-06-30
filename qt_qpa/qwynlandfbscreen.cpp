@@ -5,12 +5,18 @@
 
 QT_BEGIN_NAMESPACE
 
+#include <QtGui/QPainter>
+#include <QtGui/QCursor>
+#include <QtGui/QPainterPath>
+
 QWynlandFbScreen::QWynlandFbScreen()
     : m_depth(32),
       m_format(QImage::Format_ARGB32_Premultiplied),
       m_fbFd(-1),
       m_mmapAddr(nullptr),
-      m_mmapSize(0)
+      m_mmapSize(0),
+      m_backingStore(nullptr),
+      m_lastCursorPos(960, 540)
 {
     // Default fallback geometry
     m_geometry = QRect(0, 0, 1920, 1080);
@@ -49,6 +55,41 @@ bool QWynlandFbScreen::initialize()
     m_screenImage = QImage(m_mmapAddr, m_geometry.width(), m_geometry.height(), m_geometry.width() * 4, m_format);
     
     return true;
+}
+
+void QWynlandFbScreen::updateCursor()
+{
+    QPoint cursorPos = QCursor::pos();
+    if (m_screenImage.isNull()) return;
+
+    QPainter painter(&m_screenImage);
+    
+    // 1. Restore background at last cursor position from backing store
+    if (m_backingStore && !m_backingStore->isNull()) {
+        QRect oldRect(m_lastCursorPos, QSize(32, 32));
+        painter.drawImage(oldRect, *m_backingStore, oldRect);
+    }
+    
+    // 2. Draw the beautiful macOS white arrow with a black outline
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    
+    QPainterPath cursorPath;
+    cursorPath.moveTo(cursorPos.x(), cursorPos.y());
+    cursorPath.lineTo(cursorPos.x() + 15, cursorPos.y() + 15);
+    cursorPath.lineTo(cursorPos.x() + 8, cursorPos.y() + 15);
+    cursorPath.lineTo(cursorPos.x() + 12, cursorPos.y() + 24);
+    cursorPath.lineTo(cursorPos.x() + 9, cursorPos.y() + 25);
+    cursorPath.lineTo(cursorPos.x() + 5, cursorPos.y() + 16);
+    cursorPath.lineTo(cursorPos.x(), cursorPos.y() + 19);
+    cursorPath.closeSubpath();
+    
+    painter.fillPath(cursorPath, Qt::white);
+    painter.strokePath(cursorPath, QPen(Qt::black, 2));
+    
+    painter.restore();
+    
+    m_lastCursorPos = cursorPos;
 }
 
 QT_END_NAMESPACE

@@ -23,11 +23,14 @@ public:
     QPlatformWindow *createPlatformWindow(QWindow *window) const override;
     QPlatformBackingStore *createPlatformBackingStore(QWindow *window) const override;
     QAbstractEventDispatcher *createEventDispatcher() const override;
+    QPlatformFontDatabase *fontDatabase() const override;
 
 private:
     QWynlandFbScreen *m_screen;
     QWynlandFbInputReader *m_inputReader;
     QStringList m_parameters;
+    QPlatformFontDatabase *m_fontDb;
+    QTimer *m_cursorTimer;
 };
 
 QT_END_NAMESPACE

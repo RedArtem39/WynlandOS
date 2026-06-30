@@ -7,6 +7,10 @@
 #include <qpa/qplatformwindow.h>
 #include <qpa/qwindowsysteminterface.h>
 #include <QtGui/private/qgenericunixeventdispatcher_p.h>
+#include <QtGui/private/qgenericunixfontdatabase_p.h>
+#include <QtCore/QTimer>
+
+
 
 QT_BEGIN_NAMESPACE
 
@@ -42,6 +46,7 @@ public:
     void resize(const QSize &size, const QRegion &staticContents) override {
         Q_UNUSED(staticContents);
         m_image = QImage(size, QImage::Format_ARGB32_Premultiplied);
+        m_screen->setBackingStore(&m_image);
     }
 
 private:
@@ -50,7 +55,7 @@ private:
 };
 
 QWynlandFbIntegration::QWynlandFbIntegration(const QStringList &paramList)
-    : m_screen(nullptr), m_inputReader(nullptr), m_parameters(paramList)
+    : m_screen(nullptr), m_inputReader(nullptr), m_parameters(paramList), m_fontDb(new QGenericUnixFontDatabase), m_cursorTimer(nullptr)
 {
 }
 
@@ -61,6 +66,8 @@ QWynlandFbIntegration::~QWynlandFbIntegration()
         delete m_inputReader;
     }
     delete m_screen;
+    delete m_fontDb;
+    delete m_cursorTimer;
 }
 
 bool QWynlandFbIntegration::hasCapability(QPlatformIntegration::Capability cap) const
@@ -83,6 +90,14 @@ void QWynlandFbIntegration::initialize()
     if (m_inputReader->initialize()) {
         m_inputReader->start();
     }
+
+    // Set up a thread-safe QTimer in the main GUI thread to update the software cursor
+    m_cursorTimer = new QTimer();
+    m_cursorTimer->setInterval(16); // ~60 FPS
+    QObject::connect(m_cursorTimer, &QTimer::timeout, [=]() {
+        if (m_screen) m_screen->updateCursor();
+    });
+    m_cursorTimer->start();
 }
 
 QPlatformWindow *QWynlandFbIntegration::createPlatformWindow(QWindow *window) const
@@ -100,6 +115,11 @@ QPlatformBackingStore *QWynlandFbIntegration::createPlatformBackingStore(QWindow
 QAbstractEventDispatcher *QWynlandFbIntegration::createEventDispatcher() const
 {
     return createUnixEventDispatcher();
+}
+
+QPlatformFontDatabase *QWynlandFbIntegration::fontDatabase() const
+{
+    return m_fontDb;
 }
 
 

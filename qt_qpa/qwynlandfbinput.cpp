@@ -74,8 +74,8 @@ void QWynlandFbInputReader::run()
             // 4. Dispatch mouse event to Qt Window System Interface
             QWindowSystemInterface::handleMouseEvent(nullptr, m_cursorPos, m_cursorPos, newButtons, button, type);
             buttons = newButtons;
-        } else if (bytes < 0) {
-            // Read error or interface closed, yield thread
+        } else {
+            // Read error, EOF, or partial read: yield thread to prevent 100% CPU spinning
             msleep(10);
         }
     }

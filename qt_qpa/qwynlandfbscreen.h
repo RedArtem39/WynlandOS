@@ -22,6 +22,9 @@ public:
     // Physical screen dimensions in millimeters
     QDpi logicalDpi() const override { return QDpi(96, 96); }
 
+    void setBackingStore(QImage *img) { m_backingStore = img; }
+    void updateCursor();
+
 private:
     QRect m_geometry;
     int m_depth;
@@ -30,6 +33,8 @@ private:
     uchar *m_mmapAddr;
     ulong m_mmapSize;
     QImage m_screenImage;
+    QImage *m_backingStore;
+    QPoint m_lastCursorPos;
 };
 
 QT_END_NAMESPACE

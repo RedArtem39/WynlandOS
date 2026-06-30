@@ -897,15 +897,16 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 228: // SYS_clock_gettime
             {
-                /* Stub: return zeroed timespec */
                 struct timespec {
-                    uint64_t tv_sec;
-                    uint64_t tv_nsec;
+                    int64_t tv_sec;
+                    int64_t tv_nsec;
                 };
                 struct timespec *tp = (struct timespec *)a2;
                 if (tp) {
-                    tp->tv_sec = 0;
-                    tp->tv_nsec = 0;
+                    extern uint64_t timer_get_ticks(void);
+                    uint64_t ticks = timer_get_ticks();
+                    tp->tv_sec = ticks / 100;
+                    tp->tv_nsec = (ticks % 100) * 10000000;
                 }
                 return 0;
             }
@@ -1071,6 +1072,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 28: // SYS_madvise (stub - returning 0 is always safe)
             return 0;
+
+        case 35: // SYS_nanosleep (Linux standard)
+            {
+                struct timespec {
+                    int64_t tv_sec;
+                    int64_t tv_nsec;
+                };
+                struct timespec *req = (struct timespec *)a1;
+                if (req) {
+                    extern uint64_t timer_get_ticks(void);
+                    extern void sched_yield(void);
+                    uint64_t ticks_to_sleep = (req->tv_sec * 100) + (req->tv_nsec / 10000000);
+                    if (ticks_to_sleep == 0 && req->tv_nsec > 0) {
+                        ticks_to_sleep = 1;
+                    }
+                    uint64_t start_ticks = timer_get_ticks();
+                    uint64_t end_ticks = start_ticks + ticks_to_sleep;
+                    while (timer_get_ticks() < end_ticks) {
+                        sched_yield();
+                    }
+                }
+                return 0;
+            }
 
         case 334: // SYS_rseq — restartable sequences (stub)
             return (uint64_t)-38; /* -ENOSYS */
