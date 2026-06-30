@@ -769,11 +769,94 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 16: // SYS_ioctl (Linux standard) — stub for terminal/device control
             {
-                /* For ttys (fd 0/1/2), return -ENOTTY (25) for most ioctls */
+                int fd = (int)a1;
+                uint64_t request = a2;
+                void *argp = (void *)a3;
+
+                // Handle Framebuffer ioctl queries
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL && fd_table[fd]->node.first_cluster == 0xFFFFFFF0) {
+                    if (request == 0x4600) { // FBIOGET_VSCREENINFO
+                        struct fb_var_screeninfo {
+                            uint32_t xres;
+                            uint32_t yres;
+                            uint32_t xres_virtual;
+                            uint32_t yres_virtual;
+                            uint32_t xoffset;
+                            uint32_t yoffset;
+                            uint32_t bits_per_pixel;
+                            uint32_t grayscale;
+                            struct {
+                                uint32_t offset;
+                                uint32_t length;
+                                uint32_t msb_right;
+                            } red, green, blue, transp;
+                            uint32_t nonstd;
+                            uint32_t activate;
+                            uint32_t height;
+                            uint32_t width;
+                            uint32_t accel_flags;
+                            uint32_t pixclock;
+                            uint32_t left_margin;
+                            uint32_t right_margin;
+                            uint32_t upper_margin;
+                            uint32_t lower_margin;
+                            uint32_t hsync_len;
+                            uint32_t vsync_len;
+                            uint32_t sync;
+                            uint32_t vmode;
+                            uint32_t rotate;
+                            uint32_t colorspace;
+                            uint32_t reserved[4];
+                        } *vinfo = (struct fb_var_screeninfo *)argp;
+                        if (vinfo && g_boot_info) {
+                            memset(vinfo, 0, sizeof(*vinfo));
+                            vinfo->xres = g_boot_info->fb_width;
+                            vinfo->yres = g_boot_info->fb_height;
+                            vinfo->xres_virtual = g_boot_info->fb_width;
+                            vinfo->yres_virtual = g_boot_info->fb_height;
+                            vinfo->xoffset = 0;
+                            vinfo->yoffset = 0;
+                            vinfo->bits_per_pixel = 32;
+                            vinfo->grayscale = 0;
+                            return 0;
+                        }
+                    }
+                    else if (request == 0x4602) { // FBIOGET_FSCREENINFO
+                        struct fb_fix_screeninfo {
+                            char id[16];
+                            uint64_t smem_start;
+                            uint32_t smem_len;
+                            uint32_t type;
+                            uint32_t type_aux;
+                            uint32_t visual;
+                            uint16_t xpanstep;
+                            uint16_t ypanstep;
+                            uint16_t ywrapstep;
+                            uint32_t line_length;
+                            uint64_t mmio_start;
+                            uint32_t mmio_len;
+                            uint32_t accel;
+                            uint16_t capabilities;
+                            uint16_t reserved[2];
+                        } *finfo = (struct fb_fix_screeninfo *)argp;
+                        if (finfo && g_boot_info) {
+                            memset(finfo, 0, sizeof(*finfo));
+                            // Set ID
+                            finfo->id[0] = 'f'; finfo->id[1] = 'b'; finfo->id[2] = '0';
+                            finfo->smem_start = g_boot_info->fb_addr;
+                            finfo->smem_len = g_boot_info->fb_pitch * g_boot_info->fb_height;
+                            finfo->type = 0; // FB_TYPE_PACKED_PIXELS
+                            finfo->visual = 2; // FB_VISUAL_TRUECOLOR
+                            finfo->line_length = g_boot_info->fb_pitch;
+                            return 0;
+                        }
+                    }
+                    return (uint64_t)-22; /* -EINVAL */
+                }
+
                 if (a1 <= 2) {
                     return (uint64_t)-25; /* -ENOTTY */
                 }
-                /* For regular files, also not supported */
                 return (uint64_t)-25;
             }
 

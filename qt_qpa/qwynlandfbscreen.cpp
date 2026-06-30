@@ -2,6 +2,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
 
 QT_BEGIN_NAMESPACE
 
@@ -41,6 +43,29 @@ bool QWynlandFbScreen::initialize()
         return false;
     }
 
+    // Query screen resolution from kernel using standard Linux FBIOGET_VSCREENINFO ioctl (0x4600)
+    struct fb_var_screeninfo vinfo;
+    if (ioctl(m_fbFd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
+        m_geometry = QRect(0, 0, vinfo.xres, vinfo.yres);
+        m_depth = (vinfo.bits_per_pixel == 16 || vinfo.bits_per_pixel == 24 || vinfo.bits_per_pixel == 32) ? vinfo.bits_per_pixel : 32;
+        m_lastCursorPos = QPoint(vinfo.xres / 2, vinfo.yres / 2);
+        qDebug("QWynlandFbScreen: Detected resolution: %dx%d, depth: %d", vinfo.xres, vinfo.yres, m_depth);
+    } else {
+        qWarning("QWynlandFbScreen: Failed to query resolution via ioctl, using fallback 1920x1080.");
+        m_geometry = QRect(0, 0, 1920, 1080);
+        m_lastCursorPos = QPoint(960, 540);
+    }
+
+    // Query scanline stride (pitch) using standard Linux FBIOGET_FSCREENINFO ioctl (0x4602)
+    struct fb_fix_screeninfo finfo;
+    int stride = m_geometry.width() * 4;
+    if (ioctl(m_fbFd, FBIOGET_FSCREENINFO, &finfo) == 0) {
+        stride = finfo.line_length;
+        qDebug("QWynlandFbScreen: Detected line length (stride): %d bytes", finfo.line_length);
+    } else {
+        qWarning("QWynlandFbScreen: Failed to query line length, using default: %d", stride);
+    }
+
     // 2. Compute size and map the memory
     m_mmapSize = m_geometry.width() * m_geometry.height() * 4;
     m_mmapAddr = (uchar *)mmap(nullptr, m_mmapSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_fbFd, 0);
@@ -51,8 +76,8 @@ bool QWynlandFbScreen::initialize()
         return false;
     }
 
-    // 3. Create the QImage wrapper directly on the mapped framebuffer
-    m_screenImage = QImage(m_mmapAddr, m_geometry.width(), m_geometry.height(), m_geometry.width() * 4, m_format);
+    // 3. Create the QImage wrapper directly on the mapped framebuffer with correct stride
+    m_screenImage = QImage(m_mmapAddr, m_geometry.width(), m_geometry.height(), stride, m_format);
     
     return true;
 }

@@ -1,4 +1,5 @@
 #include "qwynlandfbinput.h"
+#include "qwynlandfbscreen.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <qpa/qwindowsysteminterface.h>
@@ -9,7 +10,8 @@ QWynlandFbInputReader::QWynlandFbInputReader()
     : m_mouseFd(-1),
       m_kbdFd(-1),
       m_cursorPos(960, 540),
-      m_running(false)
+      m_running(false),
+      m_screen(nullptr)
 {
 }
 
@@ -23,10 +25,9 @@ QWynlandFbInputReader::~QWynlandFbInputReader()
 
 bool QWynlandFbInputReader::initialize()
 {
-    // Open mouse device stream
-    m_mouseFd = open("/dev/input/mice", O_RDONLY);
+    m_mouseFd = open("/dev/input/mice", O_RDONLY | O_NONBLOCK);
     if (m_mouseFd < 0) {
-        qWarning("QWynlandFbInputReader: Failed to open /dev/input/mice!");
+        qWarning("QWynlandFbInputReader: Failed to open /dev/input/mice");
         return false;
     }
     return true;
@@ -35,8 +36,13 @@ bool QWynlandFbInputReader::initialize()
 void QWynlandFbInputReader::run()
 {
     m_running = true;
-    uchar packet[3];
+    uint8_t packet[3];
     Qt::MouseButtons buttons = Qt::NoButton;
+
+    // Set initial cursor position to center of screen
+    if (m_screen) {
+        m_cursorPos = QPoint(m_screen->geometry().width() / 2, m_screen->geometry().height() / 2);
+    }
 
     while (m_running) {
         int bytes = read(m_mouseFd, packet, 3);
@@ -45,8 +51,16 @@ void QWynlandFbInputReader::run()
             int8_t rel_x = (int8_t)packet[1];
             int8_t rel_y = (int8_t)packet[2];
 
-            m_cursorPos.setX(qBound(0, m_cursorPos.x() + rel_x, 1919));
-            m_cursorPos.setY(qBound(0, m_cursorPos.y() - rel_y, 1079)); // Invert Y for screen coordinates
+            int maxX = 1919;
+            int maxY = 1079;
+            if (m_screen) {
+                QRect geom = m_screen->geometry();
+                maxX = geom.width() - 1;
+                maxY = geom.height() - 1;
+            }
+
+            m_cursorPos.setX(qBound(0, m_cursorPos.x() + rel_x, maxX));
+            m_cursorPos.setY(qBound(0, m_cursorPos.y() - rel_y, maxY)); // Invert Y for screen coordinates
 
             // 2. Decode button states
             Qt::MouseButtons newButtons = Qt::NoButton;

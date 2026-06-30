@@ -17,6 +17,7 @@
 #include <QtWidgets/qlistwidget.h>
 #include <QtGui/qfontdatabase.h>
 #include <QtGui/qcursor.h>
+#include <QtGui/qevent.h>
 
 
 
@@ -671,57 +672,47 @@ public:
     }
 };
 
-// 7. macOS Dock Zoom Icon Button (Utilizes properties for scaling animation state)
+// 7. Premium Minimalist Dock Button
 class DockButton : public QPushButton {
 public:
-    DockButton(const QString &text, QWidget *parent = nullptr) : QPushButton(parent) {
-        setProperty("scale", 1.0);
-        setProperty("targetScale", 1.0);
-        setFixedSize(54, 54);
-        
-        QTimer *timer = new QTimer(this);
-        timer->setInterval(16); // ~60 FPS
-        connect(timer, &QTimer::timeout, this, &DockButton::stepAnimation);
-
-        QLabel *label = new QLabel(text, this);
-        label->setStyleSheet("color: white; font-weight: bold; font-size: 24px;");
-        label->setAlignment(Qt::AlignCenter);
-
-        QVBoxLayout *layout = new QVBoxLayout(this);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->addWidget(label);
-        setStyleSheet("border: none; background: transparent;");
+    DockButton(const QString &text, QWidget *parent = nullptr) : QPushButton(text, parent) {
+        setFixedSize(70, 48);
+        setStyleSheet(
+            "QPushButton {"
+            "  font-size: 13px;"
+            "  font-weight: bold;"
+            "  color: rgba(255, 255, 255, 0.75);"
+            "  border: none;"
+            "  border-radius: 12px;"
+            "  background-color: rgba(255, 255, 255, 0.06);"
+            "}"
+            "QPushButton:hover {"
+            "  color: white;"
+            "  background-color: rgba(255, 255, 255, 0.16);"
+            "}"
+            "QPushButton:pressed {"
+            "  background-color: rgba(255, 255, 255, 0.28);"
+            "}"
+        );
     }
+};
+
+class DesktopResizer : public QObject {
+    QWidget *m_wallpaper;
+    QWidget *m_workspace;
+public:
+    DesktopResizer(QWidget *wallpaper, QWidget *workspace)
+        : QObject(wallpaper), m_wallpaper(wallpaper), m_workspace(workspace) {}
 protected:
-    void enterEvent(QEnterEvent *) override {
-        setProperty("targetScale", 1.35);
-        startTimer();
-    }
-    void leaveEvent(QEvent *) override {
-        setProperty("targetScale", 1.0);
-        startTimer();
-    }
-private:
-    void startTimer() {
-        QTimer *timer = findChild<QTimer*>();
-        if (timer) timer->start();
-    }
-    void stepAnimation() {
-        double scale = property("scale").toDouble();
-        double targetScale = property("targetScale").toDouble();
-        double diff = targetScale - scale;
-        double abs_diff = (diff < 0) ? -diff : diff;
-        
-        if (abs_diff < 0.01) {
-            scale = targetScale;
-            QTimer *timer = findChild<QTimer*>();
-            if (timer) timer->stop();
-        } else {
-            scale += diff * 0.25;
+    bool eventFilter(QObject *obj, QEvent *event) override {
+        if (event->type() == QEvent::Resize) {
+            QResizeEvent *re = static_cast<QResizeEvent*>(event);
+            int w = re->size().width();
+            int h = re->size().height();
+            m_wallpaper->setGeometry(0, 0, w, h);
+            m_workspace->setGeometry(0, 30, w, h - 30 - 80 - 15);
         }
-        setProperty("scale", scale);
-        int size = 54 * scale;
-        setFixedSize(size, size);
+        return false;
     }
 };
 
@@ -754,7 +745,6 @@ int main(int argc, char *argv[])
 
     // Set background wallpaper widget (shown correctly on top of desktop background)
     WallpaperWidget *wallpaper = new WallpaperWidget(&desktop);
-    wallpaper->setGeometry(0, 0, 1920, 1080);
     wallpaper->lower();
 
     // Top Panel (WynPanel)
@@ -806,8 +796,10 @@ int main(int argc, char *argv[])
 
     // Main workspace container (for windows) - MUST BE EXPLICITLY SHOWN
     QWidget *workspace = new QWidget(&desktop);
-    workspace->setGeometry(0, 30, 1920, 980);
     workspace->setAttribute(Qt::WA_TranslucentBackground);
+
+    // Setup resizer event filter to dynamically adapt to any resolution
+    desktop.installEventFilter(new DesktopResizer(wallpaper, workspace));
 
 
 
@@ -860,14 +852,14 @@ int main(int argc, char *argv[])
     dockLayout->setContentsMargins(12, 0, 12, 0);
     dockLayout->setSpacing(14);
 
-    DockButton *btnMon = new DockButton("📊", dockFrame);
+    DockButton *btnMon = new DockButton("Stats", dockFrame);
     QObject::connect(btnMon, &QPushButton::clicked, [=]() {
         if (winMonitor->isHidden()) winMonitor->show();
         winMonitor->raise();
     });
     dockLayout->addWidget(btnMon);
 
-    DockButton *btnText = new DockButton("📝", dockFrame);
+    DockButton *btnText = new DockButton("Notes", dockFrame);
     QObject::connect(btnText, &QPushButton::clicked, [=]() {
         if (winText->isHidden()) winText->show();
         winText->raise();
@@ -875,14 +867,14 @@ int main(int argc, char *argv[])
     });
     dockLayout->addWidget(btnText);
 
-    DockButton *btnExp = new DockButton("📁", dockFrame);
+    DockButton *btnExp = new DockButton("Files", dockFrame);
     QObject::connect(btnExp, &QPushButton::clicked, [=]() {
         if (winExplorer->isHidden()) winExplorer->show();
         winExplorer->raise();
     });
     dockLayout->addWidget(btnExp);
 
-    DockButton *btnGame = new DockButton("🎮", dockFrame);
+    DockButton *btnGame = new DockButton("Play", dockFrame);
     QObject::connect(btnGame, &QPushButton::clicked, [=]() {
         if (winGame->isHidden()) winGame->show();
         winGame->raise();
@@ -892,7 +884,7 @@ int main(int argc, char *argv[])
     // Center dock on screen
     QWidget *dockContainer = new QWidget(&desktop);
     dockContainer->setFixedHeight(80);
-    dockContainer->setFixedWidth(300);
+    dockContainer->setFixedWidth(360);
     QHBoxLayout *containerLayout = new QHBoxLayout(dockContainer);
     containerLayout->setContentsMargins(0, 0, 0, 0);
     containerLayout->addWidget(dockFrame);

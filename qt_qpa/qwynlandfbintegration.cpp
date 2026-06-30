@@ -87,6 +87,7 @@ void QWynlandFbIntegration::initialize()
     }
 
     m_inputReader = new QWynlandFbInputReader();
+    m_inputReader->setScreen(m_screen);
     if (m_inputReader->initialize()) {
         m_inputReader->start();
     }
