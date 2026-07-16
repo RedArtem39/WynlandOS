@@ -1,3 +1,0 @@
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/arch/CMakeFiles/architecture_test.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/arch/CMakeFiles/edit_cache.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/arch/CMakeFiles/rebuild_cache.dir

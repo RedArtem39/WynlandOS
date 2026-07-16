@@ -1,3 +1,0 @@
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/CMakeFiles/CMakeScratch/TryCompile-GPlZUD/CMakeFiles/cmTC_c50bc.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/CMakeFiles/CMakeScratch/TryCompile-GPlZUD/CMakeFiles/edit_cache.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/CMakeFiles/CMakeScratch/TryCompile-GPlZUD/CMakeFiles/rebuild_cache.dir

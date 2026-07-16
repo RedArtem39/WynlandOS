@@ -1,3 +1,0 @@
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/x86intrin/CMakeFiles/x86intrin.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/x86intrin/CMakeFiles/edit_cache.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/x86intrin/CMakeFiles/rebuild_cache.dir

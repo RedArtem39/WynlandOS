@@ -1,4 +1,0 @@
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/binary_for_strip_built/CMakeFiles/lib1.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/binary_for_strip_built/CMakeFiles/print_lib_path.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/binary_for_strip_built/CMakeFiles/edit_cache.dir
-/mnt/c/Users/User/Desktop/WynlandOs/build_qt/config.tests/binary_for_strip_built/CMakeFiles/rebuild_cache.dir
