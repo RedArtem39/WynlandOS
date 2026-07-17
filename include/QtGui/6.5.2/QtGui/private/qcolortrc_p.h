@@ -1,0 +1,1 @@
+#include "../../../../../qtbase/src/gui/painting/qcolortrc_p.h"

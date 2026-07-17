@@ -1,0 +1,1 @@
+#include "../../qtbase/src/gui/platform/windows/qwindowsmimeconverter.h"

@@ -1,0 +1,37 @@
+# Build output
+build/
+*.o
+*.elf
+*.efi
+*.img
+*.iso
+*.bin
+
+# Third-party and Build Directories
+build_qt/
+build_qt_headers/
+external/
+qtbase/
+scratch/
+gui/HAPRYLAND/
+gui/hyprland/
+
+# Large Generated Files
+hyprland*.wyn
+*.log
+objdump.txt
+search.txt
+
+# Tools (downloaded)
+tools/ovmf/
+tools/x86_64-linux-musl-cross/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS specific
+Thumbs.db
+.DS_Store

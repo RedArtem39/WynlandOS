@@ -1,0 +1,208 @@
+# WynUI — Declarative UI Framework for WynlandOS
+# ============================================================
+# Written in pure WynLang. Provides HStack, VStack, Spacers,
+# Buttons, and Input fields with automatic layout and event handling.
+
+# Frame coordinates
+ui_rx = 0
+ui_ry = 0
+ui_rw = 0
+ui_rh = 0
+
+# Cursor coordinates
+ui_cx = 0
+ui_cy = 0
+
+# Layout Stack
+# We use variables to track stack states
+# stack_dir: 0 = Vertical (VStack), 1 = Horizontal (HStack)
+stack_dir = 0
+stack_space = 8
+
+# Interactive elements bounds (supports up to 8 bounds)
+ui_b1_x1 = 0; ui_b1_y1 = 0; ui_b1_x2 = 0; ui_b1_y2 = 0; ui_b1_action = ""
+ui_b2_x1 = 0; ui_b2_y1 = 0; ui_b2_x2 = 0; ui_b2_y2 = 0; ui_b2_action = ""
+ui_b3_x1 = 0; ui_b3_y1 = 0; ui_b3_x2 = 0; ui_b3_y2 = 0; ui_b3_action = ""
+ui_b4_x1 = 0; ui_b4_y1 = 0; ui_b4_x2 = 0; ui_b4_y2 = 0; ui_b4_action = ""
+ui_b5_x1 = 0; ui_b5_y1 = 0; ui_b5_x2 = 0; ui_b5_y2 = 0; ui_b5_action = ""
+ui_b6_x1 = 0; ui_b6_y1 = 0; ui_b6_x2 = 0; ui_b6_y2 = 0; ui_b6_action = ""
+ui_b7_x1 = 0; ui_b7_y1 = 0; ui_b7_x2 = 0; ui_b7_y2 = 0; ui_b7_action = ""
+ui_b8_x1 = 0; ui_b8_y1 = 0; ui_b8_x2 = 0; ui_b8_y2 = 0; ui_b8_action = ""
+ui_b_count = 0
+
+fn ui_init(rx, ry, rw, rh):
+    ui_rx = rx
+    ui_ry = ry
+    ui_rw = rw
+    ui_rh = rh
+    
+    ui_cx = rx + 12
+    ui_cy = ry + 12
+    
+    ui_b_count = 0
+    ui_b1_action = ""
+    ui_b2_action = ""
+    ui_b3_action = ""
+    ui_b4_action = ""
+    ui_b5_action = ""
+    ui_b6_action = ""
+    ui_b7_action = ""
+    ui_b8_action = ""
+    
+    stack_dir = 0
+    stack_space = 8
+end
+
+fn ui_vstack_begin(spacing):
+    stack_dir = 0
+    stack_space = spacing
+end
+
+fn ui_vstack_end():
+    stack_dir = 0
+    stack_space = 8
+end
+
+fn ui_hstack_begin(spacing):
+    stack_dir = 1
+    stack_space = spacing
+end
+
+fn ui_hstack_end():
+    stack_dir = 0
+    ui_cx = ui_rx + 12
+    ui_cy = ui_cy + 22
+end
+
+fn ui_spacer(size):
+    if stack_dir == 0:
+        ui_cy = ui_cy + size
+    else:
+        ui_cx = ui_cx + size
+    end
+end
+
+fn ui_text(label, color):
+    gui_draw_text(ui_cx, ui_cy, label, color)
+    
+    t_len = len(label) * 9
+    if stack_dir == 0:
+        ui_cy = ui_cy + 18 + stack_space
+    else:
+        ui_cx = ui_cx + t_len + stack_space
+    end
+end
+
+fn ui_button(label, color, action_name):
+    btn_w = len(label) * 9 + 16
+    btn_h = 22
+    
+    gui_draw_rounded_rect(ui_cx + 2, ui_cy + 2, btn_w, btn_h, 4, 4739924)
+    gui_draw_rounded_rect(ui_cx, ui_cy, btn_w, btn_h, 4, color)
+    gui_draw_text(ui_cx + 8, ui_cy + 4, label, 15594484)
+    
+    ui_register_bounds(ui_cx, ui_cy, ui_cx + btn_w, ui_cy + btn_h, action_name)
+    
+    if stack_dir == 0:
+        ui_cy = ui_cy + btn_h + 4 + stack_space
+    else:
+        ui_cx = ui_cx + btn_w + stack_space
+    end
+end
+
+fn ui_input(val, placeholder, is_focused, action_name):
+    box_w = 200
+    box_h = 22
+    
+    gui_draw_rounded_rect(ui_cx, ui_cy, box_w, box_h, 4, 15066597)
+    
+    if is_focused == 1:
+        gui_draw_rounded_rect_border(ui_cx, ui_cy, box_w, box_h, 4, 8962256)
+    else:
+        gui_draw_rounded_rect_border(ui_cx, ui_cy, box_w, box_h, 4, 14212841)
+    end
+    
+    if len(val) == 0:
+        gui_draw_text(ui_cx + 8, ui_cy + 4, placeholder, 4739924)
+    else:
+        gui_draw_text(ui_cx + 8, ui_cy + 4, val, 3027776)
+    end
+    
+    if is_focused == 1:
+        cur_pos = len(val) * 9
+        gui_draw_text(ui_cx + 8 + cur_pos, ui_cy + 4, "|", 8962256)
+    end
+    
+    ui_register_bounds(ui_cx, ui_cy, ui_cx + box_w, ui_cy + box_h, action_name)
+    
+    if stack_dir == 0:
+        ui_cy = ui_cy + box_h + stack_space
+    else:
+        ui_cx = ui_cx + box_w + stack_space
+    end
+end
+
+fn ui_register_bounds(x1, y1, x2, y2, action_name):
+    ui_b_count = ui_b_count + 1
+    if ui_b_count == 1:
+        ui_b1_x1 = x1; ui_b1_y1 = y1; ui_b1_x2 = x2; ui_b1_y2 = y2; ui_b1_action = action_name
+    elif ui_b_count == 2:
+        ui_b2_x1 = x1; ui_b2_y1 = y1; ui_b2_x2 = x2; ui_b2_y2 = y2; ui_b2_action = action_name
+    elif ui_b_count == 3:
+        ui_b3_x1 = x1; ui_b3_y1 = y1; ui_b3_x2 = x2; ui_b3_y2 = y2; ui_b3_action = action_name
+    elif ui_b_count == 4:
+        ui_b4_x1 = x1; ui_b4_y1 = y1; ui_b4_x2 = x2; ui_b4_y2 = y2; ui_b4_action = action_name
+    elif ui_b_count == 5:
+        ui_b5_x1 = x1; ui_b5_y1 = y1; ui_b5_x2 = x2; ui_b5_y2 = y2; ui_b5_action = action_name
+    elif ui_b_count == 6:
+        ui_b6_x1 = x1; ui_b6_y1 = y1; ui_b6_x2 = x2; ui_b6_y2 = y2; ui_b6_action = action_name
+    elif ui_b_count == 7:
+        ui_b7_x1 = x1; ui_b7_y1 = y1; ui_b7_x2 = x2; ui_b7_y2 = y2; ui_b7_action = action_name
+    elif ui_b_count == 8:
+        ui_b8_x1 = x1; ui_b8_y1 = y1; ui_b8_x2 = x2; ui_b8_y2 = y2; ui_b8_action = action_name
+    end
+end
+
+fn ui_check_click(mx, my):
+    if ui_b_count >= 1:
+        if mx >= ui_b1_x1 and mx <= ui_b1_x2 and my >= ui_b1_y1 and my <= ui_b1_y2:
+            return ui_b1_action
+        end
+    end
+    if ui_b_count >= 2:
+        if mx >= ui_b2_x1 and mx <= ui_b2_x2 and my >= ui_b2_y1 and my <= ui_b2_y2:
+            return ui_b2_action
+        end
+    end
+    if ui_b_count >= 3:
+        if mx >= ui_b3_x1 and mx <= ui_b3_x2 and my >= ui_b3_y1 and my <= ui_b3_y2:
+            return ui_b3_action
+        end
+    end
+    if ui_b_count >= 4:
+        if mx >= ui_b4_x1 and mx <= ui_b4_x2 and my >= ui_b4_y1 and my <= ui_b4_y2:
+            return ui_b4_action
+        end
+    end
+    if ui_b_count >= 5:
+        if mx >= ui_b5_x1 and mx <= ui_b5_x2 and my >= ui_b5_y1 and my <= ui_b5_y2:
+            return ui_b5_action
+        end
+    end
+    if ui_b_count >= 6:
+        if mx >= ui_b6_x1 and mx <= ui_b6_x2 and my >= ui_b6_y1 and my <= ui_b6_y2:
+            return ui_b6_action
+        end
+    end
+    if ui_b_count >= 7:
+        if mx >= ui_b7_x1 and mx <= ui_b7_x2 and my >= ui_b7_y1 and my <= ui_b7_y2:
+            return ui_b7_action
+        end
+    end
+    if ui_b_count >= 8:
+        if mx >= ui_b8_x1 and mx <= ui_b8_x2 and my >= ui_b8_y1 and my <= ui_b8_y2:
+            return ui_b8_action
+        end
+    end
+    return ""
+end
