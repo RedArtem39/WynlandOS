@@ -8,7 +8,15 @@
 
 extern uint8_t __kernel_end[];
 extern void *memset(void *s, int c, size_t n);
+extern void *memcpy(void *dest, const void *src, size_t n);
 extern void serial_write_string(const char *str);
+
+/* Snapshot of the boot-time PML4 (kernel code + all identity-mapped RAM +
+   framebuffer). Taken once, right after vmm_init() finishes building it and
+   before any user process exists -- see vmm_init() below. Every new
+   process's PML4 aliases these same top-level entries by pointer so kernel
+   code/data/MMIO stay reachable after a CR3 switch into a process. */
+static PageTable *g_kernel_pml4 = NULL;
 
 /* Helper to allocate and zero a new page table */
 static PageTable *vmm_alloc_table(void)
@@ -20,6 +28,87 @@ static PageTable *vmm_alloc_table(void)
     }
     memset(phys, 0, PAGE_SIZE);
     return (PageTable *)phys;
+}
+
+PageTable *vmm_get_kernel_pml4(void)
+{
+    return g_kernel_pml4;
+}
+
+PageTable *vmm_new_process_pml4(void)
+{
+    PageTable *pml4 = vmm_alloc_table();
+    if (!pml4) return NULL;
+
+    /* Alias every present top-level entry from the kernel PML4 by value --
+       this shares the same physical PDPT chains (cheap, no deep copy), and
+       is safe because ring-3 access is gated by the PAGE_USER bit at the
+       leaf PT entry, not by presence in this table; the kernel's own
+       identity-map calls never set PAGE_USER (see vmm_init()). Looping all
+       512 entries rather than hardcoding a single index keeps this correct
+       even if RAM/framebuffer placement ever grows past what one entry
+       covers. */
+    for (int i = 0; i < 512; i++) {
+        if (g_kernel_pml4->entries[i] & PAGE_PRESENT) {
+            pml4->entries[i] = g_kernel_pml4->entries[i];
+        }
+    }
+    return pml4;
+}
+
+bool vmm_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
+{
+    /* Real fork() support: deep-copy every PAGE_USER leaf mapping from the
+       parent's address space into the child's, with its own fresh physical
+       page (eager copy, not copy-on-write -- simpler and self-contained,
+       no page-fault-handler changes needed; this OS doesn't have fork-heavy
+       workloads yet, so the extra memcpy cost isn't worth the COW
+       complexity/risk right now).
+
+       Only walks PRESENT entries at each level (cheap in practice -- bounded
+       by how much is actually mapped, not the full 512^4 address space), and
+       only acts on leaves with PAGE_USER set, which automatically skips the
+       kernel/RAM/framebuffer identity-map region every process's PML4
+       aliases from vmm_new_process_pml4() (that region is never PAGE_USER,
+       see that function's own comment) -- no special-casing needed to avoid
+       re-copying it. */
+    for (uint64_t i4 = 0; i4 < 512; i4++) {
+        if (!(parent_pml4->entries[i4] & PAGE_PRESENT)) continue;
+        PageTable *pdpt = (PageTable *)(uintptr_t)(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
+
+        for (uint64_t i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt->entries[i3] & PAGE_PRESENT)) continue;
+            if (pdpt->entries[i3] & PAGE_PS) continue; /* 1GB huge page -- never produced for user mappings by vmm_map_page, skip defensively */
+            PageTable *pd = (PageTable *)(uintptr_t)(pdpt->entries[i3] & PAGE_ADDR_MASK);
+
+            for (uint64_t i2 = 0; i2 < 512; i2++) {
+                if (!(pd->entries[i2] & PAGE_PRESENT)) continue;
+                if (pd->entries[i2] & PAGE_PS) continue; /* 2MB huge page -- same as above */
+                PageTable *pt = (PageTable *)(uintptr_t)(pd->entries[i2] & PAGE_ADDR_MASK);
+
+                for (uint64_t i1 = 0; i1 < 512; i1++) {
+                    uint64_t pte = pt->entries[i1];
+                    if (!(pte & PAGE_PRESENT)) continue;
+                    if (!(pte & PAGE_USER)) continue;
+
+                    uint64_t phys  = pte & PAGE_ADDR_MASK;
+                    uint64_t flags = (pte & 0xFFFULL) & ~PAGE_PRESENT; /* vmm_map_page ORs PRESENT in itself */
+
+                    uint64_t virt = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                    if (i4 & 0x100) virt |= 0xFFFF000000000000ULL; /* canonical sign-extend, defensive -- this OS's own user addresses never actually reach the upper half today */
+
+                    void *new_phys = pmm_alloc_page();
+                    if (!new_phys) {
+                        serial_write_string("vmm_clone_user_pages: out of physical memory\r\n");
+                        return false;
+                    }
+                    memcpy(new_phys, (void *)(uintptr_t)phys, PAGE_SIZE);
+                    vmm_map_page(child_pml4, virt, (uint64_t)(uintptr_t)new_phys, flags);
+                }
+            }
+        }
+    }
+    return true;
 }
 
 void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
@@ -157,6 +246,33 @@ uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
     return (*pt_entry & PAGE_ADDR_MASK) | (virt & (PAGE_SIZE - 1));
 }
 
+bool vmm_is_user_page(PageTable *pml4, uint64_t virt)
+{
+    uint64_t pml4_idx = PML4_INDEX(virt);
+    uint64_t pdpt_idx = PDPT_INDEX(virt);
+    uint64_t pd_idx   = PD_INDEX(virt);
+    uint64_t pt_idx   = PT_INDEX(virt);
+
+    PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
+    if (!(*pml4_entry & PAGE_PRESENT)) return false;
+
+    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
+    if (!(*pdpt_entry & PAGE_PRESENT)) return false;
+    if (*pdpt_entry & PAGE_PS) return (*pdpt_entry & PAGE_USER) != 0;
+
+    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pd_entry = &pd->entries[pd_idx];
+    if (!(*pd_entry & PAGE_PRESENT)) return false;
+    if (*pd_entry & PAGE_PS) return (*pd_entry & PAGE_USER) != 0;
+
+    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pt_entry = &pt->entries[pt_idx];
+    if (!(*pt_entry & PAGE_PRESENT)) return false;
+
+    return (*pt_entry & PAGE_USER) != 0;
+}
+
 static inline uint64_t read_msr(uint32_t msr) {
     uint32_t low, high;
     __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
@@ -229,6 +345,12 @@ void vmm_init(BootInfo *boot_info)
     for (uint64_t offset = 0; offset < fb_size; offset += PAGE_SIZE) {
         vmm_map_page(pml4, fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX | PAGE_PAT);
     }
+
+    /* Snapshot this as the kernel PML4 -- at this exact point it's
+       guaranteed to contain only the kernel/RAM/framebuffer identity map
+       and nothing else, since no user process has run yet. New processes
+       (see vmm_new_process_pml4()) alias these entries by pointer. */
+    g_kernel_pml4 = pml4;
 
     /* 4. Switch to our new PML4 page table by loading it into CR3 */
     uint64_t pml4_phys = (uint64_t)(uintptr_t)pml4;

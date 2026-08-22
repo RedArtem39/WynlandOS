@@ -3,7 +3,6 @@
 
 #include <qpa/qplatformintegration.h>
 #include <qpa/qplatformscreen.h>
-#include <QtCore/QThread>
 #include <QtCore/QFile>
 
 QT_BEGIN_NAMESPACE
@@ -25,12 +24,16 @@ public:
     QAbstractEventDispatcher *createEventDispatcher() const override;
     QPlatformFontDatabase *fontDatabase() const override;
 
+    /* Client's own c2s pipe fd, used by the backingstore to send
+       ZERP_MSG_DAMAGE after each flush -- see qwynlandfbintegration.cpp. */
+    int c2sFd() const { return m_c2sFd; }
+
 private:
     QWynlandFbScreen *m_screen;
     QWynlandFbInputReader *m_inputReader;
     QStringList m_parameters;
     QPlatformFontDatabase *m_fontDb;
-    QTimer *m_cursorTimer;
+    int m_c2sFd;
 };
 
 QT_END_NAMESPACE

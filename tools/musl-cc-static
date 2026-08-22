@@ -1,0 +1,9 @@
+#!/bin/sh
+# Wrapper: cross-compile for WynlandOS (musl x86_64), but always statically
+# link. Needed because CMake's own bootstrap script does compile-AND-RUN
+# feature probes on the machine running bootstrap (this WSL host) -- a
+# dynamically-linked musl binary would fail to execute there (the host has
+# no /lib/ld-musl-x86_64.so.1), but a static binary has no runtime
+# dependency at all and a real Linux kernel (which WSL2 is) runs it fine
+# regardless of which libc built it.
+exec "$(dirname "$0")/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc" -static "$@"

@@ -11,6 +11,7 @@ build/
 build_qt/
 build_qt_headers/
 external/
+external_src/
 qtbase/
 scratch/
 gui/HAPRYLAND/

@@ -29,6 +29,22 @@ extern "C" {
 #define IN_DELETE_SELF   0x00000400
 #define IN_MOVE_SELF     0x00000800
 
+#define IN_UNMOUNT       0x00002000
+#define IN_Q_OVERFLOW    0x00004000
+#define IN_IGNORED       0x00008000
+
+#define IN_ONLYDIR       0x01000000
+#define IN_MASK_ADD      0x20000000
+#define IN_ISDIR         0x40000000
+#define IN_ONESHOT       0x80000000
+#define IN_MASK_CREATE   0x10000000
+
+#define IN_CLOSE  (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE)
+#define IN_MOVE   (IN_MOVED_FROM | IN_MOVED_TO)
+#define IN_ALL_EVENTS (IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_CLOSE_WRITE | \
+    IN_CLOSE_NOWRITE | IN_OPEN | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE | \
+    IN_DELETE | IN_DELETE_SELF | IN_MOVE_SELF)
+
 struct inotify_event {
     int      wd;
     uint32_t mask;

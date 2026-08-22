@@ -4,7 +4,6 @@
  */
 #include "wm.h"
 #include "opengl.h"
-#include "hyprland/hyprland.hpp"
 #define DOCK_ICON_COUNT 6
 
 typedef struct {
@@ -279,17 +278,6 @@ void wm_register_window(Window *win)
     }
     win->anim_direction = 0;
 
-    if (g_pHyprland && !win->hypr_win) {
-        CWindow* pHyprWin = new CWindow(win->id, win->title, "app", g_pHyprland->m_iActiveWorkspace);
-        pHyprWin->m_pBackingStore = win->backing_store;
-        pHyprWin->m_pDrawContentCb = (void (*)(void*))win->draw_content;
-        pHyprWin->m_vRealPos = Vector2D(win->x, win->y);
-        pHyprWin->m_vRealSize = Vector2D(win->w, win->h);
-        pHyprWin->m_bIsVisible = win->is_visible;
-        win->hypr_win = pHyprWin;
-        g_pHyprland->addWindow(pHyprWin);
-    }
-
     comp_mark_dirty();
     wm_mark_dirty();
 }
@@ -393,12 +381,12 @@ void wm_resize_backing_store(Window *win) {
     }
 }
 
+/* hyprctl handled by userspace Hyprland; kernel stub is a no-op */
+extern "C" int hyprctl_dispatch_c(const char* c, const char* a) { (void)c; (void)a; return 0; }
+
 extern "C" void wm_init(void)
 {
     serial_write_string("WM: Initializing Stacking Window Manager...\r\n");
-
-    g_pHyprland = new CHyprland();
-    g_pHyprland->init();
 
     g_windows_head = NULL;
     g_windows_tail = NULL;
@@ -774,7 +762,6 @@ extern "C" bool wm_draw_desktop(void)
 
     if (desktop_changed) {
         g_wm_needs_redraw = false;
-        if (g_pHyprland) g_pHyprland->tick(0.016);
 
         uint32_t sw = comp_get_width();
         uint32_t sh = comp_get_height();
@@ -858,61 +845,26 @@ extern "C" bool wm_draw_desktop(void)
                 if (win->h < 1) win->h = 1;
             }
 
-            if (g_pHyprland && win->hypr_win) {
-                win->hypr_win->m_bIsFocused = win->is_focused;
-                win->hypr_win->m_vRealPos = Vector2D(win->x, win->y);
-                win->hypr_win->m_vRealSize = Vector2D(win->w, win->h);
-
-                if (g_pHyprland->m_pRenderer) {
-                    g_pHyprland->m_pRenderer->renderWindowShadow(win->hypr_win);
-                }
-
-                comp_fill_rect_alpha(win->x, win->y, win->w, win->h, THEME_WINDOW_BG);
-
-                if (win->draw_content && scale > 96) {
-                    if (win->backing_store) {
-                        uint32_t cx = win->x;
-                        uint32_t cy = win->y;
-                        uint32_t cw = win->w;
-                        uint32_t ch = win->h;
-                        uint32_t bw = comp_get_width();
-                        uint32_t bh = comp_get_height();
-                        uint32_t *back_buffer = comp_get_backbuffer();
-                        for (uint32_t row = 0; row < ch; row++) {
-                            if (cy + row < bh && cx + cw <= bw) {
-                                memcpy(&back_buffer[(cy + row) * bw + cx], &win->backing_store[row * cw], cw * 4);
-                            }
-                        }
-                    } else {
-                        win->draw_content(win);
+            draw_window_decorations(win);
+            if (win->draw_content && scale > 96) {
+                if (win->backing_store) {
+                    uint32_t cx = win->x + 1;
+                    uint32_t cy = win->y + THEME_TITLEBAR_HEIGHT + 1;
+                    uint32_t cw = win->w - 2;
+                    uint32_t ch = win->h - THEME_TITLEBAR_HEIGHT - 2;
+                    uint32_t bw = comp_get_width();
+                    uint32_t *back_buffer = comp_get_backbuffer();
+                    for (uint32_t row = 0; row < ch; row++) {
+                        memcpy(&back_buffer[(cy + row) * bw + cx], &win->backing_store[row * cw], cw * 4);
                     }
+                } else {
+                    win->draw_content(win);
                 }
-
-                if (g_pHyprland->m_pRenderer) {
-                    g_pHyprland->m_pRenderer->renderActiveBorder(win->hypr_win);
-                }
-            } else {
-                draw_window_decorations(win);
-                if (win->draw_content && scale > 96) {
-                    if (win->backing_store) {
-                        uint32_t cx = win->x + 1;
-                        uint32_t cy = win->y + THEME_TITLEBAR_HEIGHT + 1;
-                        uint32_t cw = win->w - 2;
-                        uint32_t ch = win->h - THEME_TITLEBAR_HEIGHT - 2;
-                        uint32_t bw = comp_get_width();
-                        uint32_t *back_buffer = comp_get_backbuffer();
-                        for (uint32_t row = 0; row < ch; row++) {
-                            memcpy(&back_buffer[(cy + row) * bw + cx], &win->backing_store[row * cw], cw * 4);
-                        }
-                    } else {
-                        win->draw_content(win);
-                    }
-                }
-                if (win->is_focused && !win->is_maximized && scale == 256) {
-                    int32_t rx = win->x + win->w - 12;
-                    int32_t ry = win->y + win->h - 12;
-                    comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
-                }
+            }
+            if (win->is_focused && !win->is_maximized && scale == 256) {
+                int32_t rx = win->x + win->w - 12;
+                int32_t ry = win->y + win->h - 12;
+                comp_fill_rect(rx, ry, 8, 8, THEME_ACCENT & 0x00FFFFFF);
             }
 
             win->x = orig_x;
@@ -991,45 +943,6 @@ extern "C" void wm_tile_windows(void)
         win = win->next;
     }
     if (count == 0) return;
-
-    if (g_pHyprland) {
-        /* Sync visible state to native CWindow instances */
-        win = g_windows_head;
-        while (win) {
-            if (win->hypr_win) {
-                win->hypr_win->m_bIsVisible = (win->is_visible && win->scale_spring.target == 256 && !win->is_maximized);
-            }
-            win = win->next;
-        }
-        
-        /* Recalculate target positions using native Dwindle or Master engine */
-        if (g_pHyprland->m_pConfig && !g_pHyprland->m_pConfig->m_config.layoutDwindle) {
-            if (g_pHyprland->m_pMasterLayout) g_pHyprland->m_pMasterLayout->recalculateMonitor(g_pHyprland->m_iActiveWorkspace);
-        } else {
-            if (g_pHyprland->m_pLayout) g_pHyprland->m_pLayout->recalculateMonitor(g_pHyprland->m_iActiveWorkspace);
-        }
-
-        /* Apply calculated tiling bounds directly back to Window structs */
-        win = g_windows_head;
-        while (win) {
-            if (win->is_visible && win->scale_spring.target == 256 && !win->is_maximized && win->hypr_win) {
-                win->x = (int32_t)win->hypr_win->m_vTargetPos.x;
-                win->y = (int32_t)win->hypr_win->m_vTargetPos.y;
-                win->w = (uint32_t)win->hypr_win->m_vTargetSize.x;
-                win->h = (uint32_t)win->hypr_win->m_vTargetSize.y;
-                if (win->w < 50) win->w = 50;
-                if (win->h < 50) win->h = 50;
-                win->hypr_win->m_vRealPos = Vector2D(win->x, win->y);
-                win->hypr_win->m_vRealSize = Vector2D(win->w, win->h);
-                if (win->backing_store && (win->w != win->prev_w || win->h != win->prev_h)) {
-                    wm_resize_backing_store(win);
-                }
-            }
-            win = win->next;
-        }
-        comp_mark_dirty();
-        return;
-    }
 
     uint32_t sw = comp_get_width();
     uint32_t sh = comp_get_height();
@@ -1500,19 +1413,7 @@ extern "C" void wm_handle_key(uint8_t scancode, char ascii)
     if (scancode == 0x2A || scancode == 0x36) { s_modifiers |= 1; return; }
     if (scancode == (0x2A | 0x80) || scancode == (0x36 | 0x80)) { s_modifiers &= ~1; return; }
 
-    if ((scancode & 0x80) == 0) {
-        extern CHyprland* g_pHyprland;
-        if (g_pHyprland) {
-            uint32_t keycode = 0;
-            if (ascii >= 'a' && ascii <= 'z') keycode = ascii - 'a' + 'A';
-            else if (ascii != 0) keycode = ascii;
-            else keycode = scancode;
-
-            if (g_pHyprland->onKeyPress(s_modifiers, keycode)) {
-                return;
-            }
-        }
-    }
+    /* fake-compositor key dispatch removed */
 
     /* Deliver key presses only to focused window */
     if (g_windows_head && g_windows_head->is_focused && g_windows_head->is_visible) {

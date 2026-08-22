@@ -98,6 +98,28 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
 
         for (uint64_t addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
             void *phys = find_mapped_page(pml4, addr);
+
+            /* An existing mapping at this address that ISN'T PAGE_USER means
+               this virtual address collides with kernel-identity-mapped
+               memory this process's PML4 aliases (see vmm_new_process_pml4()
+               in vmm.c) -- e.g. a low ET_EXEC link address that happens to
+               land in the shared low region. Writing segment content
+               straight into it would silently corrupt whatever the kernel
+               actually uses that shared physical page for (in the worst
+               case, a live page table). Refuse instead of corrupting
+               memory. Link the binary at a high, non-aliased address
+               (compare the stack/ET_DYN/interpreter fixes above) instead. */
+            if (phys && !vmm_is_user_page(pml4, addr)) {
+                serial_write_string("ELF Loader Error: segment at ");
+                extern void uint_to_hex(uint64_t val, char *buf);
+                char hb[20];
+                uint_to_hex(addr, hb);
+                serial_write_string(hb);
+                serial_write_string(" collides with shared kernel memory -- refusing to load. "
+                                     "Link this binary at a high, non-identity-mapped address.\r\n");
+                return false;
+            }
+
             if (!phys) {
                 phys = pmm_alloc_page();
                 if (!phys) {
@@ -141,7 +163,7 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
     return true;
 }
 
-bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages)
+bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages, const char **argv, const char **envp)
 {
     out_pages->count = 0;
 
@@ -232,7 +254,17 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     /* Load main program segments */
     uint64_t load_offset = 0;
     if (hdr.e_type == 3) { // ET_DYN (PIE executable or shared library)
-        load_offset = 0x400000000ULL; // 16 GB base
+        /* PML4 index 160 (0x500000000000) -- was 0x400000000 (16 GB, PML4
+           index 0) which aliases the same top-level PML4 slot as the
+           kernel/RAM/framebuffer identity map. Under per-process address
+           spaces (vmm_new_process_pml4()) that slot is shared by pointer
+           across every process, so any PIE (ET_DYN) binary loaded there
+           would be visible/writable from every other process -- silently
+           breaking isolation for anything built PIE (the common default
+           for modern toolchains). Moved to a disjoint slot, clear of
+           index 0, the interpreter base (index 224), and the user stack
+           (index 192, see below). */
+        load_offset = 0x500000000000ULL; // PML4 index 160
     }
     
     phdr_vaddr += load_offset;
@@ -291,9 +323,27 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
         vfs_close(interp_f);
     }
 
-    /* 5. Map user stack (64 KB) at 0x50000000 */
-    uint64_t stack_base = 0x50000000;
-    uint64_t stack_size = 65536;
+    /* 5. Map user stack (8 MB -- see below for why it grew from 64 KB).
+       PML4 index 192 (0x600000000000) -- was 0x50000000, which aliases
+       PML4 index 0, the same shared slot as the kernel/RAM/framebuffer
+       identity map. Under per-process address spaces every process's
+       stack would land in a page-table chain shared by pointer across
+       ALL processes, silently breaking isolation (see vmm_new_process_pml4()
+       in kernel/vmm.c). Moved to a slot disjoint from index 0, the ET_DYN
+       load offset (index 160), and the interpreter base (index 224). Each
+       PML4 index spans 512GB, so growing this by orders of magnitude below
+       still leaves enormous headroom before the next region (/dev/fb0 at
+       index 194, 0x610000000000).
+
+       Size bumped from the original 64 KB to 8 MB (matching a typical real
+       Linux default `ulimit -s`) after pkg-config's own real-world `main()`
+       (a single ~66 KB local stack frame for its output-formatting buffers)
+       stack-overflowed on its very first instruction -- 64 KB was simply
+       too small for a real hosted program with realistically-sized locals,
+       not something specific to pkg-config. Every future userspace port
+       (CMake, git, curl, etc.) would hit the same wall sooner or later. */
+    uint64_t stack_base = 0x600000000000ULL;
+    uint64_t stack_size = 8 * 1024 * 1024;
     for (uint64_t offset = 0; offset < stack_size; offset += PAGE_SIZE) {
         uint64_t addr = stack_base + offset;
         void *phys = find_mapped_page(pml4, addr);
@@ -352,61 +402,95 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     auxv[ac++] = (Elf64_Auxv){AT_RANDOM, random_addr};
     auxv[ac++] = (Elf64_Auxv){AT_NULL, 0};
 
-    const char *env1 = "XDG_RUNTIME_DIR=/tmp";
-    uint32_t env1_len = 0;
-    while (env1[env1_len] != '\0') env1_len++;
-    uint64_t env1_addr = sp - (env1_len + 1);
-    char *env1_ptr = (char *)env1_addr;
-    for (uint32_t i = 0; i <= env1_len; i++) env1_ptr[i] = env1[i];
-    sp = env1_addr;
+    /* envp: NULL preserves the historical hardcoded 5-var default every
+       existing caller relies on. A real caller-supplied array (Phase 18's
+       execve()) fully replaces it, mirroring argv's own NULL-means-default
+       convention immediately below. */
+    #define MAX_SPAWN_ENVP 16
+    uint64_t envp_addrs[MAX_SPAWN_ENVP];
+    int envp_count = 0;
 
-    const char *env2 = "LD_LIBRARY_PATH=/lib64";
-    uint32_t env2_len = 0;
-    while (env2[env2_len] != '\0') env2_len++;
-    uint64_t env2_addr = sp - (env2_len + 1);
-    char *env2_ptr = (char *)env2_addr;
-    for (uint32_t i = 0; i <= env2_len; i++) env2_ptr[i] = env2[i];
-    sp = env2_addr;
+    if (envp == NULL) {
+        /* g_tz_envp_line (kernel/rtc.c) is a mutable global, not a string
+           literal -- filled at boot by tz_auto_detect() (or left at its
+           "TZ=UTC0" default if that failed/no network), so every process
+           spawned this way picks up the real, currently-known timezone
+           without needing a compile-time-constant value here. */
+        extern char g_tz_envp_line[32];
+        const char *default_envp[] = {
+            "XDG_RUNTIME_DIR=/tmp",
+            "LD_LIBRARY_PATH=/lib64",
+            "WLR_BACKENDS=headless",
+            "WLR_RENDERER=pixman",
+            "LIBGL_DRIVERS_PATH=/lib64/dri",
+            g_tz_envp_line,
+        };
+        for (int e = 0; e < 6; e++) {
+            uint32_t len = 0;
+            while (default_envp[e][len] != '\0') len++;
+            uint64_t addr = sp - (len + 1);
+            char *ptr = (char *)addr;
+            for (uint32_t i = 0; i <= len; i++) ptr[i] = default_envp[e][i];
+            sp = addr;
+            envp_addrs[envp_count++] = addr;
+        }
+    } else {
+        for (int e = 0; envp[e] != NULL && envp_count < MAX_SPAWN_ENVP; e++) {
+            uint32_t len = 0;
+            while (envp[e][len] != '\0') len++;
+            uint64_t addr = sp - (len + 1);
+            char *ptr = (char *)addr;
+            for (uint32_t i = 0; i <= len; i++) ptr[i] = envp[e][i];
+            sp = addr;
+            envp_addrs[envp_count++] = addr;
+        }
+    }
 
-    const char *env3 = "WLR_BACKENDS=headless";
-    uint32_t env3_len = 0;
-    while (env3[env3_len] != '\0') env3_len++;
-    uint64_t env3_addr = sp - (env3_len + 1);
-    char *env3_ptr = (char *)env3_addr;
-    for (uint32_t i = 0; i <= env3_len; i++) env3_ptr[i] = env3[i];
-    sp = env3_addr;
+    /* argv: NULL preserves the exact historical behavior every existing
+       caller relies on (argc=2: path + a legacy dummy arg, both using
+       stack addresses already built above/below). A real NULL-terminated
+       array (e.g. Zerp spawning a client with fd numbers as argv) fully
+       REPLACES that default -- argv[0] is whatever the caller supplied
+       (real execve() semantics: argv[0] need not literally equal path),
+       not appended after an implicit path_addr entry. Getting this
+       conflated (path_addr always forced into argv[0], caller's argv
+       appended after) was tried first and produced a duplicated/shifted
+       argv in the child -- caught live via a spawn test where the child's
+       argv[1] came back as the path string instead of the intended arg. */
+    #define MAX_SPAWN_ARGV 8
+    uint64_t argv_addrs[MAX_SPAWN_ARGV];
+    int argv_count = 0;
 
-    const char *env4 = "WLR_RENDERER=pixman";
-    uint32_t env4_len = 0;
-    while (env4[env4_len] != '\0') env4_len++;
-    uint64_t env4_addr = sp - (env4_len + 1);
-    char *env4_ptr = (char *)env4_addr;
-    for (uint32_t i = 0; i <= env4_len; i++) env4_ptr[i] = env4[i];
-    sp = env4_addr;
-
-    const char *env5 = "LIBGL_DRIVERS_PATH=/lib64/dri";
-    uint32_t env5_len = 0;
-    while (env5[env5_len] != '\0') env5_len++;
-    uint64_t env5_addr = sp - (env5_len + 1);
-    char *env5_ptr = (char *)env5_addr;
-    for (uint32_t i = 0; i <= env5_len; i++) env5_ptr[i] = env5[i];
-    sp = env5_addr;
-
-    const char *arg1 = "--i-am-really-stupid";
-    uint32_t arg1_len = 0;
-    while (arg1[arg1_len] != '\0') arg1_len++;
-    uint64_t arg1_addr = sp - (arg1_len + 1);
-    char *arg1_ptr = (char *)arg1_addr;
-    for (uint32_t i = 0; i <= arg1_len; i++) arg1_ptr[i] = arg1[i];
-    sp = arg1_addr;
+    if (argv == NULL) {
+        const char *dummy = "--i-am-really-stupid";
+        uint32_t dummy_len = 0;
+        while (dummy[dummy_len] != '\0') dummy_len++;
+        uint64_t dummy_addr = sp - (dummy_len + 1);
+        char *dummy_ptr = (char *)dummy_addr;
+        for (uint32_t i = 0; i <= dummy_len; i++) dummy_ptr[i] = dummy[i];
+        sp = dummy_addr;
+        argv_addrs[argv_count++] = path_addr;
+        argv_addrs[argv_count++] = dummy_addr;
+    } else {
+        for (int a = 0; argv[a] != NULL && argv_count < MAX_SPAWN_ARGV; a++) {
+            uint32_t len = 0;
+            while (argv[a][len] != '\0') len++;
+            uint64_t addr = sp - (len + 1);
+            char *ptr = (char *)addr;
+            for (uint32_t i = 0; i <= len; i++) ptr[i] = argv[a][i];
+            sp = addr;
+            argv_addrs[argv_count++] = addr;
+        }
+    }
 
     /* Align stack to 16 bytes again */
     sp &= ~15ULL;
 
     uint32_t auxv_size = ac * sizeof(Elf64_Auxv);
-    uint32_t envp_size = 6 * 8; // env1..env5, NULL
-    uint32_t argv_size = 3 * 8; // path_addr, arg1_addr, NULL
-    uint32_t argc_size = 8;     // argc = 2
+    uint32_t envp_size = (envp_count + 1) * 8; // + NULL terminator
+    uint32_t argc_val  = argv_count;
+    uint32_t argv_size = (argc_val + 1) * 8;   // + NULL terminator
+    uint32_t argc_size = 8;
 
     uint32_t total_stack_params = argc_size + argv_size + envp_size + auxv_size;
     sp = (sp - total_stack_params) & ~15ULL;
@@ -414,22 +498,29 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     uint64_t *sp_ptr = (uint64_t *)sp;
     int idx = 0;
     /* argc */
-    sp_ptr[idx++] = 2;
+    sp_ptr[idx++] = argc_val;
     /* argv */
-    sp_ptr[idx++] = path_addr;
-    sp_ptr[idx++] = arg1_addr;
+    for (int a = 0; a < argv_count; a++) sp_ptr[idx++] = argv_addrs[a];
     sp_ptr[idx++] = 0; // NULL
     /* envp */
-    sp_ptr[idx++] = env1_addr;
-    sp_ptr[idx++] = env2_addr;
-    sp_ptr[idx++] = env3_addr;
-    sp_ptr[idx++] = env4_addr;
-    sp_ptr[idx++] = env5_addr;
+    for (int e = 0; e < envp_count; e++) sp_ptr[idx++] = envp_addrs[e];
     sp_ptr[idx++] = 0; // NULL
-    /* auxv */
-    Elf64_Auxv *sp_auxv = (Elf64_Auxv *)&sp_ptr[idx];
-    for (int i = 0; i < ac; i++) {
-        sp_auxv[i] = auxv[i];
+
+    /* Copied byte-by-byte through a volatile pointer rather than a plain
+       `sp_auxv[i] = auxv[i]` struct assignment. This is NOT the same bug as
+       the syscall_entry.asm stack-misalignment issue fixed elsewhere (that
+       fix is confirmed independently, see drivers/video/virtio_gpu.c, which
+       now uses a plain memset() with no workaround) -- reverting *this*
+       byte-loop (with the asm fix in place) instead produces a *different*
+       crash: a Page Fault with RIP=2 inside thread_enter_user_mode_clone's
+       iretq setup (kernel/gdt_flush.asm), when process_spawn() is reached
+       via a nested SYS_spawn call from a Ring-3 process (spawner.elf
+       -> inherited.elf). Root cause of that second issue is still open;
+       this workaround stays in place until it's diagnosed separately. */
+    volatile uint8_t *sp_auxv_bytes = (volatile uint8_t *)&sp_ptr[idx];
+    const uint8_t *auxv_bytes = (const uint8_t *)auxv;
+    for (uint32_t b = 0; b < ac * sizeof(Elf64_Auxv); b++) {
+        sp_auxv_bytes[b] = auxv_bytes[b];
     }
 
     *out_entry = entry_point;

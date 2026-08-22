@@ -559,6 +559,28 @@ void tcp_close(TcpConnection *conn)
 }
 
 /* ============================================================
+ * tcp_connect_slot / tcp_get_connection — index-based wrappers
+ * for callers (syscall.c) that can only stash a uint32_t per fd.
+ * ============================================================ */
+
+int tcp_connect_slot(uint32_t remote_ip, uint16_t remote_port)
+{
+    TcpConnection *conn = tcp_connect(remote_ip, remote_port);
+    if (conn == NULL)
+        return -1;
+    return (int)(conn - connections);
+}
+
+TcpConnection *tcp_get_connection(int idx)
+{
+    if (idx < 0 || idx >= (int)TCP_MAX_CONNECTIONS)
+        return NULL;
+    if (!connections[idx].in_use)
+        return NULL;
+    return &connections[idx];
+}
+
+/* ============================================================
  * tcp_handle_packet — Incoming TCP segment handler
  *
  * Called from handle_ipv4 in net.c when protocol == TCP.

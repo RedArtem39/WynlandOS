@@ -10,7 +10,16 @@ syscall_entry:
     ; 1. Save user stack and switch to kernel stack
     mov [rel user_stack_temp], rsp
     mov rsp, [rel current_kernel_stack]
-    
+
+    ; ABI-alignment pad: 16 GPR pushes + 1 "push rsp" (7th arg) below is an
+    ; ODD number of qword pushes, which leaves RSP at (16-aligned - 8) right
+    ; before `call syscall_dispatcher` -- violating the SysV requirement that
+    ; RSP be 16-aligned immediately before a CALL. This single extra qword
+    ; restores that, so callees relying on ABI-guaranteed alignment (e.g.
+    ; GCC-emitted `movaps` stack spills) don't fault. Popped back out below,
+    ; symmetrically, before restoring user RIP/RFLAGS/RSP.
+    sub rsp, 8
+
     ; 2. Push user state (RIP, RFLAGS, RSP) onto the kernel stack
     push qword [rel user_stack_temp] ; User RSP
     push r11                         ; User RFLAGS
@@ -57,7 +66,14 @@ syscall_entry:
     pop rdi
     pop rbx
     pop rbp
-    
+
+    ; Note: no compensating `add rsp,8` is needed for the alignment pad
+    ; pushed above -- the kernel stack pointer is unconditionally
+    ; re-initialized from current_kernel_stack on the next syscall entry
+    ; (see top of this function), and `pop rsp` below immediately switches
+    ; RSP back to the user stack anyway, so the pad qword is simply
+    ; abandoned along with the rest of this frame.
+
     ; 5. Restore user execution context
     pop rcx                          ; Restore User RIP
     pop r11                          ; Restore User RFLAGS

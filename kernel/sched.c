@@ -5,6 +5,7 @@
 #include <wynland/sched.h>
 #include <wynland/heap.h>
 #include <wynland/irq.h>
+#include <wynland/process.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void thread_trampoline(void);
@@ -31,6 +32,7 @@ void sched_init(void) {
     current_thread->rsp = 0; // Will be set on context switch
     current_thread->stack_orig = NULL; // Main stack is not dynamically allocated by us
     current_thread->state = THREAD_STATE_RUNNING;
+    current_thread->proc = NULL; // Wired up by process_init(), called right after sched_init()
     current_thread->next = current_thread; // Circular linked list
     thread_list = current_thread;
 
@@ -38,12 +40,47 @@ void sched_init(void) {
 }
 
 Thread *thread_create(void (*entry)(void*), void *arg) {
+    return thread_create_ex(entry, arg, NULL);
+}
+
+/* proc == NULL: new thread shares the caller's process/address space
+   (pthread-style, the only thing SYS_clone here ever does). Passing a
+   real Process* (process_spawn()'s use) sets Thread::proc to the correct
+   value INSIDE the same disabled-interrupts critical section this
+   function already uses, before the `sti` below re-enables interrupts.
+
+   This replaces process_spawn()'s old pattern of calling plain
+   thread_create() and then overwriting t->proc = p *after* it returned.
+   That two-step version had a real race: thread_create()'s own `sti`
+   re-enables interrupts while t->proc still held the WRONG (caller's)
+   process, and if a timer IRQ landed in that exact window, the
+   scheduler could pick the brand-new thread while its proc and the
+   previous thread's proc still looked equal (both the caller's
+   process) -- sched_schedule()'s CR3-switch check
+   (`if (next_thread->proc != prev_thread->proc)`) then saw no process
+   change and skipped reloading CR3, so the new thread's first
+   instruction executed with the CALLER's page tables still loaded,
+   which don't have the new process's freshly-loaded ELF segments mapped
+   -- an instant Page Fault (not-present) right at the entry point.
+   Confirmed live via GDB: err_code=0x14 (instruction fetch, user mode,
+   not present) with CR3 still pointing at the parent's PML4. Hit
+   reliably once the parent process (Zerp) did enough pre-spawn work
+   (multiple opens/mmaps/pipes) to shift exactly where the periodic
+   100Hz timer IRQ landed relative to this window -- simpler spawners
+   like shm_test_parent.elf happened not to lose the race, which is why
+   this went unnoticed until Zerp's spawns exercised it. */
+Thread *thread_create_ex(void (*entry)(void*), void *arg, struct Process *proc) {
+    return thread_create_ex_tls(entry, arg, proc, 0);
+}
+
+Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *proc, uint64_t tls_base) {
     disable_interrupts();
 
     Thread *t = (Thread *)kmalloc(sizeof(Thread));
     t->id = next_thread_id++;
     t->state = THREAD_STATE_READY;
-    t->tls_base = 0;
+    t->tls_base = tls_base;
+    t->proc = proc ? proc : current_thread->proc;
 
     // Allocate stack
     t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
@@ -75,6 +112,11 @@ void thread_exit(void) {
     disable_interrupts();
 
     current_thread->state = THREAD_STATE_TERMINATED;
+    /* Phase 18: mark the owning Process dead here, not via a later read of
+       this (about-to-be-freed) Thread's state -- see process.h's `exited`
+       field comment. Process is 1:1 with its main thread in this OS, so
+       this thread exiting is that process exiting. */
+    if (current_thread->proc) current_thread->proc->exited = true;
 
     sched_schedule();
 
@@ -161,6 +203,16 @@ void sched_schedule(void) {
         }
         extern void gdt_update_tss_rsp0(uint64_t rsp0);
         gdt_update_tss_rsp0(next_rsp0);
+    }
+
+    // Switch address space if the new thread belongs to a different
+    // process. Pointer comparison avoids needless CR3 reloads/TLB
+    // flushes for same-process thread switches (e.g. the common case
+    // today: everything still shares Process 0, the kernel process,
+    // until process_spawn() creates real isolated processes).
+    if (next_thread->proc != prev_thread->proc && next_thread->proc) {
+        uint64_t new_cr3 = (uint64_t)(uintptr_t)next_thread->proc->pml4;
+        __asm__ volatile("mov %0, %%cr3" :: "r"(new_cr3) : "memory");
     }
 
     context_switch(&prev_thread->rsp, next_thread->rsp);

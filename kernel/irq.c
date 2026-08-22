@@ -69,6 +69,39 @@ static void keyboard_push_scancode(uint8_t scancode)
     }
 }
 
+/* Separate, always-on raw scancode queue for Ring-3 (/dev/input/kbd),
+   independent of kbd_buffer above -- mirrors drivers/input/mouse.c's
+   mouse_queue_push/mouse_read_queue exactly. kbd_buffer above is still
+   destructively drained by /dev/tty, SYS_read stdin, and the old Ring-0
+   wm_handle_key polling loop; this is a SEPARATE feed so a Ring-3 reader
+   doesn't steal scancodes from (or get stolen from by) those. */
+#define KBD_RAW_QUEUE_SIZE 256
+static uint8_t kbd_raw_queue[KBD_RAW_QUEUE_SIZE];
+static uint32_t kbd_raw_queue_head = 0;
+static uint32_t kbd_raw_queue_tail = 0;
+
+void kbd_raw_queue_push(uint8_t scancode)
+{
+    uint32_t next = (kbd_raw_queue_head + 1) % KBD_RAW_QUEUE_SIZE;
+    if (next != kbd_raw_queue_tail) {
+        kbd_raw_queue[kbd_raw_queue_head] = scancode;
+        kbd_raw_queue_head = next;
+    }
+}
+
+int kbd_raw_read_queue(uint8_t *buf, int size)
+{
+    int read_bytes = 0;
+    while (read_bytes < size) {
+        if (kbd_raw_queue_head == kbd_raw_queue_tail) {
+            break;
+        }
+        buf[read_bytes++] = kbd_raw_queue[kbd_raw_queue_tail];
+        kbd_raw_queue_tail = (kbd_raw_queue_tail + 1) % KBD_RAW_QUEUE_SIZE;
+    }
+    return read_bytes;
+}
+
 uint64_t timer_get_ticks(void)
 {
     return timer_ticks;
@@ -136,6 +169,7 @@ void irq_handler(InterruptRegisters *regs)
         /* Keyboard interrupt */
         uint8_t scancode = inb(0x60);
         keyboard_push_scancode(scancode);
+        kbd_raw_queue_push(scancode);
     } else if (irq == 12) {
         /* Mouse interrupt */
         uint8_t data = inb(0x60);

@@ -1,0 +1,3 @@
+#!/bin/sh
+# See musl-cc-static's comment -- same idea, for C++.
+exec "$(dirname "$0")/x86_64-linux-musl-cross/bin/x86_64-linux-musl-g++" -static "$@"

@@ -442,6 +442,26 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                     match = match_short_name(e->name, name);
                 }
 
+                /* 3. Fallback: vfs_create()'s own naive 8.3 truncation
+                   (no LFN entry written) can silently drop characters
+                   from a name/extension that doesn't fit 8.3 -- e.g.
+                   "resolv.conf"'s 4-char extension becomes "CON" on
+                   disk, so match_short_name()'s literal reconstructed-
+                   name comparison against the full, untruncated query
+                   ("resolv.conf") never succeeds. Applying the exact
+                   same truncation to the query before comparing raw
+                   11-byte short-name bytes makes any name created that
+                   way find-able again by its real name, without needing
+                   a full LFN-write implementation for this one case. */
+                if (!match) {
+                    char query_83[11];
+                    format_to_83_name(query_83, name);
+                    match = true;
+                    for (int qi = 0; qi < 11; qi++) {
+                        if (query_83[qi] != e->name[qi]) { match = false; break; }
+                    }
+                }
+
                 if (match) {
                     /* Debug: print cluster for ld-musl */
                     if (name[0] == 'l' || name[0] == 'L') {
@@ -457,6 +477,7 @@ static bool fat32_find_in_dir(uint32_t dir_cluster, const char *name,
                     format_short_name(out_node->name, e->name);
                     out_node->size         = e->file_size;
                     out_node->is_dir       = (e->attr & 0x10) != 0;
+                    out_node->readonly     = (e->attr & FAT32_ATTR_READONLY) != 0;
                     out_node->first_cluster = e->first_cluster_low |
                                              ((uint32_t)e->first_cluster_high << 16);
                     if (out_entry_sector) *out_entry_sector = base_sector + s;
@@ -491,6 +512,7 @@ static bool vfs_lookup_path(const char *path, VfsNode *out_node,
                              uint32_t *out_entry_offset) {
     if (str_compare(path, "/") == 0) {
         out_node->is_dir = true;
+        out_node->readonly = false;
         out_node->first_cluster = root_cluster;
         out_node->size = 0;
         str_copy(out_node->name, "/");
@@ -722,6 +744,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         str_copy(file->node.name, "fb0");
         file->node.size = g_boot_info ? (g_boot_info->fb_pitch * g_boot_info->fb_height) : 0;
         file->node.is_dir = false;
+        file->node.readonly = false;
         file->node.first_cluster = 0xFFFFFFF0; // DEV_FB0
         file->offset = 0;
         file->flags = flags;
@@ -734,7 +757,21 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         str_copy(file->node.name, "mice");
         file->node.size = 0;
         file->node.is_dir = false;
+        file->node.readonly = false;
         file->node.first_cluster = 0xFFFFFFF1; // DEV_MICE
+        file->offset = 0;
+        file->flags = flags;
+        file->dirty = false;
+        return file;
+    }
+    if (str_compare(path, "/dev/input/kbd") == 0 || path_ends_with(path, "/dev/input/kbd") || path_ends_with(path, "dev/input/kbd")) {
+        VfsFile *file = (VfsFile *)kmalloc(sizeof(VfsFile));
+        if (!file) return NULL;
+        str_copy(file->node.name, "kbd");
+        file->node.size = 0;
+        file->node.is_dir = false;
+        file->node.readonly = false;
+        file->node.first_cluster = 0xFFFFFFF3; // DEV_KBD -- raw scancode stream, independent of /dev/tty
         file->offset = 0;
         file->flags = flags;
         file->dirty = false;
@@ -746,6 +783,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         str_copy(file->node.name, "tty");
         file->node.size = 0;
         file->node.is_dir = false;
+        file->node.readonly = false;
         file->node.first_cluster = 0xFFFFFFF2; // DEV_TTY
         file->offset = 0;
         file->flags = flags;
@@ -855,7 +893,8 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
             if (file->offset + size > fb_size) {
                 size = fb_size - file->offset;
             }
-            uint8_t *fb = (uint8_t *)(uintptr_t)g_boot_info->fb_addr;
+            extern uint64_t fb_active_phys_addr(void);
+            uint8_t *fb = (uint8_t *)(uintptr_t)fb_active_phys_addr();
             for (uint32_t i = 0; i < size; i++) {
                 ((uint8_t *)buf)[i] = fb[file->offset + i];
             }
@@ -865,6 +904,10 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
         if (file->node.first_cluster == 0xFFFFFFF1) { // DEV_MICE
             extern int mouse_read_queue(uint8_t *buf, int size);
             return mouse_read_queue((uint8_t *)buf, size);
+        }
+        if (file->node.first_cluster == 0xFFFFFFF3) { // DEV_KBD
+            extern int kbd_raw_read_queue(uint8_t *buf, int size);
+            return kbd_raw_read_queue((uint8_t *)buf, size);
         }
         if (file->node.first_cluster == 0xFFFFFFF2) { // DEV_TTY
             uint32_t read_bytes = 0;
@@ -1033,7 +1076,8 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
             if (file->offset + size > fb_size) {
                 size = fb_size - file->offset;
             }
-            uint8_t *fb = (uint8_t *)(uintptr_t)g_boot_info->fb_addr;
+            extern uint64_t fb_active_phys_addr(void);
+            uint8_t *fb = (uint8_t *)(uintptr_t)fb_active_phys_addr();
             for (uint32_t i = 0; i < size; i++) {
                 fb[file->offset + i] = ((const uint8_t *)buf)[i];
             }
@@ -1270,6 +1314,23 @@ bool vfs_create(const char *path) {
         serial_write_string("\r\n");
     }
     return ok;
+}
+
+/* Phase 5: mark an existing file's on-disk FAT32_ATTR_READONLY bit. No
+   general chmod exists in this OS -- this is the one purpose-built setter,
+   used at boot to protect /etc/wynpasswd (see kernel/main.c). Mirrors
+   vfs_close()'s existing raw-sector dir-entry patch pattern. */
+bool vfs_set_readonly(const char *path) {
+    VfsNode node;
+    uint32_t entry_sector, entry_offset;
+    if (!vfs_lookup_path(path, &node, &entry_sector, &entry_offset)) return false;
+    if (entry_sector == 0) return false; /* synthetic/root node, no real dir entry */
+
+    uint8_t sector_buf[512];
+    if (!ahci_read(entry_sector, 1, sector_buf)) return false;
+    Fat32DirEntry *entry = (Fat32DirEntry *)(sector_buf + entry_offset);
+    entry->attr |= FAT32_ATTR_READONLY;
+    return ahci_write(entry_sector, 1, sector_buf);
 }
 
 bool vfs_mkdir(const char *path) {
@@ -1524,27 +1585,29 @@ int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
     uint32_t entries_per_cluster = cluster_size / sizeof(Fat32DirEntry);
     uint32_t entry_index = file->offset / sizeof(Fat32DirEntry);
 
-    // Virtual DRM directory: /sys/dev/char/226:X/device/drm — returns "card0"
-    if (file->node.first_cluster == 0xFFFFFFF8) {
+    // Virtual DRM directory: 226:0/device/drm -> "card0", 226:128/device/drm -> "renderD128"
+    if (file->node.first_cluster == 0xFFFFFFF8 || file->node.first_cluster == 0xFFFFFFF9) {
         if (file->offset > 0) return 0; // already enumerated
         struct linux_dirent64_v {
             uint64_t        d_ino;
             int64_t         d_off;
             unsigned short  d_reclen;
             unsigned char   d_type;
-            char            d_name[8];
+            char            d_name[16];
         };
-        const char *name = "card0";
-        uint32_t name_len = 5;
+        const char *name; uint64_t ino;
+        if (file->node.first_cluster == 0xFFFFFFF9) { name = "renderD128"; ino = 0xFB0F; }
+        else                                        { name = "card0";      ino = 0xFB0E; }
+        uint32_t name_len = 0; while (name[name_len]) name_len++;
         uint32_t reclen = (24 + name_len + 1 + 7) & ~7;
         if (reclen > count) return 0;
         struct linux_dirent64_v *d = (struct linux_dirent64_v *)dirp;
-        d->d_ino = 0xFB0E;
+        d->d_ino = ino;
         d->d_off = reclen;
         d->d_reclen = reclen;
         d->d_type = 4; // DT_DIR
-        for (int i = 0; i < 5; i++) d->d_name[i] = name[i];
-        d->d_name[5] = 0;
+        for (uint32_t i = 0; i < name_len; i++) d->d_name[i] = name[i];
+        d->d_name[name_len] = 0;
         file->offset = 1; // mark as done
         return reclen;
     }
@@ -1560,21 +1623,20 @@ int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
         char            d_name[];
     };
 
-    // Inline mapping helper
-    const char *map_short_to_long_local(const char *sname) {
-        if (str_compare(sname, "libqwy~1.so") == 0) return "libqwynlandfb.so";
-        if (str_compare(sname, "libqt6~4.6") == 0) return "libQt6Widgets.so.6";
-        if (str_compare(sname, "libqt6~2.6") == 0) return "libQt6Gui.so.6";
-        if (str_compare(sname, "libqt6~1.6") == 0) return "libQt6Core.so.6";
-        if (str_compare(sname, "libqt6~3.6") == 0) return "libQt6DBus.so.6";
-        if (str_compare(sname, "ld-mus~1.1") == 0) return "ld-musl-x86_64.so.1";
-        if (str_compare(sname, "libstd~1.6") == 0) return "libstdc++.so.6";
-        if (str_compare(sname, "libgcc~1.1") == 0) return "libgcc_s.so.1";
-        if (str_compare(sname, "platfo~1") == 0) return "platforms";
-        if (str_compare(sname, "50_mes~1.jso") == 0) return "50_mesa.json";
-        if (str_compare(sname, "render~1") == 0) return "renderD128";
-        return sname;
-    }
+    /* Real VFAT LFN accumulator -- same logic as fat32_find_in_dir() (the
+     * already-working open()/stat() path), applied here to readdir() too so
+     * both name-resolution paths agree instead of diverging (getdents used
+     * to only know the 8.3 short name plus a small hardcoded whitelist of
+     * long names for a few specific files, e.g. Qt's own plugin/lib names --
+     * anything not on that list, like arbitrary font files, came back
+     * mangled). Scoped to this single vfs_getdents() call: if a caller's
+     * buffer happens to fill up exactly between a file's LFN entries and its
+     * real 8.3 entry, the next call resumes past the LFN entries and that
+     * one file falls back to its short name for this listing -- a narrow,
+     * cosmetic edge case, not a correctness bug. */
+    char lfn_buf[256];
+    int  lfn_len = 0;
+    bool have_lfn = false;
 
     while (1) {
         // Navigate FAT-chain to find the cluster
@@ -1605,13 +1667,51 @@ int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
             break; // End of directory entries on disk
         }
 
-        if ((uint8_t)e->name[0] != 0xE5 && e->attr != 0x0F && (e->attr & 0x08) == 0) {
+        if ((uint8_t)e->name[0] == 0xE5) {
+            /* Deleted entry -- reset LFN accumulator, skip */
+            have_lfn = false; lfn_len = 0;
+            entry_index++;
+            file->offset = entry_index * sizeof(Fat32DirEntry);
+            continue;
+        }
+
+        if (e->attr == 0x0F) {
+            /* LFN entry -- accumulate UTF-16LE chars, emit nothing yet */
+            Fat32LfnEntry *lfn = (Fat32LfnEntry *)e;
+            uint8_t seq = lfn->order & 0x3F;
+            bool is_last = (lfn->order & 0x40) != 0;
+            int base_pos = (seq - 1) * 13;
+            for (int c = 0; c < 13; c++) {
+                uint16_t uc = lfn_get_u16(lfn, c);
+                if (uc == 0x0000 || uc == 0xFFFF) break;
+                int idx = base_pos + c;
+                if (idx < 255) {
+                    lfn_buf[idx] = (uc < 0x80) ? (char)uc : '?';
+                    if (idx + 1 > lfn_len) lfn_len = idx + 1;
+                }
+            }
+            if (is_last) have_lfn = true;
+            entry_index++;
+            file->offset = entry_index * sizeof(Fat32DirEntry);
+            continue;
+        }
+
+        if ((e->attr & 0x08) == 0) {
             char sname[64];
             format_short_name(sname, (const char *)e->name);
-            const char *lname = map_short_to_long_local(sname);
+
+            char lname_buf[256];
+            const char *ename;
+            if (have_lfn && lfn_len > 0) {
+                lfn_buf[lfn_len] = '\0';
+                str_copy(lname_buf, lfn_buf);
+                ename = lname_buf;
+            } else {
+                ename = sname;
+            }
 
             uint32_t name_len = 0;
-            while (lname[name_len] != '\0') name_len++;
+            while (ename[name_len] != '\0') name_len++;
 
             uint32_t reclen = (24 + name_len + 1 + 7) & ~7; // align 8
 
@@ -1627,13 +1727,15 @@ int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
 
             char *dst_name = d->d_name;
             for (uint32_t k = 0; k < name_len; k++) {
-                dst_name[k] = lname[k];
+                dst_name[k] = ename[k];
             }
             dst_name[name_len] = '\0';
 
             bytes_written += reclen;
         }
 
+        have_lfn = false;
+        lfn_len  = 0;
         entry_index++;
         file->offset = entry_index * sizeof(Fat32DirEntry);
     }

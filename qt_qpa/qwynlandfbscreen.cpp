@@ -1,120 +1,94 @@
 #include "qwynlandfbscreen.h"
-#include <fcntl.h>
+#include "../zerp_protocol.h"
 #include <unistd.h>
-#include <sys/mman.h>
-#include <sys/ioctl.h>
-#include <linux/fb.h>
+#include <sys/types.h>
+#include <qpa/qwindowsysteminterface.h>
+
+/* Deliberately NOT #include <sys/mman.h> -- this OS's own include/sys/mman.h
+   (used by this same build for the freestanding Zerp/test binaries, and
+   picked up here too since the toolchain prepends -Iinclude) declares
+   mmap() as an inline stub that always returns MAP_FAILED. Real musl's
+   mmap() is a normal exported libc symbol; declare it directly to bypass
+   the stub header entirely. */
+extern "C" void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+extern "C" int munmap(void *addr, size_t length);
+#define WYN_PROT_READ  1
+#define WYN_PROT_WRITE 2
+#define WYN_MAP_SHARED 0x01
+#define WYN_MAP_FAILED ((void *)-1)
 
 QT_BEGIN_NAMESPACE
 
-#include <QtGui/QPainter>
-#include <QtGui/QCursor>
-#include <QtGui/QPainterPath>
+/* Generous fixed capacity for the SHM segment -- matches zerp.c's own
+   shm_bytes = screen_w * screen_h * 4 convention (a client's tile can
+   never exceed the real screen size). */
+static const quint32 kShmCapacityPixels = 1920u * 1080u;
 
 QWynlandFbScreen::QWynlandFbScreen()
     : m_depth(32),
       m_format(QImage::Format_ARGB32_Premultiplied),
-      m_fbFd(-1),
-      m_mmapAddr(nullptr),
-      m_mmapSize(0),
-      m_backingStore(nullptr),
-      m_lastCursorPos(960, 540)
+      m_shm(nullptr),
+      m_shmCapacityPixels(0)
 {
-    // Default fallback geometry
-    m_geometry = QRect(0, 0, 1920, 1080);
+    m_geometry = QRect(0, 0, 1, 1);
 }
 
 QWynlandFbScreen::~QWynlandFbScreen()
 {
-    if (m_mmapAddr && m_mmapAddr != MAP_FAILED) {
-        munmap(m_mmapAddr, m_mmapSize);
-    }
-    if (m_fbFd >= 0) {
-        close(m_fbFd);
+    if (m_shm) {
+        munmap(m_shm, (size_t)m_shmCapacityPixels * 4);
     }
 }
 
-bool QWynlandFbScreen::initialize()
+bool QWynlandFbScreen::initialize(int shmFd, int s2cFd)
 {
-    // 1. Open the virtual frame buffer device
-    m_fbFd = open("/dev/fb0", O_RDWR);
-    if (m_fbFd < 0) {
-        qWarning("QWynlandFbScreen: Failed to open /dev/fb0, using dummy screen.");
+    if (shmFd < 0) {
+        qWarning("QWynlandFbScreen: no SHM fd from Zerp (was zerp_qpa_capture_args() called?)");
         return false;
     }
 
-    // Query screen resolution from kernel using standard Linux FBIOGET_VSCREENINFO ioctl (0x4600)
-    struct fb_var_screeninfo vinfo;
-    if (ioctl(m_fbFd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
-        m_geometry = QRect(0, 0, vinfo.xres, vinfo.yres);
-        m_depth = (vinfo.bits_per_pixel == 16 || vinfo.bits_per_pixel == 24 || vinfo.bits_per_pixel == 32) ? vinfo.bits_per_pixel : 32;
-        m_lastCursorPos = QPoint(vinfo.xres / 2, vinfo.yres / 2);
-        qDebug("QWynlandFbScreen: Detected resolution: %dx%d, depth: %d", vinfo.xres, vinfo.yres, m_depth);
-    } else {
-        qWarning("QWynlandFbScreen: Failed to query resolution via ioctl, using fallback 1920x1080.");
-        m_geometry = QRect(0, 0, 1920, 1080);
-        m_lastCursorPos = QPoint(960, 540);
-    }
-
-    // Query scanline stride (pitch) using standard Linux FBIOGET_FSCREENINFO ioctl (0x4602)
-    struct fb_fix_screeninfo finfo;
-    int stride = m_geometry.width() * 4;
-    if (ioctl(m_fbFd, FBIOGET_FSCREENINFO, &finfo) == 0) {
-        stride = finfo.line_length;
-        qDebug("QWynlandFbScreen: Detected line length (stride): %d bytes", finfo.line_length);
-    } else {
-        qWarning("QWynlandFbScreen: Failed to query line length, using default: %d", stride);
-    }
-
-    // 2. Compute size and map the memory using true stride (pitch)
-    m_mmapSize = stride * m_geometry.height();
-    m_mmapAddr = (uchar *)mmap(nullptr, m_mmapSize, PROT_READ | PROT_WRITE, MAP_SHARED, m_fbFd, 0);
-    if (m_mmapAddr == MAP_FAILED) {
-        qWarning("QWynlandFbScreen: Failed to mmap /dev/fb0!");
-        close(m_fbFd);
-        m_fbFd = -1;
+    m_shm = (uint32_t *)mmap(nullptr, (size_t)kShmCapacityPixels * 4,
+                              WYN_PROT_READ | WYN_PROT_WRITE, WYN_MAP_SHARED, shmFd, 0);
+    if (m_shm == WYN_MAP_FAILED) {
+        qWarning("QWynlandFbScreen: mmap of SHM segment failed");
+        m_shm = nullptr;
         return false;
     }
+    m_shmCapacityPixels = kShmCapacityPixels;
 
-    // 3. Create the QImage wrapper directly on the mapped framebuffer with correct stride
-    m_screenImage = QImage(m_mmapAddr, m_geometry.width(), m_geometry.height(), stride, m_format);
-    
-    return true;
+    /* Zerp always sends a TILE_RECT immediately after spawning a client --
+       block (short poll loop) until it arrives so the screen has real
+       geometry before Qt starts asking for it. */
+    for (int tries = 0; tries < 2000; tries++) {
+        ZerpMsg msg;
+        long n = read(s2cFd, &msg, sizeof(msg));
+        if (n == (long)sizeof(msg) && msg.type == ZERP_MSG_TILE_RECT) {
+            applyTileRect(msg.x, msg.y, msg.w, msg.h);
+            return true;
+        }
+        usleep(1000);
+    }
+
+    qWarning("QWynlandFbScreen: timed out waiting for initial TILE_RECT from Zerp");
+    return false;
 }
 
-void QWynlandFbScreen::updateCursor()
+void QWynlandFbScreen::applyTileRect(quint32 x, quint32 y, quint32 w, quint32 h)
 {
-    QPoint cursorPos = QCursor::pos();
-    if (m_screenImage.isNull()) return;
-
-    QPainter painter(&m_screenImage);
-    
-    // 1. Restore background at last cursor position from backing store
-    if (m_backingStore && !m_backingStore->isNull()) {
-        QRect oldRect(m_lastCursorPos, QSize(32, 32));
-        painter.drawImage(oldRect, *m_backingStore, oldRect);
+    Q_UNUSED(x);
+    Q_UNUSED(y);
+    if (w == 0 || h == 0 || !m_shm) return;
+    if ((quint64)w * h > m_shmCapacityPixels) {
+        /* Clamp -- should never happen (tile can't exceed screen size,
+           which is <= the SHM capacity above), but never wrap a QImage
+           around a stride that walks past the mapped SHM region. */
+        h = m_shmCapacityPixels / w;
     }
-    
-    // 2. Draw the beautiful macOS white arrow with a black outline
-    painter.save();
-    painter.setRenderHint(QPainter::Antialiasing);
-    
-    QPainterPath cursorPath;
-    cursorPath.moveTo(cursorPos.x(), cursorPos.y());
-    cursorPath.lineTo(cursorPos.x() + 15, cursorPos.y() + 15);
-    cursorPath.lineTo(cursorPos.x() + 8, cursorPos.y() + 15);
-    cursorPath.lineTo(cursorPos.x() + 12, cursorPos.y() + 24);
-    cursorPath.lineTo(cursorPos.x() + 9, cursorPos.y() + 25);
-    cursorPath.lineTo(cursorPos.x() + 5, cursorPos.y() + 16);
-    cursorPath.lineTo(cursorPos.x(), cursorPos.y() + 19);
-    cursorPath.closeSubpath();
-    
-    painter.fillPath(cursorPath, Qt::white);
-    painter.strokePath(cursorPath, QPen(Qt::black, 2));
-    
-    painter.restore();
-    
-    m_lastCursorPos = cursorPos;
+
+    m_geometry = QRect(0, 0, (int)w, (int)h);
+    m_screenImage = QImage((uchar *)m_shm, (int)w, (int)h, (int)w * 4, m_format);
+
+    QWindowSystemInterface::handleScreenGeometryChange(screen(), m_geometry, m_geometry);
 }
 
 QT_END_NAMESPACE

@@ -117,6 +117,18 @@ int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len);
 /* Graceful close (FIN handshake) */
 void tcp_close(TcpConnection *conn);
 
+/* Active open returning a connection-table slot index instead of a
+   pointer, so callers that can only store a uint32_t per-fd index
+   (e.g. syscall.c's VfsFile.current_cluster, matching the existing
+   pipe/SHM convention) can still reach a real connection. Returns
+   -1 on failure. */
+int tcp_connect_slot(uint32_t remote_ip, uint16_t remote_port);
+
+/* Bounds-checked lookup of a connection by slot index. Returns NULL
+   if the index is out of range or the slot isn't a live connection
+   (e.g. it was already closed). */
+TcpConnection *tcp_get_connection(int idx);
+
 /* ============================================================
  * Internal — called by the IPv4 handler in net.c
  * ============================================================ */

@@ -5,6 +5,124 @@
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/heap.h>
+#include <wynland/process.h>
+#include <wynland/tcp.h>
+#include <wynland/udpsock.h>
+#include <wynland/rtc.h>
+
+/* Magic first_cluster sentinels for real AF_INET sockets (distinct from
+   the pre-existing 0xFFFFFFF8 AF_UNIX mock, which stays untouched for
+   callers like libwayland). current_cluster holds the TCP
+   connection-table / UDP-socket-table slot index. For TCP it's set to
+   TCP_FD_NOT_CONNECTED right after socket() until connect() succeeds;
+   for UDP the slot is allocated immediately in socket() since UDP has
+   no handshake. */
+#define SOCK_FD_TCP             0xFFFFFFE8
+#define SOCK_FD_UDP             0xFFFFFFE7
+#define TCP_FD_NOT_CONNECTED    0xFFFFFFFF
+
+/* Standard Linux ABI layout, used by connect()/sendto()/recvfrom() for
+   both TCP and UDP sockets. */
+struct linux_sockaddr_in {
+    uint16_t sin_family;
+    uint16_t sin_port;   // network byte order
+    uint32_t sin_addr;   // network byte order
+    uint8_t  sin_zero[8];
+};
+
+/* Phase 18: real PTY primitive for interactive programs (nano, and later
+   git/vim) run inside zerp_term.c. Sentinels 0xFFFFFFE5/E6 -- the
+   0xFFFFFFF0-FD block is fully occupied (with some pre-existing,
+   documented, harmless collisions from earlier phases) and E7/E8 are
+   already claimed by the UDP/TCP socket work, so this picks fresh,
+   collision-free values rather than adding a third collision onto an
+   already-shared sentinel. */
+#define PTY_FD_MASTER 0xFFFFFFE6
+#define PTY_FD_SLAVE  0xFFFFFFE5
+
+#define PTY_BUF_SIZE  4096
+#define MAX_PTYS      8
+#define NCCS_LOCAL    32
+
+/* Byte-for-byte match of musl's real struct termios (bits/termios.h):
+   tcflag_t/speed_t = uint32_t, cc_t = uint8_t, NCCS = 32. Any caller
+   (ncurses' tcgetattr/tcsetattr) reads/writes this exact layout via
+   TCGETS/TCSETS, so the field order and sizes must match precisely --
+   not guessed. */
+struct linux_termios {
+    uint32_t c_iflag;
+    uint32_t c_oflag;
+    uint32_t c_cflag;
+    uint32_t c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[NCCS_LOCAL];
+    uint32_t c_ispeed;
+    uint32_t c_ospeed;
+};
+
+struct linux_winsize {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+};
+
+typedef struct {
+    uint8_t  m2s_buf[PTY_BUF_SIZE]; /* terminal -> child (keystrokes) */
+    uint32_t m2s_head, m2s_tail, m2s_count;
+    uint8_t  s2m_buf[PTY_BUF_SIZE]; /* child -> terminal (screen output) */
+    uint32_t s2m_head, s2m_tail, s2m_count;
+    struct linux_termios term;
+    uint16_t ws_row, ws_col;
+    int      refcount; /* master and slave each hold a ref; freed at 0 --
+                           needed because after fork() they typically end
+                           up in different processes, closing independently */
+    bool     in_use;
+} Pty;
+
+static Pty *g_ptys[MAX_PTYS];
+
+static uint32_t pty_ring_write(uint8_t *buf, uint32_t *head, uint32_t *tail, uint32_t *count, const void *data, uint32_t size) {
+    (void)head;
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t written = 0;
+    while (written < size && *count < PTY_BUF_SIZE) {
+        buf[*tail] = src[written];
+        *tail = (*tail + 1) % PTY_BUF_SIZE;
+        (*count)++;
+        written++;
+    }
+    return written;
+}
+
+static uint32_t pty_ring_read(uint8_t *buf, uint32_t *head, uint32_t *tail, uint32_t *count, void *data, uint32_t size) {
+    (void)tail;
+    uint8_t *dst = (uint8_t *)data;
+    uint32_t got = 0;
+    while (got < size && *count > 0) {
+        dst[got] = buf[*head];
+        *head = (*head + 1) % PTY_BUF_SIZE;
+        (*count)--;
+        got++;
+    }
+    return got;
+}
+
+/* Real musl termios flag values (bits/termios.h) -- defined locally
+   since the kernel doesn't include musl's own headers. */
+#define T_ICRNL   0000400
+#define T_IXON    0002000
+#define T_OPOST   0000001
+#define T_ONLCR   0000004
+#define T_CS8     0000060
+#define T_CREAD   0000200
+#define T_CLOCAL  0004000
+#define T_ISIG    0000001
+#define T_ICANON  0000002
+#define T_ECHO    0000010
+#define T_ECHOE   0000020
+#define T_ECHOK   0000040
+#define T_IEXTEN  0100000
 
 #define EPOLLIN  0x00000001
 #define EPOLLPRI 0x00000002
@@ -110,6 +228,7 @@ static int __attribute__((unused)) str_compare(const char *s1, const char *s2) {
 }
 
 #define MAX_PIPES 256
+#define MAX_SPAWN_ARGV 8
 #define PIPE_BUF_SIZE 4096
 
 typedef struct {
@@ -120,6 +239,21 @@ typedef struct {
 } KPipe;
 
 static KPipe *g_pipes[MAX_PIPES];
+
+/* Shared-memory segments -- Zerp's pixel transport. Mirrors the KPipe/
+   g_pipes[] pattern exactly: a fixed global table, fd sentinel dispatch,
+   index stored in VfsFile.current_cluster (same convention as pipes,
+   syscall.c's pipe/pipe2 handler below). Unlike a pipe, the *same*
+   physical pages get mapped into more than one process's PML4 (see the
+   SYS_mmap branch below) -- true zero-copy, no kernel-side data movement
+   after creation. */
+#define MAX_SHM_SEGMENTS 64
+typedef struct {
+    uint64_t phys_addr;
+    uint32_t size;
+    int      refcount;
+} ShmSegment;
+static ShmSegment g_shm_segments[MAX_SHM_SEGMENTS];
 
 static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
     const uint8_t *src = (const uint8_t *)buf;
@@ -168,12 +302,15 @@ extern void comp_mark_dirty(void);
 extern void *kmalloc(size_t size);
 extern void kfree(void *ptr);
 
-#define MAX_OPEN_FILES 128
-static VfsFile *fd_table[MAX_OPEN_FILES] = {0};
-static uint32_t fd_flags[MAX_OPEN_FILES] = {0};   /* Per-fd flags (FD_CLOEXEC etc.) */
-static uint32_t fd_oflags[MAX_OPEN_FILES] = {0};   /* Per-fd open status flags */
+/* fd_table/fd_flags/fd_oflags used to be file-scope globals here, shared by
+   every thread regardless of process. Now they live in Process (see
+   include/wynland/process.h) -- each syscall_dispatcher() call shadows the
+   names locally with the *current process's* arrays (see below), so the
+   ~80 existing `fd_table[...]`-style call sites throughout this file are
+   unchanged; only helpers declared outside syscall_dispatcher (like
+   get_free_fd()) need the table passed in explicitly. */
 
-static int get_free_fd(void) {
+static int get_free_fd(VfsFile **fd_table) {
     for (int i = 3; i < MAX_OPEN_FILES; i++) {
         if (fd_table[i] == NULL) {
             return i;
@@ -256,6 +393,14 @@ static EpollInstance* get_epoll_instance(int fd) {
 }
 
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
+    /* Per-process fd namespace -- shadows the identifiers every case below
+       already uses, so this is the only change needed to make fd_table/
+       fd_flags/fd_oflags per-process instead of one shared global table. */
+    Process *proc = sched_current()->proc;
+    VfsFile  **fd_table  = proc->fd_table;
+    uint32_t  *fd_flags  = proc->fd_flags;
+    uint32_t  *fd_oflags = proc->fd_oflags;
+
     if (num != 0 && num != 1 && num != 20) { // Don't log read/write to avoid spam
         serial_write_string("Syscall ID: ");
         char buf[32];
@@ -266,7 +411,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     }
     switch (num) {
         case 0: // SYS_read (Linux standard)
-            if (a1 == 0) { // stdin
+            /* Only take the raw-keyboard/serial shortcut when fd 0 hasn't
+               been redirected to something real (a pipe, a PTY slave,
+               etc. via dup2()) -- otherwise a program with its stdin
+               remapped (e.g. nano running inside a PTY, Phase 18) would
+               have its reads silently hijacked back to the console
+               instead of reaching whatever it was actually redirected
+               to. */
+            if (a1 == 0 && fd_table[0] == NULL) { // stdin
                 if (a3 == 0 || !a2) return 0;
                 char *cbuf = (char *)a2;
                 uint64_t read_bytes = 0;
@@ -333,10 +485,38 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 return (uint64_t)-1;
             }
+            if (fd_table[a1]->node.first_cluster == SOCK_FD_TCP) {
+                if (fd_table[a1]->current_cluster == TCP_FD_NOT_CONNECTED) return (uint64_t)-107; // ENOTCONN
+                TcpConnection *conn = tcp_get_connection((int)fd_table[a1]->current_cluster);
+                if (!conn) return (uint64_t)-104; // ECONNRESET
+                int n = tcp_recv(conn, (void *)a2, (uint32_t)a3);
+                if (n < 0) return (uint64_t)-1;
+                return (uint64_t)n;
+            }
+            if (fd_table[a1]->node.first_cluster == SOCK_FD_UDP) {
+                int n = udp_socket_recvfrom((int)fd_table[a1]->current_cluster, (void *)a2, (uint32_t)a3, NULL, NULL);
+                if (n < 0) return (uint64_t)-1;
+                return (uint64_t)n;
+            }
+            if (fd_table[a1]->node.first_cluster == PTY_FD_MASTER) {
+                Pty *pty = g_ptys[fd_table[a1]->current_cluster];
+                if (!pty) return (uint64_t)-9; // EBADF
+                uint32_t n = pty_ring_read(pty->s2m_buf, &pty->s2m_head, &pty->s2m_tail, &pty->s2m_count, (void *)a2, (uint32_t)a3);
+                return (uint64_t)n; // 0 = no data yet, non-blocking like pipes
+            }
+            if (fd_table[a1]->node.first_cluster == PTY_FD_SLAVE) {
+                Pty *pty = g_ptys[fd_table[a1]->current_cluster];
+                if (!pty) return (uint64_t)-9; // EBADF
+                uint32_t n = pty_ring_read(pty->m2s_buf, &pty->m2s_head, &pty->m2s_tail, &pty->m2s_count, (void *)a2, (uint32_t)a3);
+                return (uint64_t)n;
+            }
             return vfs_read(fd_table[a1], (void *)a2, (uint32_t)a3);
             
         case 1: // SYS_write (Linux standard)
-            if (a1 == 1 || a1 == 2) { // stdout/stderr
+            /* Same fix as SYS_read above: only take the raw
+               console/serial shortcut when fd 1/2 hasn't been
+               redirected to something real via dup2(). */
+            if ((a1 == 1 || a1 == 2) && fd_table[a1] == NULL) { // stdout/stderr
                 if (a3 == 0 || !a2) return 0;
                 const char *cbuf = (const char *)a2;
                 for (uint64_t i = 0; i < a3; i++) {
@@ -359,6 +539,31 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return pipe_write(g_pipes[pipe_idx], (const void *)a2, (uint32_t)a3);
                 }
                 return (uint64_t)-1;
+            }
+            if (fd_table[a1]->node.first_cluster == SOCK_FD_TCP) {
+                if (fd_table[a1]->current_cluster == TCP_FD_NOT_CONNECTED) return (uint64_t)-107; // ENOTCONN
+                TcpConnection *conn = tcp_get_connection((int)fd_table[a1]->current_cluster);
+                if (!conn) return (uint64_t)-104; // ECONNRESET
+                int n = tcp_send(conn, (const void *)a2, (uint32_t)a3);
+                if (n < 0) return (uint64_t)-1;
+                return (uint64_t)n;
+            }
+            if (fd_table[a1]->node.first_cluster == SOCK_FD_UDP) {
+                int n = udp_socket_sendto((int)fd_table[a1]->current_cluster, (const void *)a2, (uint32_t)a3, 0, 0);
+                if (n < 0) return (uint64_t)-1;
+                return (uint64_t)n;
+            }
+            if (fd_table[a1]->node.first_cluster == PTY_FD_MASTER) {
+                Pty *pty = g_ptys[fd_table[a1]->current_cluster];
+                if (!pty) return (uint64_t)-9; // EBADF
+                uint32_t n = pty_ring_write(pty->m2s_buf, &pty->m2s_head, &pty->m2s_tail, &pty->m2s_count, (const void *)a2, (uint32_t)a3);
+                return (uint64_t)n;
+            }
+            if (fd_table[a1]->node.first_cluster == PTY_FD_SLAVE) {
+                Pty *pty = g_ptys[fd_table[a1]->current_cluster];
+                if (!pty) return (uint64_t)-9; // EBADF
+                uint32_t n = pty_ring_write(pty->s2m_buf, &pty->s2m_head, &pty->s2m_tail, &pty->s2m_count, (const void *)a2, (uint32_t)a3);
+                return (uint64_t)n;
             }
             return vfs_write(fd_table[a1], (const void *)a2, (uint32_t)a3);
 
@@ -419,14 +624,28 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (linux_flags & 01000) vfs_flags |= 0x10; // VFS_O_TRUNC
                 if (linux_flags & 02000) vfs_flags |= 0x08; // VFS_O_APPEND
 
-                int fd = get_free_fd();
+                int fd = get_free_fd(fd_table);
                 if (fd == -1) return (uint64_t)-2;
                 VfsFile *file = vfs_open_flags((const char *)a1, vfs_flags);
                 if (!file) return (uint64_t)-2;
+
+                /* Phase 5: the OS's one real permission boundary -- a
+                   readonly-flagged (FAT32_ATTR_READONLY) node can't be
+                   opened for writing by a non-root process. See
+                   include/wynland/vfs.h's VfsNode.readonly comment for
+                   why this is the enforcement point rather than a full
+                   rwx-owner/group/other model (FAT32 has no such bits). */
+                if (file->node.readonly &&
+                    (vfs_flags & (0x02 /* VFS_O_WRITE */ | 0x10 /* VFS_O_TRUNC */ | 0x08 /* VFS_O_APPEND */)) &&
+                    sched_current()->proc->uid != 0) {
+                    kfree(file);
+                    return (uint64_t)-13; /* -EACCES */
+                }
+
                 fd_table[fd] = file;
                 return fd;
             }
-            
+
         case 3: // SYS_close (Linux standard)
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
@@ -438,10 +657,83 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 fd_table[a1] = NULL;
                 return 0;
             }
+            if (fd_table[a1]->node.first_cluster == SOCK_FD_TCP) {
+                if (fd_table[a1]->current_cluster != TCP_FD_NOT_CONNECTED) {
+                    TcpConnection *conn = tcp_get_connection((int)fd_table[a1]->current_cluster);
+                    if (conn) tcp_close(conn);
+                }
+                kfree(fd_table[a1]);
+                fd_table[a1] = NULL;
+                return 0;
+            }
+            if (fd_table[a1]->node.first_cluster == SOCK_FD_UDP) {
+                udp_socket_close((int)fd_table[a1]->current_cluster);
+                kfree(fd_table[a1]);
+                fd_table[a1] = NULL;
+                return 0;
+            }
+            if (fd_table[a1]->node.first_cluster == PTY_FD_MASTER ||
+                fd_table[a1]->node.first_cluster == PTY_FD_SLAVE) {
+                /* Matches this codebase's existing pipe/eventfd convention
+                   exactly (see the 0xFFFFFFFA/FB/FC case above): only the
+                   small per-fd VfsFile wrapper is freed here, never the
+                   underlying Pty object itself. A real refcount would
+                   need the generic fd-inheritance deep-copy loop in
+                   process.c (used by both process_spawn() and fork()) to
+                   know about PTY-specific bumping, which it deliberately
+                   doesn't (it's sentinel-agnostic by design). Leaking the
+                   Pty itself is the same accepted tradeoff already made
+                   for KPipe -- fine at this OS's current scale (one PTY
+                   per interactive nano session, not a long-running
+                   server opening thousands of them). */
+                kfree(fd_table[a1]);
+                fd_table[a1] = NULL;
+                return 0;
+            }
             vfs_close(fd_table[a1]);
             fd_table[a1] = NULL;
             return 0;
             
+        case 32: // SYS_dup(oldfd)
+            {
+                int oldfd = (int)a1;
+                if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || fd_table[oldfd] == NULL) return (uint64_t)-9; // EBADF
+                int newfd = get_free_fd(fd_table);
+                if (newfd < 0) return (uint64_t)-24; // EMFILE
+                VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
+                *copy = *fd_table[oldfd]; // deep copy of the wrapper -- same convention as
+                                          // process_spawn()'s fd-inheritance loop, never share the pointer
+                fd_table[newfd] = copy;
+                fd_flags[newfd] = 0; // dup'd fds are never CLOEXEC by default (POSIX)
+                fd_oflags[newfd] = fd_oflags[oldfd];
+                return newfd;
+            }
+
+        case 33: // SYS_dup2(oldfd, newfd) -- Phase 18. Standard idiom used
+                  // by zerp_term.c's fork()+dup2()+execve() PTY spawn: the
+                  // child remaps the PTY slave fd onto 0/1/2 before
+                  // exec'ing nano.
+            {
+                int oldfd = (int)a1;
+                int newfd = (int)a2;
+                if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || fd_table[oldfd] == NULL) return (uint64_t)-9; // EBADF
+                if (newfd < 0 || newfd >= MAX_OPEN_FILES) return (uint64_t)-9; // EBADF
+                if (oldfd == newfd) return newfd;
+                if (fd_table[newfd] != NULL) {
+                    /* Reuse SYS_close's own per-sentinel cleanup (pipe/
+                       socket/PTY-specific) instead of duplicating it --
+                       same self-recursion pattern already used by
+                       SYS_sendto/SYS_recvfrom's non-socket fallback. */
+                    syscall_dispatcher(3, (uint64_t)newfd, 0, 0, 0, 0, regs);
+                }
+                VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
+                *copy = *fd_table[oldfd];
+                fd_table[newfd] = copy;
+                fd_flags[newfd] = 0;
+                fd_oflags[newfd] = fd_oflags[oldfd];
+                return newfd;
+            }
+
         case 8: // SYS_lseek (Linux standard)
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
@@ -465,8 +757,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // Check if mapping the framebuffer character device /dev/fb0
                 if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL && fd_table[fd]->node.first_cluster == 0xFFFFFFF0) {
                     if (!g_boot_info) return 0;
-                    uint64_t fb_phys = g_boot_info->fb_addr;
-                    
+                    extern uint64_t fb_active_phys_addr(void);
+                    uint64_t fb_phys = fb_active_phys_addr();
+
                     uint64_t virt_addr = addr;
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
                         static uint64_t mmap_fb_ptr = 0x610000000000;
@@ -485,10 +778,44 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return virt_addr;
                 }
 
+                // Check if mapping a SHM segment (SYS_shm_create, case 407)
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL && fd_table[fd]->node.first_cluster == 0xFFFFFFFD) {
+                    int seg_idx = (int)fd_table[fd]->current_cluster;
+                    if (seg_idx < 0 || seg_idx >= MAX_SHM_SEGMENTS || g_shm_segments[seg_idx].phys_addr == 0) {
+                        return (uint64_t)-1;
+                    }
+                    ShmSegment *seg = &g_shm_segments[seg_idx];
+                    uint32_t shm_pages = seg->size / PAGE_SIZE;
+
+                    uint64_t virt_addr = addr;
+                    if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                        static uint64_t mmap_shm_ptr = 0x620000000000; // dedicated slot, disjoint from the stack (0x600...) and /dev/fb0 (0x610...) ranges
+                        virt_addr = mmap_shm_ptr;
+                        mmap_shm_ptr += (uint64_t)shm_pages * PAGE_SIZE;
+                    }
+                    PageTable *pml4 = vmm_get_current_pml4();
+                    for (uint32_t i = 0; i < shm_pages; i++) {
+                        vmm_map_page(pml4, virt_addr + (uint64_t)i * PAGE_SIZE, seg->phys_addr + (uint64_t)i * PAGE_SIZE,
+                                     PAGE_WRITE | PAGE_USER);
+                    }
+                    seg->refcount++;
+
+                    return virt_addr;
+                }
+
                 // Determine virtual address
                 uint64_t virt_addr = addr;
                 if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                    static uint64_t mmap_alloc_ptr = 0x600000000000;
+                    /* Must be disjoint from the process's own stack region
+                       (elf.c: stack_base = 0x600000000000, 64KB) -- this
+                       bump allocator used to start at that exact same
+                       address, so every non-MAP_FIXED mmap() (every shared
+                       library a dynamic-linked process dlopen()s) grew
+                       right on top of the live stack, silently corrupting
+                       it. Matches the project's per-purpose "0x6X0..."
+                       slot convention (stack=0x60.., /dev/fb0=0x61..,
+                       SHM=0x62..). */
+                    static uint64_t mmap_alloc_ptr = 0x630000000000;
                     virt_addr = mmap_alloc_ptr;
                     mmap_alloc_ptr += size_aligned;
                 } else {
@@ -558,7 +885,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
 
                 // Get two free file descriptors
-                int fd_read = get_free_fd();
+                int fd_read = get_free_fd(fd_table);
                 if (fd_read == -1) {
                     g_pipes[p_idx] = NULL;
                     kfree(p);
@@ -573,7 +900,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 f_read->current_cluster = p_idx; // Store pipe index
                 fd_table[fd_read] = f_read;
 
-                int fd_write = get_free_fd();
+                int fd_write = get_free_fd(fd_table);
                 if (fd_write == -1) {
                     fd_table[fd_read] = NULL;
                     kfree(f_read);
@@ -643,7 +970,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)-23; /* -ENFILE */
                 }
 
-                int fd = get_free_fd();
+                int fd = get_free_fd(fd_table);
                 if (fd == -1) {
                     g_pipes[p_idx] = NULL;
                     kfree(p);
@@ -666,7 +993,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
 
         case 4: // SYS_stat (Linux standard)
-            return (uint64_t)-38; /* -ENOSYS */
+            {
+                const char *path = (const char *)a1;
+                struct linux_stat *user_stat = (struct linux_stat *)a2;
+                if (!path || !user_stat) return (uint64_t)-14; /* -EFAULT */
+
+                VfsStat vst;
+                if (!vfs_stat(path, &vst)) {
+                    return (uint64_t)-2; /* -ENOENT */
+                }
+                memset(user_stat, 0, sizeof(*user_stat));
+                user_stat->st_dev     = 1;
+                user_stat->st_ino     = (uint64_t)vst.first_cluster;
+                user_stat->st_nlink   = 1;
+                user_stat->st_blksize = 4096;
+                if (vst.is_dir) {
+                    user_stat->st_mode = S_IFDIR | 0755;
+                } else {
+                    user_stat->st_mode = S_IFREG | 0644;
+                    user_stat->st_size = (int64_t)vst.size;
+                }
+                user_stat->st_blocks = (user_stat->st_size + 511) / 512;
+                return 0;
+            }
 
         case 10: // SYS_mprotect (Linux standard)
             return 0;
@@ -747,6 +1096,64 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 return t->id;
             }
+
+        case 57: // SYS_fork (Linux standard) -- real process duplication
+            {
+                /* musl's fork() issues this syscall number directly (confirmed
+                   via objdump on the vendored libc.so), separate from SYS_clone
+                   above -- needed by any POSIX build tool (make, ninja, cmake,
+                   sh) that spawns subprocesses via fork()+exec() rather than
+                   posix_spawn(). Eager full-copy of the address space, not
+                   copy-on-write (see vmm_clone_user_pages()'s own comment for
+                   why: simpler, no page-fault-handler changes, and this OS has
+                   no fork-heavy workloads yet to make COW's complexity worth
+                   the risk). */
+                Process *parent = sched_current()->proc;
+
+                PageTable *child_pml4 = vmm_new_process_pml4();
+                if (!child_pml4) return (uint64_t)-12; /* -ENOMEM */
+
+                if (!vmm_clone_user_pages(parent->pml4, child_pml4)) {
+                    return (uint64_t)-12; /* -ENOMEM */
+                }
+
+                Process *child = process_create(child_pml4);
+                if (!child) return (uint64_t)-12; /* -ENOMEM */
+                child->uid = parent->uid;
+
+                /* fork() inherits every open fd as-is -- FD_CLOEXEC only
+                   matters across an exec(), which fork() alone doesn't do.
+                   Same deep-copy-the-VfsFile-wrapper pattern as
+                   process_spawn()'s fd inheritance (see its own comment for
+                   the use-after-free this avoids: the small per-fd wrapper
+                   needs its own copy per process; the underlying
+                   KPipe/ShmSegment/file position it indexes into does not). */
+                for (int i = 0; i < MAX_OPEN_FILES; i++) {
+                    if (parent->fd_table[i]) {
+                        VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
+                        *copy = *parent->fd_table[i];
+                        child->fd_table[i]  = copy;
+                        child->fd_flags[i]  = parent->fd_flags[i];
+                        child->fd_oflags[i] = parent->fd_oflags[i];
+                    }
+                }
+
+                /* Heap copy of the parent's exact syscall-entry register
+                   state -- the child resumes execution from HERE (same RIP,
+                   same RSP, same every register except RAX), not from a
+                   fresh entry point. See fork_child_entry in
+                   kernel/sched_switch.asm for the other half of this. */
+                SyscallRegs *regs_copy = (SyscallRegs *)kmalloc(sizeof(SyscallRegs));
+                *regs_copy = *regs;
+
+                extern void fork_child_entry(void *arg);
+                Thread *child_thread = thread_create_ex_tls(fork_child_entry, regs_copy, child, sched_current()->tls_base);
+                child->main_thread = child_thread;
+                child->thread_count = 1;
+
+                return child->pid; /* parent's own return value: the child's real pid */
+            }
+
         case 59: // SYS_execve (Linux standard)
             {
                 const char *user_path = (const char *)a1;
@@ -768,17 +1175,68 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t entry_point = 0;
                 uint64_t stack_top = 0;
                 PageTable *pml4 = vmm_get_current_pml4();
-                
 
-                
+
+
                 #include <wynland/elf.h>
+
+                /* Phase 18: real argv/envp support. Same kmalloc+copy
+                   pattern as SYS_spawn_argv (408) -- every string must
+                   already be in kernel-owned memory before elf_load()
+                   runs, it writes through raw pointers. a2=argv, a3=envp,
+                   both optional (NULL preserves the old hardcoded
+                   defaults, matching elf_load()'s own NULL-means-default
+                   convention). */
+                #define MAX_SPAWN_ENVP 16
+                char *argv_bufs_e[MAX_SPAWN_ARGV] = {0};
+                const char *kargv_e[MAX_SPAWN_ARGV + 1];
+                int argc_e = 0;
+                const char **uargv_e = (const char **)a2;
+                if (uargv_e) {
+                    for (; argc_e < MAX_SPAWN_ARGV && uargv_e[argc_e]; argc_e++) {
+                        char *buf = (char *)kmalloc(MAX_PATH);
+                        if (!buf) break;
+                        const char *ustr = uargv_e[argc_e];
+                        int j = 0;
+                        for (; j < MAX_PATH - 1 && ustr[j]; j++) buf[j] = ustr[j];
+                        buf[j] = '\0';
+                        argv_bufs_e[argc_e] = buf;
+                        kargv_e[argc_e] = buf;
+                    }
+                }
+                kargv_e[argc_e] = NULL;
+
+                char *envp_bufs_e[MAX_SPAWN_ENVP] = {0};
+                const char *kenvp_e[MAX_SPAWN_ENVP + 1];
+                int envc_e = 0;
+                const char **uenvp_e = (const char **)a3;
+                if (uenvp_e) {
+                    for (; envc_e < MAX_SPAWN_ENVP && uenvp_e[envc_e]; envc_e++) {
+                        char *buf = (char *)kmalloc(MAX_PATH);
+                        if (!buf) break;
+                        const char *ustr = uenvp_e[envc_e];
+                        int j = 0;
+                        for (; j < MAX_PATH - 1 && ustr[j]; j++) buf[j] = ustr[j];
+                        buf[j] = '\0';
+                        envp_bufs_e[envc_e] = buf;
+                        kenvp_e[envc_e] = buf;
+                    }
+                }
+                kenvp_e[envc_e] = NULL;
+
                 LoadedPages *lp = kmalloc(sizeof(LoadedPages));
                 if (!lp) {
                     serial_write_string("SYS_execve: out of memory for LoadedPages allocation!\r\n");
+                    for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
+                    for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
                     return (uint64_t)-12; /* -ENOMEM */
                 }
-                
-                if (!elf_load(kernel_path, &entry_point, &stack_top, pml4, lp)) {
+
+                bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4, lp,
+                                          uargv_e ? kargv_e : NULL, uenvp_e ? kenvp_e : NULL);
+                for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
+                for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
+                if (!execve_ok) {
                     serial_write_string("SYS_execve: elf_load failed!\r\n");
                     kfree(lp);
                     return (uint64_t)-2; /* -ENOENT */
@@ -826,8 +1284,32 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             thread_exit();
             return 0;
 
-        case 202: // SYS_futex (Linux standard)
-            return 0;
+        case 202: // SYS_futex(uaddr, futex_op, val, ...) -- this OS has no
+                   // real sleep/wake queue, so this doesn't literally block;
+                   // it approximates real futex semantics closely enough for
+                   // musl's own mutex/condvar retry loops (e.g. the
+                   // threaded resolver's cross-thread signaling): a real
+                   // futex checks *uaddr against val BEFORE deciding to wait
+                   // at all, returning EAGAIN immediately if they already
+                   // differ (the value changed before we got here) rather
+                   // than claiming success unconditionally as the previous
+                   // stub did. That unconditional-success behavior let a
+                   // caller's wait loop believe it had been really woken
+                   // every single call, without ever yielding the CPU --
+                   // starving whatever other thread was supposed to
+                   // actually change the value (observed live: curl's
+                   // background DNS-resolver thread never got scheduled
+                   // because the main thread's futex(WAIT) retry loop spun
+                   // with zero yields). Yielding once here before returning
+                   // EAGAIN lets that other thread actually run.
+            {
+                int op = (int)a2 & 0x7F; // mask off FUTEX_PRIVATE_FLAG(128)/FUTEX_CLOCK_REALTIME(256)
+                if (op == 0) { // FUTEX_WAIT
+                    sched_yield();
+                    return (uint64_t)-11; // -EAGAIN -- caller re-checks its own condition and retries
+                }
+                return 0; // FUTEX_WAKE and other ops: no-op success
+            }
 
         case 218: // SYS_set_tid_address (Linux standard)
             return 1;
@@ -846,7 +1328,280 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 kfree((void *)a1);
             }
             return 0;
-            
+
+        case 405: // SYS_spawn -- launch a1 (const char *path) as a new,
+                   // isolated process (kernel/process.c: process_spawn()).
+                   // Inherits every non-FD_CLOEXEC fd from the caller at
+                   // the same fd number. Returns the new pid, or -1 on
+                   // failure.
+            {
+                if (!a1) return (uint64_t)-1;
+
+                /* process_spawn() switches CR3 to the NEW (still-empty)
+                   process's PML4 before elf_load() ever dereferences the
+                   path. If `path` were left as a raw pointer into the
+                   CALLING process's own memory, that dereference would
+                   fault as soon as CR3 changes (the new PML4 has nothing
+                   mapped there yet) -- caught this live via a kernel panic
+                   (CR2 pointed straight into the target binary's own
+                   address range, PML4E=0 -- a fresh, unpopulated table).
+                   Copy the path into kernel memory first, while the
+                   caller's own CR3/PML4 is still active, exactly like a
+                   real execve() syscall copies path/argv/envp in before
+                   doing anything else. */
+                char *path_buf = (char *)kmalloc(MAX_PATH);
+                if (!path_buf) return (uint64_t)-1;
+                const char *upath = (const char *)a1;
+                int i = 0;
+                for (; i < MAX_PATH - 1 && upath[i]; i++) {
+                    path_buf[i] = upath[i];
+                }
+                path_buf[i] = '\0';
+
+                extern Process *process_spawn(const char *path, const char **argv, uint32_t uid);
+                Process *child = process_spawn(path_buf, NULL, PROC_UID_INHERIT);
+                kfree(path_buf);
+                if (!child) return (uint64_t)-1;
+                return child->pid;
+            }
+
+        case 406: // SYS_fb_flush(x, y, w, h) -- push a dirty rect of the
+                   // active framebuffer (see fb_active_phys_addr(), which
+                   // /dev/fb0's mmap/read/write now target) to the real
+                   // display. Needed because virtio-gpu requires an
+                   // explicit TRANSFER+FLUSH before it re-reads its
+                   // resource's backing memory -- nothing else calls this
+                   // on behalf of a Ring-3 writer. No-op when virtio-gpu
+                   // isn't the active display (GOP framebuffer is scanned
+                   // directly, no flush needed).
+            {
+                extern bool virtio_gpu_is_active(void);
+                extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+                if (virtio_gpu_is_active()) {
+                    virtio_gpu_flush((uint32_t)a1, (uint32_t)a2, (uint32_t)a3, (uint32_t)a4);
+                }
+                return 0;
+            }
+
+        case 408: // SYS_spawn_argv(path_ptr, argv_ptr) -- like SYS_spawn
+                   // (405) but also hands the child a real argv array: a2
+                   // is a NULL-terminated array of user-space char*
+                   // pointers. Kept as a SEPARATE syscall number rather
+                   // than overloading 405's a2, because existing 2-arg
+                   // callers of 405 (via musl's variadic syscall()) have
+                   // no guarantee unused argument registers are zeroed --
+                   // reusing 405 would risk misinterpreting register
+                   // garbage as a real argv pointer and dereferencing it.
+            {
+                if (!a1) return (uint64_t)-1;
+
+                char *path_buf = (char *)kmalloc(MAX_PATH);
+                if (!path_buf) return (uint64_t)-1;
+                const char *upath = (const char *)a1;
+                int i = 0;
+                for (; i < MAX_PATH - 1 && upath[i]; i++) path_buf[i] = upath[i];
+                path_buf[i] = '\0';
+
+                char *argv_bufs[MAX_SPAWN_ARGV] = {0};
+                const char *kargv[MAX_SPAWN_ARGV + 1];
+                int argc = 0;
+
+                const char **uargv = (const char **)a2;
+                if (uargv) {
+                    for (; argc < MAX_SPAWN_ARGV && uargv[argc]; argc++) {
+                        char *buf = (char *)kmalloc(MAX_PATH);
+                        if (!buf) break;
+                        const char *ustr = uargv[argc];
+                        int j = 0;
+                        for (; j < MAX_PATH - 1 && ustr[j]; j++) buf[j] = ustr[j];
+                        buf[j] = '\0';
+                        argv_bufs[argc] = buf;
+                        kargv[argc] = buf;
+                    }
+                }
+                kargv[argc] = NULL;
+
+                extern Process *process_spawn(const char *path, const char **argv, uint32_t uid);
+                Process *child = process_spawn(path_buf, argc > 0 ? kargv : NULL, PROC_UID_INHERIT);
+
+                kfree(path_buf);
+                for (int k = 0; k < argc; k++) kfree(argv_bufs[k]);
+
+                if (!child) return (uint64_t)-1;
+                return child->pid;
+            }
+
+        case 409: // SYS_wynland_elevate(password_ptr) -- Phase 5's minimal
+                   // password gate. Not cryptographically secure -- a
+                   // plain string compare against a constant compiled
+                   // into the kernel (no crypto library exists in this
+                   // tree). A real, working, auditable authentication
+                   // boundary, not a hardened one; documented as such
+                   // rather than overclaimed. On match, elevates the
+                   // CALLING process's own uid to 0 IN PLACE (like `su`,
+                   // not spawning a new process) -- any command it later
+                   // runs via SYS_spawn_argv (408, PROC_UID_INHERIT)
+                   // correctly inherits uid 0.
+            {
+                if (!a1) return (uint64_t)-1;
+                static const char root_password[] = "wynland";
+                const char *given = (const char *)a1;
+                bool match = true;
+                int i = 0;
+                for (; i < (int)sizeof(root_password) - 1; i++) {
+                    if (given[i] != root_password[i]) { match = false; break; }
+                }
+                if (match && given[i] == '\0') {
+                    sched_current()->proc->uid = 0;
+                    return 0;
+                }
+                return (uint64_t)-1;
+            }
+
+        case 410: // SYS_pty_create(int fds[2]) -- Phase 18. Allocates a
+                   // real Pty (dual ring buffer + termios + winsize),
+                   // writes fds[0]=master, fds[1]=slave, mirroring the
+                   // existing pipe()/pipe2() int[2] output convention
+                   // (case 22/293 above). No canonical-mode line
+                   // discipline is implemented -- the child (nano) always
+                   // requests raw mode itself via tcsetattr(), so the PTY
+                   // layer just passes bytes through unconditionally in
+                   // both directions.
+            {
+                int *ptyfd = (int *)a1;
+                if (!ptyfd) return (uint64_t)-14; /* -EFAULT */
+
+                Pty *pty = NULL;
+                int pty_idx = -1;
+                for (int i = 0; i < MAX_PTYS; i++) {
+                    if (!g_ptys[i]) {
+                        pty = (Pty *)kmalloc(sizeof(Pty));
+                        if (!pty) return (uint64_t)-12; /* -ENOMEM */
+                        memset(pty, 0, sizeof(Pty));
+                        pty->in_use = true;
+                        pty->refcount = 2; /* master + slave */
+                        /* Sane raw-mode-friendly defaults; nano overwrites
+                           these itself via tcsetattr() right after open. */
+                        pty->term.c_iflag = T_ICRNL | T_IXON;
+                        pty->term.c_oflag = T_OPOST | T_ONLCR;
+                        pty->term.c_cflag = T_CS8 | T_CREAD | T_CLOCAL;
+                        pty->term.c_lflag = T_ISIG | T_ICANON | T_ECHO | T_ECHOE | T_ECHOK | T_IEXTEN;
+                        pty->ws_row = 24;
+                        pty->ws_col = 80;
+                        g_ptys[i] = pty;
+                        pty_idx = i;
+                        break;
+                    }
+                }
+                if (!pty) return (uint64_t)-23; /* -ENFILE */
+
+                int fd_master = get_free_fd(fd_table);
+                if (fd_master == -1) {
+                    g_ptys[pty_idx] = NULL;
+                    kfree(pty);
+                    return (uint64_t)-24; /* -EMFILE */
+                }
+                VfsFile *f_master = (VfsFile *)kmalloc(sizeof(VfsFile));
+                memset(f_master, 0, sizeof(VfsFile));
+                str_copy(f_master->node.name, "pty_master");
+                f_master->node.first_cluster = PTY_FD_MASTER;
+                f_master->current_cluster = (uint32_t)pty_idx;
+                fd_table[fd_master] = f_master;
+
+                int fd_slave = get_free_fd(fd_table);
+                if (fd_slave == -1) {
+                    fd_table[fd_master] = NULL;
+                    kfree(f_master);
+                    g_ptys[pty_idx] = NULL;
+                    kfree(pty);
+                    return (uint64_t)-24; /* -EMFILE */
+                }
+                VfsFile *f_slave = (VfsFile *)kmalloc(sizeof(VfsFile));
+                memset(f_slave, 0, sizeof(VfsFile));
+                str_copy(f_slave->node.name, "pty_slave");
+                f_slave->node.first_cluster = PTY_FD_SLAVE;
+                f_slave->current_cluster = (uint32_t)pty_idx;
+                fd_table[fd_slave] = f_slave;
+
+                ptyfd[0] = fd_master;
+                ptyfd[1] = fd_slave;
+                return 0;
+            }
+
+        case 411: // SYS_process_alive(pid) -- Phase 18. Lets zerp_term.c
+                   // poll whether a forked-and-exec'd child (nano) has
+                   // exited yet, so it knows when to leave MODE_PTY. Reads
+                   // Process.exited (set by thread_exit() itself, see
+                   // sched.c) rather than the process's main_thread's
+                   // state, since a terminated Thread struct can already be
+                   // kfree()'d by the time anything else gets a chance to
+                   // look at it -- Process itself is never freed.
+            {
+                Process *target = process_find_by_pid((uint64_t)a1);
+                if (!target) return 0; /* never existed / bogus pid -- treat as dead */
+                return target->exited ? 0 : 1;
+            }
+
+        case 407: // SYS_shm_create(size) -- allocate a shared-memory
+                   // segment and return an fd for it. Mapping it (via
+                   // SYS_mmap's 0xFFFFFFFD branch below) into more than one
+                   // process's PML4 gives real zero-copy shared memory --
+                   // hand the fd to a child via ordinary fd inheritance
+                   // (process_spawn(), already proven end-to-end by
+                   // spawner.elf/inherited.elf) exactly like a pipe fd.
+            {
+                uint64_t size = a1;
+                if (size == 0) return (uint64_t)-1;
+
+                uint32_t pages = (uint32_t)((size + PAGE_SIZE - 1) / PAGE_SIZE);
+                extern void *pmm_alloc_contiguous(uint32_t count);
+                void *phys_ptr = pmm_alloc_contiguous(pages);
+                if (!phys_ptr) {
+                    serial_write_string("SYS_shm_create: pmm_alloc_contiguous failed\r\n");
+                    return (uint64_t)-1;
+                }
+                uint64_t phys_addr = (uint64_t)(uintptr_t)phys_ptr;
+
+                /* Zero it through the caller's own mapping of the kernel's
+                   identity-mapped physical range (kernel range is aliased
+                   into every process's PML4, see vmm_new_process_pml4()),
+                   so this is safe regardless of which process's CR3 is
+                   currently loaded. Plain memset -- proven safe from
+                   syscall context after the Phase 3 stack-alignment fix
+                   (kernel/syscall_entry.asm), no workaround needed. */
+                memset((void *)(uintptr_t)phys_addr, 0, pages * PAGE_SIZE);
+
+                int seg_idx = -1;
+                for (int i = 0; i < MAX_SHM_SEGMENTS; i++) {
+                    if (g_shm_segments[i].phys_addr == 0) {
+                        seg_idx = i;
+                        break;
+                    }
+                }
+                if (seg_idx == -1) {
+                    serial_write_string("SYS_shm_create: out of SHM segment slots\r\n");
+                    return (uint64_t)-1;
+                }
+                g_shm_segments[seg_idx].phys_addr = phys_addr;
+                g_shm_segments[seg_idx].size      = pages * PAGE_SIZE;
+                g_shm_segments[seg_idx].refcount   = 0;
+
+                int fd = get_free_fd(fd_table);
+                if (fd == -1) {
+                    g_shm_segments[seg_idx].phys_addr = 0;
+                    return (uint64_t)-1;
+                }
+                VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+                memset(f, 0, sizeof(VfsFile));
+                str_copy(f->node.name, "shm");
+                f->node.is_dir = false;
+                f->node.first_cluster = 0xFFFFFFFD; // SHM segment signature
+                f->current_cluster = seg_idx;        // index into g_shm_segments[]
+                fd_table[fd] = f;
+
+                return fd;
+            }
+
         case 5: // SYS_fstat (Linux standard) — get file status by fd
             {
                 uint64_t fd = a1;
@@ -884,6 +1639,43 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     serial_write_string(" request=");
                     serial_write_string(req_str);
                     serial_write_string("\r\n");
+                }
+
+                // Phase 18: termios / window-size ioctls for PTY master+slave fds
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    (fd_table[fd]->node.first_cluster == PTY_FD_MASTER ||
+                     fd_table[fd]->node.first_cluster == PTY_FD_SLAVE)) {
+                    Pty *pty = g_ptys[fd_table[fd]->current_cluster];
+                    if (!pty) return (uint64_t)-9; // EBADF
+                    if (request == 0x5401) { // TCGETS
+                        struct linux_termios *out = (struct linux_termios *)argp;
+                        if (out) *out = pty->term;
+                        return 0;
+                    }
+                    if (request == 0x5402 || request == 0x5403 || request == 0x5404) { // TCSETS/W/F
+                        struct linux_termios *in = (struct linux_termios *)argp;
+                        if (in) pty->term = *in;
+                        return 0;
+                    }
+                    if (request == 0x5413) { // TIOCGWINSZ
+                        struct linux_winsize *out = (struct linux_winsize *)argp;
+                        if (out) {
+                            out->ws_row = pty->ws_row;
+                            out->ws_col = pty->ws_col;
+                            out->ws_xpixel = 0;
+                            out->ws_ypixel = 0;
+                        }
+                        return 0;
+                    }
+                    if (request == 0x5414) { // TIOCSWINSZ
+                        struct linux_winsize *in = (struct linux_winsize *)argp;
+                        if (in) {
+                            pty->ws_row = in->ws_row;
+                            pty->ws_col = in->ws_col;
+                        }
+                        return 0;
+                    }
+                    return (uint64_t)-25; // -ENOTTY for anything else on a PTY fd
                 }
 
                 // Handle Framebuffer ioctl queries
@@ -956,7 +1748,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                             memset(finfo, 0, sizeof(*finfo));
                             // Set ID
                             finfo->id[0] = 'f'; finfo->id[1] = 'b'; finfo->id[2] = '0';
-                            finfo->smem_start = g_boot_info->fb_addr;
+                            extern uint64_t fb_active_phys_addr(void);
+                            finfo->smem_start = fb_active_phys_addr();
                             finfo->smem_len = g_boot_info->fb_pitch * g_boot_info->fb_height;
                             finfo->type = 0; // FB_TYPE_PACKED_PIXELS
                             finfo->visual = 2; // FB_VISUAL_TRUECOLOR
@@ -1133,7 +1926,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 104: // SYS_getgid
         case 107: // SYS_geteuid
         case 108: // SYS_getegid
-            return 1000; /* non-root user to please Hyprland */
+            /* Phase 5: real per-process uid (Process.uid, kernel/process.c).
+               No separate GID model -- gid mirrors uid, matching the
+               convention that root (uid 0) is also "group 0". */
+            return sched_current()->proc->uid;
 
         case 110: // SYS_getppid
             return 1;
@@ -1154,10 +1950,27 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (tp) {
                     extern uint64_t timer_get_ticks(void);
                     uint64_t ticks = timer_get_ticks();
-                    tp->tv_sec = ticks / 100;
-                    tp->tv_nsec = (ticks % 100) * 10000000;
+                    /* CLOCK_REALTIME (0) -- real wall-clock UTC, from the
+                       CMOS RTC read at boot (see kernel/rtc.c). Everything
+                       else (CLOCK_MONOTONIC=1, etc.) stays uptime-based,
+                       matching real Linux semantics: monotonic clocks are
+                       never supposed to jump with wall-clock adjustments. */
+                    if ((int)a1 == 0) {
+                        tp->tv_sec = (int64_t)rtc_get_unix_time();
+                    } else {
+                        tp->tv_sec = (int64_t)(ticks / 100);
+                    }
+                    tp->tv_nsec = (int64_t)((ticks % 100) * 10000000);
                 }
                 return 0;
+            }
+        case 201: // SYS_time (legacy, some programs call this directly
+                   // instead of clock_gettime) -- real wall-clock UTC.
+            {
+                int64_t now = (int64_t)rtc_get_unix_time();
+                int64_t *tloc = (int64_t *)a1;
+                if (tloc) *tloc = now;
+                return (uint64_t)now;
             }
         case 217: // SYS_getdents64 (Linux standard)
             {
@@ -1187,7 +2000,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (linux_flags & 01000) vfs_flags |= 0x10; // VFS_O_TRUNC
                 if (linux_flags & 02000) vfs_flags |= 0x08; // VFS_O_APPEND
 
-                int fd = get_free_fd();
+                int fd = get_free_fd(fd_table);
                 if (fd == -1) return (uint64_t)-24; /* -EMFILE */
                 
                 if (str_compare(path, "/sys/dev/char/226:0/device/vendor") == 0 ||
@@ -1242,12 +2055,20 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     fd_table[fd] = sfile;
                     return fd;
                 }
-                // /sys/dev/char/226:X/device/drm — virtual directory containing card0 subdir
-                if (str_compare(path, "/sys/dev/char/226:0/device/drm") == 0 ||
-                    str_compare(path, "/sys/dev/char/226:128/device/drm") == 0) {
+                // /sys/dev/char/226:0/device/drm — virtual dir listing "card0"
+                if (str_compare(path, "/sys/dev/char/226:0/device/drm") == 0) {
                     VfsFile *sfile = kmalloc(sizeof(VfsFile));
                     memset(sfile, 0, sizeof(VfsFile));
-                    sfile->node.first_cluster = 0xFFFFFFF8; // DRM_DIR virtual
+                    sfile->node.first_cluster = 0xFFFFFFF8; // DRM_DIR card
+                    sfile->node.is_dir = 1;
+                    fd_table[fd] = sfile;
+                    return fd;
+                }
+                // /sys/dev/char/226:128/device/drm — virtual dir listing "renderD128"
+                if (str_compare(path, "/sys/dev/char/226:128/device/drm") == 0) {
+                    VfsFile *sfile = kmalloc(sizeof(VfsFile));
+                    memset(sfile, 0, sizeof(VfsFile));
+                    sfile->node.first_cluster = 0xFFFFFFF9; // DRM_DIR render
                     sfile->node.is_dir = 1;
                     fd_table[fd] = sfile;
                     return fd;
@@ -1349,6 +2170,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 157: // SYS_prctl (Linux standard)
             return 0;
 
+        case 7:   // SYS_poll (Linux standard) -- shares ppoll's implementation;
+                   // a3 here is a plain int timeout_ms rather than a timespec*,
+                   // but the code below only ever discards a3 as a pointer
+                   // ((void)tmo;), never dereferences it, so reusing it is safe.
         case 271: // SYS_ppoll (Linux standard)
             {
                 struct pollfd {
@@ -1423,21 +2248,148 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
         case 41: // SYS_socket
             {
-                // int domain = a1, int type = a2, int protocol = a3;
-                int fd = get_free_fd();
+                int domain = (int)a1;
+                int type   = (int)a2 & 0xFF; // mask off SOCK_NONBLOCK/SOCK_CLOEXEC flag bits
+
+                /* This OS's network stack is IPv4-only -- no IPv6 anywhere
+                   in drivers/net/. AF_INET6 (10) must fail here, at
+                   socket() creation time, with a real error, exactly like
+                   a real kernel built without IPv6 support would. Letting
+                   it silently fall through to the generic AF_UNIX-mock
+                   branch below (as it did before this check existed) was
+                   a real, previously-invisible bug: SYS_connect()
+                   unconditionally "succeeds" for any non-TCP/UDP socket,
+                   so a caller doing real Happy-Eyeballs-style dual-stack
+                   connection racing (e.g. curl, which tries AAAA records
+                   before falling back to A records) would believe its
+                   IPv6 attempt had genuinely connected, then hang forever
+                   trying to actually use that fake, unbacked fd for a
+                   real protocol handshake -- never reaching the IPv4
+                   fallback its own logic would otherwise correctly take
+                   (confirmed on the real host: IPv6 connect there fails
+                   fast with ENETUNREACH, and curl falls back to IPv4
+                   immediately). */
+                if (domain == 10 /* AF_INET6 */) {
+                    return (uint64_t)-97; // -EAFNOSUPPORT
+                }
+
+                int fd = get_free_fd(fd_table);
                 if (fd < 0) return -24; // EMFILE
-                
+
                 VfsFile *sfile = kmalloc(sizeof(VfsFile));
                 memset(sfile, 0, sizeof(VfsFile));
-                sfile->node.first_cluster = 0xFFFFFFF8; // Magic for AF_UNIX socket
+                if (domain == 2 /* AF_INET */ && type == 1 /* SOCK_STREAM */) {
+                    sfile->node.first_cluster = SOCK_FD_TCP;
+                    sfile->current_cluster    = TCP_FD_NOT_CONNECTED;
+                } else if (domain == 2 /* AF_INET */ && type == 2 /* SOCK_DGRAM */) {
+                    int udp_idx = udp_socket_create();
+                    if (udp_idx < 0) {
+                        kfree(sfile);
+                        return -24; // EMFILE (no free UDP socket slots)
+                    }
+                    sfile->node.first_cluster = SOCK_FD_UDP;
+                    sfile->current_cluster    = (uint32_t)udp_idx;
+                } else {
+                    sfile->node.first_cluster = 0xFFFFFFF8; // Magic for AF_UNIX socket (unchanged mock)
+                }
                 fd_table[fd] = sfile;
                 return fd;
+            }
+
+        case 42: // SYS_connect
+            {
+                int fd = (int)a1;
+                if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
+
+                VfsFile *file = fd_table[fd];
+                struct linux_sockaddr_in *addr = (struct linux_sockaddr_in *)a2;
+
+                if (file->node.first_cluster == SOCK_FD_UDP) {
+                    if (!addr) return -14; // EFAULT
+                    udp_socket_connect((int)file->current_cluster, addr->sin_addr, ntohs(addr->sin_port));
+                    return 0;
+                }
+
+                if (file->node.first_cluster != SOCK_FD_TCP) {
+                    return 0; // AF_UNIX / other mock sockets: pretend success (unchanged)
+                }
+
+                if (!addr) return -14; // EFAULT
+
+                int idx = tcp_connect_slot(addr->sin_addr, ntohs(addr->sin_port));
+                if (idx < 0) return -110; // ETIMEDOUT (covers both handshake timeout and RST)
+
+                file->current_cluster = (uint32_t)idx;
+                return 0;
+            }
+
+        case 44: // SYS_sendto(fd, buf, len, flags, dest_addr, addrlen) -- dest_addr is a5
+            {
+                int fd = (int)a1;
+                if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
+                VfsFile *file = fd_table[fd];
+
+                if (file->node.first_cluster == SOCK_FD_UDP) {
+                    struct linux_sockaddr_in *addr = (struct linux_sockaddr_in *)a5;
+                    uint32_t dst_ip   = addr ? addr->sin_addr : 0;
+                    uint16_t dst_port = addr ? ntohs(addr->sin_port) : 0;
+                    int n = udp_socket_sendto((int)file->current_cluster, (const void *)a2, (uint32_t)a3, dst_ip, dst_port);
+                    if (n < 0) return (uint64_t)-1;
+                    return (uint64_t)n;
+                }
+
+                if (file->node.first_cluster == SOCK_FD_TCP) {
+                    if (file->current_cluster == TCP_FD_NOT_CONNECTED) return -107; // ENOTCONN
+                    TcpConnection *conn = tcp_get_connection((int)file->current_cluster);
+                    if (!conn) return -104; // ECONNRESET
+                    int n = tcp_send(conn, (const void *)a2, (uint32_t)a3);
+                    if (n < 0) return (uint64_t)-1;
+                    return (uint64_t)n;
+                }
+                // Non-TCP/UDP fds: fall back to plain write() semantics
+                return syscall_dispatcher(1, a1, a2, a3, 0, 0, regs);
+            }
+
+        case 45: // SYS_recvfrom(fd, buf, len, flags, src_addr, addrlen) -- src_addr is a5, addrlen* is r9
+            {
+                int fd = (int)a1;
+                if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
+                VfsFile *file = fd_table[fd];
+
+                if (file->node.first_cluster == SOCK_FD_UDP) {
+                    uint32_t from_ip = 0;
+                    uint16_t from_port = 0;
+                    int n = udp_socket_recvfrom((int)file->current_cluster, (void *)a2, (uint32_t)a3, &from_ip, &from_port);
+                    if (n < 0) return (uint64_t)-1;
+                    struct linux_sockaddr_in *addr = (struct linux_sockaddr_in *)a5;
+                    if (addr) {
+                        addr->sin_family = 2; // AF_INET
+                        addr->sin_port   = htons(from_port);
+                        addr->sin_addr   = from_ip;
+                        memset(addr->sin_zero, 0, sizeof(addr->sin_zero));
+                        uint32_t *addrlen = (uint32_t *)regs->r9;
+                        if (addrlen) *addrlen = sizeof(struct linux_sockaddr_in);
+                    }
+                    return (uint64_t)n;
+                }
+
+                if (file->node.first_cluster == SOCK_FD_TCP) {
+                    if (file->current_cluster == TCP_FD_NOT_CONNECTED) return -107; // ENOTCONN
+                    TcpConnection *conn = tcp_get_connection((int)file->current_cluster);
+                    if (!conn) return -104; // ECONNRESET
+                    int n = tcp_recv(conn, (void *)a2, (uint32_t)a3);
+                    if (n < 0) return (uint64_t)-1;
+                    return (uint64_t)n;
+                }
+                // Non-TCP/UDP fds: fall back to plain read() semantics
+                return syscall_dispatcher(0, a1, a2, a3, 0, 0, regs);
             }
 
         case 49: // SYS_bind
         case 50: // SYS_listen
         case 54: // SYS_setsockopt
         case 55: // SYS_getsockopt
+        case 48: // SYS_shutdown
             return 0; // Pretend success
 
         case 51: // SYS_getsockname
@@ -1457,7 +2409,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 213: // SYS_epoll_create
         case 291: // SYS_epoll_create1
             {
-                int fd = get_free_fd();
+                int fd = get_free_fd(fd_table);
                 if (fd < 0) return -24; // EMFILE
                 
                 VfsFile *efile = kmalloc(sizeof(VfsFile));

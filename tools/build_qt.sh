@@ -30,7 +30,12 @@ cmake "${QT_SRC_DIR}" \
     -DQT_FEATURE_eglfs=OFF \
     -DINPUT_opengl=no \
     -DFEATURE_opengl=OFF \
-    -DFEATURE_qwynlandfb=ON
+    -DFEATURE_qwynlandfb=ON \
+    -DQT_FEATURE_network=OFF \
+    -DQT_FEATURE_dbus=OFF \
+    -DQT_FEATURE_sql=OFF \
+    -DQT_FEATURE_printsupport=OFF \
+    -DQT_FEATURE_xml=OFF
 
 echo "==> Compiling qtbase..."
 cmake --build . --parallel $(nproc)

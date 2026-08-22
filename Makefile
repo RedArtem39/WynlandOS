@@ -317,11 +317,17 @@ $(BUILD)/test_raw_fb.elf: test_raw_fb.c
 	@echo "  CC(USER)   $< (FB diagnostic)"
 	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -static -O2 -o $@ $<
 
+# Real TTF font for QFreeTypeFontDatabase (vendored inside qtbase's own 3rdparty tree)
+$(BUILD)/lib/fonts/DejaVuSans.ttf: qtbase/src/3rdparty/wasm/DejaVuSans.ttf
+	@mkdir -p $(BUILD)/lib/fonts
+	@echo "  CP         $< -> $@"
+	@cp $< $@
+
 # ---------- Disk Image ----------
 
-image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_raw_fb.elf $(DISK_IMAGE)
+image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_raw_fb.elf $(BUILD)/lib/fonts/DejaVuSans.ttf $(DISK_IMAGE)
 
-$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_raw_fb.elf
+$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_raw_fb.elf $(BUILD)/lib/fonts/DejaVuSans.ttf
 	@echo "  IMG        Creating FAT32 disk image..."
 	@dd if=/dev/zero of=$@ bs=1M count=1024 status=none
 	@mformat -i $@ -F -v WYNLAND ::
@@ -368,7 +374,6 @@ $(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_c
 	@mcopy -o -i $@ $(BUILD)/main_dynamic.elf ::/t_dyn.elf
 	@mcopy -o -i $@ app.wasm ::/app.was
 	@mcopy -o -i $@ hello.wyn ::/hello.wyn
-	@mcopy -o -i $@ browser.wyn ::/browser.wyn
 	@mcopy -o -i $@ hyprland.conf ::/hyprland.conf
 	-@mcopy -o -i $@ external/nixos-configuration/config/sessions/hyprland/hyprland.conf ::/nixos_hyprland.conf
 	-@mcopy -o -i $@ external/nixos-configuration/config/sessions/hyprland/config/settings.conf ::/nixos_settings.conf

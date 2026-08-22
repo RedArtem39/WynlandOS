@@ -32,6 +32,7 @@ static bool g_live_wallpaper_active = false;
 static uint32_t g_live_wallpaper_style = 0;
 static uint32_t *g_blur_temp = NULL;
 static uint32_t  g_blur_temp_size = 0;
+static uint64_t  g_backbuffer_phys = 0;
 
 /* ---- Bounded Dirty Rectangle tracking ---- */
 static int32_t g_dirty_x1 = 999999;
@@ -248,6 +249,7 @@ void compositor_init(BootInfo *info)
         vmm_map_page(pml4, virt, phys, PAGE_WRITE | PAGE_NX);
     }
     g_comp.back_buffer = (uint32_t *)(uintptr_t)start_virt;
+    g_backbuffer_phys = (uint64_t)(uintptr_t)fb_phys_start;
 
     /* Allocate blur temp buffer to avoid allocations inside drawing loop */
     g_blur_temp_size = g_comp.fb_width * g_comp.fb_height;
@@ -1006,6 +1008,22 @@ void comp_draw_rounded_rect_border(uint32_t x, uint32_t y, uint32_t w, uint32_t 
 uint32_t *comp_get_backbuffer(void) { return g_comp.back_buffer;  }
 uint32_t  comp_get_width(void)      { return g_comp.fb_width;     }
 uint32_t  comp_get_height(void)     { return g_comp.fb_height;    }
+uint64_t  comp_get_backbuffer_phys(void) { return g_backbuffer_phys; }
+
+/* Whichever physical framebuffer memory the display is *actually* being
+   scanned from right now. virtio-gpu never looks at the raw GOP/UEFI
+   framebuffer (g_comp.boot_info->fb_addr) -- it only reads the back-buffer
+   above, which drivers/video/virtio_gpu.c registers as its resource's
+   backing memory via RESOURCE_ATTACH_BACKING. Anything (a Ring-3 process
+   via /dev/fb0, a future compositor) that wants its writes to actually
+   reach the screen needs to target THIS address, not the raw GOP one. */
+uint64_t fb_active_phys_addr(void) {
+    extern bool virtio_gpu_is_active(void);
+    if (virtio_gpu_is_active()) {
+        return g_backbuffer_phys;
+    }
+    return g_comp.boot_info->fb_addr;
+}
 
 void comp_mark_dirty(void)
 {

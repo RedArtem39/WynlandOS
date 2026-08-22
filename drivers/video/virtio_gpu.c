@@ -91,10 +91,10 @@ static VirtioGpuCtrlResponse resp_attach;
 static VirtioGpuSetScanout            cmd_scanout;
 static VirtioGpuCtrlResponse          resp_scanout;
 
-static VirtioGpuTransferToHost2d      cmd_transfer;
+static VirtioGpuTransferToHost2d cmd_transfer;
 static VirtioGpuCtrlResponse          resp_transfer;
 
-static VirtioGpuResourceFlush         cmd_flush;
+static VirtioGpuResourceFlush    cmd_flush;
 static VirtioGpuCtrlResponse          resp_flush;
 
 /* MMIO Register Access Helpers */
@@ -753,7 +753,7 @@ bool virtio_gpu_init(void)
     cmd_transfer.rhh = 64;
     cmd_transfer.offset = 0;
 
-    if (!virtio_gpu_send_cmd(&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer)) ||
+    if (!virtio_gpu_send_cmd((void *)&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer)) ||
         resp_transfer.type != VIRTIO_GPU_RESP_OK_NODATA) {
         log_str("VIRTIO-GPU: ERROR - TRANSFER_TO_HOST_2D for Cursor failed!\r\n");
         return false;
@@ -766,7 +766,6 @@ bool virtio_gpu_init(void)
     log_str("VIRTIO-GPU: Initialization and Hardware Cursor completed successfully!\r\n");
     return true;
 }
-
 
 
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -793,8 +792,8 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_flush.rww = w;
     cmd_flush.rhh = h;
 
-    virtio_gpu_send_cmd(&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer));
-    virtio_gpu_send_cmd(&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
+    virtio_gpu_send_cmd((void *)&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer));
+    virtio_gpu_send_cmd((void *)&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
 }
 
 bool virtio_gpu_is_active(void)

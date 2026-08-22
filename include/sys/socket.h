@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+typedef unsigned short sa_family_t;
+
 #define AF_UNIX 1
 #define SOCK_STREAM 1
 #define SOCK_DGRAM 2
@@ -29,9 +31,14 @@ struct sockaddr_storage {
 // sockaddr_un, sockaddr_in, socklen_t and SUN_LEN are in system sys/un.h and netinet/in.h
 
 inline int socket(int domain, int type, int protocol) { return -1; }
+inline int socketpair(int domain, int type, int protocol, int sv[2]) { return -1; }
 inline int bind(int sockfd, const struct sockaddr *addr, unsigned int addrlen) { return -1; }
 inline int listen(int sockfd, int backlog) { return -1; }
+inline int accept(int sockfd, struct sockaddr *addr, unsigned int *addrlen) { return -1; }
 inline int accept4(int sockfd, struct sockaddr *addr, unsigned int *addrlen, int flags) { return -1; }
 inline int getsockopt(int sockfd, int level, int optname, void *optval, unsigned int *optlen) { return -1; }
+inline int setsockopt(int sockfd, int level, int optname, const void *optval, unsigned int optlen) { return -1; }
+inline int shutdown(int sockfd, int how) { return -1; }
 inline int connect(int sockfd, const struct sockaddr *addr, unsigned int addrlen) { return -1; }
 inline long send(int sockfd, const void *buf, size_t len, int flags) { return -1; }
+inline long recv(int sockfd, void *buf, size_t len, int flags) { return -1; }

@@ -1,6 +1,5 @@
 #include "window.h"
 #include "qt.hpp"
-#include "hyprland/hyprland.hpp"
 
 bool g_applauncher_visible = false;
 
@@ -59,7 +58,7 @@ public:
         : QWidget(x, y, w, h) {}
 
     void paint() override {
-        if (g_pHyprland) {
+        if (true) {
             /* 1. Restore wallpaper under the top bar area (0..56px) */
             extern void comp_draw_wallpaper_rect(uint32_t rx, uint32_t ry, uint32_t rw, uint32_t rh);
             comp_draw_wallpaper_rect(0, 0, w, 56);
@@ -79,10 +78,10 @@ public:
             for (int i = 1; i <= 8; i++) {
                 int32_t ws_x = bar_x + 124 + (i - 1) * 34;
                 char ws_num[4] = { (char)('0' + i), '\0' };
-                if (g_pHyprland->m_iActiveWorkspace == i) {
+                if (i == 1) {
                     comp_draw_glass_surface(ws_x, bar_y + 5, 28, 32, 10, 0xC089B4FA, 0, 0x30FFFFFF);
                     comp_draw_string_aa(ws_x + 10, bar_y + 14, ws_num, 0xFF1E1E2E, 14);
-                } else if (g_pHyprland->m_pWorkspaces[i - 1] && (g_pHyprland->m_pWorkspaces[i - 1]->m_pDwindleRoot || g_pHyprland->m_pWorkspaces[i - 1]->m_pMasterNodesHead)) {
+                } else if (false) {
                     comp_draw_glass_surface(ws_x, bar_y + 5, 28, 32, 10, 0x80313244, 0, 0x14CDD6F4);
                     comp_draw_string_aa(ws_x + 10, bar_y + 14, ws_num, 0xFFCDD6F4, 14);
                 } else {
@@ -213,7 +212,7 @@ public:
         bool clicked_down = left_pressed && !s_prev_left;
         s_prev_left = left_pressed;
 
-        if (g_pHyprland && clicked_down) {
+        if (clicked_down) {
             uint32_t bar_x = 6;
             if (mx >= (int32_t)bar_x + 40 && mx < (int32_t)bar_x + 78) {
                 /* Clicked >_ AppLauncher / Terminal */
@@ -236,7 +235,6 @@ public:
                 /* Clicked Workspaces 1..8 */
                 int ws_idx = (mx - ((int32_t)bar_x + 124)) / 34 + 1;
                 if (ws_idx >= 1 && ws_idx <= 8) {
-                    g_pHyprland->switchWorkspace(ws_idx);
                     extern void comp_mark_dirty(void);
                     comp_mark_dirty();
                 }
@@ -274,7 +272,7 @@ public:
         : QWidget(x, y, w, h) {}
 
     void paint() override {
-        if (g_pHyprland) {
+        if (true) {
             if (!g_applauncher_visible) return;
             uint32_t sw = comp_get_width();
             uint32_t sh = comp_get_height();
@@ -387,7 +385,7 @@ public:
         bool clicked_down = left_pressed && !s_prev_left;
         s_prev_left = left_pressed;
 
-        if (g_pHyprland) {
+        if (true) {
             if (!g_applauncher_visible || !clicked_down) return;
             uint32_t sw = comp_get_width();
             uint32_t sh = comp_get_height();

@@ -12,6 +12,7 @@
 #include <wynland/virtio.h>
 #include <wynland/types.h>
 #include <wynland/tcp.h>
+#include <wynland/udpsock.h>
 
 /* ============================================================
  * External helpers (provided by the kernel elsewhere)
@@ -255,8 +256,21 @@ static void handle_ipv4(const uint8_t *data, uint32_t len,
     if (ihl < 20 || ihl > len)
         return;
 
-    payload     = data + ihl;
-    payload_len = len - ihl;
+    /* Use the IP header's own total_length, not the raw Ethernet frame
+       length -- small packets (bare ACKs, FINs) get zero-padded by the
+       sender/NIC to Ethernet's 60-byte minimum frame size, and treating
+       that padding as real IP payload silently corrupts every short
+       segment's payload_len (and whatever protocol handler reads past
+       the real packet boundary into the padding zeros). */
+    {
+        uint32_t ip_total_len = (uint32_t)ntohs(ip_hdr->total_length);
+        if (ip_total_len < ihl)
+            return; /* malformed */
+        if (ip_total_len > len)
+            ip_total_len = len; /* truncated capture safety clamp */
+        payload     = data + ihl;
+        payload_len = ip_total_len - ihl;
+    }
 
     switch (ip_hdr->protocol) {
     case IP_PROTO_ICMP:
@@ -344,27 +358,33 @@ static void handle_udp(const uint8_t *data, uint32_t len,
 {
     const UdpHeader *udp;
     uint16_t dst_port;
+    uint16_t src_port;
     uint32_t udp_payload_len;
     const uint8_t *udp_payload;
-
-    (void)ip_hdr;
 
     if (len < sizeof(UdpHeader))
         return;
 
     udp = (const UdpHeader *)data;
     dst_port = ntohs(udp->dst_port);
+    src_port = ntohs(udp->src_port);
 
     udp_payload     = data + sizeof(UdpHeader);
     udp_payload_len = len - sizeof(UdpHeader);
 
     if (dst_port == DHCP_CLIENT_PORT) {
         handle_dhcp(udp_payload, udp_payload_len);
+    } else if (src_port == 53 && dst_port == 12345) {
+        /* The OS's own dedicated Ring-0 DNS client (net_dns_resolve())
+           always queries from this fixed local port -- kept as its own
+           narrow check (not just "src_port == 53") so a real userspace
+           resolver's own DNS query, sent from a completely different
+           ephemeral port via udp_socket_*, doesn't get misrouted into
+           this legacy singleton-state handler instead of its own socket. */
+        handle_dns_response(udp_payload, udp_payload_len);
     } else {
-        /* Check for DNS response (source port 53) */
-        if (ntohs(udp->src_port) == 53) {
-            handle_dns_response(udp_payload, udp_payload_len);
-        }
+        udp_socket_deliver(ip_hdr->src_ip, src_port, dst_port,
+                           udp_payload, udp_payload_len);
     }
 }
 

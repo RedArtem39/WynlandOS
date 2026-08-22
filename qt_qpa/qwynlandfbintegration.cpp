@@ -1,6 +1,9 @@
 #include "qwynlandfbintegration.h"
 #include "qwynlandfbscreen.h"
 #include "qwynlandfbinput.h"
+#include "qwynlandfb_zerpargs.h"
+#include "../zerp_protocol.h"
+#include <unistd.h>
 #include <QtGui/QPainter>
 
 #include <qpa/qplatformbackingstore.h>
@@ -8,17 +11,14 @@
 #include <qpa/qwindowsysteminterface.h>
 #include <QtGui/private/qgenericunixeventdispatcher_p.h>
 #include <QtGui/private/qgenericunixfontdatabase_p.h>
-#include <QtCore/QTimer>
-
-
 
 QT_BEGIN_NAMESPACE
 
 class QWynlandFbBackingStore : public QPlatformBackingStore
 {
 public:
-    QWynlandFbBackingStore(QWindow *window, QWynlandFbScreen *screen)
-        : QPlatformBackingStore(window), m_screen(screen) {}
+    QWynlandFbBackingStore(QWindow *window, QWynlandFbScreen *screen, int c2sFd)
+        : QPlatformBackingStore(window), m_screen(screen), m_c2sFd(c2sFd) {}
 
     QPaintDevice *paintDevice() override { return &m_image; }
 
@@ -33,41 +33,49 @@ public:
         Q_UNUSED(window);
         Q_UNUSED(offset);
 
-        // Copy backing store contents directly to mapped framebuffer
-        QImage *fbImage = m_screen->image();
-        if (fbImage && !fbImage->isNull()) {
-            QPainter painter(fbImage);
-            for (const QRect &rect : region) {
-                painter.drawImage(rect, m_image, rect);
-            }
+        // Copy backing store contents directly into the client's SHM tile.
+        QImage *tileImage = m_screen->image();
+        if (!tileImage || tileImage->isNull()) return;
+
+        QPainter painter(tileImage);
+        for (const QRect &rect : region) {
+            painter.drawImage(rect, m_image, rect);
         }
+        painter.end();
+
+        // Tell Zerp this region needs blitting to the real display.
+        QRect dirty = region.boundingRect();
+        ZerpMsg msg = { ZERP_MSG_DAMAGE, (quint32)dirty.x(), (quint32)dirty.y(),
+                         (quint32)dirty.width(), (quint32)dirty.height() };
+        write(m_c2sFd, &msg, sizeof(msg));
     }
 
     void resize(const QSize &size, const QRegion &staticContents) override {
         Q_UNUSED(staticContents);
         m_image = QImage(size, QImage::Format_ARGB32_Premultiplied);
-        m_screen->setBackingStore(&m_image);
     }
 
 private:
     QImage m_image;
     QWynlandFbScreen *m_screen;
+    int m_c2sFd;
 };
 
 QWynlandFbIntegration::QWynlandFbIntegration(const QStringList &paramList)
-    : m_screen(nullptr), m_inputReader(nullptr), m_parameters(paramList), m_fontDb(new QGenericUnixFontDatabase), m_cursorTimer(nullptr)
+    : m_screen(nullptr), m_inputReader(nullptr), m_parameters(paramList),
+      m_fontDb(new QGenericUnixFontDatabase), m_c2sFd(-1)
 {
 }
 
 QWynlandFbIntegration::~QWynlandFbIntegration()
 {
     if (m_inputReader) {
+        m_inputReader->stop();
         m_inputReader->wait();
         delete m_inputReader;
     }
     delete m_screen;
     delete m_fontDb;
-    delete m_cursorTimer;
 }
 
 bool QWynlandFbIntegration::hasCapability(QPlatformIntegration::Capability cap) const
@@ -81,24 +89,26 @@ bool QWynlandFbIntegration::hasCapability(QPlatformIntegration::Capability cap) 
 
 void QWynlandFbIntegration::initialize()
 {
+    m_c2sFd = zerp_qpa_c2s_fd();
+    int s2cFd = zerp_qpa_s2c_fd();
+    int shmFd = zerp_qpa_shm_fd();
+
+    if (m_c2sFd < 0 || s2cFd < 0 || shmFd < 0) {
+        qWarning("QWynlandFbIntegration: missing Zerp fds -- did the app call "
+                 "zerp_qpa_capture_args(argc, argv) before constructing QApplication?");
+        return;
+    }
+
     m_screen = new QWynlandFbScreen();
-    if (m_screen->initialize()) {
+    if (m_screen->initialize(shmFd, s2cFd)) {
         QWindowSystemInterface::handleScreenAdded(m_screen);
     }
 
     m_inputReader = new QWynlandFbInputReader();
     m_inputReader->setScreen(m_screen);
-    if (m_inputReader->initialize()) {
+    if (m_inputReader->initialize(s2cFd)) {
         m_inputReader->start();
     }
-
-    // Set up a thread-safe QTimer in the main GUI thread to update the software cursor
-    m_cursorTimer = new QTimer();
-    m_cursorTimer->setInterval(16); // ~60 FPS
-    QObject::connect(m_cursorTimer, &QTimer::timeout, [=]() {
-        if (m_screen) m_screen->updateCursor();
-    });
-    m_cursorTimer->start();
 }
 
 QPlatformWindow *QWynlandFbIntegration::createPlatformWindow(QWindow *window) const
@@ -110,7 +120,7 @@ QPlatformWindow *QWynlandFbIntegration::createPlatformWindow(QWindow *window) co
 
 QPlatformBackingStore *QWynlandFbIntegration::createPlatformBackingStore(QWindow *window) const
 {
-    return new QWynlandFbBackingStore(window, m_screen);
+    return new QWynlandFbBackingStore(window, m_screen, m_c2sFd);
 }
 
 QAbstractEventDispatcher *QWynlandFbIntegration::createEventDispatcher() const

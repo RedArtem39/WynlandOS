@@ -177,6 +177,13 @@ int main(void) {
     write_str("[test_raw_fb] PASS: If grid is straight -> kernel fb OK, check QPA plugin.\n");
     write_str("[test_raw_fb] FAIL: If grid is diagonal -> kernel mmap/pitch wrong.\n");
 
+    /* /dev/fb0 writes land in memory virtio-gpu never reads from on its
+       own -- push the whole dirty rect to the real display explicitly.
+       Custom syscall 406 (SYS_fb_flush), no-op if virtio-gpu isn't the
+       active display (GOP framebuffer is scanned directly instead). */
+    write_str("[test_raw_fb] Flushing to display (syscall 406)...\n");
+    syscall(406, 0, 0, W, H);
+
     /* Keep it visible — wait for any keypress via read on stdin */
     write_str("[test_raw_fb] Press Enter to exit...\n");
     char buf[1];

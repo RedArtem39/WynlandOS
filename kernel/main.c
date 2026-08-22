@@ -25,9 +25,12 @@
 #include <wynland/wlang.h>
 #include <wynland/net.h>
 #include <wynland/tcp.h>
+#include <wynland/udpsock.h>
 #include <wynland/http.h>
 #include <wynland/wynpkg.h>
 #include <wynland/elf.h>
+#include <wynland/process.h>
+#include <wynland/rtc.h>
 
 /* GUI Compositor */
 extern void compositor_init(BootInfo *info);
@@ -1655,47 +1658,33 @@ static void execute_command(BootInfo *info, const char *cmd)
         char resolved[512];
         resolve_path(arg, resolved);
 
-        PageTable *pml4 = vmm_get_current_pml4();
-        LoadedPages *lp = kmalloc(sizeof(LoadedPages));
-        uint64_t entry_point = 0;
-        uint64_t stack_top = 0;
+        // Flush serial FIFO to prevent leftover input from leaking into the child process
+        extern bool serial_received(void);
+        extern char serial_read_char(void);
+        while (serial_received()) {
+            serial_read_char();
+        }
 
-        if (!elf_load(resolved, &entry_point, &stack_top, pml4, lp)) {
+        console_print_string(info, "Launching user ELF binary in its own process...\n", 0x0000FF00, term_bg_color);
+        /* uid=1000, not PROC_UID_INHERIT: this Ring-0 debug shell runs as
+           part of kernel Process 0 (uid 0); a manually exec'd program
+           should come up as a normal user, same as the boot-time launches
+           below, not silently as root. */
+        Process *p = process_spawn(resolved, NULL, 1000);
+
+        if (!p) {
             console_print_string(info, "exec: failed to load ELF file: ", 0x00FF0000, term_bg_color);
             console_print_string(info, resolved, 0x00FFFFFF, term_bg_color);
             console_print_string(info, "\n", 0, term_bg_color);
-            kfree(lp);
         } else {
-            typedef struct {
-                void *entry;
-                void *stack;
-            } ExecArg;
-
-            extern void user_exec_wrapper(void *arg);
-            ExecArg *earg = kmalloc(sizeof(ExecArg));
-            earg->entry = (void *)entry_point;
-            earg->stack = (void *)stack_top;
-
-            // Flush serial FIFO to prevent leftover input from leaking into the child process
-            extern bool serial_received(void);
-            extern char serial_read_char(void);
-            while (serial_received()) {
-                serial_read_char();
-            }
-
-            console_print_string(info, "Launching user ELF binary in Ring 3...\n", 0x0000FF00, term_bg_color);
-            Thread *t = thread_create(user_exec_wrapper, earg);
-
-            while (t->state != THREAD_STATE_TERMINATED) {
+            while (p->main_thread->state != THREAD_STATE_TERMINATED) {
                 sched_yield();
             }
 
-            // Clean up mapped user pages and physical pages
-            for (int i = 0; i < lp->count; i++) {
-                vmm_unmap_page(pml4, lp->virt_addrs[i]);
-                pmm_free_page(lp->phys_pages[i]);
-            }
-            kfree(lp);
+            // NOTE: page/PML4 reclamation on process exit isn't implemented
+            // yet (Phase 0 is address-space isolation, not process teardown)
+            // -- matches the pre-existing SYS_execve behavior, which also
+            // never frees a replaced image's pages.
             console_print_string(info, "Process exited.\n", 0x0000FF00, term_bg_color);
         }
     } else if (str_compare(cmd, "clear") == 0) {
@@ -2496,8 +2485,19 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize Scheduler ---- */
     sched_init();
 
+    /* ---- Initialize Process 0 (kernel) and wire it to Thread 0 ---- */
+    process_init();
+
     /* ---- Initialize IRQs ---- */
     irq_init();
+
+    /* ---- Real wall-clock time: read the CMOS RTC now that the PIT (used
+       to track elapsed time since this read) is running. Fixes the
+       long-standing "OS thinks it's some default past time" gap --
+       needed for real HTTPS cert-date validation and correct file
+       timestamps. Timezone auto-detection happens later, once the
+       network is up (see net_dhcp_request() below). ---- */
+    rtc_init();
 
     /* ---- Initialize Mouse ---- */
     mouse_init(boot_info);
@@ -2522,9 +2522,75 @@ void kernel_main(BootInfo *boot_info)
     vfs_create("/dev/dri/card0");
     vfs_create("/dev/dri/renderD128");
 
+    /* Phase 5: the one concrete protected resource demonstrating the new
+       real permission boundary -- created writable, populated, THEN
+       marked FAT32_ATTR_READONLY (must write the content before locking
+       it, since vfs_set_readonly() only flips the on-disk attribute bit,
+       it doesn't itself bypass write-protection). A natural bootstrapping
+       example: changing the elevation password later requires already
+       being root.
+       Name is "sudopw" (6 chars), not "wynpasswd" -- FAT32 8.3 short
+       names cap the name portion at 8 characters, vfs_create() doesn't
+       generate an LFN entry, and "wynpasswd" (9 chars) silently produced
+       a directory entry that a same-name lookup could never find again
+       (caught live: vfs_create() reported success, the very next
+       vfs_lookup_path() call for the identical path failed). */
+    vfs_mkdir("/etc"); /* no-op if it already exists, matching the /dev calls above */
+    if (vfs_create("/etc/sudopw")) {
+        VfsFile *pwfile = vfs_open_flags("/etc/sudopw", VFS_O_WRITE);
+        if (pwfile) {
+            const char *pw_content = "wynland\n";
+            vfs_write(pwfile, pw_content, 8);
+            vfs_close(pwfile);
+        }
+        vfs_set_readonly("/etc/sudopw");
+    }
+
     /* ---- Initialize Network Stack ---- */
     net_init();
     tcp_init();
+    udp_socket_init();
+
+    /* Automatically request a DHCP lease and write /etc/resolv.conf so
+       real Ring-3 programs' standard DNS resolvers (musl's getaddrinfo(),
+       via a real socket()+sendto()/recvfrom() UDP round-trip) can find
+       a real nameserver -- matching how every real Linux system boots,
+       rather than requiring a manual "dhcp" shell command first.
+       Best-effort: if there's no network configured for this boot (e.g.
+       QEMU launched with no NIC), net_dhcp_request() just returns false
+       and nothing else regresses -- apps simply have no DNS, same as
+       before this phase existed. */
+    if (net_dhcp_request()) {
+        /* vfs_create() only makes the directory entry -- call it
+           unconditionally (ignoring its return value, which is false
+           if the file already exists from a prior boot) and always
+           follow up with an open-for-write, so the nameserver line
+           gets refreshed every boot rather than only the very first
+           time this file is ever created. */
+        vfs_create("/etc/resolv.conf");
+        {
+            VfsFile *rf = vfs_open_flags("/etc/resolv.conf", VFS_O_WRITE | VFS_O_TRUNC);
+            if (rf) {
+                char ip_str[20];
+                net_ip_to_str(net_get_dns(), ip_str);
+                char line[64];
+                uint32_t pos = 0;
+                const char *prefix = "nameserver ";
+                for (const char *p = prefix; *p; p++) line[pos++] = *p;
+                for (const char *p = ip_str; *p; p++) line[pos++] = *p;
+                line[pos++] = '\n';
+                vfs_write(rf, line, pos);
+                vfs_close(rf);
+            }
+        }
+
+        /* Best-effort timezone auto-detection (IP geolocation, no
+           hardcoded location anywhere in this source tree -- see
+           kernel/rtc.c). Only attempted if DHCP/DNS actually came up;
+           tz_auto_detect() itself leaves everything at UTC on any
+           failure rather than ever guessing wrong. */
+        tz_auto_detect();
+    }
 
     /* ---- Draw gradient background ---- */
     serial_write_string("Main: Drawing gradient background...\r\n");
@@ -2591,21 +2657,26 @@ void kernel_main(BootInfo *boot_info)
     /* Draw initial prompt */
     console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
 
-    /* Auto-start Hyprland at boot */
+    /* Auto-start Hyprland at boot -- now in its own isolated process
+       (process_spawn(), kernel/process.c) instead of loading into the
+       shared kernel address space. */
     console_print_string(boot_info, "Auto-launching Hyprland...\n", 0x0000FF00, term_bg_color);
-    PageTable *pml4 = vmm_get_current_pml4();
-    LoadedPages *lp = kmalloc(sizeof(LoadedPages));
-    uint64_t entry_point = 0;
-    uint64_t stack_top = 0;
-    if (elf_load("/hyprland.wyn", &entry_point, &stack_top, pml4, lp)) {
-        typedef struct { void *entry; void *stack; } ExecArg;
-        extern void user_exec_wrapper(void *arg);
-        ExecArg *earg = kmalloc(sizeof(ExecArg));
-        earg->entry = (void *)entry_point; earg->stack = (void *)stack_top;
-        thread_create(user_exec_wrapper, earg);
-    } else {
+    /* uid=1000: the actual demotion point -- the kernel (uid 0) hands off
+       to a normal-user session here, like a real init spawning a login
+       shell. See Phase 5's Process.uid / process_spawn() plan notes. */
+
+    if (!process_spawn("/hyprland.wyn", NULL, 1000)) {
         console_print_string(boot_info, "Failed to load /hyprland.wyn\n", 0x00FF0000, term_bg_color);
     }
+
+    /* Zerp v0 -- additive alongside hyprland.wyn for now (Phase 4
+       verification), not yet the default launch. hyprland.wyn crashes
+       early during its own dynamic-loader mmap, well before drawing
+       anything, so it doesn't race with Zerp's /dev/fb0 writes in
+       practice. */
+    console_print_string(boot_info, "Auto-launching Zerp...\n", 0x0000FF00, term_bg_color);
+    process_spawn("/zerp.elf", NULL, 1000);
+
     static bool was_gui_active = false;
     while (1) {
         extern bool wm_is_gui_active(void);

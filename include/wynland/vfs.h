@@ -35,6 +35,11 @@ typedef struct {
     uint32_t size;
     bool is_dir;
     uint32_t first_cluster;
+    bool readonly; /* Phase 5: mirrors the on-disk FAT32_ATTR_READONLY bit.
+                       SYS_open() enforces write-open denial for non-root
+                       processes against this -- the OS's one real
+                       permission boundary, since FAT32 has no owner/mode
+                       bits to build a fuller model on. */
 } VfsNode;
 
 typedef struct {
@@ -81,3 +86,4 @@ bool vfs_mkdir(const char *path);
 bool vfs_create(const char *path);
 bool vfs_delete(const char *path);
 bool vfs_stat(const char *path, VfsStat *out);
+bool vfs_set_readonly(const char *path); /* Phase 5: mark FAT32_ATTR_READONLY */

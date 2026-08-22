@@ -68,6 +68,12 @@ void comp_draw_glass_surface(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 uint32_t *comp_get_backbuffer(void);
 uint32_t  comp_get_width(void);
 uint32_t  comp_get_height(void);
+uint64_t  comp_get_backbuffer_phys(void);
+
+/* Physical address of whichever framebuffer is actually being scanned out
+   right now (back-buffer when virtio-gpu owns the display, raw GOP
+   framebuffer otherwise). See gui/compositor.c for why these two differ. */
+uint64_t  fb_active_phys_addr(void);
 
 /* ---- Mark dirty ---- */
 void comp_mark_dirty(void);
