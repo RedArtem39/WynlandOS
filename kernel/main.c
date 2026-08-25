@@ -1562,59 +1562,42 @@ static void execute_command(BootInfo *info, const char *cmd)
             console_print_string(info, "\n", 0, term_bg_color);
         }
     } else if (str_compare(cmd, "disk_dump") == 0) {
-        extern uint32_t first_data_sector;
-        extern uint32_t root_cluster;
-        extern uint32_t reserved_sectors;
-        extern uint32_t fat_count;
-        extern uint32_t sectors_per_fat;
-        
         char buf[64];
-        console_print_string(info, "reserved_sectors:  ", 0x00CCCCCC, term_bg_color);
-        uint_to_str(reserved_sectors, buf);
-        console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
-        console_print_string(info, "\n", 0, term_bg_color);
-        
-        console_print_string(info, "fat_count:         ", 0x00CCCCCC, term_bg_color);
-        uint_to_str(fat_count, buf);
+        console_print_string(info, "root partition LBA: ", 0x00CCCCCC, term_bg_color);
+        uint_to_str(ext2_fs_root_lba(), buf);
         console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n", 0, term_bg_color);
 
-        console_print_string(info, "sectors_per_fat:   ", 0x00CCCCCC, term_bg_color);
-        uint_to_str(sectors_per_fat, buf);
+        console_print_string(info, "root sectors:       ", 0x00CCCCCC, term_bg_color);
+        uint_to_str(ext2_fs_root_sectors(), buf);
         console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n", 0, term_bg_color);
 
-        console_print_string(info, "first_data_sector: ", 0x00CCCCCC, term_bg_color);
-        uint_to_str(first_data_sector, buf);
+        console_print_string(info, "block_size:         ", 0x00CCCCCC, term_bg_color);
+        uint_to_str(ext2_fs_block_size(), buf);
         console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n", 0, term_bg_color);
-        
-        console_print_string(info, "root_cluster:      ", 0x00CCCCCC, term_bg_color);
-        uint_to_str(root_cluster, buf);
+
+        console_print_string(info, "block groups:       ", 0x00CCCCCC, term_bg_color);
+        uint_to_str(ext2_fs_groups(), buf);
         console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
         console_print_string(info, "\n", 0, term_bg_color);
-        
-        extern bool ahci_read(uint32_t lba, uint32_t count, void *buf);
-        uint8_t temp[512];
-        uint32_t root_sector = first_data_sector + (root_cluster - 2) * 1;
-        if (ahci_read(root_sector, 1, temp)) {
-            console_print_string(info, "Root sector dump (first 128 bytes):\n", 0x00FFFF00, term_bg_color);
-            const char *hex_chars = "0123456789ABCDEF";
-            for (int r = 0; r < 4; r++) {
-                for (int c = 0; c < 32; c++) {
-                    uint8_t val = temp[r * 32 + c];
-                    char hex_buf[4];
-                    hex_buf[0] = hex_chars[(val >> 4) & 0x0F];
-                    hex_buf[1] = hex_chars[val & 0x0F];
-                    hex_buf[2] = ' ';
-                    hex_buf[3] = '\0';
-                    console_print_string(info, hex_buf, 0x00FFFFFF, term_bg_color);
-                }
-                console_print_string(info, "\n", 0, term_bg_color);
-            }
-        } else {
-            console_print_string(info, "Error: Failed to read root sector!\n", 0x00FF0000, term_bg_color);
-        }
+
+        console_print_string(info, "inodes:             ", 0x00CCCCCC, term_bg_color);
+        uint_to_str(ext2_fs_inodes_count(), buf);
+        console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
+        uint_to_str(ext2_fs_free_inodes(), buf);
+        console_print_string(info, " (free: ", 0x00CCCCCC, term_bg_color);
+        console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
+        console_print_string(info, ")\n", 0, term_bg_color);
+
+        console_print_string(info, "blocks:             ", 0x00CCCCCC, term_bg_color);
+        uint_to_str(ext2_fs_blocks_count(), buf);
+        console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
+        uint_to_str(ext2_fs_free_blocks(), buf);
+        console_print_string(info, " (free: ", 0x00CCCCCC, term_bg_color);
+        console_print_string(info, buf, 0x00FFFFFF, term_bg_color);
+        console_print_string(info, ")\n", 0, term_bg_color);
     } else if (str_compare(cmd, "tasks") == 0) {
         sched_print_tasks(info, term_bg_color);
     } else if (str_compare(cmd, "sched_test") == 0) {

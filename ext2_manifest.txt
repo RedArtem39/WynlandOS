@@ -1,0 +1,144 @@
+# WynlandOS ext2 root filesystem manifest
+#
+# Transcribed 1:1 from the old FAT32 Makefile's mmd/mcopy recipe
+# (Phase 20e), with exact-duplicate host->image mappings de-duplicated
+# (mtools' -o silently overwrote them; debugfs write fails on an
+# existing destination, so they must not appear twice).
+#
+# D  /dir              -- directory
+# F  /dest host/src    -- required file (build fails if missing)
+# Fo /dest host/src    -- optional file (skipped if host source absent)
+#
+# NOTE: debugfs `write` fails COMPLETELY SILENTLY if the destination's
+# parent directory isn't in the D list. Every F below must have its
+# parents declared; build_ext2_image.py verifies every required
+# destination afterwards and fails the build loudly otherwise.
+
+D /lib
+D /lib/platforms
+D /lib/fonts
+D /plugins
+D /plugins/platforms
+D /tmp
+D /etc
+D /etc/hypr
+D /lib64
+D /lib64/dri
+D /dev
+D /dev/dri
+D /etc/glvnd
+D /etc/glvnd/egl_vendor.d
+D /usr
+D /usr/bin
+D /usr/share
+D /usr/share/glvnd
+D /usr/share/glvnd/egl_vendor.d
+D /etc/ssl
+
+# ---- test/regression binaries ----
+F  /test.bin            build/test.bin
+F  /test_cpp.bin        build/test_cpp.bin
+F  /test_dev.bin        build/test_dev.bin
+F  /test_qt.bin         build/test_qt.bin
+F  /t_clone.bin         build/t_clone.bin
+F  /test.elf            build/test.elf
+F  /test_cpp.elf        build/test_cpp.elf
+F  /test_dev.elf        build/test_dev.elf
+F  /test_qt.elf         build/test_qt.elf
+F  /t_clone.elf         build/t_clone.elf
+Fo /qtreal.elf          build/test_qt_real.elf
+F  /test_raw_fb.elf     build/test_raw_fb.elf
+F  /t_dyn.elf           build/main_dynamic.elf
+F  /lib/ld-dummy.so     build/interp.elf
+
+# ---- musl cross-toolchain runtime ----
+F  /lib/ld-musl-x86_64.so.1    tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libc.so
+F  /lib/libstdc++.so.6         tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29
+F  /lib/libstdc++.so.6.0.29    tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29
+F  /lib/libgcc_s.so.1          tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libgcc_s.so.1
+
+# ---- Qt6 (optional: built separately when present) ----
+Fo /lib/libQt6Core.so.6.5.2      build/lib/libQt6Core.so.6.5.2
+Fo /lib/libQt6Core.so.6          build/lib/libQt6Core.so.6.5.2
+Fo /lib/libQt6Gui.so.6.5.2       build/lib/libQt6Gui.so.6.5.2
+Fo /lib/libQt6Gui.so.6           build/lib/libQt6Gui.so.6.5.2
+Fo /lib/libQt6DBus.so.6.5.2      build/lib/libQt6DBus.so.6.5.2
+Fo /lib/libQt6DBus.so.6          build/lib/libQt6DBus.so.6.5.2
+Fo /lib/libQt6Widgets.so.6.5.2   build/lib/libQt6Widgets.so.6.5.2
+Fo /lib/libQt6Widgets.so.6       build/lib/libQt6Widgets.so.6.5.2
+Fo /lib/platforms/libqwynlandfb.so       build/plugins/platforms/libqwynlandfb.so
+Fo /plugins/platforms/libqwynlandfb.so   build/plugins/platforms/libqwynlandfb.so
+Fo /lib/fonts/DejaVuSans.ttf     build/lib/fonts/DejaVuSans.ttf
+
+# ---- Wynlang scripts & config ----
+F  /app.was             app.wasm
+F  /hello.wyn           hello.wyn
+F  /hyprland.conf       hyprland.conf
+Fo /nixos_hyprland.conf external/nixos-configuration/config/sessions/hyprland/hyprland.conf
+Fo /nixos_settings.conf external/nixos-configuration/config/sessions/hyprland/config/settings.conf
+F  /wynui.wyn           wynui.wyn
+F  /node.wyn            node.wyn
+F  /script.js           script.js
+F  /hyprland.wyn        hyprland_stripped.wyn
+
+# ---- glibc-hosted dynamic loader + shared libs (Hyprland port deps) ----
+F  /lib64/ld-linux-x86-64.so.2      /lib64/ld-linux-x86-64.so.2
+F  /lib64/libc.so.6                 /usr/lib/x86_64-linux-gnu/libc.so.6
+F  /lib64/libm.so.6                 /usr/lib/x86_64-linux-gnu/libm.so.6
+F  /lib64/libgcc_s.so.1             /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
+F  /lib64/libstdc++.so.6            /usr/lib/x86_64-linux-gnu/libstdc++.so.6
+F  /lib64/libEGL.so.1               /usr/lib/x86_64-linux-gnu/libEGL.so.1
+F  /lib64/libGLESv2.so.2            /usr/lib/x86_64-linux-gnu/libGLESv2.so.2
+F  /lib64/libdrm.so.2               /usr/lib/x86_64-linux-gnu/libdrm.so.2
+F  /lib64/libgbm.so.1               /usr/lib/x86_64-linux-gnu/libgbm.so.1
+F  /lib64/libGLdispatch.so.0        /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0
+F  /lib64/libexpat.so.1             /usr/lib/x86_64-linux-gnu/libexpat.so.1
+Fo /lib64/libwayland-server.so.0    /usr/lib/x86_64-linux-gnu/libwayland-server.so.0
+F  /lib64/libxcb-present.so.0       /usr/lib/x86_64-linux-gnu/libxcb-present.so.0
+F  /lib64/libdrm_amdgpu.so.1        /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1
+F  /lib64/libX11-xcb.so.1           /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1
+F  /lib64/libgallium-26.0.3-1ubuntu1.so /usr/lib/x86_64-linux-gnu/libgallium-26.0.3-1ubuntu1.so
+F  /lib64/libxshmfence.so.1         /usr/lib/x86_64-linux-gnu/libxshmfence.so.1
+F  /lib64/libelf.so.1               /usr/lib/x86_64-linux-gnu/libelf.so.1
+F  /lib64/libbsd.so.0               /usr/lib/x86_64-linux-gnu/libbsd.so.0
+F  /lib64/libzstd.so.1              /usr/lib/x86_64-linux-gnu/libzstd.so.1
+F  /lib64/libxcb-sync.so.1          /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1
+F  /lib64/libedit.so.2              /usr/lib/x86_64-linux-gnu/libedit.so.2
+F  /lib64/libXau.so.6               /usr/lib/x86_64-linux-gnu/libXau.so.6
+F  /lib64/libLLVM.so.21.1           /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1
+F  /lib64/libxcb-dri3.so.0          /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0
+F  /lib64/libxcb-randr.so.0         /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0
+F  /lib64/libffi.so.8               /usr/lib/x86_64-linux-gnu/libffi.so.8
+F  /lib64/libxcb-xfixes.so.0        /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0
+F  /lib64/libtinfo.so.6             /usr/lib/x86_64-linux-gnu/libtinfo.so.6
+F  /lib64/libXdmcp.so.6             /usr/lib/x86_64-linux-gnu/libXdmcp.so.6
+F  /lib64/libsensors.so.5           /usr/lib/x86_64-linux-gnu/libsensors.so.5
+F  /lib64/libwayland-client.so.0    /usr/lib/x86_64-linux-gnu/libwayland-client.so.0
+F  /lib64/libEGL_mesa.so.0          /usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0
+F  /lib64/libpciaccess.so.0         /usr/lib/x86_64-linux-gnu/libpciaccess.so.0
+F  /lib64/libX11.so.6               /usr/lib/x86_64-linux-gnu/libX11.so.6
+F  /lib64/libdrm_intel.so.1         /usr/lib/x86_64-linux-gnu/libdrm_intel.so.1
+F  /lib64/libxml2.so.16             /usr/lib/x86_64-linux-gnu/libxml2.so.16
+F  /lib64/libz.so.1                 /usr/lib/x86_64-linux-gnu/libz.so.1
+F  /lib64/libmd.so.0                /usr/lib/x86_64-linux-gnu/libmd.so.0
+F  /lib64/libxcb-shm.so.0           /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0
+F  /lib64/dri/swrast_dri.so         /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so
+
+# ---- DRM device stubs (kernel recreates them at boot anyway) ----
+F  /dev/dri/card0                   build/card0
+F  /dev/dri/renderD128              build/renderD128
+
+# ---- GLVND vendor config ----
+F  /etc/glvnd/egl_vendor.d/50_mesa.json     /usr/share/glvnd/egl_vendor.d/50_mesa.json
+F  /usr/share/glvnd/egl_vendor.d/50_mesa.json /usr/share/glvnd/egl_vendor.d/50_mesa.json
+
+# ---- Userspace software ported in Phases 13-19 ----
+# First time part of the real repeatable build. Host paths follow where
+# each phase staged its musl-built binaries; entries whose host source
+# is absent on a given machine are marked optional so `make image`
+# still succeeds everywhere.
+Fo /usr/bin/curl                  build/ports/curl
+Fo /usr/bin/nano                  build/ports/nano
+Fo /usr/bin/cmake                 build/ports/cmake
+Fo /usr/bin/pkgconf               build/ports/pkgconf
+Fo /etc/ssl/cert.pem              build/ports/cert.pem

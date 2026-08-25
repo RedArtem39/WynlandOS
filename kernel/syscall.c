@@ -629,17 +629,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 VfsFile *file = vfs_open_flags((const char *)a1, vfs_flags);
                 if (!file) return (uint64_t)-2;
 
-                /* Phase 5: the OS's one real permission boundary -- a
-                   readonly-flagged (FAT32_ATTR_READONLY) node can't be
-                   opened for writing by a non-root process. See
-                   include/wynland/vfs.h's VfsNode.readonly comment for
-                   why this is the enforcement point rather than a full
-                   rwx-owner/group/other model (FAT32 has no such bits). */
-                if (file->node.readonly &&
-                    (vfs_flags & (0x02 /* VFS_O_WRITE */ | 0x10 /* VFS_O_TRUNC */ | 0x08 /* VFS_O_APPEND */)) &&
-                    sched_current()->proc->uid != 0) {
-                    kfree(file);
-                    return (uint64_t)-13; /* -EACCES */
+                /* Real permission enforcement backed by the ext2 inode's
+                   own owner + mode bits (replaces the old FAT32
+                   readonly-attribute hack). Owner-vs-other model: the
+                   Process struct has no gid, so there is honestly no
+                   group dimension to check against -- documented as
+                   such rather than overclaimed. Root bypasses. */
+                if ((vfs_flags & (0x01 /* VFS_O_READ */ |
+                                  0x02 /* VFS_O_WRITE */ |
+                                  0x10 /* VFS_O_TRUNC */ |
+                                  0x08 /* VFS_O_APPEND */))) {
+                    uint32_t puid = sched_current()->proc->uid;
+                    if (puid != 0) {
+                        uint32_t want = 0;
+                        if (vfs_flags & 0x01) want |= 04;
+                        if (vfs_flags & (0x02 | 0x10 | 0x08)) want |= 02;
+                        uint32_t have = (puid == file->node.uid)
+                            ? ((file->node.mode >> 6) & 7)
+                            : (file->node.mode & 7);
+                        if ((have & want) != want) {
+                            kfree(file);
+                            return (uint64_t)-13; /* -EACCES */
+                        }
+                    }
                 }
 
                 fd_table[fd] = file;
@@ -1978,7 +1990,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
                     return (uint64_t)-9; /* -EBADF */
                 }
-                extern int vfs_getdents(void *file, void *dirp, uint32_t count);
                 return (uint64_t)vfs_getdents(fd_table[fd], (void *)a2, (uint32_t)a3);
             }
 

@@ -1,7 +1,11 @@
 /*
  * WynlandOS - Virtual Filesystem (VFS) Header
  *
- * Phase 4: Full FAT32 read/write support with VFS abstraction
+ * The API surface the rest of the kernel programs against. Since the
+ * ext2 migration this header is filesystem-neutral: the implementation
+ * lives in drivers/fs/ext2.c (root filesystem) and drivers/fs/mbr.c
+ * (partition discovery). The previous FAT32 implementation is kept
+ * dormant as drivers/fs/vfs.c.dormant.
  */
 #pragma once
 
@@ -22,35 +26,36 @@
 #define VFS_SEEK_CUR  1
 #define VFS_SEEK_END  2
 
-/* FAT32 attributes */
-#define FAT32_ATTR_READONLY  0x01
-#define FAT32_ATTR_HIDDEN    0x02
-#define FAT32_ATTR_SYSTEM    0x04
-#define FAT32_ATTR_VOLUME_ID 0x08
-#define FAT32_ATTR_DIRECTORY 0x10
-#define FAT32_ATTR_ARCHIVE   0x20
+/* Device sentinels carried in VfsNode.first_cluster for synthetic
+   nodes. Real files carry their ext2 inode number in this field; inode
+   counts can never approach the sentinel range. kernel/syscall.c checks
+   these directly in ~40 places -- do not renumber. */
+#define DEV_FB0       0xFFFFFFF0
+#define DEV_MICE      0xFFFFFFF1
+#define DEV_TTY       0xFFFFFFF2
+#define DEV_KBD       0xFFFFFFF3
+#define DEV_NULL      0xFFFFFFFE
+#define DEV_URANDOM   0xFFFFFFF8
 
 typedef struct {
     char name[MAX_FILENAME];
     uint32_t size;
     bool is_dir;
-    uint32_t first_cluster;
-    bool readonly; /* Phase 5: mirrors the on-disk FAT32_ATTR_READONLY bit.
-                       SYS_open() enforces write-open denial for non-root
-                       processes against this -- the OS's one real
-                       permission boundary, since FAT32 has no owner/mode
-                       bits to build a fuller model on. */
+    uint32_t first_cluster; /* real file: ext2 inode number; devices: DEV_* sentinel */
+    bool readonly;          /* true iff no write bit at all in the ext2 mode */
+    uint16_t mode;          /* ext2 i_mode & 07777 -- real permission bits */
+    uint32_t uid;           /* ext2 i_uid -- real ownership */
 } VfsNode;
 
 typedef struct {
     VfsNode  node;
     uint32_t offset;
-    uint32_t current_cluster;
-    uint32_t current_cluster_offset; /* Byte offset within current cluster */
+    uint32_t current_cluster;        /* unused under ext2 (kept: ABI + syscall.c sentinels) */
+    uint32_t current_cluster_offset; /* unused under ext2 */
     uint32_t flags;                  /* VFS_O_* flags */
-    uint32_t dir_entry_sector;       /* LBA sector of this file's directory entry */
-    uint32_t dir_entry_offset;       /* Byte offset within that sector (0..480) */
-    bool     dirty;                  /* File metadata changed, needs flush on close */
+    uint32_t dir_entry_sector;       /* unused under ext2 */
+    uint32_t dir_entry_offset;       /* unused under ext2 */
+    bool     dirty;
 } VfsFile;
 
 /* File statistics */
@@ -58,12 +63,12 @@ typedef struct {
     char     name[MAX_FILENAME];
     uint32_t size;
     bool     is_dir;
-    uint32_t first_cluster;
-    uint16_t create_time;
+    uint32_t first_cluster; /* consumers pass this on as st_ino */
+    uint16_t create_time;   /* FAT-era fields, zeroed under ext2 */
     uint16_t create_date;
     uint16_t write_time;
     uint16_t write_date;
-    uint8_t  attr;
+    uint8_t  attr;          /* low byte of the ext2 mode */
 } VfsStat;
 
 /* ---- Core VFS API ---- */
@@ -81,9 +86,21 @@ uint32_t vfs_tell(VfsFile *file);
 /* Directory operations */
 bool vfs_readdir(const char *path, void (*callback)(VfsNode *node));
 bool vfs_mkdir(const char *path);
+int  vfs_getdents(VfsFile *file, void *dirp, uint32_t count); /* linux_dirent64 */
 
 /* File management */
 bool vfs_create(const char *path);
 bool vfs_delete(const char *path);
+bool vfs_rename(const char *oldpath, const char *newpath);
 bool vfs_stat(const char *path, VfsStat *out);
-bool vfs_set_readonly(const char *path); /* Phase 5: mark FAT32_ATTR_READONLY */
+bool vfs_set_readonly(const char *path); /* clears all write bits in i_mode */
+
+/* ---- ext2 mount diagnostics (shell disk_dump etc.) ---- */
+uint32_t ext2_fs_block_size(void);
+uint32_t ext2_fs_groups(void);
+uint32_t ext2_fs_inodes_count(void);
+uint32_t ext2_fs_blocks_count(void);
+uint32_t ext2_fs_free_blocks(void);
+uint32_t ext2_fs_free_inodes(void);
+uint32_t ext2_fs_root_lba(void);
+uint32_t ext2_fs_root_sectors(void);

@@ -166,6 +166,18 @@ KERNEL_ELF     = $(BUILD)/kernel.elf
 DISK_IMAGE     = $(BUILD)/wynland.img
 OVMF_FW        = tools/ovmf/OVMF.fd
 
+# Two-partition disk layout (real MBR): a small FAT32 ESP holding only
+# what UEFI firmware needs (BOOTX64.EFI + kernel.elf), plus the ext2
+# root partition populated from ext2_manifest.txt. All 1MiB-aligned.
+# ESP must stay >= 64MB: below ~65525 clusters real OVMF firmware
+# refuses the FAT32 volume that mtools still accepts (Phase 20a finding).
+ESP_SIZE_MB    = 64
+TOTAL_IMG_MB   = 2048
+ESP_PART_IMG   = $(BUILD)/esp_part.img
+EXT2_PART_IMG  = $(BUILD)/ext2_part.img
+MBR_SECT       = $(BUILD)/mbr.bin
+EXT2_MANIFEST  = ext2_manifest.txt
+
 # ============================================================================
 # Targets
 # ============================================================================
@@ -327,128 +339,36 @@ $(BUILD)/lib/fonts/DejaVuSans.ttf: qtbase/src/3rdparty/wasm/DejaVuSans.ttf
 
 image: bootloader kernel $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_raw_fb.elf $(BUILD)/lib/fonts/DejaVuSans.ttf $(DISK_IMAGE)
 
-$(DISK_IMAGE): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/test.bin $(BUILD)/test_cpp.bin $(BUILD)/test_dev.bin $(BUILD)/test_qt.bin $(BUILD)/t_clone.bin $(BUILD)/interp.elf $(BUILD)/main_dynamic.elf $(BUILD)/test_raw_fb.elf $(BUILD)/lib/fonts/DejaVuSans.ttf
-	@echo "  IMG        Creating FAT32 disk image..."
-	@dd if=/dev/zero of=$@ bs=1M count=1024 status=none
-	@mformat -i $@ -F -v WYNLAND ::
+$(BUILD)/card0:
+	@echo "mock" > $@
+
+$(BUILD)/renderD128:
+	@echo "mock" > $@
+
+# ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
+# populated from the manifest, verified file-by-file afterwards.
+$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128
+	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
+	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
+
+# ESP partition image: FAT32, firmware-loadable content only.
+$(ESP_PART_IMG): $(BOOTLOADER_EFI) $(KERNEL_ELF)
+	@echo "  IMG        Building FAT32 ESP partition..."
+	@mformat -i $@ -C -T $$(( $(ESP_SIZE_MB) * 2048 )) -F -v WYNLAND ::
 	@mmd -i $@ ::/EFI
 	@mmd -i $@ ::/EFI/BOOT
-	@mmd -i $@ ::/lib
-	@mmd -i $@ ::/lib/platforms
-	-@mmd -i $@ ::/lib/fonts
-	-@mmd -i $@ ::/plugins
-	-@mmd -i $@ ::/plugins/platforms
-	-@mmd -i $@ ::/tmp
-	-@mmd -i $@ ::/etc
-	-@mmd -i $@ ::/etc/hypr
 	@mcopy -o -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -o -i $@ $(KERNEL_ELF) ::/kernel.elf
-	@mcopy -o -i $@ $(BUILD)/test.bin ::/test.bin
-	@mcopy -o -i $@ $(BUILD)/test_cpp.bin ::/test_cpp.bin
-	@mcopy -o -i $@ $(BUILD)/test_dev.bin ::/test_dev.bin
-	@mcopy -o -i $@ $(BUILD)/test_qt.bin ::/test_qt.bin
-	@mcopy -o -i $@ $(BUILD)/t_clone.bin ::/t_clone.bin
-	@mcopy -o -i $@ $(BUILD)/test.elf ::/test.elf
-	@mcopy -o -i $@ $(BUILD)/test_cpp.elf ::/test_cpp.elf
-	@mcopy -o -i $@ $(BUILD)/test_dev.elf ::/test_dev.elf
-	@mcopy -o -i $@ $(BUILD)/test_qt.elf ::/test_qt.elf
-	@mcopy -o -i $@ $(BUILD)/t_clone.elf ::/t_clone.elf
-	-@mcopy -o -i $@ $(BUILD)/test_qt_real.elf ::/qtreal.elf
-	@mcopy -o -i $@ $(BUILD)/test_raw_fb.elf ::/test_raw_fb.elf
-	@mcopy -o -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libc.so ::/lib/ld-musl-x86_64.so.1
-	@mcopy -o -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29 ::/lib/libstdc++.so.6
-	@mcopy -o -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29 ::/lib/libstdc++.so.6.0.29
-	@mcopy -o -i $@ tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libgcc_s.so.1 ::/lib/libgcc_s.so.1
-	-@mcopy -o -i $@ build/lib/libQt6Core.so.6.5.2 ::/lib/libQt6Core.so.6
-	-@mcopy -o -i $@ build/lib/libQt6Core.so.6.5.2 ::/lib/libQt6Core.so.6.5.2
-	-@mcopy -o -i $@ build/lib/libQt6Gui.so.6.5.2 ::/lib/libQt6Gui.so.6
-	-@mcopy -o -i $@ build/lib/libQt6Gui.so.6.5.2 ::/lib/libQt6Gui.so.6.5.2
-	-@mcopy -o -i $@ build/lib/libQt6DBus.so.6.5.2 ::/lib/libQt6DBus.so.6
-	-@mcopy -o -i $@ build/lib/libQt6DBus.so.6.5.2 ::/lib/libQt6DBus.so.6.5.2
-	-@mcopy -o -i $@ build/lib/libQt6Widgets.so.6.5.2 ::/lib/libQt6Widgets.so.6
-	-@mcopy -o -i $@ build/lib/libQt6Widgets.so.6.5.2 ::/lib/libQt6Widgets.so.6.5.2
-	-@mcopy -o -i $@ build/plugins/platforms/libqwynlandfb.so ::/lib/platforms/libqwynlandfb.so
-	-@mcopy -o -i $@ build/plugins/platforms/libqwynlandfb.so ::/plugins/platforms/libqwynlandfb.so
-	-@mcopy -o -i $@ build/lib/fonts/DejaVuSans.ttf ::/lib/fonts/DejaVuSans.ttf
-	@mcopy -o -i $@ $(BUILD)/interp.elf ::/lib/ld-dummy.so
-	@mcopy -o -i $@ $(BUILD)/main_dynamic.elf ::/t_dyn.elf
-	@mcopy -o -i $@ app.wasm ::/app.was
-	@mcopy -o -i $@ hello.wyn ::/hello.wyn
-	@mcopy -o -i $@ hyprland.conf ::/hyprland.conf
-	-@mcopy -o -i $@ external/nixos-configuration/config/sessions/hyprland/hyprland.conf ::/nixos_hyprland.conf
-	-@mcopy -o -i $@ external/nixos-configuration/config/sessions/hyprland/config/settings.conf ::/nixos_settings.conf
-	@mcopy -o -i $@ wynui.wyn ::/wynui.wyn
-	@mcopy -o -i $@ node.wyn ::/node.wyn
-	@mcopy -o -i $@ script.js ::/script.js
-	@mmd -i $@ ::/lib64
-	@mcopy -o -i $@ hyprland_stripped.wyn ::/hyprland.wyn
-	@mcopy -o -i $@ /lib64/ld-linux-x86-64.so.2 ::/lib64/ld-linux-x86-64.so.2
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libc.so.6 ::/lib64/libc.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libm.so.6 ::/lib64/libm.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 ::/lib64/libgcc_s.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libstdc++.so.6 ::/lib64/libstdc++.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libEGL.so.1 ::/lib64/libEGL.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 ::/lib64/libGLESv2.so.2
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libdrm.so.2 ::/lib64/libdrm.so.2
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libgbm.so.1 ::/lib64/libgbm.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0 ::/lib64/libGLdispatch.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libexpat.so.1 ::/lib64/libexpat.so.1
-	-@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libwayland-server.so.0 ::/lib64/libwayland-server.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb-present.so.0 ::/lib64/libxcb-present.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libdrm_amdgpu.so.1 ::/lib64/libdrm_amdgpu.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libX11-xcb.so.1 ::/lib64/libX11-xcb.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libgbm.so.1 ::/lib64/libgbm.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb.so.1 ::/lib64/libxcb.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libgallium-26.0.3-1ubuntu1.so ::/lib64/libgallium-26.0.3-1ubuntu1.so
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxshmfence.so.1 ::/lib64/libxshmfence.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libelf.so.1 ::/lib64/libelf.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libc.so.6 ::/lib64/libc.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libbsd.so.0 ::/lib64/libbsd.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libzstd.so.1 ::/lib64/libzstd.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb-sync.so.1 ::/lib64/libxcb-sync.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 ::/lib64/libgcc_s.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libedit.so.2 ::/lib64/libedit.so.2
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libXau.so.6 ::/lib64/libXau.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libdrm.so.2 ::/lib64/libdrm.so.2
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libLLVM.so.21.1 ::/lib64/libLLVM.so.21.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb-dri3.so.0 ::/lib64/libxcb-dri3.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb-randr.so.0 ::/lib64/libxcb-randr.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libffi.so.8 ::/lib64/libffi.so.8
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb-xfixes.so.0 ::/lib64/libxcb-xfixes.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libstdc++.so.6 ::/lib64/libstdc++.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libm.so.6 ::/lib64/libm.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libtinfo.so.6 ::/lib64/libtinfo.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libGLESv2.so.2 ::/lib64/libGLESv2.so.2
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libXdmcp.so.6 ::/lib64/libXdmcp.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libsensors.so.5 ::/lib64/libsensors.so.5
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libwayland-client.so.0 ::/lib64/libwayland-client.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0 ::/lib64/libEGL_mesa.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libexpat.so.1 ::/lib64/libexpat.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libpciaccess.so.0 ::/lib64/libpciaccess.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libX11.so.6 ::/lib64/libX11.so.6
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libdrm_intel.so.1 ::/lib64/libdrm_intel.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxml2.so.16 ::/lib64/libxml2.so.16
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libz.so.1 ::/lib64/libz.so.1
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libGLdispatch.so.0 ::/lib64/libGLdispatch.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libmd.so.0 ::/lib64/libmd.so.0
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/libxcb-shm.so.0 ::/lib64/libxcb-shm.so.0
-	-@mmd -i $@ ::/dev
-	-@mmd -i $@ ::/dev/dri
-	-@echo "mock" > build/card0
-	-@echo "mock" > build/renderD128
-	@mcopy -o -i $@ build/card0 ::/dev/dri/card0
-	@mcopy -o -i $@ build/renderD128 ::/dev/dri/renderD128
-	-@mmd -i $@ ::/lib64/dri
-	@mcopy -o -i $@ /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so ::/lib64/dri/swrast_dri.so
-	-@mmd -i $@ ::/etc/glvnd
-	-@mmd -i $@ ::/etc/glvnd/egl_vendor.d
-	@mcopy -o -i $@ /usr/share/glvnd/egl_vendor.d/50_mesa.json ::/etc/glvnd/egl_vendor.d/50_mesa.json
-	-@mmd -i $@ ::/usr
-	-@mmd -i $@ ::/usr/share
-	-@mmd -i $@ ::/usr/share/glvnd
-	-@mmd -i $@ ::/usr/share/glvnd/egl_vendor.d
-	@mcopy -o -i $@ /usr/share/glvnd/egl_vendor.d/50_mesa.json ::/usr/share/glvnd/egl_vendor.d/50_mesa.json
-	@echo "  => wynland.img created (1024 MB)"
+
+# Final assembly: zeroed disk <- MBR sector <- ESP @1MiB <- ext2 root @1MiB+ESP.
+$(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG)
+	@echo "  IMG        Assembling MBR + ESP + ext2 disk image..."
+	@dd if=/dev/zero of=$@ bs=1M count=$(TOTAL_IMG_MB) status=none
+	@python3 make_mbr.py $(MBR_SECT) $(TOTAL_IMG_MB) $(ESP_SIZE_MB)
+	@dd if=$(MBR_SECT) of=$@ bs=512 count=1 conv=notrunc status=none
+	@dd if=$(ESP_PART_IMG) of=$@ bs=1M seek=1 conv=notrunc status=none
+	@dd if=$(EXT2_PART_IMG) of=$@ bs=1M seek=$$(( 1 + $(ESP_SIZE_MB) )) conv=notrunc status=none
+	@echo "  => wynland.img created ($(TOTAL_IMG_MB) MB, ESP $(ESP_SIZE_MB) MB + ext2 root)"
 
 # ---------- Run in QEMU ----------
 
@@ -506,5 +426,8 @@ check-tools:
 	@which $(CC_KERNEL) > /dev/null 2>&1 || (echo "ERROR: $(CC_KERNEL) not found." && exit 1)
 	@which $(AS) > /dev/null 2>&1       || (echo "ERROR: nasm not found. Run ./setup.sh" && exit 1)
 	@which mformat > /dev/null 2>&1     || (echo "ERROR: mtools not found. Run ./setup.sh" && exit 1)
+	@which mke2fs > /dev/null 2>&1      || (echo "ERROR: mke2fs (e2fsprogs) not found. Run ./setup.sh" && exit 1)
+	@which debugfs > /dev/null 2>&1     || (echo "ERROR: debugfs (e2fsprogs) not found. Run ./setup.sh" && exit 1)
+	@which python3 > /dev/null 2>&1     || (echo "ERROR: python3 not found." && exit 1)
 	@test -f $(OVMF_FW)                 || (echo "ERROR: OVMF firmware not found at $(OVMF_FW). Run ./setup.sh" && exit 1)
 	@echo "All tools found."
