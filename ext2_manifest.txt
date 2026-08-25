@@ -51,6 +51,15 @@ F  /test_raw_fb.elf     build/test_raw_fb.elf
 F  /t_dyn.elf           build/main_dynamic.elf
 F  /lib/ld-dummy.so     build/interp.elf
 
+# ---- staged application regression binaries ----
+# Real musl-static programs exercising distinct syscall mixes; the
+# Phase 20f-style verification spawns them from the ext2 root.
+Fo /test_zlib.elf       test_zlib.elf
+Fo /test_readdir.elf    build/test_readdir.elf
+Fo /test_fork.elf       test_fork.elf
+Fo /test_tcp.elf        build/test_tcp.elf
+Fo /test_dns.elf        build/test_dns.elf
+
 # ---- musl cross-toolchain runtime ----
 F  /lib/ld-musl-x86_64.so.1    tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libc.so
 F  /lib/libstdc++.so.6         tools/x86_64-linux-musl-cross/x86_64-linux-musl/lib/libstdc++.so.6.0.29

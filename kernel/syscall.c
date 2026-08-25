@@ -518,10 +518,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                redirected to something real via dup2(). */
             if ((a1 == 1 || a1 == 2) && fd_table[a1] == NULL) { // stdout/stderr
                 if (a3 == 0 || !a2) return 0;
+                extern bool g_quiet_console;
                 const char *cbuf = (const char *)a2;
                 for (uint64_t i = 0; i < a3; i++) {
                     char ch = cbuf[i];
-                    if (g_boot_info) {
+                    if (g_boot_info && !g_quiet_console) {
                         console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
                     }
                     char single[2] = {ch, '\0'};
@@ -577,12 +578,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 size_t total_written = 0;
 
                 if (a1 == 1 || a1 == 2) { // stdout/stderr
+                    extern bool g_quiet_console;
                     for (int i = 0; i < iovcnt; i++) {
                         if (iov[i].iov_base && iov[i].iov_len > 0) {
                             const char *cbuf = (const char *)iov[i].iov_base;
                             for (size_t j = 0; j < iov[i].iov_len; j++) {
                                 char ch = cbuf[j];
-                                if (g_boot_info) {
+                                if (g_boot_info && !g_quiet_console) {
                                     console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
                                 }
                                 char single[2] = {ch, '\0'};

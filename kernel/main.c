@@ -658,6 +658,13 @@ static void console_scroll(BootInfo *info)
     cursor_y--;
 }
 
+/* Headless app-verification flag: while set, /dev/tty writes skip
+   framebuffer drawing and go to serial only. TCG emulation costs ~2.5s
+   per full-screen console scroll, which makes any userspace printf run
+   minutes per line; real KVM/hardware is unaffected. Set only around
+   the boot-time app regression hook. */
+bool g_quiet_console = false;
+
 static void console_clear_current_line(BootInfo *info)
 {
     extern bool wm_is_gui_active(void);

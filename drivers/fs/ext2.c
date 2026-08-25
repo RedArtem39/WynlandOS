@@ -1668,13 +1668,14 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
         if (file->node.first_cluster == DEV_TTY) {
             extern BootInfo *g_boot_info;
             extern uint32_t term_bg_color;
+            extern bool g_quiet_console;
             extern void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg);
             const char *cbuf = (const char *)buf;
             for (uint32_t i = 0; i < size; i++) {
                 char ch = cbuf[i];
                 char single[2] = { ch, '\0' };
                 serial_write_string(single);
-                if (g_boot_info) console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
+                if (g_boot_info && !g_quiet_console) console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
             }
             return (int)size;
         }
