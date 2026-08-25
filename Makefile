@@ -347,7 +347,8 @@ $(BUILD)/renderD128:
 
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
-$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128
+PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
+$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING)
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

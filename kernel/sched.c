@@ -112,11 +112,20 @@ void thread_exit(void) {
     disable_interrupts();
 
     current_thread->state = THREAD_STATE_TERMINATED;
-    /* Phase 18: mark the owning Process dead here, not via a later read of
-       this (about-to-be-freed) Thread's state -- see process.h's `exited`
-       field comment. Process is 1:1 with its main thread in this OS, so
-       this thread exiting is that process exiting. */
-    if (current_thread->proc) current_thread->proc->exited = true;
+    /* Phase 18: mark the owning Process dead here -- but ONLY when the
+       process's own main thread exits. The original unconditional
+       version let ANY helper thread's death kill the whole process
+       status: musl's threaded resolver inside curl (and any other
+       pthread user) spawns a short-lived worker sharing the Process;
+       the moment it finished, Process.exited flipped true while the
+       real main thread was still running -- callers polling Process
+       (boot regression hook, future wait4) saw a live program as dead.
+       The 1:1 model this field documents is main-thread-exit == process
+       exit; helper threads are just threads. */
+    if (current_thread->proc &&
+        current_thread->proc->main_thread == current_thread) {
+        current_thread->proc->exited = true;
+    }
 
     sched_schedule();
 
