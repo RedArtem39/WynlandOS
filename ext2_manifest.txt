@@ -51,6 +51,12 @@ F  /test_raw_fb.elf     build/test_raw_fb.elf
 F  /t_dyn.elf           build/main_dynamic.elf
 F  /lib/ld-dummy.so     build/interp.elf
 
+# ---- Zerp compositor + default clients (GUI desktop) ----
+Fo /zerp.elf            build/zerp.elf
+Fo /zerp_files.elf      build/zerp_files.elf
+Fo /zerp_term.elf       build/zerp_term.elf
+Fo /wall.png            build/wall.png
+
 # ---- staged application regression binaries ----
 # Real musl-static programs exercising distinct syscall mixes; the
 # Phase 20f-style verification spawns them from the ext2 root.

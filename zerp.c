@@ -23,9 +23,17 @@
  */
 #include "zerp_syscalls.h"
 #include "zerp_protocol.h"
+#include "zerp_png.h"
 
 #define MAX_CLIENTS 16
-#define BORDER_COLOR 0xFF444444
+#define BORDER_COLOR      0xFF3A3A44
+#define FOCUS_BORDER      0xFF3B82F6
+#define UNFOCUS_BORDER    0xFF26262C
+#define BAR_BG            0xFF17171B
+#define BAR_ACCENT        0xFF3B82F6
+#define OUTER_STROKE      0xFF0E0E12
+#define TILE_GAP          6
+#define TITLE_H           20
 
 typedef struct {
     int c2s_read_fd;
@@ -46,6 +54,17 @@ static uint32_t g_shm_bytes; /* g_screen_w * g_screen_h * 4, set once at boot;
                                 reused by every dynamic (runtime) spawn too --
                                 a client's tile can never exceed the real
                                 screen, so this stays a safe upper bound. */
+
+#ifndef SYS_nanosleep
+#define SYS_nanosleep 35
+#endif
+static void znap_ms(long ms) {
+    struct { long sec, nsec; } ts = { 0, ms * 1000 * 1000 };
+    zsys6(SYS_nanosleep, (long)&ts, 0, 0, 0, 0, 0);
+}
+
+/* focused-client mirror for the blit/chrome code (main loop owns `focused`) */
+static int g_focused_client = 0;
 
 static int spawn_client(const char *path, uint32_t shm_bytes) {
     if (g_client_count >= MAX_CLIENTS) return -1;
@@ -165,27 +184,76 @@ static void retile(void) {
         c->tile_w = rw[i]; c->tile_h = rh[i];
         ZerpMsg msg;
         msg.type = ZERP_MSG_TILE_RECT;
-        msg.x = rx[i]; msg.y = ry[i]; msg.w = rw[i]; msg.h = rh[i];
+        uint32_t ccx = rx[i] + TILE_GAP;
+        uint32_t ccy = ry[i] + TILE_GAP + TITLE_H;
+        uint32_t ccw = rw[i] - 2 * TILE_GAP;
+        uint32_t cch = rh[i] - 2 * TILE_GAP - TITLE_H;
+        msg.x = ccx; msg.y = ccy;
+        msg.w = (ccw > 8) ? ccw : 8;
+        msg.h = (cch > 8) ? cch : 8;
         zwrite(c->s2c_write_fd, &msg, sizeof(msg));
     }
+}
+
+/* Content rect = tile minus outer gap and titlebar strip. Clients receive
+   THIS rect in ZERP_MSG_TILE_RECT and render into it; the compositor owns
+   everything inside the tile outside it (titlebar + borders). */
+static void content_rect(ClientSlot *c, uint32_t *cx, uint32_t *cy,
+                         uint32_t *cw, uint32_t *ch) {
+    *cx = c->tile_x + TILE_GAP;
+    *cy = c->tile_y + TILE_GAP + TITLE_H;
+    uint32_t w = c->tile_w - 2 * TILE_GAP;
+    uint32_t h = c->tile_h - 2 * TILE_GAP - TITLE_H;
+    *cw = (w > 8) ? w : 8;
+    *ch = (h > 8) ? h : 8;
 }
 
 static void blit_client(int idx) {
     ClientSlot *c = &g_clients[idx];
     if (!c->shm || c->tile_w == 0 || c->tile_h == 0) return;
 
-    for (uint32_t row = 0; row < c->tile_h; row++) {
-        uint32_t *src = &c->shm[row * c->tile_w];
-        uint32_t *dst = &g_fb[(c->tile_y + row) * g_fb_pitch_pixels + c->tile_x];
-        for (uint32_t col = 0; col < c->tile_w; col++) dst[col] = src[col];
+    uint32_t cx, cy, cw, ch;
+    content_rect(c, &cx, &cy, &cw, &ch);
+
+    /* client content */
+    for (uint32_t row = 0; row < ch && cy + row < g_screen_h; row++) {
+        uint32_t *src = &c->shm[row * cw];
+        uint32_t *dst = &g_fb[(cy + row) * g_fb_pitch_pixels + cx];
+        for (uint32_t col = 0; col < cw; col++) dst[col] = src[col];
     }
+
+    /* titlebar strip */
+    for (uint32_t y = c->tile_y + TILE_GAP; y < c->tile_y + TILE_GAP + TITLE_H; y++) {
+        uint32_t *row = &g_fb[y * g_fb_pitch_pixels];
+        for (uint32_t x = cx; x < cx + cw; x++) row[x] = BAR_BG;
+    }
+    /* accent underline on the titlebar: bright when focused */
+    uint32_t accent = (idx == g_focused_client) ? BAR_ACCENT : UNFOCUS_BORDER;
+    {
+        uint32_t y = c->tile_y + TILE_GAP + TITLE_H - 2;
+        uint32_t *row = &g_fb[y * g_fb_pitch_pixels];
+        for (uint32_t x = cx; x < cx + cw; x++) row[x] = accent;
+    }
+
+    /* content border */
+    uint32_t bc = (idx == g_focused_client) ? FOCUS_BORDER : UNFOCUS_BORDER;
+    for (uint32_t x = cx; x < cx + cw; x++) {
+        g_fb[(cy - 1) * g_fb_pitch_pixels + x] = bc;
+        g_fb[(cy + ch) * g_fb_pitch_pixels + x] = bc;
+    }
+    for (uint32_t y = cy - 1; y <= cy + ch; y++) {
+        g_fb[y * g_fb_pitch_pixels + cx - 1] = bc;
+        g_fb[y * g_fb_pitch_pixels + cx + cw] = bc;
+    }
+
+    /* outer tile stroke (subtle separation against the wallpaper) */
     for (uint32_t x = c->tile_x; x < c->tile_x + c->tile_w; x++) {
-        g_fb[c->tile_y * g_fb_pitch_pixels + x] = BORDER_COLOR;
-        g_fb[(c->tile_y + c->tile_h - 1) * g_fb_pitch_pixels + x] = BORDER_COLOR;
+        g_fb[c->tile_y * g_fb_pitch_pixels + x] = OUTER_STROKE;
+        g_fb[(c->tile_y + c->tile_h - 1) * g_fb_pitch_pixels + x] = OUTER_STROKE;
     }
     for (uint32_t y = c->tile_y; y < c->tile_y + c->tile_h; y++) {
-        g_fb[y * g_fb_pitch_pixels + c->tile_x] = BORDER_COLOR;
-        g_fb[y * g_fb_pitch_pixels + c->tile_x + c->tile_w - 1] = BORDER_COLOR;
+        g_fb[y * g_fb_pitch_pixels + c->tile_x] = OUTER_STROKE;
+        g_fb[y * g_fb_pitch_pixels + c->tile_x + c->tile_w - 1] = OUTER_STROKE;
     }
 }
 
@@ -210,6 +278,45 @@ int zerp_main(int argc, char **argv) {
 
     long mice_fd = zopen("/dev/input/mice", O_RDONLY);
     long kbd_fd  = zopen("/dev/input/kbd", O_RDONLY);
+
+    /* ---- Wallpaper: /wall.png if present, else the bootloader gradient
+       stays underneath. Decoded with the same self-contained inflate+defilter
+       pipeline the terminal's image viewer uses (zerp_png.h). Nearest-
+       neighbor stretch to the full screen -- no filtering, honest v1. ---- */
+    {
+        static uint8_t  wall_file[512 * 1024];
+        static uint32_t wall_rgba[1920 * 1080];
+
+        long wfd = zopen("/wall.png", O_RDONLY);
+        if (wfd >= 0) {
+            long total = 0;
+            while (total < (long)sizeof(wall_file)) {
+                long n = zread((int)wfd, wall_file + total, sizeof(wall_file) - total);
+                if (n <= 0) break;
+                total += n;
+            }
+            zclose(wfd);
+            if (total > 8) {
+                ZerpPngInfo inf = zerp_png_decode(wall_file, (uint32_t)total,
+                                                  wall_rgba,
+                                                  sizeof(wall_rgba) / 4);
+                if (inf.ok && inf.width > 0 && inf.height > 0) {
+                    for (uint32_t y2 = 0; y2 < g_screen_h; y2++) {
+                        uint32_t sy = y2 * inf.height / g_screen_h;
+                        const uint32_t *srow = &wall_rgba[sy * inf.width];
+                        uint32_t *drow = &g_fb[y2 * g_fb_pitch_pixels];
+                        for (uint32_t x2 = 0; x2 < g_screen_w; x2++) {
+                            drow[x2] = srow[x2 * inf.width / g_screen_w] | 0xFF000000;
+                        }
+                    }
+                    zfb_flush(0, 0, (int)g_screen_w, (int)g_screen_h);
+                    zwrite(1, "[zerp] wallpaper applied\n", 26);
+                } else {
+                    zwrite(1, "[zerp] wallpaper decode failed\n", 32);
+                }
+            }
+        }
+    }
 
     g_shm_bytes = g_screen_w * g_screen_h * 4;
     spawn_client("/zerp_files.elf", g_shm_bytes);
@@ -255,7 +362,7 @@ int zerp_main(int argc, char **argv) {
                 if (!c->alive) continue;
                 if ((uint32_t)cursor_x >= c->tile_x && (uint32_t)cursor_x < c->tile_x + c->tile_w &&
                     (uint32_t)cursor_y >= c->tile_y && (uint32_t)cursor_y < c->tile_y + c->tile_h) {
-                    focused = i;
+                    focused = i; g_focused_client = focused;
                     break;
                 }
             }
@@ -312,7 +419,7 @@ int zerp_main(int argc, char **argv) {
                            other client that spawns something expects the new
                            window to be immediately ready for keyboard input,
                            same as any real WM. */
-                        focused = new_idx;
+                        focused = new_idx; g_focused_client = focused;
                     }
                 } else {
                     uint32_t rest[4];
@@ -335,6 +442,7 @@ int zerp_main(int argc, char **argv) {
         if (need_retile) {
             compact_clients();
             if (focused >= g_client_count) focused = g_client_count > 0 ? g_client_count - 1 : 0;
+            g_focused_client = focused;
             retile();
         }
 
@@ -342,6 +450,9 @@ int zerp_main(int argc, char **argv) {
             zfb_flush((int)union_x, (int)union_y, (int)(union_x2 - union_x), (int)(union_y2 - union_y));
         }
 
+        /* Frame pacing: nanosleep(8ms) + yield. The raw yield storm made
+           the compositor burn an entire TCG-emulated core even idle. */
+        znap_ms(8);
         zyield();
     }
 }

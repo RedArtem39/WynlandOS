@@ -22,6 +22,7 @@
 #include "zerp_font.h"
 #include "zerp_png.h"
 #include "zerp_vt100.h"
+#include <stddef.h>
 
 #define O_WRONLY 1
 
@@ -328,6 +329,73 @@ static void cmd_nano(const char *path) {
     g_mode = MODE_PTY;
 }
 
+/* Phase 22b-era upgrade: run ANY binary from /usr/bin on its own PTY --
+   the exact fork+dup2+execve idiom cmd_nano uses, generalized so curl,
+   cmake, pkgconf etc. are usable straight from the terminal. */
+static void cmd_pty_exec(const char *app, const char *args) {
+    char path[160];
+    size_t pl = 0;
+    const char *pre = "/usr/bin/";
+    while (*pre && pl < sizeof(path) - 1) path[pl++] = *pre++;
+    const char *ap = app;
+    while (*ap && pl < sizeof(path) - 1) path[pl++] = *ap++;
+    path[pl] = '\0';
+
+    /* existence pre-check: execve failure inside the child is silent here,
+       so probe the file first (same open trick cmd_cat uses) */
+    long fd = zopen(path, O_RDONLY);
+    if (fd < 0) {
+        add_line("unknown command (try 'help')", ERR_COLOR);
+        return;
+    }
+    zclose(fd);
+
+    int fds[2];
+    if (zpty_create(fds) != 0) { add_line("pty_create failed", ERR_COLOR); return; }
+    int master = fds[0], slave = fds[1];
+
+    struct linux_winsize ws;
+    ws.ws_row = (unsigned short)(g_zc->tile_h / ROW_H);
+    ws.ws_col = (unsigned short)(g_zc->tile_w / ZERP_FONT_WIDTH);
+    ws.ws_xpixel = 0;
+    ws.ws_ypixel = 0;
+    zioctl(master, TIOCSWINSZ, &ws);
+
+    /* tokenize args (spaces) -- max 7 */
+    const char *argv2[9];
+    int argc = 0;
+    argv2[argc++] = path;
+    while (args && *args && argc < 8) {
+        while (*args == ' ') args++;
+        if (!*args) break;
+        argv2[argc++] = args;
+        while (*args && *args != ' ') args++;
+        if (*args) { *((char *)args) = '\0'; args++; }
+    }
+    argv2[argc] = 0;
+
+    long pid = zfork();
+    if (pid == 0) {
+        zdup2(slave, 0);
+        zdup2(slave, 1);
+        zdup2(slave, 2);
+        zclose(master);
+        zclose(slave);
+        const char *envp2[2];
+        envp2[0] = "TERM=vt100";
+        envp2[1] = 0;
+        zexecve(path, argv2, envp2);
+        zexit(127);
+    }
+
+    zclose(slave);
+    g_pty_master = master;
+    g_pty_child = pid;
+    g_ctrl_held = 0;
+    vt_reset((int)ws.ws_row, (int)ws.ws_col);
+    g_mode = MODE_PTY;
+}
+
 static void run_command(const char *line) {
     add_line(line, ECHO_COLOR); /* echo what was typed, styled differently from output */
 
@@ -356,9 +424,11 @@ static void run_command(const char *line) {
         zerp_send_spawn(g_zc, "/zerp_rofi.elf");
         add_line("launching rofi...", TEXT_COLOR);
     } else if (str_eq(cmd, "help")) {
-        add_line("ls cd pwd cat whoami write nano sudo rofi clear help", TEXT_COLOR);
+        add_line("built-ins: ls cd pwd cat whoami write nano sudo rofi clear help", TEXT_COLOR);
+        add_line("/usr/bin: curl cmake nano pkgconf (run directly, e.g. 'curl --version')", TEXT_COLOR);
     } else {
-        add_line("unknown command (try 'help')", ERR_COLOR);
+        /* not a built-in: try /usr/bin/<cmd> on a PTY (curl, cmake, ...) */
+        cmd_pty_exec(cmd, args);
     }
 }
 
