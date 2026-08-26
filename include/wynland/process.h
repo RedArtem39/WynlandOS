@@ -21,6 +21,15 @@
 struct Thread; /* include/wynland/sched.h -- forward-declared to avoid a
                   header dependency here */
 
+/* Phase 22b: one signal disposition. Handlers live PER-PROCESS (threads
+   share them); masks/pending live on Thread. */
+typedef struct SigAct {
+    uint64_t handler;   /* 0 = default action */
+    uint64_t restorer;  /* SA_RESTORER trampoline */
+    uint64_t flags;
+    uint64_t mask;
+} SigAct;
+
 typedef struct Process {
     uint64_t   pid;
     PageTable *pml4;
@@ -37,6 +46,9 @@ typedef struct Process {
                                      sched_schedule() call -- Process itself
                                      is never freed, so this flag is safe to
                                      poll from a syscall at any time. */
+    /* Phase 22b: signal dispositions are PER-PROCESS (threads share them);
+       masks/pending live on Thread. Zeroed by process_create()'s memset. */
+    SigAct sig_acts[65];
     struct Process *next;
 } Process;
 

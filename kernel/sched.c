@@ -137,6 +137,9 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     t->state = THREAD_STATE_READY;
     t->tls_base = tls_base;
     t->clear_tid = NULL;
+    t->sig_pending = 0;
+    t->sig_mask = 0;
+    t->sig_frame = NULL;
     t->proc = proc ? proc : current_thread->proc;
 
     // Allocate stack

@@ -9,6 +9,7 @@
 #include <wynland/tcp.h>
 #include <wynland/udpsock.h>
 #include <wynland/futex.h>
+#include <wynland/signal.h>
 #include <wynland/rtc.h>
 
 /* Magic first_cluster sentinels for real AF_INET sockets (distinct from
@@ -1038,11 +1039,18 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 11: // SYS_munmap (Linux standard)
             return 0;
 
-        case 13: // SYS_rt_sigaction (Linux standard)
-            return 0;
+        case 13: // SYS_rt_sigaction (Linux standard) -- Phase 22b: real
+                   // handler registration (per-process dispositions).
+            return signal_do_sigaction((int)a1, a2, a3);
 
-        case 14: // SYS_rt_sigprocmask (Linux standard)
-            return 0;
+        case 14: // SYS_rt_sigprocmask (Linux standard) -- Phase 22b: real
+                   // blocked-set management (delivery happens at the
+                   // syscall-return tail; masked signals stay pending).
+            return signal_do_procmask((int)a1, a2, a3);
+
+        case 15: // SYS_rt_sigreturn (Linux standard) -- Phase 22b: restore
+                   // the interrupted context from the kernel-side frame.
+            return signal_rt_return(regs);
 
         case 17: // SYS_pread64 (Linux standard)
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
@@ -2147,28 +2155,20 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return 0;
             }
 
-        case 200: // SYS_tkill (Linux standard)
-        case 234: // SYS_tgkill (Linux standard)
+        case 200: // SYS_tkill(tid, sig) -- 2-arg form; the unused a3
+                  // register holds UNINITIALIZED USER GARBAGE (same lesson
+                  // as case 408 -- never read unused arg registers).
+        case 234: // SYS_tgkill(tgid, tid, sig) -- 3-arg form.
             {
-                int sig = (int)a3;
-                // sig=6 is SIGABRT, sig=11 is SIGSEGV
-                serial_write_string("Syscall: tkill/tgkill signal=");
-                char sbuf[12];
-                int si = 0;
-                int sv = sig;
-                if (sv < 0) { sbuf[si++] = '-'; sv = -sv; }
-                if (sv == 0) { sbuf[si++] = '0'; }
-                else {
-                    char tmp[10]; int ti = 0;
-                    while (sv > 0) { tmp[ti++] = '0' + (sv % 10); sv /= 10; }
-                    for (int ri = ti-1; ri >= 0; ri--) sbuf[si++] = tmp[ri];
-                }
-                sbuf[si++] = '\r'; sbuf[si++] = '\n'; sbuf[si] = 0;
-                serial_write_string(sbuf);
-                if (sig == 6 || sig == 11 || sig == 9) {
-                    thread_exit();
-                }
-                return 0; // ignore other signals
+                /* Phase 22b: raise a real pending signal on the calling
+                   thread. Delivered at this same syscall's return tail, so
+                   raise()/abort() land in the installed handler (or die by
+                   default action) right here, synchronously from the
+                   caller's point of view. Pick the signal slot by syscall
+                   NUMBER: tkill carries sig in a2, tgkill in a3. */
+                int sig = (num == 200) ? (int)a2 : (int)a3;
+                signal_raise_current(sig);
+return 0;
             }
 
         case 204: // SYS_sched_getparam (Linux standard)

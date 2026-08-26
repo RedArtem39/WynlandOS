@@ -48,6 +48,10 @@ typedef struct Thread {
                                  DEPENDS on this (it passes &__thread_list_lock
                                  as ctid for every pthread and relies on the
                                  kernel to release it if the holder dies). */
+    /* ---- Phase 22b: signal state (per-thread; dispositions per-Process) */
+    uint64_t sig_pending;     /* bitmask, bit N = signal N pending */
+    uint64_t sig_mask;        /* blocked-set (9 KILL / 19 STOP unblockable) */
+    void *sig_frame;          /* kernel-side frame copy for SYS_rt_sigreturn */
 } Thread;
 
 void sched_init(void);

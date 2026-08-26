@@ -1,6 +1,7 @@
 global syscall_entry
 extern syscall_dispatcher
 extern current_kernel_stack
+extern signal_deliver_check
 
 section .data
 user_stack_temp: dq 0
@@ -51,7 +52,19 @@ syscall_entry:
     push rsp           ; 7th argument: SyscallRegs* (on stack)
     call syscall_dispatcher
     add rsp, 8         ; Clean up 7th argument
-    
+
+    ; 3b. Phase 22b signal delivery point. Runs after the dispatcher, before
+    ; the saved user context is popped back -- so it can patch that context
+    ; in place and sysret lands straight in a signal handler. Only RDI/RBX/
+    ; RAX/EFLAGS are touched here; every other register is dead anyway
+    ; (popped back from the struct below). On delivery, live RAX keeps the
+    ; dispatcher's return value -- meaningless inside a handler (Linux also
+    ; enters handlers with syscall-result garbage in RAX), documented.
+    mov rbx, rax              ; stash syscall return value
+    mov rdi, rsp              ; SyscallRegs*
+    call signal_deliver_check
+    mov rax, rbx              ; syscall result back in RAX either way
+
     ; 4. Restore all registers
     pop r15
     pop r14
