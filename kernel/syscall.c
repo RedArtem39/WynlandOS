@@ -8,6 +8,7 @@
 #include <wynland/process.h>
 #include <wynland/tcp.h>
 #include <wynland/udpsock.h>
+#include <wynland/futex.h>
 #include <wynland/rtc.h>
 
 /* Magic first_cluster sentinels for real AF_INET sockets (distinct from
@@ -1107,6 +1108,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         *child_tid = (int)t->id;
                     }
                 }
+                if (a1 & 0x00080000) { // CLONE_CHILD_CLEARTID
+                    /* Phase 22a: on this thread's death the kernel must zero
+                       this word and futex-wake it. musl's thread-list lock is
+                       cloned with ctid = &__thread_list_lock precisely so a
+                       dying holder gets released by the kernel. */
+                    t->clear_tid = (uint32_t *)a4;
+                }
 
                 return t->id;
             }
@@ -1298,35 +1306,30 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             thread_exit();
             return 0;
 
-        case 202: // SYS_futex(uaddr, futex_op, val, ...) -- this OS has no
-                   // real sleep/wake queue, so this doesn't literally block;
-                   // it approximates real futex semantics closely enough for
-                   // musl's own mutex/condvar retry loops (e.g. the
-                   // threaded resolver's cross-thread signaling): a real
-                   // futex checks *uaddr against val BEFORE deciding to wait
-                   // at all, returning EAGAIN immediately if they already
-                   // differ (the value changed before we got here) rather
-                   // than claiming success unconditionally as the previous
-                   // stub did. That unconditional-success behavior let a
-                   // caller's wait loop believe it had been really woken
-                   // every single call, without ever yielding the CPU --
-                   // starving whatever other thread was supposed to
-                   // actually change the value (observed live: curl's
-                   // background DNS-resolver thread never got scheduled
-                   // because the main thread's futex(WAIT) retry loop spun
-                   // with zero yields). Yielding once here before returning
-                   // EAGAIN lets that other thread actually run.
-            {
-                int op = (int)a2 & 0x7F; // mask off FUTEX_PRIVATE_FLAG(128)/FUTEX_CLOCK_REALTIME(256)
-                if (op == 0) { // FUTEX_WAIT
-                    sched_yield();
-                    return (uint64_t)-11; // -EAGAIN -- caller re-checks its own condition and retries
-                }
-                return 0; // FUTEX_WAKE and other ops: no-op success
-            }
+        case 202: // SYS_futex -- Phase 22a: REAL sleep/wake queues. The old
+                   // EAGAIN+yield approximation is gone: FUTEX_WAIT now
+                   // genuinely parks the thread on a queue keyed by
+                   // (address space, uaddr) until a matching FUTEX_WAKE (or
+                   // CMP_REQUEUE handoff) unblocks it, or its timeout
+                   // expires with -ETIMEDOUT. This is what pthread_join,
+                   // contended mutexes/condvars and epoll's future sleepers
+                   // reduce to; curl's threaded resolver runs again without
+                   // the Phase 17 workaround build flag (verified live:
+                   // TLS 1.3 + HTTP/1.1 200 OK from example.com).
+            return (uint64_t)futex_syscall(a1, (uint32_t)a2, (uint32_t)a3,
+                                           a4, a5, (uint32_t)regs->r9);
 
         case 218: // SYS_set_tid_address (Linux standard)
-            return 1;
+            /* Phase 22a: register this thread's clear-tid word. Real Linux
+               returns the CALLER's tid; the historical constant-1 return is
+               wrong for every thread after the first and broke nothing only
+               because nothing compared it. musl calls this at pthread start
+               as a belt-and-suspenders alternative to clone's ctid. */
+            sched_current()->clear_tid = (uint32_t *)a1;
+            return (uint64_t)sched_current()->id;
+
+        case 229: // legacy duplicate seen in some musl paths
+            return (uint64_t)sched_current()->id;
 
         /* Custom / Extended Syscalls */
         case 400: // SYS_draw_rect
@@ -2173,9 +2176,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 324: // SYS_memfd_create (Linux standard)
             return (uint64_t)-38; /* -ENOSYS */
-
-        case 229: // SYS_set_tid_address (Linux standard)
-            return 1; // Return main thread ID 1
 
         case 273: // SYS_set_robust_list (Linux standard)
             return 0;

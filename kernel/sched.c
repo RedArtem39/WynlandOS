@@ -17,10 +17,22 @@ extern void uint_to_str(uint64_t val, char *buf);
 static Thread *thread_list = NULL;
 static Thread *current_thread = NULL;
 static uint64_t next_thread_id = 1;
-
+static Thread *idle_thread = NULL;
 
 static void disable_interrupts(void) {
     __asm__ volatile("cli");
+}
+
+/* Runs whenever every real thread is BLOCKED (Phase 22a). The 100Hz timer
+   IRQ preempts this thread like any other (it is RUNNING while executing),
+   and each preemption's sched_yield() re-enters sched_schedule(), whose
+   deadline pass converts expired futex waits back to READY -- so hlt sleeps
+   here cost at most one tick of wake latency. */
+static void idle_loop(void *arg) {
+    (void)arg;
+    for (;;) {
+        __asm__ volatile("sti; hlt");
+    }
 }
 
 void sched_init(void) {
@@ -35,6 +47,50 @@ void sched_init(void) {
     current_thread->proc = NULL; // Wired up by process_init(), called right after sched_init()
     current_thread->next = current_thread; // Circular linked list
     thread_list = current_thread;
+    current_thread->wq = NULL;
+    current_thread->wq_next = NULL;
+    current_thread->wake_deadline = SCHED_NO_DEADLINE;
+    current_thread->wake_result = 0;
+
+    /* Phase 22a: the idle thread. Without it, "all threads blocked" used to
+       be a permanent cli;hlt halt inside sched_schedule() -- correct when
+       nothing could ever unblock, fatal once real blocking exists (the
+       waker needs a CPU to run on, and only the timer can provide one by
+       preempting whoever is actually executing).
+
+       Built by hand instead of via thread_create(): sched_init() runs
+       BEFORE irq_init() (main.c boot order), and thread_create()'s trailing
+       `sti` would enable interrupts before any IDT/PIC exists. Same trampoline
+       stack layout as thread_create_ex_tls(), minus the interrupt flag flip. */
+    {
+        disable_interrupts();
+        Thread *t = (Thread *)kmalloc(sizeof(Thread));
+        t->id = next_thread_id++;
+        t->state = THREAD_STATE_READY;
+        t->tls_base = 0;
+        t->proc = NULL;
+        t->wq = NULL;
+        t->wq_next = NULL;
+        t->wake_deadline = SCHED_NO_DEADLINE;
+        t->wake_result = 0;
+
+        t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
+        uint64_t *stack_top = t->stack_orig + (THREAD_STACK_SIZE / 8);
+        stack_top = (uint64_t *)((uintptr_t)stack_top & ~0xF);
+        *(--stack_top) = (uint64_t)thread_trampoline; // Return address
+        *(--stack_top) = 0;                          // RBP
+        *(--stack_top) = 0;                          // RBX
+        *(--stack_top) = (uint64_t)idle_loop;        // R12 -> entry
+        *(--stack_top) = 0;                          // R13 -> arg
+        *(--stack_top) = 0;                          // R14
+        *(--stack_top) = 0;                          // R15
+        t->rsp = (uint64_t)stack_top;
+
+        t->next = current_thread->next;
+        current_thread->next = t;
+        idle_thread = t;
+        /* leave interrupts exactly as the caller had them */
+    }
 
     serial_write_string("Sched: Scheduler initialized successfully.\r\n");
 }
@@ -80,6 +136,7 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     t->id = next_thread_id++;
     t->state = THREAD_STATE_READY;
     t->tls_base = tls_base;
+    t->clear_tid = NULL;
     t->proc = proc ? proc : current_thread->proc;
 
     // Allocate stack
@@ -110,6 +167,22 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
 
 void thread_exit(void) {
     disable_interrupts();
+
+    /* Phase 22a (pulls a slice of 22e forward): honor CLONE_CHILD_CLEARTID /
+       set_tid_address. Must run while this thread's own address space is
+       still loaded and its Process is intact: the userspace word write needs
+       this CR3, and the futex wake keys on this process's PML4.
+       musl's __thread_list_lock protocol DEPENDS on the kernel doing this:
+       every pthread is cloned with ctid = &__thread_list_lock precisely so
+       that death releases the list lock even if held. Without it, the first
+       exiting pthread left the lock stamped with its own tid and the next
+       pthread_create blocked forever on __tl_lock(). */
+    if (current_thread->clear_tid) {
+        extern void futex_wake_user(uint64_t uaddr, uint32_t n);
+        *current_thread->clear_tid = 0;
+        futex_wake_user((uint64_t)(uintptr_t)current_thread->clear_tid, 1);
+        current_thread->clear_tid = NULL;
+    }
 
     current_thread->state = THREAD_STATE_TERMINATED;
     /* Phase 18: mark the owning Process dead here -- but ONLY when the
@@ -148,7 +221,7 @@ void sched_schedule(void) {
                 }
                 Thread *to_free = curr;
                 curr = curr->next;
-                
+
                 if (to_free->stack_orig) {
                     kfree(to_free->stack_orig);
                 }
@@ -158,6 +231,28 @@ void sched_schedule(void) {
                 curr = curr->next;
             }
         } while (curr != thread_list);
+    }
+
+    /* Phase 22a: deadline pass -- a BLOCKED thread whose futex timeout has
+       expired becomes READY with an -ETIMEDOUT wake result. Runs on every
+       schedule point (timer preemptions, yields, wakes), which is what
+       makes timed waits work without any dedicated timer-wheel machinery:
+       worst-case latency is one 10ms tick. */
+    {
+        extern uint64_t timer_get_ticks(void);
+        uint64_t now = timer_get_ticks();
+        Thread *t = thread_list;
+        if (t) {
+            do {
+                if (t->state == THREAD_STATE_BLOCKED &&
+                    t->wake_deadline != SCHED_NO_DEADLINE &&
+                    now >= t->wake_deadline) {
+                    t->wake_result = -110; /* -ETIMEDOUT */
+                    t->state = THREAD_STATE_READY;
+                }
+                t = t->next;
+            } while (t != thread_list);
+        }
     }
 
     Thread *prev_thread = current_thread;
@@ -177,11 +272,25 @@ void sched_schedule(void) {
             current_thread->state = THREAD_STATE_RUNNING;
             return;
         }
-        
-        // Deadlock/idle condition: no ready threads left
-        serial_write_string("Sched: No ready threads! System halted.\r\n");
-        while (1) {
-            __asm__ volatile("cli; hlt");
+
+        /* Phase 22a: everything real is BLOCKED. Hand the CPU to the idle
+           thread instead of halting forever -- its hlt loop sleeps until the
+           next tick, and the tick's own preempt-yield re-runs this scan so
+           expired deadlines/wakes get picked up. The blocked thread we came
+           from keeps its parked state untouched; it resumes inside its own
+           sched_block() frame whenever something marks it READY. */
+        if (idle_thread && idle_thread != current_thread &&
+            idle_thread->state == THREAD_STATE_READY) {
+            next_thread = idle_thread;
+        } else if (idle_thread && idle_thread == current_thread) {
+            /* already the idle context resuming after hlt: just go back to it */
+            current_thread->state = THREAD_STATE_RUNNING;
+            return;
+        } else {
+            serial_write_string("Sched: No ready threads! System halted.\r\n");
+            while (1) {
+                __asm__ volatile("cli; hlt");
+            }
         }
     }
 
@@ -246,6 +355,45 @@ void sched_preempt_tick(void) {
 
 Thread *sched_current(void) {
     return current_thread;
+}
+
+/* ---- Phase 22a: real blocking primitives ---- */
+
+int64_t sched_block(void *wq, uint64_t wake_deadline) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    Thread *t = current_thread;
+    t->wq = wq;
+    t->wake_deadline = wake_deadline;
+    /* wake_result is written by sched_unblock()/the deadline pass BEFORE
+       this thread is marked READY, so no initialization race exists: we
+       cannot be scheduled until state leaves BLOCKED. */
+    t->state = THREAD_STATE_BLOCKED;
+
+    sched_schedule();
+    /* Resumed: either a waker or the deadline pass set our result and made
+       us READY. Restore the caller's interrupt flag exactly like
+       sched_yield() does. */
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+    return t->wake_result;
+}
+
+void sched_unblock(Thread *t, int64_t result) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    if (t && t->state == THREAD_STATE_BLOCKED) {
+        t->wake_result = result;
+        t->state = THREAD_STATE_READY;
+        t->wq = NULL;
+    }
+
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
 }
 
 static uint32_t local_strlen(const char *s) {

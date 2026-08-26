@@ -56,6 +56,7 @@ F  /lib/ld-dummy.so     build/interp.elf
 # Phase 20f-style verification spawns them from the ext2 root.
 Fo /test_zlib.elf       test_zlib.elf
 Fo /test_readdir.elf    build/test_readdir.elf
+Fo /test_futex.elf      build/test_futex.elf
 Fo /test_fork.elf       test_fork.elf
 Fo /test_tcp.elf        build/test_tcp.elf
 Fo /test_dns.elf        build/test_dns.elf

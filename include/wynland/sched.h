@@ -9,6 +9,9 @@
 
 #define THREAD_STACK_SIZE 16384 // 16 KB stack
 
+/* Passed as wake_deadline to sched_block(): never time out on its own. */
+#define SCHED_NO_DEADLINE 0ULL
+
 typedef enum {
     THREAD_STATE_READY,
     THREAD_STATE_RUNNING,
@@ -28,6 +31,23 @@ typedef struct Thread {
     uint64_t tls_base;        // Thread-Local Storage base address (FS segment base)
     struct Process *proc;     // Process this thread belongs to (address space, fd table)
     struct Thread *next;
+    /* ---- Phase 22a: real blocking (sleep/wake) support ---- */
+    void *wq;                 /* opaque wait queue this thread is parked on
+                                 (futex.c-owned; NULL while runnable). Because
+                                 every thread owns a persistent kernel stack,
+                                 blocking = park + schedule away; resuming
+                                 continues INSIDE sched_block()'s frame and its
+                                 return value carries the wake result. */
+    struct Thread *wq_next;   /* intrusive FIFO link within that queue */
+    uint64_t wake_deadline;   /* absolute timer ticks after which the scheduler
+                                 unblocks with -ETIMEDOUT; SCHED_NO_DEADLINE */
+    int64_t wake_result;      /* value sched_block() returns once resumed */
+    uint32_t *clear_tid;      /* CLONE_CHILD_CLEARTID / set_tid_address target:
+                                 on this thread's death the kernel writes 0 here
+                                 and futex-wakes it. musl's thread-list lock
+                                 DEPENDS on this (it passes &__thread_list_lock
+                                 as ctid for every pthread and relies on the
+                                 kernel to release it if the holder dies). */
 } Thread;
 
 void sched_init(void);
@@ -48,3 +68,13 @@ void sched_preempt_tick(void);
 void sched_print_tasks(BootInfo *info, uint32_t bg_color);
 Thread *sched_get_thread_list(void);
 bool sched_kill_thread(uint64_t id);
+
+/* Phase 22a blocking primitives. sched_block() parks the CURRENT thread on
+   the opaque wait queue `wq` until sched_wake_* targets it (returns
+   *result) or wake_deadline ticks elapse (returns -ETIMEDOUT). Callers must
+   hold interrupts disabled OR accept the internal cli window; the primitive
+   saves/restores the caller's IF flag exactly like sched_yield().
+   sched_unblock() marks one parked thread READY with its wake result; safe
+   from any context with interrupts disabled internally. */
+int64_t sched_block(void *wq, uint64_t wake_deadline);
+void sched_unblock(Thread *t, int64_t result);
