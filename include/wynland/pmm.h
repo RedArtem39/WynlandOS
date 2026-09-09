@@ -16,8 +16,20 @@ void pmm_init(BootInfo *boot_info);
 void *pmm_alloc_page(void);
 void *pmm_alloc_contiguous(uint32_t count);
 
-/* Free a previously allocated physical page */
+/* Free a previously allocated physical page. If the frame is still shared
+   (refcount > 1, see pmm_page_incref()) this only drops one reference and
+   keeps the frame allocated for the remaining owner(s); the frame is only
+   actually returned to the free bitmap once the last reference drops. */
 void pmm_free_page(void *addr);
+
+/* Add one reference to an already-allocated frame -- used by fork()'s COW
+   sharing (vmm_cow_clone_user_pages()) when a physical page gets aliased
+   into a second process's address space instead of copied. */
+void pmm_page_incref(void *addr);
+
+/* Current reference count of an allocated frame (0 if not allocated). A
+   freshly allocated, unshared page has refcount 1. */
+uint32_t pmm_page_refcount(void *addr);
 
 /* Utility functions to get memory stats */
 uint64_t pmm_get_total_memory(void);

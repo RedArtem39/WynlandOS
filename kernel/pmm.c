@@ -9,6 +9,7 @@ extern uint8_t __kernel_end[];
 extern void serial_write_string(const char *str);
 
 static uint8_t  *bitmap = NULL;
+static uint8_t  *refcount = NULL;  /* one byte per page frame; 0 = untracked/exclusive owner path via bitmap alone */
 static uint64_t total_pages = 0;
 static uint64_t free_pages = 0;
 static uint64_t total_mem_size = 0;
@@ -133,6 +134,28 @@ void pmm_init(BootInfo *boot_info)
             }
         }
     }
+
+    /* 8. Home the per-frame refcount table (one byte per page, used by
+       fork()'s COW sharing -- see vmm_cow_clone_user_pages()) right after
+       the bitmap in the same region -- both are tiny (KB-scale) compared to
+       any usable region large enough to hold the bitmap in the first place,
+       so this avoids a second region search and its edge cases entirely. */
+    uint64_t refcount_size = total_pages;
+    uint64_t refcount_phys_addr = (bitmap_phys_addr + bitmap_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    refcount = (uint8_t *)(uintptr_t)refcount_phys_addr;
+    memset(refcount, 0, refcount_size);
+
+    uint64_t refcount_start_page = refcount_phys_addr / PAGE_SIZE;
+    uint64_t refcount_end_page = (refcount_phys_addr + refcount_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint64_t i = refcount_start_page; i < refcount_end_page; i++) {
+        if (i < total_pages) {
+            if (!bitmap_test(i)) {
+                bitmap_set(i);
+                free_pages--;
+            }
+        }
+    }
 }
 
 void *pmm_alloc_page(void)
@@ -152,6 +175,7 @@ void *pmm_alloc_page(void)
                 if (!bitmap_test(idx)) {
                     bitmap_set(idx);
                     free_pages--;
+                    refcount[idx] = 1;
                     result = (void *)(idx * PAGE_SIZE);
                     goto cleanup;
                 }
@@ -197,6 +221,7 @@ void *pmm_alloc_contiguous(uint32_t count)
                 /* Found contiguous range! Mark all as allocated */
                 for (uint64_t j = start_idx; j < start_idx + count; j++) {
                     bitmap_set(j);
+                    refcount[j] = 1;
                 }
                 free_pages -= count;
                 result = (void *)(start_idx * PAGE_SIZE);
@@ -222,14 +247,45 @@ void pmm_free_page(void *addr)
     uint64_t idx = (uint64_t)addr / PAGE_SIZE;
     if (idx < total_pages) {
         if (bitmap_test(idx)) {
-            bitmap_clear(idx);
-            free_pages++;
+            if (refcount[idx] > 1) {
+                /* Still shared (COW) -- drop this owner's reference, keep
+                   the frame allocated for the remaining owner(s). */
+                refcount[idx]--;
+            } else {
+                bitmap_clear(idx);
+                refcount[idx] = 0;
+                free_pages++;
+            }
         }
     }
 
     if (rflags & 0x200) {
         __asm__ volatile("sti");
     }
+}
+
+void pmm_page_incref(void *addr)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    uint64_t idx = (uint64_t)addr / PAGE_SIZE;
+    if (idx < total_pages && bitmap_test(idx)) {
+        refcount[idx]++;
+    }
+
+    if (rflags & 0x200) {
+        __asm__ volatile("sti");
+    }
+}
+
+uint32_t pmm_page_refcount(void *addr)
+{
+    uint64_t idx = (uint64_t)addr / PAGE_SIZE;
+    if (idx < total_pages && bitmap_test(idx)) {
+        return refcount[idx];
+    }
+    return 0;
 }
 
 uint64_t pmm_get_total_memory(void)

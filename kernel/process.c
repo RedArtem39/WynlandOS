@@ -139,7 +139,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        *caller's* userspace memory would fault exactly like the path
        argument already did before Phase 1's SYS_spawn fix (see that
        writeup). SYS_spawn's argv handling below mirrors that same fix. */
-    bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, lp, argv, NULL);
+    bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, lp, argv, NULL, p);
 
     self->proc = caller_proc;
     __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)caller_proc->pml4) : "memory");

@@ -6,6 +6,11 @@
 #include <wynland/pmm.h>
 #include <wynland/vmm.h>
 #include <wynland/heap.h>
+#include <wynland/vma.h>
+
+#define PF_X 1
+#define PF_W 2
+#define PF_R 4
 
 #define EI_MAG0        0
 #define EI_MAG1        1
@@ -76,7 +81,7 @@ static void *find_mapped_page(PageTable *pml4, uint64_t virt) {
     return (void *)(uintptr_t)phys;
 }
 
-static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset, PageTable *pml4, LoadedPages *out_pages)
+static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset, PageTable *pml4, LoadedPages *out_pages, struct Process *proc)
 {
     for (uint16_t i = 0; i < hdr->e_phnum; i++) {
         Elf64_Phdr phdr;
@@ -159,11 +164,32 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
                 }
             }
         }
+
+        /* Phase 22c: register a real VMA for this segment (prot derived
+           from p_flags), and if it's not supposed to be writable, drop
+           PAGE_WRITE now that its content has been written -- every page
+           above was mapped PAGE_WRITE|PAGE_USER unconditionally just to let
+           the read-into-memory above work at all. This is what makes
+           mprotect()/a stray write into .text/.rodata a real, correctly
+           fatal page fault instead of silent success. */
+        if (proc) {
+            uint32_t vma_prot = 0;
+            if (phdr.p_flags & PF_R) vma_prot |= VMA_PROT_READ;
+            if (phdr.p_flags & PF_W) vma_prot |= VMA_PROT_WRITE;
+            if (phdr.p_flags & PF_X) vma_prot |= VMA_PROT_EXEC;
+            vma_insert(proc, start_addr, end_addr, vma_prot, 0);
+
+            if (!(phdr.p_flags & PF_W)) {
+                for (uint64_t addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
+                    vmm_protect_page(pml4, addr, PAGE_USER);
+                }
+            }
+        }
     }
     return true;
 }
 
-bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages, const char **argv, const char **envp)
+bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages, const char **argv, const char **envp, struct Process *proc)
 {
     out_pages->count = 0;
 
@@ -269,7 +295,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     
     phdr_vaddr += load_offset;
 
-    if (!load_elf_segments(f, &hdr, load_offset, pml4, out_pages)) {
+    if (!load_elf_segments(f, &hdr, load_offset, pml4, out_pages, proc)) {
         vfs_close(f);
         goto error_cleanup_no_file;
     }
@@ -314,7 +340,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             goto error_cleanup_no_file;
         }
 
-        if (!load_elf_segments(interp_f, &interp_hdr, interpreter_base, pml4, out_pages)) {
+        if (!load_elf_segments(interp_f, &interp_hdr, interpreter_base, pml4, out_pages, proc)) {
             vfs_close(interp_f);
             goto error_cleanup_no_file;
         }
@@ -363,6 +389,17 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
             memset((void *)addr, 0, PAGE_SIZE);
         }
+    }
+
+    if (proc) {
+        vma_insert(proc, stack_base, stack_base + stack_size, VMA_PROT_READ | VMA_PROT_WRITE, VMA_ANON);
+        /* Guard page: one page immediately below the stack, deliberately
+           left unmapped (bookkeeping only -- no vmm_map_page call for it,
+           ever). A stack overflow faults here with no PAGE_COW bit and no
+           covering non-guard VMA, so it hits the page fault handler's
+           existing fatal path instead of silently corrupting whatever used
+           to live at the next address down. */
+        vma_insert(proc, stack_base - PAGE_SIZE, stack_base, 0, VMA_GUARD);
     }
 
     /* 6. Set up System V ABI stack layout */

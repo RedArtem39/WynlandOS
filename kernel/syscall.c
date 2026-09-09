@@ -11,6 +11,7 @@
 #include <wynland/futex.h>
 #include <wynland/signal.h>
 #include <wynland/rtc.h>
+#include <wynland/elf.h>
 
 /* Magic first_cluster sentinels for real AF_INET sockets (distinct from
    the pre-existing 0xFFFFFFF8 AF_UNIX mock, which stays untouched for
@@ -762,7 +763,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t addr = a1;
                 uint64_t len = a2;
                 uint64_t prot = a3;
-                (void)prot;
                 uint64_t flags = a4;
                 int fd = (int)a5;
                 uint64_t offset = regs->r9;
@@ -836,10 +836,27 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     mmap_alloc_ptr += size_aligned;
                 } else {
                     virt_addr &= ~(PAGE_SIZE - 1); // align down to page boundary
+                    /* MAP_FIXED: real semantics replace whatever was mapped
+                       in this range before -- drop the old VMA coverage and
+                       actually unmap+free any pages currently backing it,
+                       instead of silently leaking the old physical frames
+                       (previously vmm_map_page() below would have just
+                       overwritten the PTEs, orphaning whatever pmm_alloc'd
+                       frame they used to point at). */
+                    Process *mmap_proc = sched_current()->proc;
+                    PageTable *cur_pml4 = vmm_get_current_pml4();
+                    for (uint64_t off = 0; off < size_aligned; off += PAGE_SIZE) {
+                        uint64_t old_phys = vmm_get_phys(cur_pml4, virt_addr + off);
+                        if (old_phys) {
+                            vmm_unmap_page(cur_pml4, virt_addr + off);
+                            pmm_free_page((void *)(uintptr_t)old_phys);
+                        }
+                    }
+                    vma_unmap_range(mmap_proc, virt_addr, virt_addr + size_aligned);
                 }
 
                 PageTable *pml4 = vmm_get_current_pml4();
-                
+
                 // Allocate physical pages
                 extern void *pmm_alloc_contiguous(uint32_t count);
                 void *phys_ptr = pmm_alloc_contiguous(pages);
@@ -849,7 +866,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 uint64_t phys_start = (uint64_t)(uintptr_t)phys_ptr;
 
-                // Map pages
+                /* Real prot: map writable now regardless of the requested
+                   PROT_WRITE (file content/zeroing below needs to write
+                   through this same mapping), then downgrade to the real
+                   requested permissions once populated -- same pattern as
+                   the ELF loader's segment loading (kernel/elf.c). */
                 for (uint64_t i = 0; i < pages; i++) {
                     vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, phys_start + i * PAGE_SIZE, PAGE_WRITE | PAGE_USER);
                     // Clear the page
@@ -865,6 +886,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint32_t read_bytes = vfs_read(file, (void *)(uintptr_t)virt_addr, (uint32_t)len);
                         vfs_seek(file, (int32_t)prev_pos, 0); // restore file position
                         (void)read_bytes;
+                    }
+                }
+
+                /* Real VMA bookkeeping + real prot: register the range so
+                   mprotect()/munmap()/the page fault handler's COW path
+                   have something to look up, then drop PAGE_WRITE if the
+                   caller didn't actually ask for it. */
+                Process *mmap_proc2 = sched_current()->proc;
+                uint32_t vma_prot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
+                vma_insert(mmap_proc2, virt_addr, virt_addr + size_aligned, vma_prot,
+                           (flags & 0x20) ? VMA_ANON : 0);
+
+                if (!(prot & 0x2)) { // !PROT_WRITE
+                    for (uint64_t i = 0; i < pages; i++) {
+                        vmm_protect_page(pml4, virt_addr + i * PAGE_SIZE, PAGE_USER);
                     }
                 }
 
@@ -1034,10 +1070,55 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
 
         case 10: // SYS_mprotect (Linux standard)
-            return 0;
+            {
+                uint64_t addr = a1 & ~(PAGE_SIZE - 1);
+                uint64_t end = addr + ((a2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+                uint64_t prot = a3;
+
+                Process *proc = sched_current()->proc;
+                uint32_t new_prot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
+                if (!vma_protect_range(proc, addr, end, new_prot)) {
+                    return (uint64_t)-12; /* -ENOMEM: part of the range isn't mapped */
+                }
+
+                PageTable *pml4 = vmm_get_current_pml4();
+                for (uint64_t a = addr; a < end; a += PAGE_SIZE) {
+                    uint64_t old_flags = vmm_get_page_flags(pml4, a);
+                    if (!(old_flags & PAGE_PRESENT)) continue; /* shouldn't happen under the eager-allocation model, but don't fault the kernel over it */
+
+                    uint64_t pte_flags = PAGE_USER;
+                    if (prot & 0x2) { // requested PROT_WRITE
+                        /* If this leaf is still COW-shared (fork()'d, never
+                           written since), stay read-only + PAGE_COW rather
+                           than granting real PAGE_WRITE directly -- the
+                           frame is still shared physically, so the actual
+                           grant has to go through the fault handler's COW
+                           resolution on the next write, same as it would
+                           without this mprotect() call. */
+                        pte_flags |= (old_flags & PAGE_COW) ? PAGE_COW : PAGE_WRITE;
+                    }
+                    vmm_protect_page(pml4, a, pte_flags);
+                }
+                return 0;
+            }
 
         case 11: // SYS_munmap (Linux standard)
-            return 0;
+            {
+                uint64_t addr = a1 & ~(PAGE_SIZE - 1);
+                uint64_t end = addr + ((a2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+
+                Process *proc = sched_current()->proc;
+                PageTable *pml4 = vmm_get_current_pml4();
+                for (uint64_t a = addr; a < end; a += PAGE_SIZE) {
+                    uint64_t phys = vmm_get_phys(pml4, a);
+                    if (phys) {
+                        vmm_unmap_page(pml4, a);
+                        pmm_free_page((void *)(uintptr_t)phys);
+                    }
+                }
+                vma_unmap_range(proc, addr, end);
+                return 0;
+            }
 
         case 13: // SYS_rt_sigaction (Linux standard) -- Phase 22b: real
                    // handler registration (per-process dispositions).
@@ -1133,23 +1214,33 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    via objdump on the vendored libc.so), separate from SYS_clone
                    above -- needed by any POSIX build tool (make, ninja, cmake,
                    sh) that spawns subprocesses via fork()+exec() rather than
-                   posix_spawn(). Eager full-copy of the address space, not
-                   copy-on-write (see vmm_clone_user_pages()'s own comment for
-                   why: simpler, no page-fault-handler changes, and this OS has
-                   no fork-heavy workloads yet to make COW's complexity worth
-                   the risk). */
+                   posix_spawn(). Phase 22c: real copy-on-write via
+                   vmm_cow_clone_user_pages() -- both address spaces share
+                   physical frames read-only until either side writes,
+                   resolved lazily in the page fault handler (kernel/idt.c)
+                   instead of paying a full eager memcpy of the parent's
+                   entire address space at every fork() call. */
                 Process *parent = sched_current()->proc;
 
                 PageTable *child_pml4 = vmm_new_process_pml4();
                 if (!child_pml4) return (uint64_t)-12; /* -ENOMEM */
 
-                if (!vmm_clone_user_pages(parent->pml4, child_pml4)) {
+                if (!vmm_cow_clone_user_pages(parent->pml4, child_pml4)) {
                     return (uint64_t)-12; /* -ENOMEM */
                 }
 
                 Process *child = process_create(child_pml4);
                 if (!child) return (uint64_t)-12; /* -ENOMEM */
                 child->uid = parent->uid;
+
+                /* The VMA list is process-local bookkeeping, not part of the
+                   page tables vmm_cow_clone_user_pages() just shared -- copy
+                   every parent VMA into the child's own list so mprotect/
+                   munmap/the page fault handler's vma_find() lookups work
+                   identically in both processes after the fork. */
+                for (VMA *pv = parent->vma_list; pv; pv = pv->next) {
+                    vma_insert(child, pv->start, pv->end, pv->prot, pv->flags);
+                }
 
                 /* fork() inherits every open fd as-is -- FD_CLOEXEC only
                    matters across an exec(), which fork() alone doesn't do.
@@ -1206,10 +1297,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t stack_top = 0;
                 PageTable *pml4 = vmm_get_current_pml4();
 
-
-
-                #include <wynland/elf.h>
-
                 /* Phase 18: real argv/envp support. Same kmalloc+copy
                    pattern as SYS_spawn_argv (408) -- every string must
                    already be in kernel-owned memory before elf_load()
@@ -1262,8 +1349,23 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)-12; /* -ENOMEM */
                 }
 
+                /* execve() replaces the address space in place -- the old
+                   image's VMAs (segments, stack, any mmap'd regions) no
+                   longer describe anything real once elf_load() below
+                   overwrites their virtual addresses with the new binary's
+                   content, so drop them before loading rather than leaving
+                   stale/overlapping records for mprotect()/munmap() to trip
+                   over later. */
+                Process *exec_proc = sched_current()->proc;
+                for (VMA *v = exec_proc->vma_list; v; ) {
+                    VMA *next_v = v->next;
+                    kfree(v);
+                    v = next_v;
+                }
+                exec_proc->vma_list = NULL;
+
                 bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4, lp,
-                                          uargv_e ? kargv_e : NULL, uenvp_e ? kenvp_e : NULL);
+                                          uargv_e ? kargv_e : NULL, uenvp_e ? kenvp_e : NULL, exec_proc);
                 for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
                 for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
                 if (!execve_ok) {

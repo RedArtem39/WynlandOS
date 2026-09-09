@@ -14,6 +14,7 @@
 #include <wynland/types.h>
 #include <wynland/vmm.h>
 #include <wynland/vfs.h>
+#include <wynland/vma.h>
 
 #define MAX_OPEN_FILES 128
 #define FD_CLOEXEC 1
@@ -49,6 +50,11 @@ typedef struct Process {
     /* Phase 22b: signal dispositions are PER-PROCESS (threads share them);
        masks/pending live on Thread. Zeroed by process_create()'s memset. */
     SigAct sig_acts[65];
+    /* Phase 22c: real VMAs -- every mapped range (ELF segments, stack, mmap
+       regions) is registered here so mprotect/munmap/the page fault
+       handler's COW path have something to look up. Zeroed by
+       process_create()'s memset (NULL = empty list). */
+    struct VMA *vma_list;
     struct Process *next;
 } Process;
 

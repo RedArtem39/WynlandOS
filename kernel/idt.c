@@ -5,6 +5,9 @@
 #include <wynland/idt.h>
 #include <wynland/boot_info.h>
 #include <wynland/vmm.h>
+#include <wynland/pmm.h>
+
+extern void *memcpy(void *dest, const void *src, size_t n);
 
 /* Declare all assembly ISR stubs */
 extern void isr0();
@@ -207,6 +210,46 @@ static void print_reg(BootInfo *info, const char *name, uint64_t val)
 
 void exception_handler(InterruptRegisters *regs)
 {
+    /* Phase 22c: COW resolution. A write fault (err_code: PRESENT|WRITE
+       both set) to a leaf tagged PAGE_COW (see vmm_cow_clone_user_pages())
+       isn't a real crash -- it's fork()'s deferred copy actually happening.
+       Resolve it and return to re-execute the faulting instruction instead
+       of falling through to the fatal path below. Every other fault
+       (not-present, a genuine read-only violation, a guard page, kernel
+       mode) is unaffected and keeps today's behavior exactly. */
+    if (regs->int_no == 14 && (regs->cs & 0x03) == 3 && (regs->err_code & 0x3) == 0x3) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        PageTable *pml4 = vmm_get_current_pml4();
+        uint64_t flags = vmm_get_page_flags(pml4, cr2);
+
+        if (flags & PAGE_COW) {
+            uint64_t page_addr = cr2 & ~(PAGE_SIZE - 1);
+            uint64_t phys = vmm_get_phys(pml4, page_addr);
+            uint32_t refs = pmm_page_refcount((void *)(uintptr_t)phys);
+
+            if (refs <= 1) {
+                /* Last (or only) owner -- no one else can be looking at
+                   this frame, so just reclaim write access on it in
+                   place, no copy needed. */
+                serial_write_string("COW: reclaimed write access (last owner)\r\n");
+                vmm_protect_page(pml4, page_addr, (flags & ~PAGE_COW) | PAGE_WRITE);
+                return;
+            }
+
+            void *new_phys = pmm_alloc_page();
+            if (new_phys) {
+                serial_write_string("COW: duplicated shared page\r\n");
+                memcpy(new_phys, (void *)(uintptr_t)phys, PAGE_SIZE);
+                vmm_map_page(pml4, page_addr, (uint64_t)(uintptr_t)new_phys, (flags & ~PAGE_COW) | PAGE_WRITE);
+                pmm_free_page((void *)(uintptr_t)phys); /* drop this owner's share of the old, still-shared frame */
+                return;
+            }
+            /* OOM duplicating a COW page: fall through to the fatal path
+               below rather than spin re-faulting forever. */
+        }
+    }
+
     /* Check if the exception happened in user mode (Ring 3) */
     if ((regs->cs & 0x03) == 3) {
         serial_write_string("\r\n======================================\r\n");

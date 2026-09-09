@@ -5,6 +5,9 @@
 #include <wynland/types.h>
 #include <wynland/vmm.h>
 
+struct Process; /* include/wynland/process.h -- forward-declared; elf_load()
+                    only needs a pointer to register real VMAs (Phase 22c) */
+
 #define MAX_LOADED_PAGES 1024
 
 typedef struct {
@@ -25,4 +28,4 @@ typedef struct {
    needed by Phase 18's execve() so a spawned child can receive a real
    TERM=vt100 (required for ncurses' setupterm() to pick the right
    escape-sequence set). */
-bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages, const char **argv, const char **envp);
+bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages, const char **argv, const char **envp, struct Process *proc);

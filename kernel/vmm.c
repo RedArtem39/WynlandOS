@@ -111,6 +111,63 @@ bool vmm_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
     return true;
 }
 
+bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
+{
+    /* Same PML4/PDPT/PD/PT walk as vmm_clone_user_pages() above, but instead
+       of allocating a fresh frame + memcpy per leaf, both parent and child
+       end up pointing at the SAME frame, read-only, with PAGE_COW set. The
+       actual duplication (or outright reclaim, if this faulter turns out to
+       be the last owner) happens lazily in the page fault handler. */
+    for (uint64_t i4 = 0; i4 < 512; i4++) {
+        if (!(parent_pml4->entries[i4] & PAGE_PRESENT)) continue;
+        PageTable *pdpt = (PageTable *)(uintptr_t)(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
+
+        for (uint64_t i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt->entries[i3] & PAGE_PRESENT)) continue;
+            if (pdpt->entries[i3] & PAGE_PS) continue;
+            PageTable *pd = (PageTable *)(uintptr_t)(pdpt->entries[i3] & PAGE_ADDR_MASK);
+
+            for (uint64_t i2 = 0; i2 < 512; i2++) {
+                if (!(pd->entries[i2] & PAGE_PRESENT)) continue;
+                if (pd->entries[i2] & PAGE_PS) continue;
+                PageTable *pt = (PageTable *)(uintptr_t)(pd->entries[i2] & PAGE_ADDR_MASK);
+
+                for (uint64_t i1 = 0; i1 < 512; i1++) {
+                    uint64_t pte = pt->entries[i1];
+                    if (!(pte & PAGE_PRESENT)) continue;
+                    if (!(pte & PAGE_USER)) continue;
+
+                    uint64_t phys  = pte & PAGE_ADDR_MASK;
+                    uint64_t flags = (pte & 0xFFFULL) & ~PAGE_PRESENT;
+
+                    uint64_t virt = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                    if (i4 & 0x100) virt |= 0xFFFF000000000000ULL;
+
+                    /* If this leaf was writable, it's a real COW candidate:
+                       both sides lose PAGE_WRITE and gain PAGE_COW, and a
+                       write fault from either resolves through the page
+                       fault handler. If it was ALREADY read-only (e.g. an
+                       mprotect(PROT_READ) region), just share the frame
+                       as-is with no COW tag -- a write fault there is a
+                       genuine permission violation on both sides, not
+                       something to resolve by duplicating. Either way this
+                       is exactly one new owner of the frame (the child), so
+                       exactly one incref. */
+                    uint64_t new_flags = (flags & PAGE_WRITE) ? ((flags & ~PAGE_WRITE) | PAGE_COW) : flags;
+
+                    pmm_page_incref((void *)(uintptr_t)phys);
+
+                    pt->entries[i1] = phys | new_flags | PAGE_PRESENT;
+                    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+
+                    vmm_map_page(child_pml4, virt, phys, new_flags);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 {
     uint64_t rflags;
@@ -211,6 +268,68 @@ cleanup:
     if (rflags & 0x200) {
         __asm__ volatile("sti\n\tnop" ::: "memory");
     }
+}
+
+bool vmm_protect_page(PageTable *pml4, uint64_t virt, uint64_t flags)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+
+    bool ok = false;
+    virt &= ~(PAGE_SIZE - 1);
+    uint64_t pml4_idx = PML4_INDEX(virt);
+    uint64_t pdpt_idx = PDPT_INDEX(virt);
+    uint64_t pd_idx   = PD_INDEX(virt);
+    uint64_t pt_idx   = PT_INDEX(virt);
+
+    PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
+    if (!(*pml4_entry & PAGE_PRESENT)) goto cleanup;
+
+    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
+    if (!(*pdpt_entry & PAGE_PRESENT)) goto cleanup;
+
+    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pd_entry = &pd->entries[pd_idx];
+    if (!(*pd_entry & PAGE_PRESENT)) goto cleanup;
+
+    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pt_entry = &pt->entries[pt_idx];
+    if (!(*pt_entry & PAGE_PRESENT)) goto cleanup;
+
+    uint64_t phys = *pt_entry & PAGE_ADDR_MASK;
+    *pt_entry = phys | flags | PAGE_PRESENT;
+    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    ok = true;
+
+cleanup:
+    if (rflags & 0x200) {
+        __asm__ volatile("sti\n\tnop" ::: "memory");
+    }
+    return ok;
+}
+
+uint64_t vmm_get_page_flags(PageTable *pml4, uint64_t virt)
+{
+    uint64_t pml4_idx = PML4_INDEX(virt);
+    uint64_t pdpt_idx = PDPT_INDEX(virt);
+    uint64_t pd_idx   = PD_INDEX(virt);
+    uint64_t pt_idx   = PT_INDEX(virt);
+
+    PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
+    if (!(*pml4_entry & PAGE_PRESENT)) return 0;
+
+    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
+    if (!(*pdpt_entry & PAGE_PRESENT)) return 0;
+
+    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pd_entry = &pd->entries[pd_idx];
+    if (!(*pd_entry & PAGE_PRESENT)) return 0;
+
+    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTableEntry *pt_entry = &pt->entries[pt_idx];
+    return *pt_entry & 0xFFFULL;
 }
 
 uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
