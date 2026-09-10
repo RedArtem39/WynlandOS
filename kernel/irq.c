@@ -163,6 +163,18 @@ void irq_handler(InterruptRegisters *regs)
         timer_ticks++;
         /* Send End of Interrupt (EOI) to PIC before yielding */
         outb(PIC1_COMMAND, PIC_EOI);
+        /* Phase 22d: virtio-net has no RX interrupt of its own (confirmed:
+           no IRQ/MSI-X registration anywhere in drivers/net/) -- net_poll()
+           draining the RX virtqueue used to happen only as a side effect of
+           tcp_recv/tcp_send/udp_recv's own busy-spin loops. Now that those
+           block instead of spinning, something has to keep driving RX
+           regardless of whether any thread is actively waiting on a
+           socket, or a blocked reader would never wake up. Runs BEFORE
+           sched_preempt_tick() so it fires on literally every tick
+           unconditionally, not only on ticks where this particular thread
+           happens to get rescheduled back after a preemption. */
+        extern void net_poll(void);
+        net_poll();
         sched_preempt_tick();
         return;
     } else if (irq == 1) {

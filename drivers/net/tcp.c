@@ -11,6 +11,15 @@
 #include <wynland/net.h>
 #include <wynland/types.h>
 
+extern uint64_t timer_get_ticks(void);
+
+/* Phase 22d: bounded retry slice for real blocking recv, same reasoning
+   as KPipe/Pty's own (see kernel/syscall.c) -- a real wake fires
+   immediately via tcp_handle_packet()'s waitqueue_wake_all() on any
+   state change, this is only a safety net against a connection that
+   goes silent with no RST/FIN ever arriving (dead route, no ICMP). */
+#define TCP_WAIT_RETRY_TICKS 500
+
 /* ============================================================
  * External helpers (provided by the kernel / net.c)
  * ============================================================ */
@@ -293,8 +302,6 @@ int tcp_send(TcpConnection *conn, const void *data, uint32_t len)
         acked = false;
 
         for (retries = 0; retries < TCP_RETRANSMIT_MAX; retries++) {
-            uint32_t wait;
-
             /* Set snd_nxt to snd_una to ensure first send or retransmission uses correct seq */
             conn->snd_nxt = conn->snd_una;
 
@@ -309,20 +316,29 @@ int tcp_send(TcpConnection *conn, const void *data, uint32_t len)
             /* Advance snd_nxt immediately to validate incoming ACK */
             conn->snd_nxt = expected_ack;
 
-            /* Busy-poll for ACK */
-            for (wait = 0; wait < TCP_RECV_TIMEOUT; wait++) {
-                net_poll();
+            /* Real blocking wait for ACK, bounded to one RTO-ish window per
+               attempt (~1s) -- this genuinely needs a real timeout, that's
+               what triggers TCP_RETRANSMIT_MAX's retransmit, not something
+               to block on forever like tcp_recv(). net_poll() no longer
+               needs calling here either way (timer-tick-driven now, see
+               kernel/irq.c). */
+            {
+                uint64_t ack_deadline = timer_get_ticks() + 100;
+                for (;;) {
+                    if (conn->reset_received) {
+                        serial_write_string("[TCP] Connection reset during send\n");
+                        conn->state = TCP_STATE_CLOSED;
+                        return -1;
+                    }
 
-                if (conn->reset_received) {
-                    serial_write_string("[TCP] Connection reset during send\n");
-                    conn->state = TCP_STATE_CLOSED;
-                    return -1;
-                }
+                    if (conn->snd_una >= expected_ack) {
+                        acked = true;
+                        break;
+                    }
 
-                /* Check if the remote acknowledged our data */
-                if (conn->snd_una >= expected_ack) {
-                    acked = true;
-                    break;
+                    if (timer_get_ticks() >= ack_deadline) break; /* RTO expired -- go retransmit */
+
+                    waitqueue_wait(&conn->rx_wq, ack_deadline);
                 }
             }
 
@@ -349,12 +365,11 @@ int tcp_send(TcpConnection *conn, const void *data, uint32_t len)
  * tcp_recv — Receive data from connection
  *
  * If data is already in rx_buf, copy and return immediately.
- * Otherwise busy-poll with net_poll() up to TCP_RECV_TIMEOUT.
+ * Otherwise blocks for real until data/FIN/RST (Phase 22d).
  * ============================================================ */
 
 int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len)
 {
-    uint32_t i;
     uint32_t copy_len;
 
     if (conn == NULL || (conn->state != TCP_STATE_ESTABLISHED &&
@@ -384,12 +399,18 @@ int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len)
         return (int)copy_len;
     }
 
-    /* No data buffered — busy-poll */
+    /* No data buffered yet -- real blocking recv: park until data/FIN/RST
+       instead of spinning net_poll() up to TCP_RECV_TIMEOUT times (net_poll()
+       is now driven unconditionally off the timer tick, see kernel/irq.c,
+       so this loop no longer needs to call it at all). Real POSIX recv()
+       on an open socket with nothing buffered yet just waits -- it
+       doesn't give up on its own, so this loops until one of the three
+       terminal conditions is true, each wait bounded only as an internal
+       safety-net retry slice (see TCP_WAIT_RETRY_TICKS), not an overall
+       timeout. */
     conn->data_available = false;
 
-    for (i = 0; i < TCP_RECV_TIMEOUT; i++) {
-        net_poll();
-
+    for (;;) {
         if (conn->reset_received) {
             serial_write_string("[TCP] Connection reset during recv\n");
             conn->state = TCP_STATE_CLOSED;
@@ -405,11 +426,9 @@ int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len)
 
         if (conn->data_available && conn->rx_len > 0)
             break;
-    }
 
-    /* Copy whatever we have */
-    if (conn->rx_len == 0)
-        return -1;  /* Timeout with no data */
+        waitqueue_wait(&conn->rx_wq, timer_get_ticks() + TCP_WAIT_RETRY_TICKS);
+    }
 
     copy_len = conn->rx_len;
     if (copy_len > max_len)
@@ -635,6 +654,7 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
         serial_write_string("[TCP] RST received\n");
         conn->reset_received = true;
         conn->state = TCP_STATE_CLOSED;
+        waitqueue_wake_all(&conn->rx_wq);
         return;
     }
 
@@ -703,12 +723,14 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
 
             /* ACK the FIN */
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            waitqueue_wake_all(&conn->rx_wq);
             return;
         }
 
         /* If we had data but no FIN, ACK it */
         if (payload_len > 0) {
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            waitqueue_wake_all(&conn->rx_wq);
             return;
         }
         break;
@@ -800,4 +822,10 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
     default:
         break;
     }
+
+    /* Covers every switch case that falls through via break (SYN_SENT's
+       bad-ACK path, FIN_WAIT_1/2, CLOSE_WAIT, LAST_ACK, TIME_WAIT/default)
+       -- the two ESTABLISHED paths that `return` early wake explicitly
+       above instead of falling through to here. */
+    waitqueue_wake_all(&conn->rx_wq);
 }

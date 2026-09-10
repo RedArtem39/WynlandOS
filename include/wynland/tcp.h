@@ -7,6 +7,7 @@
 
 #include <wynland/types.h>
 #include <wynland/net.h>
+#include <wynland/waitqueue.h>
 
 /* ============================================================
  * TCP Constants
@@ -96,6 +97,11 @@ typedef struct {
     volatile bool data_available;
     volatile bool reset_received;
     volatile bool ack_of_fin;
+
+    /* Phase 22d: real blocking recv/send. Woken from tcp_handle_packet()
+       (net.c's IRQ0-timer-driven net_poll(), not a caller's own busy-spin
+       -- see kernel/irq.c) whenever any of the flags/state above change. */
+    WaitQueue rx_wq;
 } TcpConnection;
 
 /* ============================================================

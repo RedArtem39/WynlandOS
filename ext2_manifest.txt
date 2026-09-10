@@ -1456,3 +1456,4 @@ F /usr/share/cmake-3.28/Templates/Windows/StoreLogo.png build/ports/cmake-share/
 F /usr/share/cmake-3.28/Templates/Windows/Windows_TemporaryKey.pfx build/ports/cmake-share/share/Templates/Windows/Windows_TemporaryKey.pfx
 Fo /test_signals.elf build/test_signals.elf
 Fo /test_vma.elf build/test_vma.elf
+Fo /test_blockio.elf build/test_blockio.elf

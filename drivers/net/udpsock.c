@@ -4,10 +4,18 @@
  */
 #include <wynland/udpsock.h>
 #include <wynland/net.h>
+#include <wynland/waitqueue.h>
 
-extern void net_poll(void);
 extern bool net_send_udp(uint32_t dst_ip, uint16_t src_port, uint16_t dst_port,
                          const void *data, uint32_t len);
+extern uint64_t timer_get_ticks(void);
+
+/* Phase 22d: bounded retry slice for real blocking recvfrom(), same
+   reasoning as KPipe/TcpConnection (see kernel/syscall.c / drivers/net/tcp.c) --
+   a real wake fires immediately via udp_socket_deliver()'s
+   waitqueue_wake_all() when a datagram arrives, this only bounds the
+   pathological case of nothing ever arriving. */
+#define UDP_WAIT_RETRY_TICKS 500
 
 typedef struct {
     bool     in_use;
@@ -27,6 +35,7 @@ typedef struct {
     uint32_t rx_from_ip;
     uint16_t rx_from_port;
     volatile bool data_available;
+    WaitQueue rx_wq; /* Phase 22d: real blocking recvfrom() */
 } UdpSocket;
 
 static UdpSocket sockets[UDP_MAX_SOCKETS];
@@ -83,13 +92,12 @@ int udp_socket_recvfrom(int idx, void *buf, uint32_t max_len,
 
     UdpSocket *s = &sockets[idx];
 
-    for (uint32_t i = 0; i < UDP_RECV_TIMEOUT; i++) {
-        net_poll();
-        if (s->data_available && s->rx_len > 0)
-            break;
+    /* Real blocking recvfrom(): net_poll() is timer-tick-driven now (see
+       kernel/irq.c), so this only needs to wait for udp_socket_deliver()
+       to wake it -- no more busy-spinning net_poll() itself. */
+    while (!(s->data_available && s->rx_len > 0)) {
+        waitqueue_wait(&s->rx_wq, timer_get_ticks() + UDP_WAIT_RETRY_TICKS);
     }
-    if (!s->data_available || s->rx_len == 0)
-        return -1; /* timeout */
 
     uint32_t copy_len = s->rx_len;
     if (copy_len > max_len)
@@ -131,6 +139,7 @@ bool udp_socket_deliver(uint32_t src_ip, uint16_t src_port,
             sockets[i].rx_from_ip     = src_ip;
             sockets[i].rx_from_port   = src_port;
             sockets[i].data_available = true;
+            waitqueue_wake_all(&sockets[i].rx_wq);
             return true;
         }
     }

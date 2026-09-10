@@ -12,6 +12,9 @@
 #include <wynland/signal.h>
 #include <wynland/rtc.h>
 #include <wynland/elf.h>
+#include <wynland/waitqueue.h>
+
+extern uint64_t timer_get_ticks(void);
 
 /* Magic first_cluster sentinels for real AF_INET sockets (distinct from
    the pre-existing 0xFFFFFFF8 AF_UNIX mock, which stays untouched for
@@ -81,6 +84,11 @@ typedef struct {
                            needed because after fork() they typically end
                            up in different processes, closing independently */
     bool     in_use;
+    /* Phase 22d: real blocking, same bounded-retry safety net as KPipe
+       (see pipe_read/pipe_write's own comment -- neither end here tracks
+       peer-closed either). */
+    WaitQueue s2m_wq; /* master read() / slave write() block here */
+    WaitQueue m2s_wq; /* slave read() / master write() block here */
 } Pty;
 
 static Pty *g_ptys[MAX_PTYS];
@@ -239,6 +247,11 @@ typedef struct {
     uint32_t head;
     uint32_t tail;
     uint32_t count;
+    /* Phase 22d: real blocking. Zero-initialized by kmalloc+memset at
+       creation, same as every other field here -- an empty WaitQueue is
+       just a NULL head. */
+    WaitQueue read_wq;  /* readers block here while count == 0 */
+    WaitQueue write_wq; /* writers block here while count == PIPE_BUF_SIZE */
 } KPipe;
 
 static KPipe *g_pipes[MAX_PIPES];
@@ -258,29 +271,47 @@ typedef struct {
 } ShmSegment;
 static ShmSegment g_shm_segments[MAX_SHM_SEGMENTS];
 
+/* Phase 22d: real blocking pipe I/O. Neither end tracks "peer closed" (see
+   SYS_close's own comment on this pipe/PTY-wide accepted gap -- proper
+   refcounting needs the fd-inheritance loop in process.c to know about
+   pipe-specific bumping, deliberately deferred), so an unbounded block
+   here could wedge a thread forever if its only peer closes without ever
+   writing again. Retrying the wait in bounded ~2s slices (independent of
+   the real, immediate wake pipe_write()/pipe_read() below fire on every
+   actual data change) keeps this a genuine sleep -- not a spin -- while
+   still bounding the worst case instead of trading one failure mode
+   (busy-loop) for a strictly worse one (unkillable hang). */
+#define PIPE_WAIT_RETRY_TICKS 200
+
 static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
     const uint8_t *src = (const uint8_t *)buf;
+    while (pipe->count >= PIPE_BUF_SIZE) {
+        waitqueue_wait(&pipe->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+    }
     uint32_t written = 0;
-    while (written < size) {
-        if (pipe->count >= PIPE_BUF_SIZE) break;
+    while (written < size && pipe->count < PIPE_BUF_SIZE) {
         pipe->buffer[pipe->tail] = src[written];
         pipe->tail = (pipe->tail + 1) % PIPE_BUF_SIZE;
         pipe->count++;
         written++;
     }
+    if (written > 0) waitqueue_wake_all(&pipe->read_wq);
     return written;
 }
 
 static uint32_t pipe_read(KPipe *pipe, void *buf, uint32_t size) {
     uint8_t *dst = (uint8_t *)buf;
+    while (pipe->count == 0) {
+        waitqueue_wait(&pipe->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+    }
     uint32_t read_bytes = 0;
-    while (read_bytes < size) {
-        if (pipe->count == 0) break;
+    while (read_bytes < size && pipe->count > 0) {
         dst[read_bytes] = pipe->buffer[pipe->head];
         pipe->head = (pipe->head + 1) % PIPE_BUF_SIZE;
         pipe->count--;
         read_bytes++;
     }
+    if (read_bytes > 0) waitqueue_wake_all(&pipe->write_wq);
     return read_bytes;
 }
 
@@ -504,13 +535,25 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (fd_table[a1]->node.first_cluster == PTY_FD_MASTER) {
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
+                while (pty->s2m_count == 0) {
+                    waitqueue_wait(&pty->s2m_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+                }
                 uint32_t n = pty_ring_read(pty->s2m_buf, &pty->s2m_head, &pty->s2m_tail, &pty->s2m_count, (void *)a2, (uint32_t)a3);
-                return (uint64_t)n; // 0 = no data yet, non-blocking like pipes
+                /* One WaitQueue per direction serves both "empty" (reader)
+                   and "full" (writer) waiters -- wake unconditionally after
+                   any read/write touches the buffer, each waiter rechecks
+                   its own condition on resume (see the while() loops here). */
+                if (n > 0) waitqueue_wake_all(&pty->s2m_wq);
+                return (uint64_t)n;
             }
             if (fd_table[a1]->node.first_cluster == PTY_FD_SLAVE) {
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
+                while (pty->m2s_count == 0) {
+                    waitqueue_wait(&pty->m2s_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+                }
                 uint32_t n = pty_ring_read(pty->m2s_buf, &pty->m2s_head, &pty->m2s_tail, &pty->m2s_count, (void *)a2, (uint32_t)a3);
+                if (n > 0) waitqueue_wake_all(&pty->m2s_wq);
                 return (uint64_t)n;
             }
             return vfs_read(fd_table[a1], (void *)a2, (uint32_t)a3);
@@ -560,13 +603,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (fd_table[a1]->node.first_cluster == PTY_FD_MASTER) {
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
+                while (pty->m2s_count >= PTY_BUF_SIZE) {
+                    waitqueue_wait(&pty->m2s_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+                }
                 uint32_t n = pty_ring_write(pty->m2s_buf, &pty->m2s_head, &pty->m2s_tail, &pty->m2s_count, (const void *)a2, (uint32_t)a3);
+                if (n > 0) waitqueue_wake_all(&pty->m2s_wq);
                 return (uint64_t)n;
             }
             if (fd_table[a1]->node.first_cluster == PTY_FD_SLAVE) {
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
+                while (pty->s2m_count >= PTY_BUF_SIZE) {
+                    waitqueue_wait(&pty->s2m_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+                }
                 uint32_t n = pty_ring_write(pty->s2m_buf, &pty->s2m_head, &pty->s2m_tail, &pty->s2m_count, (const void *)a2, (uint32_t)a3);
+                if (n > 0) waitqueue_wake_all(&pty->s2m_wq);
                 return (uint64_t)n;
             }
             return vfs_write(fd_table[a1], (const void *)a2, (uint32_t)a3);
@@ -2285,10 +2336,10 @@ return 0;
         case 157: // SYS_prctl (Linux standard)
             return 0;
 
-        case 7:   // SYS_poll (Linux standard) -- shares ppoll's implementation;
-                   // a3 here is a plain int timeout_ms rather than a timespec*,
-                   // but the code below only ever discards a3 as a pointer
-                   // ((void)tmo;), never dereferences it, so reusing it is safe.
+        case 7:   // SYS_poll (Linux standard) -- shares ppoll's implementation.
+                   // a3 here is a plain int timeout_ms (poll()'s real third
+                   // arg), NOT a timespec* like ppoll's -- same register,
+                   // different meaning, disambiguated below via `num`.
         case 271: // SYS_ppoll (Linux standard)
             {
                 struct pollfd {
@@ -2297,69 +2348,116 @@ return 0;
                     short revents;
                 } *fds = (struct pollfd *)a1;
                 uint64_t nfds = a2;
-                struct linux_timespec {
-                    int64_t tv_sec;
-                    int64_t tv_nsec;
-                } *tmo = (struct linux_timespec *)a3;
-                (void)tmo;
 
-                // Set all revents to 0 initially
-                if (fds) {
-                    for (uint64_t i = 0; i < nfds; i++) {
-                        fds[i].revents = 0;
-                    }
+                /* Phase 22d: real timeout instead of the old single-check-
+                   then-yield-then-return-0 (which silently ignored
+                   whatever timeout the caller asked for). -1 = block
+                   forever, 0 = poll once and return immediately, >0 =
+                   real tick budget. Timer runs at 100Hz (kernel/irq.c). */
+                int64_t timeout_ticks;
+                if (num == 7) {
+                    int timeout_ms = (int)(int32_t)a3;
+                    timeout_ticks = (timeout_ms < 0) ? -1 : (int64_t)timeout_ms / 10;
+                } else {
+                    struct linux_timespec {
+                        int64_t tv_sec;
+                        int64_t tv_nsec;
+                    } *tmo = (struct linux_timespec *)a3;
+                    timeout_ticks = !tmo ? -1 : (tmo->tv_sec * 100 + tmo->tv_nsec / 10000000);
                 }
+                uint64_t deadline = (timeout_ticks < 0) ? SCHED_NO_DEADLINE : timer_get_ticks() + (uint64_t)timeout_ticks;
 
-                int ready = 0;
-                for (uint64_t i = 0; i < nfds; i++) {
-                    int fd = fds[i].fd;
-                    if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
-                        if (fds) fds[i].revents = 0x0020; // POLLNVAL
-                        ready++;
-                        continue;
+                for (;;) {
+                    if (fds) {
+                        for (uint64_t i = 0; i < nfds; i++) fds[i].revents = 0;
                     }
-                    VfsFile *file = fd_table[fd];
-                    
-                    // Check if it's eventfd or pipe
-                    if (file->node.first_cluster == 0xFFFFFFFA || // Pipe Read
-                        file->node.first_cluster == 0xFFFFFFFC)   // Eventfd
-                    {
-                        int p_idx = file->current_cluster;
-                        if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
-                            KPipe *p = g_pipes[p_idx];
-                            // Check if readable (there are bytes in the buffer)
-                            if (p->head != p->tail) {
-                                if (fds && (fds[i].events & 0x0001)) { // POLLIN
-                                    fds[i].revents |= 0x0001;
-                                    ready++;
+
+                    int ready = 0;
+                    WaitQueue *single_wq = NULL; /* only meaningful when nfds == 1 and that one fd isn't ready yet */
+
+                    for (uint64_t i = 0; i < nfds; i++) {
+                        int fd = fds[i].fd;
+                        if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
+                            if (fds) fds[i].revents = 0x0020; // POLLNVAL
+                            ready++;
+                            continue;
+                        }
+                        VfsFile *file = fd_table[fd];
+
+                        if (file->node.first_cluster == 0xFFFFFFFA || // Pipe Read
+                            file->node.first_cluster == 0xFFFFFFFC)   // Eventfd
+                        {
+                            int p_idx = file->current_cluster;
+                            if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
+                                KPipe *p = g_pipes[p_idx];
+                                if (p->count > 0) {
+                                    if (fds && (fds[i].events & 0x0001)) { // POLLIN
+                                        fds[i].revents |= 0x0001;
+                                        ready++;
+                                    }
+                                } else {
+                                    single_wq = &p->read_wq;
                                 }
                             }
                         }
-                    }
-                    else if (file->node.first_cluster == 0xFFFFFFFB) { // Pipe Write
-                        // Pipes are always writable in our simple buffer
-                        if (fds && (fds[i].events & 0x0004)) { // POLLOUT
-                            fds[i].revents |= 0x0004;
+                        else if (file->node.first_cluster == 0xFFFFFFFB) { // Pipe Write
+                            if (fds && (fds[i].events & 0x0004)) { // POLLOUT
+                                fds[i].revents |= 0x0004;
+                                ready++;
+                            }
+                        }
+                        else if (file->node.first_cluster == PTY_FD_MASTER) {
+                            Pty *pty = g_ptys[file->current_cluster];
+                            if (pty && pty->s2m_count > 0 && fds && (fds[i].events & 0x0001)) {
+                                fds[i].revents |= 0x0001;
+                                ready++;
+                            } else if (pty) {
+                                single_wq = &pty->s2m_wq;
+                            }
+                            if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
+                        }
+                        else if (file->node.first_cluster == PTY_FD_SLAVE) {
+                            Pty *pty = g_ptys[file->current_cluster];
+                            if (pty && pty->m2s_count > 0 && fds && (fds[i].events & 0x0001)) {
+                                fds[i].revents |= 0x0001;
+                                ready++;
+                            } else if (pty) {
+                                single_wq = &pty->m2s_wq;
+                            }
+                            if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
+                        }
+                        else {
+                            // Regular files/devices/sockets are always readable/writable
+                            // (real socket readiness lands in Phase 22d's net_poll wiring).
+                            if (fds) {
+                                if (fds[i].events & 0x0001) fds[i].revents |= 0x0001;
+                                if (fds[i].events & 0x0004) fds[i].revents |= 0x0004;
+                            }
                             ready++;
                         }
                     }
-                    else {
-                        // Regular files/devices are always readable/writable
-                        if (fds) {
-                            if (fds[i].events & 0x0001) fds[i].revents |= 0x0001;
-                            if (fds[i].events & 0x0004) fds[i].revents |= 0x0004;
-                        }
-                        ready++;
+
+                    if (ready > 0) return (uint64_t)ready;
+                    if (timeout_ticks == 0) return 0; // caller asked for an immediate check only
+
+                    uint64_t now = timer_get_ticks();
+                    if (deadline != SCHED_NO_DEADLINE && now >= deadline) return 0; // real timeout
+
+                    /* Genuinely sleep instead of spinning. Single watched fd
+                       with a real wait queue -> wake instantly on data via
+                       waitqueue_wake_all(); otherwise fall back to a bounded
+                       ~50ms nap so the CPU is actually free between checks
+                       (still not a spin -- just not per-fd event-driven yet
+                       for the multi-fd case, honestly short of "real epoll"
+                       but a genuine sleep, not the old single-yield). */
+                    if (single_wq && nfds == 1) {
+                        waitqueue_wait(single_wq, deadline);
+                    } else {
+                        uint64_t nap_deadline = now + 5;
+                        if (deadline != SCHED_NO_DEADLINE && nap_deadline > deadline) nap_deadline = deadline;
+                        sched_block(NULL, nap_deadline);
                     }
                 }
-
-                if (ready > 0) {
-                    return (uint64_t)ready;
-                }
-
-                // If no file descriptors are ready, yield to prevent tight busy loop
-                sched_yield();
-                return 0; // Timeout
             }
         case 41: // SYS_socket
             {
@@ -2583,10 +2681,16 @@ return 0;
                 int epfd = (int)a1;
                 struct epoll_event *events = (struct epoll_event *)a2;
                 int maxevents = (int)a3;
-                
+                /* epoll_wait(epfd, events, maxevents, timeout) -- timeout
+                   is a4, milliseconds, same convention as poll()'s third
+                   arg. Previously dropped entirely (the inner dispatch
+                   always passed 0), so epoll_wait never actually honored
+                   its own caller's timeout even before Phase 22d. */
+                int timeout_ms = (int)(int32_t)a4;
+
                 EpollInstance *inst = get_epoll_instance(epfd);
                 if (!inst) return -9; // EBADF
-                
+
                 struct pollfd {
                     int fd;
                     short events;
@@ -2600,9 +2704,11 @@ return 0;
                     if (inst->watches[i].ev.events & EPOLLOUT) pfds[i].events |= 0x0004; // POLLOUT
                     pfds[i].revents = 0;
                 }
-                
-                // Call our internal syscall_dispatcher for ppoll
-                uint64_t ready = syscall_dispatcher(271, (uint64_t)pfds, inst->num_watches, 0, 0, 0, regs);
+
+                // Delegate to SYS_poll (num=7) so the timeout is read as a
+                // plain int-milliseconds value, matching epoll_wait's own
+                // convention (not ppoll's timespec-pointer one).
+                uint64_t ready = syscall_dispatcher(7, (uint64_t)pfds, inst->num_watches, (uint64_t)(int64_t)timeout_ms, 0, 0, regs);
                 
                 if (ready > 0) {
                     int ev_count = 0;
