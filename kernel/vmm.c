@@ -332,6 +332,31 @@ uint64_t vmm_get_page_flags(PageTable *pml4, uint64_t virt)
     return *pt_entry & 0xFFFULL;
 }
 
+bool vmm_resolve_cow_page(PageTable *pml4, uint64_t page_addr)
+{
+    page_addr &= ~(PAGE_SIZE - 1);
+    uint64_t flags = vmm_get_page_flags(pml4, page_addr);
+    if (!(flags & PAGE_COW)) return true; /* not COW -- nothing to resolve */
+
+    uint64_t phys = vmm_get_phys(pml4, page_addr);
+    uint32_t refs = pmm_page_refcount((void *)(uintptr_t)phys);
+
+    if (refs <= 1) {
+        /* Last (or only) owner -- no one else can be looking at this
+           frame, so just reclaim write access in place, no copy needed. */
+        vmm_protect_page(pml4, page_addr, (flags & ~PAGE_COW) | PAGE_WRITE);
+        return true;
+    }
+
+    void *new_phys = pmm_alloc_page();
+    if (!new_phys) return false; /* OOM duplicating a still-shared page */
+
+    memcpy(new_phys, (void *)(uintptr_t)phys, PAGE_SIZE);
+    vmm_map_page(pml4, page_addr, (uint64_t)(uintptr_t)new_phys, (flags & ~PAGE_COW) | PAGE_WRITE);
+    pmm_free_page((void *)(uintptr_t)phys); /* drop this owner's share of the old, still-shared frame */
+    return true;
+}
+
 uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
 {
     uint64_t pml4_idx = PML4_INDEX(virt);

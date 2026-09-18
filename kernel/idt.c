@@ -224,29 +224,12 @@ void exception_handler(InterruptRegisters *regs)
         uint64_t flags = vmm_get_page_flags(pml4, cr2);
 
         if (flags & PAGE_COW) {
-            uint64_t page_addr = cr2 & ~(PAGE_SIZE - 1);
-            uint64_t phys = vmm_get_phys(pml4, page_addr);
-            uint32_t refs = pmm_page_refcount((void *)(uintptr_t)phys);
-
-            if (refs <= 1) {
-                /* Last (or only) owner -- no one else can be looking at
-                   this frame, so just reclaim write access on it in
-                   place, no copy needed. */
-                serial_write_string("COW: reclaimed write access (last owner)\r\n");
-                vmm_protect_page(pml4, page_addr, (flags & ~PAGE_COW) | PAGE_WRITE);
+            /* vmm_resolve_cow_page() only returns false on OOM duplicating
+               a still-shared page; fall through to the fatal path below
+               rather than spin re-faulting forever in that case. */
+            if (vmm_resolve_cow_page(pml4, cr2)) {
                 return;
             }
-
-            void *new_phys = pmm_alloc_page();
-            if (new_phys) {
-                serial_write_string("COW: duplicated shared page\r\n");
-                memcpy(new_phys, (void *)(uintptr_t)phys, PAGE_SIZE);
-                vmm_map_page(pml4, page_addr, (uint64_t)(uintptr_t)new_phys, (flags & ~PAGE_COW) | PAGE_WRITE);
-                pmm_free_page((void *)(uintptr_t)phys); /* drop this owner's share of the old, still-shared frame */
-                return;
-            }
-            /* OOM duplicating a COW page: fall through to the fatal path
-               below rather than spin re-faulting forever. */
         }
     }
 

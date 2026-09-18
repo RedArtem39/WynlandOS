@@ -13,6 +13,7 @@
 #include <wynland/rtc.h>
 #include <wynland/elf.h>
 #include <wynland/waitqueue.h>
+#include <wynland/usercopy.h>
 
 extern uint64_t timer_get_ticks(void);
 
@@ -241,6 +242,11 @@ static int __attribute__((unused)) str_compare(const char *s1, const char *s2) {
 #define MAX_PIPES 256
 #define MAX_SPAWN_ARGV 8
 #define PIPE_BUF_SIZE 4096
+/* Bound on how many struct iovec entries SYS_readv/SYS_writev will copy
+   into a kernel-side array in one call -- real Linux's own IOV_MAX is
+   1024; 64 comfortably covers every real caller here (this OS has no
+   scatter/gather-heavy workload) while keeping the on-stack copy small. */
+#define IOV_MAX_LOCAL 64
 
 typedef struct {
     uint8_t  buffer[PIPE_BUF_SIZE];
@@ -353,6 +359,37 @@ static int get_free_fd(VfsFile **fd_table) {
     return -1;
 }
 
+/* Copies up to max_entries strings out of a NULL-terminated user array of
+   user string pointers at `uarray` (e.g. argv/envp) into freshly kmalloc'd
+   kernel buffers (each up to MAX_PATH-1 bytes). Every level is validated:
+   the array slot itself (a user pointer to a user pointer) via
+   user_check_read() before it's dereferenced, and the string it points to
+   via strncpy_from_user() -- neither the old execve()/SYS_spawn_argv()
+   loops here validated anything, so a bad argv/envp pointer (or a bad
+   pointer buried inside one) panicked the kernel outright.
+   kptrs[] is left NULL-terminated at the returned count. Stops (without
+   failing) at the first invalid array slot or string, an entry that's
+   NULL, max_entries, or an allocation failure -- same truncate-not-fail
+   style the original loops used for running out of slots. Returns -1
+   only when `uarray` itself was NULL, so callers can keep their existing
+   "NULL means no array / use defaults" convention. */
+static int copy_argv_array_from_user(const char *const *uarray, char **kbufs, const char **kptrs, int max_entries) {
+    if (!uarray) return -1;
+    int count = 0;
+    for (; count < max_entries; count++) {
+        if (!user_check_read((uint64_t)(uintptr_t)(uarray + count), sizeof(char *))) break;
+        const char *ustr = uarray[count];
+        if (!ustr) break;
+        char *buf = (char *)kmalloc(MAX_PATH);
+        if (!buf) break;
+        if (strncpy_from_user(buf, ustr, MAX_PATH) < 0) { kfree(buf); break; }
+        kbufs[count] = buf;
+        kptrs[count] = buf;
+    }
+    kptrs[count] = NULL;
+    return count;
+}
+
 /* Helper: fill a linux_stat structure from a VFS file descriptor */
 static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
     memset(st, 0, sizeof(*st));
@@ -426,6 +463,120 @@ static EpollInstance* get_epoll_instance(int fd) {
     return NULL;
 }
 
+/* Bound on how many struct wl_pollfd entries SYS_poll/SYS_ppoll will copy
+   into a kernel-side array in one call. */
+#define POLL_MAX_LOCAL 256
+
+struct wl_pollfd { int fd; short events; short revents; };
+
+/* Poll `nfds` KERNEL-owned wl_pollfd entries for readiness, genuinely
+   blocking (not spinning) until at least one is ready or `timeout_ticks`
+   elapses (-1 = block forever, 0 = one immediate check, >0 = real tick
+   budget). Shared by SYS_poll/SYS_ppoll (case 7/271 below, which copy the
+   user-supplied array in/out around this) and SYS_epoll_wait (case
+   232/281, whose own pfds array is a local kernel stack buffer that was
+   NEVER user memory -- it used to reach this same loop via a recursive
+   syscall_dispatcher(7, (uint64_t)pfds, ...) call, which broke the moment
+   case 7 started validating a1 as a genuine user pointer, since a kernel
+   stack address is never PAGE_USER). Takes fd_table explicitly since it's
+   a local in the calling syscall_dispatcher() invocation (per-process,
+   see the top of that function), not a global this can reach on its own. */
+static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ticks) {
+    uint64_t deadline = (timeout_ticks < 0) ? SCHED_NO_DEADLINE : timer_get_ticks() + (uint64_t)timeout_ticks;
+
+    for (;;) {
+        if (fds) {
+            for (uint64_t i = 0; i < nfds; i++) fds[i].revents = 0;
+        }
+
+        int ready = 0;
+        WaitQueue *single_wq = NULL; /* only meaningful when nfds == 1 and that one fd isn't ready yet */
+
+        for (uint64_t i = 0; i < nfds; i++) {
+            int fd = fds[i].fd;
+            if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
+                if (fds) fds[i].revents = 0x0020; // POLLNVAL
+                ready++;
+                continue;
+            }
+            VfsFile *file = fd_table[fd];
+
+            if (file->node.first_cluster == 0xFFFFFFFA || // Pipe Read
+                file->node.first_cluster == 0xFFFFFFFC)   // Eventfd
+            {
+                int p_idx = file->current_cluster;
+                if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
+                    KPipe *p = g_pipes[p_idx];
+                    if (p->count > 0) {
+                        if (fds && (fds[i].events & 0x0001)) { // POLLIN
+                            fds[i].revents |= 0x0001;
+                            ready++;
+                        }
+                    } else {
+                        single_wq = &p->read_wq;
+                    }
+                }
+            }
+            else if (file->node.first_cluster == 0xFFFFFFFB) { // Pipe Write
+                if (fds && (fds[i].events & 0x0004)) { // POLLOUT
+                    fds[i].revents |= 0x0004;
+                    ready++;
+                }
+            }
+            else if (file->node.first_cluster == PTY_FD_MASTER) {
+                Pty *pty = g_ptys[file->current_cluster];
+                if (pty && pty->s2m_count > 0 && fds && (fds[i].events & 0x0001)) {
+                    fds[i].revents |= 0x0001;
+                    ready++;
+                } else if (pty) {
+                    single_wq = &pty->s2m_wq;
+                }
+                if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
+            }
+            else if (file->node.first_cluster == PTY_FD_SLAVE) {
+                Pty *pty = g_ptys[file->current_cluster];
+                if (pty && pty->m2s_count > 0 && fds && (fds[i].events & 0x0001)) {
+                    fds[i].revents |= 0x0001;
+                    ready++;
+                } else if (pty) {
+                    single_wq = &pty->m2s_wq;
+                }
+                if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
+            }
+            else {
+                // Regular files/devices/sockets are always readable/writable
+                // (real socket readiness lands in Phase 22d's net_poll wiring).
+                if (fds) {
+                    if (fds[i].events & 0x0001) fds[i].revents |= 0x0001;
+                    if (fds[i].events & 0x0004) fds[i].revents |= 0x0004;
+                }
+                ready++;
+            }
+        }
+
+        if (ready > 0) return ready;
+        if (timeout_ticks == 0) return 0; // caller asked for an immediate check only
+
+        uint64_t now = timer_get_ticks();
+        if (deadline != SCHED_NO_DEADLINE && now >= deadline) return 0; // real timeout
+
+        /* Genuinely sleep instead of spinning. Single watched fd
+           with a real wait queue -> wake instantly on data via
+           waitqueue_wake_all(); otherwise fall back to a bounded
+           ~50ms nap so the CPU is actually free between checks
+           (still not a spin -- just not per-fd event-driven yet
+           for the multi-fd case, honestly short of "real epoll"
+           but a genuine sleep, not the old single-yield). */
+        if (single_wq && nfds == 1) {
+            waitqueue_wait(single_wq, deadline);
+        } else {
+            uint64_t nap_deadline = now + 5;
+            if (deadline != SCHED_NO_DEADLINE && nap_deadline > deadline) nap_deadline = deadline;
+            sched_block(NULL, nap_deadline);
+        }
+    }
+}
+
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     /* Per-process fd namespace -- shadows the identifiers every case below
        already uses, so this is the only change needed to make fd_table/
@@ -452,6 +603,16 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                have its reads silently hijacked back to the console
                instead of reaching whatever it was actually redirected
                to. */
+            /* Every branch below this point writes at most a3 bytes into
+               a2 (the raw keyboard/serial shortcut, the VENDOR/DEVICE
+               mocks, pipe_read/tcp_recv/udp_socket_recvfrom/pty_ring_read,
+               and the vfs_read() fallback) -- one guard up front covers
+               all of them instead of validating only the first path taken.
+               Real read(fd, NULL, n>0) is -EFAULT, not the old silent
+               "return 0". */
+            if (a3 != 0 && !user_prepare_write(a2, a3)) {
+                return (uint64_t)-14; /* -EFAULT */
+            }
             if (a1 == 0 && fd_table[0] == NULL) { // stdin
                 if (a3 == 0 || !a2) return 0;
                 char *cbuf = (char *)a2;
@@ -562,6 +723,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             /* Same fix as SYS_read above: only take the raw
                console/serial shortcut when fd 1/2 hasn't been
                redirected to something real via dup2(). */
+            /* Mirrors SYS_read's guard above: every branch below reads at
+               most a3 bytes FROM a2 (console/serial, pipe_write/tcp_send/
+               udp_socket_sendto/pty_ring_write, vfs_write() fallback). */
+            if (a3 != 0 && !user_check_read(a2, a3)) {
+                return (uint64_t)-14; /* -EFAULT */
+            }
             if ((a1 == 1 || a1 == 2) && fd_table[a1] == NULL) { // stdout/stderr
                 if (a3 == 0 || !a2) return 0;
                 extern bool g_quiet_console;
@@ -624,19 +791,35 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 20: // SYS_writev (Linux standard)
             {
-                struct iovec {
-                    void  *iov_base;
-                    size_t iov_len;
-                } *iov = (struct iovec *)a2;
+                struct iovec { void *iov_base; size_t iov_len; };
                 int iovcnt = (int)a3;
+                if (iovcnt < 0 || iovcnt > IOV_MAX_LOCAL) return (uint64_t)-22; /* -EINVAL */
+
+                /* The iovec ARRAY itself is just as much user-controlled
+                   memory as the buffers it points to -- copy it into a
+                   bounded kernel buffer before trusting any entry in it. */
+                struct iovec kiov[IOV_MAX_LOCAL];
+                if (iovcnt > 0 && copy_from_user(kiov, (const void *)a2, (uint64_t)iovcnt * sizeof(struct iovec)) != 0) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
+                /* Validate every buffer up front -- never validate only the
+                   first one -- so a bad entry fails cleanly before an
+                   earlier, valid entry has already been written out. */
+                for (int i = 0; i < iovcnt; i++) {
+                    if (kiov[i].iov_base && kiov[i].iov_len > 0 &&
+                        !user_check_read((uint64_t)(uintptr_t)kiov[i].iov_base, kiov[i].iov_len)) {
+                        return (uint64_t)-14; /* -EFAULT */
+                    }
+                }
+
                 size_t total_written = 0;
 
                 if (a1 == 1 || a1 == 2) { // stdout/stderr
                     extern bool g_quiet_console;
                     for (int i = 0; i < iovcnt; i++) {
-                        if (iov[i].iov_base && iov[i].iov_len > 0) {
-                            const char *cbuf = (const char *)iov[i].iov_base;
-                            for (size_t j = 0; j < iov[i].iov_len; j++) {
+                        if (kiov[i].iov_base && kiov[i].iov_len > 0) {
+                            const char *cbuf = (const char *)kiov[i].iov_base;
+                            for (size_t j = 0; j < kiov[i].iov_len; j++) {
                                 char ch = cbuf[j];
                                 if (g_boot_info && !g_quiet_console) {
                                     console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
@@ -645,7 +828,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                                 extern void serial_write_string(const char *str);
                                 serial_write_string(single);
                             }
-                            total_written += iov[i].iov_len;
+                            total_written += kiov[i].iov_len;
                         }
                     }
                     return total_written;
@@ -655,20 +838,25 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)-1;
                 }
                 for (int i = 0; i < iovcnt; i++) {
-                    if (iov[i].iov_base && iov[i].iov_len > 0) {
-                        int written = vfs_write(fd_table[a1], iov[i].iov_base, iov[i].iov_len);
+                    if (kiov[i].iov_base && kiov[i].iov_len > 0) {
+                        int written = vfs_write(fd_table[a1], kiov[i].iov_base, kiov[i].iov_len);
                         if (written < 0) return (uint64_t)-1;
                         total_written += written;
                     }
                 }
                 return total_written;
             }
-            
+
         case 2: // SYS_open (Linux standard)
             if (!a1) return (uint64_t)-2;
             {
+                char path_kbuf[MAX_PATH];
+                if (strncpy_from_user(path_kbuf, (const void *)a1, sizeof(path_kbuf)) < 0) {
+                    return (uint64_t)-14; /* -EFAULT (also covers a too-long path) */
+                }
+
                 serial_write_string("Syscall: open path: ");
-                serial_write_string((const char *)a1);
+                serial_write_string(path_kbuf);
                 serial_write_string("\r\n");
 
                 int linux_flags = (int)a2;
@@ -682,7 +870,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 int fd = get_free_fd(fd_table);
                 if (fd == -1) return (uint64_t)-2;
-                VfsFile *file = vfs_open_flags((const char *)a1, vfs_flags);
+                VfsFile *file = vfs_open_flags(path_kbuf, vfs_flags);
                 if (!file) return (uint64_t)-2;
 
                 /* Real permission enforcement backed by the ext2 inode's
@@ -963,8 +1151,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             {
                 serial_write_string("Syscall: pipe/pipe2 called\r\n");
                 int *pipefd = (int *)a1;
-                if (!pipefd) {
-                    serial_write_string("  Error: pipefd is NULL\r\n");
+                if (!pipefd || !user_prepare_write(a1, 2 * sizeof(int))) {
+                    serial_write_string("  Error: pipefd is NULL or invalid\r\n");
                     return (uint64_t)-14; /* -EFAULT */
                 }
 
@@ -1035,11 +1223,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 83: // SYS_mkdir
             {
-                const char *path = (const char *)a1;
+                char path[MAX_PATH];
+                if (strncpy_from_user(path, (const void *)a1, sizeof(path)) < 0) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
                 serial_write_string("Syscall: mkdir path: ");
                 serial_write_string(path);
                 serial_write_string("\r\n");
-                
+
                 extern bool vfs_mkdir(const char *path);
                 if (vfs_mkdir(path)) {
                     return 0;
@@ -1097,9 +1288,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 4: // SYS_stat (Linux standard)
             {
-                const char *path = (const char *)a1;
+                char path[MAX_PATH];
                 struct linux_stat *user_stat = (struct linux_stat *)a2;
-                if (!path || !user_stat) return (uint64_t)-14; /* -EFAULT */
+                if (!a1 || !user_stat) return (uint64_t)-14; /* -EFAULT */
+                if (strncpy_from_user(path, (const void *)a1, sizeof(path)) < 0 ||
+                    !user_prepare_write(a2, sizeof(*user_stat))) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
 
                 VfsStat vst;
                 if (!vfs_stat(path, &vst)) {
@@ -1188,6 +1383,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-9; /* -EBADF */
             }
+            if (a3 != 0 && !user_prepare_write(a2, a3)) {
+                return (uint64_t)-14; /* -EFAULT */
+            }
             {
                 VfsFile *file = fd_table[a1];
                 uint32_t prev_pos = file->offset;
@@ -1228,6 +1426,19 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 56: // SYS_clone (Linux standard)
             {
+                bool want_parent_tid = (a1 & 0x00000100) != 0; // CLONE_PARENT_SETTID
+                bool want_child_tid  = (a1 & 0x01000000) != 0; // CLONE_CHILD_SETTID
+                /* Validate BEFORE creating the thread -- a bad ptid/ctid
+                   pointer should fail the whole clone(), not leave an
+                   orphaned thread behind because the write after the fact
+                   discovered the pointer was bad. */
+                if (want_parent_tid && a3 && !user_prepare_write(a3, sizeof(int))) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
+                if (want_child_tid && a4 && !user_prepare_write(a4, sizeof(int))) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
+
                 CloneArg *ca = (CloneArg *)kmalloc(sizeof(CloneArg));
                 ca->regs = *regs;
                 ca->regs.rsp = a2; // Child stack pointer
@@ -1236,23 +1447,22 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 Thread *t = thread_create(clone_child_entry, ca);
                 t->tls_base = a5;
 
-                if (a1 & 0x00000100) { // CLONE_PARENT_SETTID
-                    int *parent_tid = (int *)a3;
-                    if (parent_tid) {
-                        *parent_tid = (int)t->id;
-                    }
+                if (want_parent_tid && a3) {
+                    *(int *)(uintptr_t)a3 = (int)t->id;
                 }
-                if (a1 & 0x01000000) { // CLONE_CHILD_SETTID
-                    int *child_tid = (int *)a4;
-                    if (child_tid) {
-                        *child_tid = (int)t->id;
-                    }
+                if (want_child_tid && a4) {
+                    *(int *)(uintptr_t)a4 = (int)t->id;
                 }
                 if (a1 & 0x00080000) { // CLONE_CHILD_CLEARTID
                     /* Phase 22a: on this thread's death the kernel must zero
                        this word and futex-wake it. musl's thread-list lock is
                        cloned with ctid = &__thread_list_lock precisely so a
-                       dying holder gets released by the kernel. */
+                       dying holder gets released by the kernel. Deliberately
+                       not validated here (unlike ptid/ctid above): it's only
+                       ever read back later, at this same thread's own exit,
+                       from its own address space (kernel/sched.c) -- not an
+                       immediate cross-process disclosure/corruption risk the
+                       way writing through a bad pointer right now would be. */
                     t->clear_tid = (uint32_t *)a4;
                 }
 
@@ -1328,17 +1538,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 59: // SYS_execve (Linux standard)
             {
-                const char *user_path = (const char *)a1;
-                if (!user_path) return (uint64_t)-14; /* -EFAULT */
-                
-                // Copy path from user space
-                char kernel_path[256];
-                uint32_t len = 0;
-                while (user_path[len] != '\0' && len < 255) {
-                    kernel_path[len] = user_path[len];
-                    len++;
+                if (!a1) return (uint64_t)-14; /* -EFAULT */
+
+                char kernel_path[MAX_PATH];
+                if (strncpy_from_user(kernel_path, (const void *)a1, sizeof(kernel_path)) < 0) {
+                    return (uint64_t)-14; /* -EFAULT */
                 }
-                kernel_path[len] = '\0';
 
                 serial_write_string("SYS_execve: Loading target: ");
                 serial_write_string(kernel_path);
@@ -1348,49 +1553,24 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t stack_top = 0;
                 PageTable *pml4 = vmm_get_current_pml4();
 
-                /* Phase 18: real argv/envp support. Same kmalloc+copy
-                   pattern as SYS_spawn_argv (408) -- every string must
-                   already be in kernel-owned memory before elf_load()
-                   runs, it writes through raw pointers. a2=argv, a3=envp,
-                   both optional (NULL preserves the old hardcoded
-                   defaults, matching elf_load()'s own NULL-means-default
-                   convention). */
+                /* Phase 18: real argv/envp support. a2=argv, a3=envp, both
+                   optional (NULL preserves the old hardcoded defaults,
+                   matching elf_load()'s own NULL-means-default convention).
+                   copy_argv_array_from_user() validates every level -- the
+                   array of user pointers, and each string it points to --
+                   before elf_load() touches any of it. */
                 #define MAX_SPAWN_ENVP 16
                 char *argv_bufs_e[MAX_SPAWN_ARGV] = {0};
                 const char *kargv_e[MAX_SPAWN_ARGV + 1];
-                int argc_e = 0;
-                const char **uargv_e = (const char **)a2;
-                if (uargv_e) {
-                    for (; argc_e < MAX_SPAWN_ARGV && uargv_e[argc_e]; argc_e++) {
-                        char *buf = (char *)kmalloc(MAX_PATH);
-                        if (!buf) break;
-                        const char *ustr = uargv_e[argc_e];
-                        int j = 0;
-                        for (; j < MAX_PATH - 1 && ustr[j]; j++) buf[j] = ustr[j];
-                        buf[j] = '\0';
-                        argv_bufs_e[argc_e] = buf;
-                        kargv_e[argc_e] = buf;
-                    }
-                }
-                kargv_e[argc_e] = NULL;
+                int argc_e = copy_argv_array_from_user((const char *const *)a2, argv_bufs_e, kargv_e, MAX_SPAWN_ARGV);
+                bool have_argv_e = (argc_e >= 0);
+                if (!have_argv_e) { argc_e = 0; kargv_e[0] = NULL; }
 
                 char *envp_bufs_e[MAX_SPAWN_ENVP] = {0};
                 const char *kenvp_e[MAX_SPAWN_ENVP + 1];
-                int envc_e = 0;
-                const char **uenvp_e = (const char **)a3;
-                if (uenvp_e) {
-                    for (; envc_e < MAX_SPAWN_ENVP && uenvp_e[envc_e]; envc_e++) {
-                        char *buf = (char *)kmalloc(MAX_PATH);
-                        if (!buf) break;
-                        const char *ustr = uenvp_e[envc_e];
-                        int j = 0;
-                        for (; j < MAX_PATH - 1 && ustr[j]; j++) buf[j] = ustr[j];
-                        buf[j] = '\0';
-                        envp_bufs_e[envc_e] = buf;
-                        kenvp_e[envc_e] = buf;
-                    }
-                }
-                kenvp_e[envc_e] = NULL;
+                int envc_e = copy_argv_array_from_user((const char *const *)a3, envp_bufs_e, kenvp_e, MAX_SPAWN_ENVP);
+                bool have_envp_e = (envc_e >= 0);
+                if (!have_envp_e) { envc_e = 0; kenvp_e[0] = NULL; }
 
                 LoadedPages *lp = kmalloc(sizeof(LoadedPages));
                 if (!lp) {
@@ -1416,7 +1596,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 exec_proc->vma_list = NULL;
 
                 bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4, lp,
-                                          uargv_e ? kargv_e : NULL, uenvp_e ? kenvp_e : NULL, exec_proc);
+                                          have_argv_e ? kargv_e : NULL, have_envp_e ? kenvp_e : NULL, exec_proc);
                 for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
                 for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
                 if (!execve_ok) {
@@ -1529,12 +1709,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    doing anything else. */
                 char *path_buf = (char *)kmalloc(MAX_PATH);
                 if (!path_buf) return (uint64_t)-1;
-                const char *upath = (const char *)a1;
-                int i = 0;
-                for (; i < MAX_PATH - 1 && upath[i]; i++) {
-                    path_buf[i] = upath[i];
+                if (strncpy_from_user(path_buf, (const void *)a1, MAX_PATH) < 0) {
+                    kfree(path_buf);
+                    return (uint64_t)-14; /* -EFAULT */
                 }
-                path_buf[i] = '\0';
 
                 extern Process *process_spawn(const char *path, const char **argv, uint32_t uid);
                 Process *child = process_spawn(path_buf, NULL, PROC_UID_INHERIT);
@@ -1575,29 +1753,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 char *path_buf = (char *)kmalloc(MAX_PATH);
                 if (!path_buf) return (uint64_t)-1;
-                const char *upath = (const char *)a1;
-                int i = 0;
-                for (; i < MAX_PATH - 1 && upath[i]; i++) path_buf[i] = upath[i];
-                path_buf[i] = '\0';
+                if (strncpy_from_user(path_buf, (const void *)a1, MAX_PATH) < 0) {
+                    kfree(path_buf);
+                    return (uint64_t)-14; /* -EFAULT */
+                }
 
                 char *argv_bufs[MAX_SPAWN_ARGV] = {0};
                 const char *kargv[MAX_SPAWN_ARGV + 1];
-                int argc = 0;
-
-                const char **uargv = (const char **)a2;
-                if (uargv) {
-                    for (; argc < MAX_SPAWN_ARGV && uargv[argc]; argc++) {
-                        char *buf = (char *)kmalloc(MAX_PATH);
-                        if (!buf) break;
-                        const char *ustr = uargv[argc];
-                        int j = 0;
-                        for (; j < MAX_PATH - 1 && ustr[j]; j++) buf[j] = ustr[j];
-                        buf[j] = '\0';
-                        argv_bufs[argc] = buf;
-                        kargv[argc] = buf;
-                    }
-                }
-                kargv[argc] = NULL;
+                int argc = copy_argv_array_from_user((const char *const *)a2, argv_bufs, kargv, MAX_SPAWN_ARGV);
+                if (argc < 0) { argc = 0; kargv[0] = NULL; }
 
                 extern Process *process_spawn(const char *path, const char **argv, uint32_t uid);
                 Process *child = process_spawn(path_buf, argc > 0 ? kargv : NULL, PROC_UID_INHERIT);
@@ -1623,13 +1787,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             {
                 if (!a1) return (uint64_t)-1;
                 static const char root_password[] = "wynland";
-                const char *given = (const char *)a1;
-                bool match = true;
-                int i = 0;
-                for (; i < (int)sizeof(root_password) - 1; i++) {
-                    if (given[i] != root_password[i]) { match = false; break; }
+                char given[32];
+                if (strncpy_from_user(given, (const void *)a1, sizeof(given)) < 0) {
+                    return (uint64_t)-14; /* -EFAULT */
                 }
-                if (match && given[i] == '\0') {
+                if (str_compare(given, root_password) == 0) {
                     sched_current()->proc->uid = 0;
                     return 0;
                 }
@@ -1647,7 +1809,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    // both directions.
             {
                 int *ptyfd = (int *)a1;
-                if (!ptyfd) return (uint64_t)-14; /* -EFAULT */
+                if (!ptyfd || !user_prepare_write(a1, 2 * sizeof(int))) return (uint64_t)-14; /* -EFAULT */
 
                 Pty *pty = NULL;
                 int pty_idx = -1;
@@ -1784,7 +1946,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             {
                 uint64_t fd = a1;
                 struct linux_stat *user_stat = (struct linux_stat *)a2;
-                if (!user_stat) return (uint64_t)-14; /* -EFAULT */
+                if (!user_stat || !user_prepare_write(a2, sizeof(*user_stat))) return (uint64_t)-14; /* -EFAULT */
 
                 /* Handle stdout/stderr/stdin */
                 if (fd <= 2) {
@@ -1827,17 +1989,24 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if (!pty) return (uint64_t)-9; // EBADF
                     if (request == 0x5401) { // TCGETS
                         struct linux_termios *out = (struct linux_termios *)argp;
-                        if (out) *out = pty->term;
+                        if (out) {
+                            if (!user_prepare_write(a3, sizeof(*out))) return (uint64_t)-14;
+                            *out = pty->term;
+                        }
                         return 0;
                     }
                     if (request == 0x5402 || request == 0x5403 || request == 0x5404) { // TCSETS/W/F
                         struct linux_termios *in = (struct linux_termios *)argp;
-                        if (in) pty->term = *in;
+                        if (in) {
+                            if (!user_check_read(a3, sizeof(*in))) return (uint64_t)-14;
+                            pty->term = *in;
+                        }
                         return 0;
                     }
                     if (request == 0x5413) { // TIOCGWINSZ
                         struct linux_winsize *out = (struct linux_winsize *)argp;
                         if (out) {
+                            if (!user_prepare_write(a3, sizeof(*out))) return (uint64_t)-14;
                             out->ws_row = pty->ws_row;
                             out->ws_col = pty->ws_col;
                             out->ws_xpixel = 0;
@@ -1848,6 +2017,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if (request == 0x5414) { // TIOCSWINSZ
                         struct linux_winsize *in = (struct linux_winsize *)argp;
                         if (in) {
+                            if (!user_check_read(a3, sizeof(*in))) return (uint64_t)-14;
                             pty->ws_row = in->ws_row;
                             pty->ws_col = in->ws_col;
                         }
@@ -1892,6 +2062,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                             uint32_t reserved[4];
                         } *vinfo = (struct fb_var_screeninfo *)argp;
                         if (vinfo && g_boot_info) {
+                            if (!user_prepare_write(a3, sizeof(*vinfo))) return (uint64_t)-14;
                             memset(vinfo, 0, sizeof(*vinfo));
                             vinfo->xres = g_boot_info->fb_width;
                             vinfo->yres = g_boot_info->fb_height;
@@ -1923,6 +2094,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                             uint16_t reserved[2];
                         } *finfo = (struct fb_fix_screeninfo *)argp;
                         if (finfo && g_boot_info) {
+                            if (!user_prepare_write(a3, sizeof(*finfo))) return (uint64_t)-14;
                             memset(finfo, 0, sizeof(*finfo));
                             // Set ID
                             finfo->id[0] = 'f'; finfo->id[1] = 'b'; finfo->id[2] = '0';
@@ -1961,16 +2133,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                                 uint64_t desc;
                             } *v = (struct drm_version *)argp;
                             if (v) {
+                                if (!user_prepare_write(a3, sizeof(*v))) return (uint64_t)-14;
                                 v->version_major = 1;
                                 v->version_minor = 0;
                                 v->version_patchlevel = 0;
-                                if (v->name && v->name_len > 0) {
+                                if (v->name && v->name_len > 0 && user_prepare_write(v->name, v->name_len)) {
                                     char *n = (char *)(uintptr_t)v->name;
                                     const char *drv = "virtio_gpu";
                                     for (int ki = 0; drv[ki] && (uint64_t)ki < v->name_len - 1; ki++) n[ki] = drv[ki];
                                 }
-                                if (v->date && v->date_len > 0) { char *d = (char *)(uintptr_t)v->date; d[0]='2'; d[1]='0'; d[2]='2'; d[3]='4'; d[4]=0; }
-                                if (v->desc && v->desc_len > 0) { char *d = (char *)(uintptr_t)v->desc; d[0]='V'; d[1]='G'; d[2]='P'; d[3]='U'; d[4]=0; }
+                                if (v->date && v->date_len > 0 && user_prepare_write(v->date, 5)) { char *d = (char *)(uintptr_t)v->date; d[0]='2'; d[1]='0'; d[2]='2'; d[3]='4'; d[4]=0; }
+                                if (v->desc && v->desc_len > 0 && user_prepare_write(v->desc, 5)) { char *d = (char *)(uintptr_t)v->desc; d[0]='V'; d[1]='G'; d[2]='P'; d[3]='U'; d[4]=0; }
                             }
                             return 0;
                         }
@@ -1981,7 +2154,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         // DRM_IOCTL_GET_CAP = 0xC010640C
                         if ((request & 0xFFFF) == 0x640C) {
                             uint64_t *cap_pair = (uint64_t *)argp;
-                            if (cap_pair) { cap_pair[1] = 0; } // cap value = 0
+                            if (cap_pair && user_prepare_write(a3, 2 * sizeof(uint64_t))) { cap_pair[1] = 0; } // cap value = 0
                             return 0;
                         }
                         // DRM_IOCTL_SET_CLIENT_CAP = 0x4010641D
@@ -2002,22 +2175,34 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 19: // SYS_readv (Linux standard) — scatter read
             {
-                struct iovec {
-                    void  *iov_base;
-                    size_t iov_len;
-                } *iov = (struct iovec *)a2;
+                struct iovec { void *iov_base; size_t iov_len; };
                 int iovcnt = (int)a3;
-                size_t total_read = 0;
+                if (iovcnt < 0 || iovcnt > IOV_MAX_LOCAL) return (uint64_t)-22; /* -EINVAL */
 
+                struct iovec kiov[IOV_MAX_LOCAL];
+                if (iovcnt > 0 && copy_from_user(kiov, (const void *)a2, (uint64_t)iovcnt * sizeof(struct iovec)) != 0) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
+                /* Validate + resolve COW on every destination up front --
+                   vfs_read() below writes straight into iov_base, so this
+                   needs the same "prepare" treatment as SYS_read's buffer. */
+                for (int i = 0; i < iovcnt; i++) {
+                    if (kiov[i].iov_base && kiov[i].iov_len > 0 &&
+                        !user_prepare_write((uint64_t)(uintptr_t)kiov[i].iov_base, kiov[i].iov_len)) {
+                        return (uint64_t)-14; /* -EFAULT */
+                    }
+                }
+
+                size_t total_read = 0;
                 if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                     return (uint64_t)-9; /* -EBADF */
                 }
                 for (int i = 0; i < iovcnt; i++) {
-                    if (iov[i].iov_base && iov[i].iov_len > 0) {
-                        int nread = vfs_read(fd_table[a1], iov[i].iov_base, iov[i].iov_len);
+                    if (kiov[i].iov_base && kiov[i].iov_len > 0) {
+                        int nread = vfs_read(fd_table[a1], kiov[i].iov_base, kiov[i].iov_len);
                         if (nread < 0) return (uint64_t)-1;
                         total_read += nread;
-                        if ((size_t)nread < iov[i].iov_len) break; /* short read */
+                        if ((size_t)nread < kiov[i].iov_len) break; /* short read */
                     }
                 }
                 return total_read;
@@ -2026,8 +2211,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 21: // SYS_access (Linux standard) — check file accessibility
             {
                 if (!a1) return (uint64_t)-14; /* -EFAULT */
+                char path[MAX_PATH];
+                if (strncpy_from_user(path, (const void *)a1, sizeof(path)) < 0) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
                 VfsStat vst;
-                if (vfs_stat((const char *)a1, &vst)) {
+                if (vfs_stat(path, &vst)) {
                     return 0; /* File exists and is accessible */
                 }
                 return (uint64_t)-2; /* -ENOENT */
@@ -2079,6 +2268,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 char *buf = (char *)a1;
                 uint64_t size = a2;
                 if (!buf || size < 2) return (uint64_t)-34; /* -ERANGE */
+                if (!user_prepare_write(a1, 2)) return (uint64_t)-14; /* -EFAULT */
                 buf[0] = '/';
                 buf[1] = '\0';
                 return (uint64_t)(uintptr_t)buf;
@@ -2093,6 +2283,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t rlim_max;
                 };
                 if (num == 302 && a3) {
+                    if (!user_prepare_write(a3, sizeof(struct rlimit64))) return (uint64_t)-14; /* -EFAULT */
                     struct rlimit64 *out = (struct rlimit64 *)a3;
                     out->rlim_cur = 0x100000; /* 1 MB stack */
                     out->rlim_max = 0x100000;
@@ -2126,6 +2317,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 };
                 struct timespec *tp = (struct timespec *)a2;
                 if (tp) {
+                    if (!user_prepare_write(a2, sizeof(*tp))) return (uint64_t)-14; /* -EFAULT */
                     extern uint64_t timer_get_ticks(void);
                     uint64_t ticks = timer_get_ticks();
                     /* CLOCK_REALTIME (0) -- real wall-clock UTC, from the
@@ -2147,7 +2339,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             {
                 int64_t now = (int64_t)rtc_get_unix_time();
                 int64_t *tloc = (int64_t *)a1;
-                if (tloc) *tloc = now;
+                if (tloc) {
+                    if (!user_prepare_write(a1, sizeof(*tloc))) return (uint64_t)-14; /* -EFAULT */
+                    *tloc = now;
+                }
                 return (uint64_t)now;
             }
         case 217: // SYS_getdents64 (Linux standard)
@@ -2156,14 +2351,20 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
                     return (uint64_t)-9; /* -EBADF */
                 }
+                if (a3 != 0 && !user_prepare_write(a2, a3)) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
                 return (uint64_t)vfs_getdents(fd_table[fd], (void *)a2, (uint32_t)a3);
             }
 
         case 257: // SYS_openat (Linux standard) — open relative to dirfd
             {
                 /* If dirfd == AT_FDCWD (-100), treat as regular open */
-                const char *path = (const char *)a2;
-                if (!path) return (uint64_t)-14;
+                if (!a2) return (uint64_t)-14;
+                char path[MAX_PATH];
+                if (strncpy_from_user(path, (const void *)a2, sizeof(path)) < 0) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
                 serial_write_string("Syscall: openat path: ");
                 serial_write_string(path);
                 serial_write_string("\r\n");
@@ -2259,9 +2460,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 262: // SYS_newfstatat (Linux standard) — fstat relative to dirfd
             {
-                const char *path = (const char *)a2;
+                char path[MAX_PATH];
                 struct linux_stat *user_stat = (struct linux_stat *)a3;
-                if (!path || !user_stat) return (uint64_t)-14;
+                if (!a2 || !user_stat) return (uint64_t)-14;
+                if (strncpy_from_user(path, (const void *)a2, sizeof(path)) < 0 ||
+                    !user_prepare_write(a3, sizeof(*user_stat))) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
 
                 VfsStat vst;
                 if (!vfs_stat(path, &vst)) {
@@ -2342,12 +2547,19 @@ return 0;
                    // different meaning, disambiguated below via `num`.
         case 271: // SYS_ppoll (Linux standard)
             {
-                struct pollfd {
-                    int fd;
-                    short events;
-                    short revents;
-                } *fds = (struct pollfd *)a1;
                 uint64_t nfds = a2;
+                if (nfds > POLL_MAX_LOCAL) return (uint64_t)-22; /* -EINVAL: also bounds the kernel copy below */
+
+                /* Copy the caller's array into a bounded kernel buffer --
+                   do_poll() writes revents into it repeatedly across
+                   however many blocking iterations it takes, and none of
+                   that is safe to do directly against a raw user pointer
+                   (unmapped, kernel-space, or a COW page mid-syscall). */
+                bool have_fds = (a1 != 0);
+                struct wl_pollfd kfds[POLL_MAX_LOCAL];
+                if (have_fds && nfds > 0 && copy_from_user(kfds, (const void *)a1, nfds * sizeof(struct wl_pollfd)) != 0) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
 
                 /* Phase 22d: real timeout instead of the old single-check-
                    then-yield-then-return-0 (which silently ignored
@@ -2358,106 +2570,20 @@ return 0;
                 if (num == 7) {
                     int timeout_ms = (int)(int32_t)a3;
                     timeout_ticks = (timeout_ms < 0) ? -1 : (int64_t)timeout_ms / 10;
+                } else if (a3 == 0) {
+                    timeout_ticks = -1;
                 } else {
-                    struct linux_timespec {
-                        int64_t tv_sec;
-                        int64_t tv_nsec;
-                    } *tmo = (struct linux_timespec *)a3;
-                    timeout_ticks = !tmo ? -1 : (tmo->tv_sec * 100 + tmo->tv_nsec / 10000000);
+                    struct linux_timespec { int64_t tv_sec; int64_t tv_nsec; } tmo;
+                    if (copy_from_user(&tmo, (const void *)a3, sizeof(tmo)) != 0) return (uint64_t)-14;
+                    timeout_ticks = tmo.tv_sec * 100 + tmo.tv_nsec / 10000000;
                 }
-                uint64_t deadline = (timeout_ticks < 0) ? SCHED_NO_DEADLINE : timer_get_ticks() + (uint64_t)timeout_ticks;
 
-                for (;;) {
-                    if (fds) {
-                        for (uint64_t i = 0; i < nfds; i++) fds[i].revents = 0;
-                    }
+                int ready = do_poll(fd_table, have_fds ? kfds : NULL, nfds, timeout_ticks);
 
-                    int ready = 0;
-                    WaitQueue *single_wq = NULL; /* only meaningful when nfds == 1 and that one fd isn't ready yet */
-
-                    for (uint64_t i = 0; i < nfds; i++) {
-                        int fd = fds[i].fd;
-                        if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
-                            if (fds) fds[i].revents = 0x0020; // POLLNVAL
-                            ready++;
-                            continue;
-                        }
-                        VfsFile *file = fd_table[fd];
-
-                        if (file->node.first_cluster == 0xFFFFFFFA || // Pipe Read
-                            file->node.first_cluster == 0xFFFFFFFC)   // Eventfd
-                        {
-                            int p_idx = file->current_cluster;
-                            if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
-                                KPipe *p = g_pipes[p_idx];
-                                if (p->count > 0) {
-                                    if (fds && (fds[i].events & 0x0001)) { // POLLIN
-                                        fds[i].revents |= 0x0001;
-                                        ready++;
-                                    }
-                                } else {
-                                    single_wq = &p->read_wq;
-                                }
-                            }
-                        }
-                        else if (file->node.first_cluster == 0xFFFFFFFB) { // Pipe Write
-                            if (fds && (fds[i].events & 0x0004)) { // POLLOUT
-                                fds[i].revents |= 0x0004;
-                                ready++;
-                            }
-                        }
-                        else if (file->node.first_cluster == PTY_FD_MASTER) {
-                            Pty *pty = g_ptys[file->current_cluster];
-                            if (pty && pty->s2m_count > 0 && fds && (fds[i].events & 0x0001)) {
-                                fds[i].revents |= 0x0001;
-                                ready++;
-                            } else if (pty) {
-                                single_wq = &pty->s2m_wq;
-                            }
-                            if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
-                        }
-                        else if (file->node.first_cluster == PTY_FD_SLAVE) {
-                            Pty *pty = g_ptys[file->current_cluster];
-                            if (pty && pty->m2s_count > 0 && fds && (fds[i].events & 0x0001)) {
-                                fds[i].revents |= 0x0001;
-                                ready++;
-                            } else if (pty) {
-                                single_wq = &pty->m2s_wq;
-                            }
-                            if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
-                        }
-                        else {
-                            // Regular files/devices/sockets are always readable/writable
-                            // (real socket readiness lands in Phase 22d's net_poll wiring).
-                            if (fds) {
-                                if (fds[i].events & 0x0001) fds[i].revents |= 0x0001;
-                                if (fds[i].events & 0x0004) fds[i].revents |= 0x0004;
-                            }
-                            ready++;
-                        }
-                    }
-
-                    if (ready > 0) return (uint64_t)ready;
-                    if (timeout_ticks == 0) return 0; // caller asked for an immediate check only
-
-                    uint64_t now = timer_get_ticks();
-                    if (deadline != SCHED_NO_DEADLINE && now >= deadline) return 0; // real timeout
-
-                    /* Genuinely sleep instead of spinning. Single watched fd
-                       with a real wait queue -> wake instantly on data via
-                       waitqueue_wake_all(); otherwise fall back to a bounded
-                       ~50ms nap so the CPU is actually free between checks
-                       (still not a spin -- just not per-fd event-driven yet
-                       for the multi-fd case, honestly short of "real epoll"
-                       but a genuine sleep, not the old single-yield). */
-                    if (single_wq && nfds == 1) {
-                        waitqueue_wait(single_wq, deadline);
-                    } else {
-                        uint64_t nap_deadline = now + 5;
-                        if (deadline != SCHED_NO_DEADLINE && nap_deadline > deadline) nap_deadline = deadline;
-                        sched_block(NULL, nap_deadline);
-                    }
+                if (have_fds && nfds > 0 && copy_to_user((void *)a1, kfds, nfds * sizeof(struct wl_pollfd)) != 0) {
+                    return (uint64_t)-14; /* -EFAULT */
                 }
+                return (uint64_t)ready;
             }
         case 41: // SYS_socket
             {
@@ -2515,11 +2641,12 @@ return 0;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
 
                 VfsFile *file = fd_table[fd];
-                struct linux_sockaddr_in *addr = (struct linux_sockaddr_in *)a2;
+                struct linux_sockaddr_in addr;
+                bool have_addr = (a2 != 0) && (copy_from_user(&addr, (const void *)a2, sizeof(addr)) == 0);
 
                 if (file->node.first_cluster == SOCK_FD_UDP) {
-                    if (!addr) return -14; // EFAULT
-                    udp_socket_connect((int)file->current_cluster, addr->sin_addr, ntohs(addr->sin_port));
+                    if (!have_addr) return -14; // EFAULT
+                    udp_socket_connect((int)file->current_cluster, addr.sin_addr, ntohs(addr.sin_port));
                     return 0;
                 }
 
@@ -2527,9 +2654,9 @@ return 0;
                     return 0; // AF_UNIX / other mock sockets: pretend success (unchanged)
                 }
 
-                if (!addr) return -14; // EFAULT
+                if (!have_addr) return -14; // EFAULT
 
-                int idx = tcp_connect_slot(addr->sin_addr, ntohs(addr->sin_port));
+                int idx = tcp_connect_slot(addr.sin_addr, ntohs(addr.sin_port));
                 if (idx < 0) return -110; // ETIMEDOUT (covers both handshake timeout and RST)
 
                 file->current_cluster = (uint32_t)idx;
@@ -2540,12 +2667,14 @@ return 0;
             {
                 int fd = (int)a1;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
+                if (a3 != 0 && !user_check_read(a2, a3)) return -14; // EFAULT
                 VfsFile *file = fd_table[fd];
 
                 if (file->node.first_cluster == SOCK_FD_UDP) {
-                    struct linux_sockaddr_in *addr = (struct linux_sockaddr_in *)a5;
-                    uint32_t dst_ip   = addr ? addr->sin_addr : 0;
-                    uint16_t dst_port = addr ? ntohs(addr->sin_port) : 0;
+                    struct linux_sockaddr_in addr;
+                    bool have_addr = (a5 != 0) && (copy_from_user(&addr, (const void *)a5, sizeof(addr)) == 0);
+                    uint32_t dst_ip   = have_addr ? addr.sin_addr : 0;
+                    uint16_t dst_port = have_addr ? ntohs(addr.sin_port) : 0;
                     int n = udp_socket_sendto((int)file->current_cluster, (const void *)a2, (uint32_t)a3, dst_ip, dst_port);
                     if (n < 0) return (uint64_t)-1;
                     return (uint64_t)n;
@@ -2567,6 +2696,7 @@ return 0;
             {
                 int fd = (int)a1;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
+                if (a3 != 0 && !user_prepare_write(a2, a3)) return -14; // EFAULT
                 VfsFile *file = fd_table[fd];
 
                 if (file->node.first_cluster == SOCK_FD_UDP) {
@@ -2574,14 +2704,17 @@ return 0;
                     uint16_t from_port = 0;
                     int n = udp_socket_recvfrom((int)file->current_cluster, (void *)a2, (uint32_t)a3, &from_ip, &from_port);
                     if (n < 0) return (uint64_t)-1;
-                    struct linux_sockaddr_in *addr = (struct linux_sockaddr_in *)a5;
-                    if (addr) {
-                        addr->sin_family = 2; // AF_INET
-                        addr->sin_port   = htons(from_port);
-                        addr->sin_addr   = from_ip;
-                        memset(addr->sin_zero, 0, sizeof(addr->sin_zero));
-                        uint32_t *addrlen = (uint32_t *)regs->r9;
-                        if (addrlen) *addrlen = sizeof(struct linux_sockaddr_in);
+                    if (a5) {
+                        struct linux_sockaddr_in addr;
+                        addr.sin_family = 2; // AF_INET
+                        addr.sin_port   = htons(from_port);
+                        addr.sin_addr   = from_ip;
+                        memset(addr.sin_zero, 0, sizeof(addr.sin_zero));
+                        if (copy_to_user((void *)a5, &addr, sizeof(addr)) != 0) return (uint64_t)-14;
+                        if (regs->r9) {
+                            uint32_t addrlen = sizeof(struct linux_sockaddr_in);
+                            if (copy_to_user((void *)regs->r9, &addrlen, sizeof(addrlen)) != 0) return (uint64_t)-14;
+                        }
                     }
                     return (uint64_t)n;
                 }
@@ -2646,15 +2779,19 @@ return 0;
                 int epfd = (int)a1;
                 int op = (int)a2;
                 int fd = (int)a3;
-                struct epoll_event *event = (struct epoll_event *)a4;
-                
+
                 EpollInstance *inst = get_epoll_instance(epfd);
                 if (!inst) return -9; // EBADF
-                
+
+                struct epoll_event event;
+                if (op != EPOLL_CTL_DEL) { // real epoll_ctl allows event==NULL only for DEL
+                    if (copy_from_user(&event, (const void *)a4, sizeof(event)) != 0) return -14; // EFAULT
+                }
+
                 if (op == EPOLL_CTL_ADD) {
                     if (inst->num_watches >= MAX_EPOLL_EVENTS) return -12; // ENOMEM
                     inst->watches[inst->num_watches].target_fd = fd;
-                    inst->watches[inst->num_watches].ev = *event;
+                    inst->watches[inst->num_watches].ev = event;
                     inst->num_watches++;
                 } else if (op == EPOLL_CTL_DEL) {
                     for (int i = 0; i < inst->num_watches; i++) {
@@ -2667,7 +2804,7 @@ return 0;
                 } else if (op == EPOLL_CTL_MOD) {
                     for (int i = 0; i < inst->num_watches; i++) {
                         if (inst->watches[i].target_fd == fd) {
-                            inst->watches[i].ev = *event;
+                            inst->watches[i].ev = event;
                             break;
                         }
                     }
@@ -2681,6 +2818,9 @@ return 0;
                 int epfd = (int)a1;
                 struct epoll_event *events = (struct epoll_event *)a2;
                 int maxevents = (int)a3;
+                if (maxevents > 0 && !user_prepare_write(a2, (uint64_t)maxevents * sizeof(struct epoll_event))) {
+                    return (uint64_t)-14; /* -EFAULT */
+                }
                 /* epoll_wait(epfd, events, maxevents, timeout) -- timeout
                    is a4, milliseconds, same convention as poll()'s third
                    arg. Previously dropped entirely (the inner dispatch
@@ -2691,12 +2831,7 @@ return 0;
                 EpollInstance *inst = get_epoll_instance(epfd);
                 if (!inst) return -9; // EBADF
 
-                struct pollfd {
-                    int fd;
-                    short events;
-                    short revents;
-                };
-                struct pollfd pfds[MAX_EPOLL_EVENTS];
+                struct wl_pollfd pfds[MAX_EPOLL_EVENTS];
                 for (int i = 0; i < inst->num_watches; i++) {
                     pfds[i].fd = inst->watches[i].target_fd;
                     pfds[i].events = 0;
@@ -2705,11 +2840,13 @@ return 0;
                     pfds[i].revents = 0;
                 }
 
-                // Delegate to SYS_poll (num=7) so the timeout is read as a
-                // plain int-milliseconds value, matching epoll_wait's own
-                // convention (not ppoll's timespec-pointer one).
-                uint64_t ready = syscall_dispatcher(7, (uint64_t)pfds, inst->num_watches, (uint64_t)(int64_t)timeout_ms, 0, 0, regs);
-                
+                // Call do_poll() directly -- pfds is a kernel stack buffer,
+                // never user memory, so this must NOT go back through
+                // syscall_dispatcher(7, ...), which now validates its a1 as
+                // a genuine user pointer.
+                int64_t timeout_ticks = (timeout_ms < 0) ? -1 : (int64_t)timeout_ms / 10;
+                int ready = do_poll(fd_table, pfds, inst->num_watches, timeout_ticks);
+
                 if (ready > 0) {
                     int ev_count = 0;
                     for (int i = 0; i < inst->num_watches; i++) {
@@ -2731,6 +2868,7 @@ return 0;
             {
                 uint8_t *buf = (uint8_t *)a1;
                 uint64_t len = a2;
+                if (len != 0 && !user_prepare_write(a1, len)) return (uint64_t)-14; /* -EFAULT */
                 uint64_t val = 0;
                 for (uint64_t i = 0; i < len; i++) {
                     if ((i % 8) == 0) {
@@ -2754,6 +2892,7 @@ return 0;
                 };
                 struct timespec *req = (struct timespec *)a1;
                 if (req) {
+                    if (!user_check_read(a1, sizeof(*req))) return (uint64_t)-14; /* -EFAULT */
                     extern uint64_t timer_get_ticks(void);
                     extern void sched_yield(void);
                     uint64_t ticks_to_sleep = (req->tv_sec * 100) + (req->tv_nsec / 10000000);
@@ -2774,17 +2913,19 @@ return 0;
             
         case 89: // SYS_readlink
             {
-                const char *path = (const char *)a1;
+                char path[MAX_PATH];
                 char *buf = (char *)a2;
                 uint64_t bufsiz = a3;
-                if (!path || !buf) return (uint64_t)-14;
-                
+                if (!a1 || !buf) return (uint64_t)-14;
+                if (strncpy_from_user(path, (const void *)a1, sizeof(path)) < 0) return (uint64_t)-14;
+
                 if (str_compare(path, "/sys/dev/char/226:0/device/subsystem") == 0 ||
                     str_compare(path, "/sys/dev/char/226:128/device/subsystem") == 0) {
                     const char *target = "../../../../../../bus/pci";
                     uint64_t len = 0;
                     while (target[len]) len++;
                     if (len > bufsiz) len = bufsiz;
+                    if (!user_prepare_write(a2, len)) return (uint64_t)-14;
                     for (uint64_t i = 0; i < len; i++) {
                         buf[i] = target[i];
                     }
@@ -2796,6 +2937,7 @@ return 0;
                     uint64_t len = 0;
                     while (target[len]) len++;
                     if (len > bufsiz) len = bufsiz;
+                    if (!user_prepare_write(a2, len)) return (uint64_t)-14;
                     for (uint64_t i = 0; i < len; i++) {
                         buf[i] = target[i];
                     }
@@ -2808,6 +2950,7 @@ return 0;
                     uint64_t len = 0;
                     while (target[len]) len++;
                     if (len > bufsiz) len = bufsiz;
+                    if (!user_prepare_write(a2, len)) return (uint64_t)-14;
                     for (uint64_t i = 0; i < len; i++) {
                         buf[i] = target[i];
                     }
@@ -2815,21 +2958,23 @@ return 0;
                 }
                 return (uint64_t)-2; // ENOENT
             }
-            
+
         case 267: // SYS_readlinkat
             {
                 // int dirfd = a1
-                const char *path = (const char *)a2;
+                char path[MAX_PATH];
                 char *buf = (char *)a3;
                 uint64_t bufsiz = a4;
-                if (!path || !buf) return (uint64_t)-14;
-                
+                if (!a2 || !buf) return (uint64_t)-14;
+                if (strncpy_from_user(path, (const void *)a2, sizeof(path)) < 0) return (uint64_t)-14;
+
                 if (str_compare(path, "/sys/dev/char/226:0/device/subsystem") == 0 ||
                     str_compare(path, "/sys/dev/char/226:128/device/subsystem") == 0) {
                     const char *target = "../../../../../../bus/pci";
                     uint64_t len = 0;
                     while (target[len]) len++;
                     if (len > bufsiz) len = bufsiz;
+                    if (!user_prepare_write(a3, len)) return (uint64_t)-14;
                     for (uint64_t i = 0; i < len; i++) {
                         buf[i] = target[i];
                     }
@@ -2841,6 +2986,7 @@ return 0;
                     uint64_t len = 0;
                     while (target[len]) len++;
                     if (len > bufsiz) len = bufsiz;
+                    if (!user_prepare_write(a3, len)) return (uint64_t)-14;
                     for (uint64_t i = 0; i < len; i++) {
                         buf[i] = target[i];
                     }
@@ -2853,6 +2999,7 @@ return 0;
                     uint64_t len = 0;
                     while (target[len]) len++;
                     if (len > bufsiz) len = bufsiz;
+                    if (!user_prepare_write(a3, len)) return (uint64_t)-14;
                     for (uint64_t i = 0; i < len; i++) {
                         buf[i] = target[i];
                     }

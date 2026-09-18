@@ -95,3 +95,15 @@ bool vmm_protect_page(PageTable *pml4, uint64_t virt, uint64_t flags);
    mapping at virt, or 0 if unmapped. Used by the page fault handler to tell
    a real permission violation apart from a COW-pending write. */
 uint64_t vmm_get_page_flags(PageTable *pml4, uint64_t virt);
+
+/* Resolve a PAGE_COW leaf at `page_addr` (must already be page-aligned) into
+   a real writable mapping: reclaims the frame in place if this is the last
+   owner (refcount <= 1), otherwise duplicates it into a fresh frame and
+   drops this owner's share of the old one. No-op (returns true) if the page
+   isn't actually PAGE_COW. Returns false only on OOM duplicating a
+   still-shared page. Shared by the page-fault handler's user-mode COW path
+   (kernel/idt.c) and copy_to_user() (kernel/usercopy.c), which must resolve
+   COW itself before writing since a CPL0 write fault on a COW page taken
+   mid-syscall (CS still ring 0) does NOT hit that fault handler's ring-3-only
+   fast path. */
+bool vmm_resolve_cow_page(PageTable *pml4, uint64_t page_addr);
