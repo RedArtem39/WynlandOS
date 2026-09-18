@@ -19,6 +19,21 @@
 #define MAX_OPEN_FILES 128
 #define FD_CLOEXEC 1
 
+/* Phase 2 (sec hardening): private per-process heap slot. PML4 index 176
+   (0x580000000000) -- strictly between the ET_DYN/PIE load offset (index
+   160, 0x500000000000, kernel/elf.c) and the user stack (index 192,
+   0x600000000000, kernel/elf.c), and nowhere near the shared kernel/RAM/
+   framebuffer identity map (index 0, see vmm_new_process_pml4() in
+   kernel/vmm.c) that the OLD single-global brk (kernel/syscall.c, started
+   at 0x60000000) collided with -- mapping heap pages there modified a
+   page-table chain shared BY POINTER across every process, so one
+   process's malloc() could appear in (or corrupt) another's address
+   space. One full PML4 slot (512 GB of address space) is reserved for
+   it, only ever backed by as many physical pages as the process actually
+   grows into. */
+#define HEAP_BASE 0x580000000000ULL
+#define HEAP_MAX  (HEAP_BASE + 0x8000000000ULL) /* +512GB: one PML4 slot's worth */
+
 struct Thread; /* include/wynland/sched.h -- forward-declared to avoid a
                   header dependency here */
 
@@ -55,6 +70,14 @@ typedef struct Process {
        handler's COW path have something to look up. Zeroed by
        process_create()'s memset (NULL = empty list). */
     struct VMA *vma_list;
+    /* Phase 2 (sec hardening): process-local brk state, private to this
+       address space -- see HEAP_BASE/HEAP_MAX above. brk_start is the
+       fixed base (== HEAP_BASE for every process); brk_current is the
+       current break, grown/shrunk by SYS_brk (kernel/syscall.c). Set by
+       process_create() and copied by fork(); execve() resets brk_current
+       back to brk_start for the new image. */
+    uint64_t brk_start;
+    uint64_t brk_current;
     struct Process *next;
 } Process;
 

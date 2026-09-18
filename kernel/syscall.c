@@ -1397,24 +1397,84 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 12: // SYS_brk (Linux standard)
             {
-                static uint64_t current_brk = 0x60000000;
-                if (a1 == 0) {
-                    return current_brk;
+                /* Phase 2 (sec hardening): process-local break in a private
+                   PML4 slot (HEAP_BASE/HEAP_MAX, include/wynland/process.h)
+                   -- replaces the old single function-static current_brk
+                   shared by every process on the system, starting at
+                   0x60000000 (PML4 index 0, the SAME shared kernel/RAM/
+                   framebuffer identity-map chain every process's PML4
+                   aliases by pointer, see vmm_new_process_pml4()). Mapping
+                   heap pages there modified that shared chain directly:
+                   one process's malloc() could appear in (or corrupt)
+                   every other process's address space, and the single
+                   global counter made unrelated processes fight over each
+                   other's heap. */
+                Process *proc = sched_current()->proc;
+                uint64_t requested = a1;
+
+                if (requested == 0) {
+                    return proc->brk_current;
                 }
-                if (a1 > current_brk) {
-                    uint64_t start = (current_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-                    uint64_t end = (a1 + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-                    PageTable *pml4 = vmm_get_current_pml4();
-                    for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
+                /* Reject out-of-range requests by leaving the break
+                   unchanged (real brk(2) semantics: an invalid request is
+                   a no-op that returns the CURRENT break, not a hard
+                   error) -- this also catches address+length-style
+                   overflow for free, since any wrapped uint64_t value is
+                   either < brk_start or > HEAP_MAX. */
+                if (requested < proc->brk_start || requested > HEAP_MAX) {
+                    return proc->brk_current;
+                }
+
+                PageTable *pml4 = vmm_get_current_pml4();
+
+                if (requested > proc->brk_current) {
+                    uint64_t start = (proc->brk_current + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    uint64_t end   = (requested + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    uint64_t total_pages = (end - start) / PAGE_SIZE;
+
+                    /* Transactional growth: map every page the request
+                       needs before reporting success. If allocation fails
+                       partway through, unmap and free everything mapped
+                       so far and report the OLD break unchanged -- never
+                       leave (or report) a half-mapped range. */
+                    uint64_t mapped;
+                    bool ok = true;
+                    for (mapped = 0; mapped < total_pages; mapped++) {
+                        uint64_t addr = start + mapped * PAGE_SIZE;
                         void *phys = pmm_alloc_page();
+                        if (!phys) { ok = false; break; }
+                        vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
+                        memset((void *)(uintptr_t)addr, 0, PAGE_SIZE);
+                    }
+                    if (!ok) {
+                        for (uint64_t j = 0; j < mapped; j++) {
+                            uint64_t addr = start + j * PAGE_SIZE;
+                            uint64_t phys = vmm_get_phys(pml4, addr);
+                            vmm_unmap_page(pml4, addr);
+                            if (phys) pmm_free_page((void *)(uintptr_t)phys);
+                        }
+                        return proc->brk_current;
+                    }
+                    if (total_pages > 0) vma_insert(proc, start, end, VMA_PROT_READ | VMA_PROT_WRITE, VMA_ANON);
+                    proc->brk_current = requested;
+                } else if (requested < proc->brk_current) {
+                    /* Shrink: only free pages whose ENTIRE range is past
+                       the new break -- a page the new break still lands
+                       inside keeps whatever live sub-page data it holds. */
+                    uint64_t new_ceiling = (requested + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    uint64_t old_ceiling = (proc->brk_current + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    for (uint64_t addr = new_ceiling; addr < old_ceiling; addr += PAGE_SIZE) {
+                        uint64_t phys = vmm_get_phys(pml4, addr);
                         if (phys) {
-                            vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
-                            memset(phys, 0, PAGE_SIZE);
+                            vmm_unmap_page(pml4, addr);
+                            pmm_free_page((void *)(uintptr_t)phys); /* refcount-aware -- correct even if this page is still COW-shared post-fork() */
                         }
                     }
-                    current_brk = a1;
+                    if (new_ceiling < old_ceiling) vma_unmap_range(proc, new_ceiling, old_ceiling);
+                    proc->brk_current = requested;
                 }
-                return current_brk;
+
+                return proc->brk_current;
             }
 
         case 24: // SYS_sched_yield (Linux standard)
@@ -1493,6 +1553,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 Process *child = process_create(child_pml4);
                 if (!child) return (uint64_t)-12; /* -ENOMEM */
                 child->uid = parent->uid;
+                /* Heap pages themselves were already deep-copied/COW-shared
+                   by vmm_cow_clone_user_pages() above (they're ordinary
+                   PAGE_USER leaves in that range, same as any other); this
+                   just carries over the BREAK METADATA so the child's own
+                   future brk() calls grow/shrink from the same point the
+                   parent was at, instead of process_create()'s fresh-process
+                   default of "no heap yet". */
+                child->brk_start = parent->brk_start;
+                child->brk_current = parent->brk_current;
 
                 /* The VMA list is process-local bookkeeping, not part of the
                    page tables vmm_cow_clone_user_pages() just shared -- copy
@@ -1594,6 +1663,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     v = next_v;
                 }
                 exec_proc->vma_list = NULL;
+
+                /* Same reasoning as the VMA list above: the old image's heap
+                   pages describe nothing the new image wants, and unlike the
+                   VMA nodes (plain kernel bookkeeping) these are real
+                   physical frames -- reset the metadata AND actually give
+                   the frames back, or every execve() would leak the exiting
+                   image's entire heap forever. */
+                for (uint64_t a = exec_proc->brk_start; a < exec_proc->brk_current; a += PAGE_SIZE) {
+                    uint64_t phys = vmm_get_phys(pml4, a);
+                    if (phys) {
+                        vmm_unmap_page(pml4, a);
+                        pmm_free_page((void *)(uintptr_t)phys);
+                    }
+                }
+                exec_proc->brk_current = exec_proc->brk_start;
 
                 bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4, lp,
                                           have_argv_e ? kargv_e : NULL, have_envp_e ? kenvp_e : NULL, exec_proc);

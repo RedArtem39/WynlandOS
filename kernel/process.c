@@ -25,6 +25,8 @@ Process *process_create(PageTable *pml4) {
     p->pml4 = pml4;
     p->thread_count = 0;
     p->main_thread = NULL;
+    p->brk_start = HEAP_BASE;
+    p->brk_current = HEAP_BASE;
     p->next = g_process_list;
     g_process_list = p;
     return p;
