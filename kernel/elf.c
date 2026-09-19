@@ -81,7 +81,7 @@ static void *find_mapped_page(PageTable *pml4, uint64_t virt) {
     return (void *)(uintptr_t)phys;
 }
 
-static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset, PageTable *pml4, LoadedPages *out_pages, struct Process *proc)
+static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset, PageTable *pml4, struct Process *proc)
 {
     for (uint16_t i = 0; i < hdr->e_phnum; i++) {
         Elf64_Phdr phdr;
@@ -130,12 +130,6 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
                 if (!phys) {
                     serial_write_string("ELF Loader Error: Out of physical memory for segment load.\r\n");
                     return false;
-                }
-
-                if (out_pages->count < MAX_LOADED_PAGES) {
-                    out_pages->phys_pages[out_pages->count] = phys;
-                    out_pages->virt_addrs[out_pages->count] = addr;
-                    out_pages->count++;
                 }
 
                 vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
@@ -189,10 +183,8 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
     return true;
 }
 
-bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, LoadedPages *out_pages, const char **argv, const char **envp, struct Process *proc)
+bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, const char **argv, const char **envp, struct Process *proc)
 {
-    out_pages->count = 0;
-
     VfsFile *f = vfs_open(path);
     if (!f) {
         serial_write_string("ELF Loader Error: File not found: ");
@@ -295,7 +287,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     
     phdr_vaddr += load_offset;
 
-    if (!load_elf_segments(f, &hdr, load_offset, pml4, out_pages, proc)) {
+    if (!load_elf_segments(f, &hdr, load_offset, pml4, proc)) {
         vfs_close(f);
         goto error_cleanup_no_file;
     }
@@ -340,7 +332,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             goto error_cleanup_no_file;
         }
 
-        if (!load_elf_segments(interp_f, &interp_hdr, interpreter_base, pml4, out_pages, proc)) {
+        if (!load_elf_segments(interp_f, &interp_hdr, interpreter_base, pml4, proc)) {
             vfs_close(interp_f);
             goto error_cleanup_no_file;
         }
@@ -378,12 +370,6 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             if (!phys) {
                 serial_write_string("ELF Loader Error: Out of physical memory for stack allocation.\r\n");
                 goto error_cleanup_no_file;
-            }
-
-            if (out_pages->count < MAX_LOADED_PAGES) {
-                out_pages->phys_pages[out_pages->count] = phys;
-                out_pages->virt_addrs[out_pages->count] = addr;
-                out_pages->count++;
             }
 
             vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
@@ -565,11 +551,14 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     return true;
 
 error_cleanup_no_file:
-    /* Clean up all pages mapped so far */
-    for (int i = 0; i < out_pages->count; i++) {
-        vmm_unmap_page(pml4, out_pages->virt_addrs[i]);
-        pmm_free_page(out_pages->phys_pages[i]);
-    }
-    out_pages->count = 0;
+    /* Unwind everything mapped so far by walking the actual page tables
+       (vmm_free_user_mappings(), kernel/vmm.c) rather than a fixed-size
+       tracking array -- no size limit on what gets rolled back, so a
+       large binary (or its stack, interpreter, etc.) failing partway
+       through can't leave untracked, unrecoverable pages behind. Doesn't
+       free `pml4` itself -- this function doesn't own it; the caller
+       (process_spawn()/execve(), kernel/process.c and kernel/syscall.c)
+       does. */
+    vmm_free_user_mappings(pml4);
     return false;
 }

@@ -91,3 +91,18 @@ Process  *process_create(PageTable *pml4);
 Process  *process_kernel(void);         /* Process 0 -- pml4 = boot snapshot */
 Process  *process_find_by_pid(uint64_t pid); /* Phase 18: NULL if never existed. Never freed once created (see g_process_list), so safe to hold across calls -- check ->exited, don't assume liveness from non-NULL alone. */
 Process  *process_spawn(const char *path, const char **argv, uint32_t uid); /* Loads path into a fresh address space, spawns its entry thread. argv may be NULL (historical default args) or a NULL-terminated array of kernel-owned strings. uid: PROC_UID_INHERIT to keep the caller's current uid, or a specific value (e.g. boot launches demoting to 1000). */
+
+/* Releases everything real about a process: every open fd (type-specific
+   cleanup -- closes real TCP connections, real UDP sockets, drops SHM
+   refcounts -- same as a live close() would do), the VMA list, and the
+   entire private address space (vmm_destroy_process_pml4(), which also
+   frees the PML4 root itself -- proc->pml4 is NULL after this call).
+   Defined in kernel/syscall.c (needs that file's pipe/PTY/socket/SHM
+   tables). Does NOT free or unlink the Process struct itself or touch
+   ->exited/->pid -- callers decide that part: a real process exit
+   (kernel/sched.c) keeps the struct alive as a zombie so PID lookups via
+   process_find_by_pid() stay safe; process_spawn()'s own failure path
+   (this file) unlinks and frees it outright since a process that never
+   finished spawning was never visible as a live pid to anything. Safe to
+   call on a process that already has no address space (idempotent). */
+void process_teardown(Process *proc);

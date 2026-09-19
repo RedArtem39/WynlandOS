@@ -107,3 +107,22 @@ uint64_t vmm_get_page_flags(PageTable *pml4, uint64_t virt);
    mid-syscall (CS still ring 0) does NOT hit that fault handler's ring-3-only
    fast path. */
 bool vmm_resolve_cow_page(PageTable *pml4, uint64_t page_addr);
+
+/* Frees every mapping this process PRIVATELY owns in `pml4`: every present
+   leaf (via the refcount-aware pmm_free_page(), so a COW-shared leaf just
+   drops this owner's share) and every PT/PD/PDPT page-table page under a
+   top-level PML4 entry that ISN'T aliased from the shared kernel/RAM/
+   framebuffer identity map (vmm_new_process_pml4() copies those entries by
+   raw value from vmm_get_kernel_pml4()'s snapshot -- an entry that still
+   matches that snapshot exactly is shared and is skipped entirely; anything
+   else present was mapped later, specifically for this process, by
+   vmm_map_page(), and is safe to free). Walks the actual page tables rather
+   than any side list, so there is no size limit on how much can be torn
+   down. Does NOT free the `pml4` root itself -- see
+   vmm_destroy_process_pml4() for that, and elf_load()'s failure path
+   (kernel/elf.c) for the other caller, which doesn't own the root. */
+void vmm_free_user_mappings(PageTable *pml4);
+
+/* vmm_free_user_mappings() plus the PML4 root page itself. Full address-
+   space teardown for a process that's actually going away. */
+void vmm_destroy_process_pml4(PageTable *pml4);

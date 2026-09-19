@@ -168,6 +168,58 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
     return true;
 }
 
+void vmm_free_user_mappings(PageTable *pml4)
+{
+    if (!pml4) return;
+    PageTable *kernel_pml4 = vmm_get_kernel_pml4();
+
+    /* Same PML4/PDPT/PD/PT walk as vmm_clone_user_pages()/
+       vmm_cow_clone_user_pages() above, but freeing instead of copying or
+       sharing. Only walks PRESENT entries (cheap -- bounded by how much is
+       actually mapped) and only frees a top-level branch that ISN'T shared
+       with the kernel snapshot -- see this function's own header comment
+       in vmm.h for exactly why that comparison is safe. */
+    for (uint64_t i4 = 0; i4 < 512; i4++) {
+        uint64_t pml4_entry = pml4->entries[i4];
+        if (!(pml4_entry & PAGE_PRESENT)) continue;
+        if (kernel_pml4 && pml4_entry == kernel_pml4->entries[i4]) continue; /* shared -- never touch */
+
+        PageTable *pdpt = (PageTable *)(uintptr_t)(pml4_entry & PAGE_ADDR_MASK);
+
+        for (uint64_t i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt->entries[i3] & PAGE_PRESENT)) continue;
+            if (pdpt->entries[i3] & PAGE_PS) continue; /* 1GB huge page -- never produced for a private branch, skip defensively */
+            PageTable *pd = (PageTable *)(uintptr_t)(pdpt->entries[i3] & PAGE_ADDR_MASK);
+
+            for (uint64_t i2 = 0; i2 < 512; i2++) {
+                if (!(pd->entries[i2] & PAGE_PRESENT)) continue;
+                if (pd->entries[i2] & PAGE_PS) continue; /* 2MB huge page -- same as above */
+                PageTable *pt = (PageTable *)(uintptr_t)(pd->entries[i2] & PAGE_ADDR_MASK);
+
+                for (uint64_t i1 = 0; i1 < 512; i1++) {
+                    uint64_t pte = pt->entries[i1];
+                    if (!(pte & PAGE_PRESENT)) continue;
+                    /* Refcount-aware: a leaf still COW-shared with a sibling
+                       process (fork()'d, never written since) just drops
+                       this owner's share here instead of freeing outright. */
+                    pmm_free_page((void *)(uintptr_t)(pte & PAGE_ADDR_MASK));
+                }
+                pmm_free_page(pt); /* privately owned -- this whole branch isn't shared */
+            }
+            pmm_free_page(pd);
+        }
+        pmm_free_page(pdpt);
+        pml4->entries[i4] = 0;
+    }
+}
+
+void vmm_destroy_process_pml4(PageTable *pml4)
+{
+    if (!pml4) return;
+    vmm_free_user_mappings(pml4);
+    pmm_free_page(pml4);
+}
+
 void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 {
     uint64_t rflags;

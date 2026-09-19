@@ -577,6 +577,68 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
     }
 }
 
+/* See the declaration in include/wynland/process.h for the full contract.
+   Lives here (not process.c) because it needs this file's pipe/PTY/socket/
+   SHM tables to give each fd type the same real cleanup a live close()
+   would -- mirrors SYS_close's own per-sentinel handling below, but can't
+   just call it: SYS_close operates on sched_current()'s process via
+   syscall_dispatcher()'s local fd_table/fd_flags/fd_oflags shadows (top of
+   this function), and a process being torn down here is never the
+   currently-running one (see kernel/sched.c's cleanup loop, and
+   process_spawn()'s own failure path, kernel/process.c). */
+void process_teardown(Process *proc) {
+    if (!proc || proc->pid == 0) return; /* never tear down the kernel process */
+
+    for (int i = 0; i < MAX_OPEN_FILES; i++) {
+        VfsFile *f = proc->fd_table[i];
+        if (!f) continue;
+        proc->fd_table[i] = NULL;
+
+        uint32_t fc = f->node.first_cluster;
+        if (fc == SOCK_FD_TCP) {
+            if (f->current_cluster != TCP_FD_NOT_CONNECTED) {
+                TcpConnection *conn = tcp_get_connection((int)f->current_cluster);
+                if (conn) tcp_close(conn);
+            }
+            kfree(f);
+        } else if (fc == SOCK_FD_UDP) {
+            udp_socket_close((int)f->current_cluster);
+            kfree(f);
+        } else if (fc == 0xFFFFFFFD) { /* SHM segment */
+            int seg_idx = (int)f->current_cluster;
+            if (seg_idx >= 0 && seg_idx < MAX_SHM_SEGMENTS && g_shm_segments[seg_idx].refcount > 0) {
+                g_shm_segments[seg_idx].refcount--;
+            }
+            kfree(f);
+        } else if (fc == 0xFFFFFFFA || fc == 0xFFFFFFFB || fc == 0xFFFFFFFC ||
+                   fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) {
+            /* Same accepted tradeoff as SYS_close (case 3 below): only the
+               small per-fd VfsFile wrapper is freed, never the underlying
+               KPipe/Pty object. */
+            kfree(f);
+        } else {
+            vfs_close(f); /* frees f itself */
+        }
+    }
+
+    for (VMA *v = proc->vma_list; v; ) {
+        VMA *next_v = v->next;
+        kfree(v);
+        v = next_v;
+    }
+    proc->vma_list = NULL;
+
+    /* Real address-space teardown: walks the actual page tables (never a
+       side list -- see vmm_destroy_process_pml4()'s own comment) freeing
+       every leaf frame and private page-table page this process owns,
+       then the PML4 root itself. Never touches the shared kernel/RAM/
+       framebuffer identity map every process's PML4 aliases by pointer. */
+    if (proc->pml4) {
+        vmm_destroy_process_pml4(proc->pml4);
+        proc->pml4 = NULL;
+    }
+}
+
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     /* Per-process fd namespace -- shadows the identifiers every case below
        already uses, so this is the only change needed to make fd_table/
@@ -924,6 +986,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
             if (fd_table[a1]->node.first_cluster == SOCK_FD_UDP) {
                 udp_socket_close((int)fd_table[a1]->current_cluster);
+                kfree(fd_table[a1]);
+                fd_table[a1] = NULL;
+                return 0;
+            }
+            if (fd_table[a1]->node.first_cluster == 0xFFFFFFFD) { // SHM segment
+                int seg_idx = (int)fd_table[a1]->current_cluster;
+                if (seg_idx >= 0 && seg_idx < MAX_SHM_SEGMENTS && g_shm_segments[seg_idx].refcount > 0) {
+                    g_shm_segments[seg_idx].refcount--;
+                }
                 kfree(fd_table[a1]);
                 fd_table[a1] = NULL;
                 return 0;
@@ -1506,6 +1577,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 extern Thread *thread_create(void (*entry)(void*), void *arg);
                 Thread *t = thread_create(clone_child_entry, ca);
                 t->tls_base = a5;
+                /* This new thread shares the CALLER's process (thread_create()
+                   -> thread_create_ex(..., NULL) defaults Thread.proc to
+                   current_thread->proc, kernel/sched.c) -- keep a real live
+                   count so the process's address space isn't torn down
+                   (kernel/sched.c's cleanup loop) while a pthread sibling
+                   is still running on it after the main thread exits. */
+                sched_current()->proc->thread_count++;
 
                 if (want_parent_tid && a3) {
                     *(int *)(uintptr_t)a3 = (int)t->id;
@@ -1547,11 +1625,23 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (!child_pml4) return (uint64_t)-12; /* -ENOMEM */
 
                 if (!vmm_cow_clone_user_pages(parent->pml4, child_pml4)) {
+                    /* Unwinds whatever pages THIS call managed to
+                       COW-share before hitting OOM (each was refcounted
+                       on both sides -- freeing here drops the child's
+                       never-actually-created share back down). The
+                       parent-side PTEs that sharing already flipped to
+                       read-only+PAGE_COW are NOT reverted -- harmless
+                       (a real COW candidate either way) but documented
+                       rather than silently assumed away. */
+                    vmm_destroy_process_pml4(child_pml4);
                     return (uint64_t)-12; /* -ENOMEM */
                 }
 
                 Process *child = process_create(child_pml4);
-                if (!child) return (uint64_t)-12; /* -ENOMEM */
+                if (!child) {
+                    vmm_destroy_process_pml4(child_pml4);
+                    return (uint64_t)-12; /* -ENOMEM */
+                }
                 child->uid = parent->uid;
                 /* Heap pages themselves were already deep-copied/COW-shared
                    by vmm_cow_clone_user_pages() above (they're ordinary
@@ -1582,6 +1672,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 for (int i = 0; i < MAX_OPEN_FILES; i++) {
                     if (parent->fd_table[i]) {
                         VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
+                        if (!copy) break; /* OOM partway through -- same best-effort tolerance as process_spawn()'s own fd-inheritance loop */
                         *copy = *parent->fd_table[i];
                         child->fd_table[i]  = copy;
                         child->fd_flags[i]  = parent->fd_flags[i];
@@ -1641,14 +1732,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 bool have_envp_e = (envc_e >= 0);
                 if (!have_envp_e) { envc_e = 0; kenvp_e[0] = NULL; }
 
-                LoadedPages *lp = kmalloc(sizeof(LoadedPages));
-                if (!lp) {
-                    serial_write_string("SYS_execve: out of memory for LoadedPages allocation!\r\n");
-                    for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
-                    for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
-                    return (uint64_t)-12; /* -ENOMEM */
-                }
-
                 /* execve() replaces the address space in place -- the old
                    image's VMAs (segments, stack, any mmap'd regions) no
                    longer describe anything real once elf_load() below
@@ -1679,16 +1762,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 exec_proc->brk_current = exec_proc->brk_start;
 
-                bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4, lp,
+                bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4,
                                           have_argv_e ? kargv_e : NULL, have_envp_e ? kenvp_e : NULL, exec_proc);
                 for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
                 for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
                 if (!execve_ok) {
                     serial_write_string("SYS_execve: elf_load failed!\r\n");
-                    kfree(lp);
                     return (uint64_t)-2; /* -ENOENT */
                 }
-                kfree(lp);
 
                 // Update syscall regs to jump to the new entry point on return
                 regs->rip = entry_point;

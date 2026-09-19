@@ -225,6 +225,28 @@ void sched_schedule(void) {
                 Thread *to_free = curr;
                 curr = curr->next;
 
+                /* Real address-space teardown, deferred to exactly here:
+                   thread_exit() (above) can't do it itself -- it's still
+                   running ON this thread/process's own CR3 at that point,
+                   and freeing a process's page tables while the CPU could
+                   still walk them for an ordinary kernel-code TLB miss is
+                   not safe. By the time a terminated thread reaches this
+                   loop from a LATER sched_schedule() call, current_thread
+                   (and CR3) has long since moved on -- same reasoning that
+                   already made it safe to kfree() the Thread struct itself
+                   here instead of in thread_exit(). Only tears down once
+                   every thread sharing this process (SYS_clone pthreads
+                   included, see kernel/syscall.c) has actually terminated,
+                   so a surviving pthread sibling is never left running on
+                   a freed address space. process_teardown() itself refuses
+                   to touch the kernel process (pid 0). */
+                if (to_free->proc) {
+                    to_free->proc->thread_count--;
+                    if (to_free->proc->exited && to_free->proc->thread_count <= 0) {
+                        process_teardown(to_free->proc);
+                    }
+                }
+
                 if (to_free->stack_orig) {
                     kfree(to_free->stack_orig);
                 }

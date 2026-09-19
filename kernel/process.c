@@ -55,6 +55,23 @@ Process *process_find_by_pid(uint64_t pid) {
     return NULL;
 }
 
+/* Removes `p` from g_process_list and frees the struct outright -- unlike
+   a real process exit (see process_teardown(), kernel/syscall.c, which
+   keeps the struct alive as a zombie so PID lookups/liveness polling stay
+   safe), a process that failed to spawn never became visible as a live
+   pid to anything, so there's no one who could be holding a reference to
+   reap. Used only by process_spawn()'s own failure paths below. */
+static void process_unlink_and_free(Process *p) {
+    if (g_process_list == p) {
+        g_process_list = p->next;
+    } else {
+        for (Process *cur = g_process_list; cur; cur = cur->next) {
+            if (cur->next == p) { cur->next = p->next; break; }
+        }
+    }
+    kfree(p);
+}
+
 Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
     PageTable *new_pml4 = vmm_new_process_pml4();
     if (!new_pml4) {
@@ -65,6 +82,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
     Process *p = process_create(new_pml4);
     if (!p) {
         serial_write_string("process_spawn: failed to allocate Process\r\n");
+        vmm_destroy_process_pml4(new_pml4);
         return NULL;
     }
     /* Set before any thread of this process can run -- same "assign inside
@@ -101,6 +119,12 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
     for (int i = 0; i < MAX_OPEN_FILES; i++) {
         if (caller->fd_table[i] && !(caller->fd_flags[i] & FD_CLOEXEC)) {
             VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
+            /* OOM partway through inheritance: stop copying rather than
+               dereference a NULL kmalloc result -- the process still gets
+               created with whatever fds copied so far (same best-effort
+               tolerance this loop already had for running out of memory
+               entirely, just without the crash). */
+            if (!copy) break;
             *copy = *caller->fd_table[i];
             p->fd_table[i]  = copy;
             p->fd_flags[i]  = caller->fd_flags[i];
@@ -108,7 +132,6 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
         }
     }
 
-    LoadedPages *lp = (LoadedPages *)kmalloc(sizeof(LoadedPages));
     uint64_t entry_point = 0;
     uint64_t stack_top = 0;
 
@@ -141,7 +164,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        *caller's* userspace memory would fault exactly like the path
        argument already did before Phase 1's SYS_spawn fix (see that
        writeup). SYS_spawn's argv handling below mirrors that same fix. */
-    bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, lp, argv, NULL, p);
+    bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, argv, NULL, p);
 
     self->proc = caller_proc;
     __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)caller_proc->pml4) : "memory");
@@ -150,7 +173,14 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
         serial_write_string("process_spawn: elf_load failed for ");
         serial_write_string(path);
         serial_write_string("\r\n");
-        kfree(lp);
+        /* elf_load() already unwound whatever IT mapped (kernel/elf.c); this
+           cleans up everything ELSE this function itself is responsible for
+           -- the inherited fd copies, the VMA list load_elf_segments() may
+           have partially built, and new_pml4/p themselves -- so a failed
+           spawn leaves nothing behind (previously all of this, plus the
+           Process struct and its PML4, leaked on every failed spawn). */
+        process_teardown(p);
+        process_unlink_and_free(p);
         return NULL;
     }
 
