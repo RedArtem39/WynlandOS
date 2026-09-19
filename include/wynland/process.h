@@ -48,6 +48,13 @@ typedef struct SigAct {
 
 typedef struct Process {
     uint64_t   pid;
+    uint64_t   ppid;  /* Phase 6: real parent pid. Set by process_spawn()/
+                          fork() (kernel/process.c, kernel/syscall.c) to the
+                          caller's pid at creation time; 0 for the kernel
+                          process itself (process_init(), the root of the
+                          tree -- matches real Linux's pid-1-has-parent-0
+                          convention). Never updated afterward (this OS has
+                          no reparent-to-init-on-parent-exit behavior). */
     PageTable *pml4;
     VfsFile   *fd_table[MAX_OPEN_FILES];
     uint32_t   fd_flags[MAX_OPEN_FILES];   /* Per-fd flags (FD_CLOEXEC etc.) */

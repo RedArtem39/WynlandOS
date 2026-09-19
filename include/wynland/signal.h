@@ -53,3 +53,15 @@ uint64_t signal_rt_return(void *regs);
 
 /* Mark a signal pending on the CALLING thread (raise()/tgkill-on-self). */
 void signal_raise_current(int sig);
+
+/* Mark a signal pending on the thread with id `tid`, wherever it is in the
+   system -- real SYS_tkill/SYS_tgkill target a specific thread by id, not
+   necessarily the caller (kernel/syscall.c's case 200/234 previously always
+   called signal_raise_current() instead, silently ignoring the tid/tgid
+   arguments whenever they named anyone but the caller). If `tgid` is
+   nonzero, delivery is refused (false, no-op) unless the target thread's
+   owning process's pid matches it, matching real tgkill(2)'s "signal only
+   this thread if it's actually in thread group tgid" semantics; pass 0 for
+   plain tkill(2), which has no thread-group argument to check against.
+   Returns false if no thread with that id currently exists. */
+bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig);

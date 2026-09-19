@@ -90,6 +90,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        Thread.proc (see kernel/sched.c) for the exact class of race this
        avoids. */
     p->uid = (uid == PROC_UID_INHERIT) ? sched_current()->proc->uid : uid;
+    p->ppid = sched_current()->proc->pid;
 
     /* fd inheritance -- mirrors real execve() semantics: everything the
        caller has open carries over to the new process at the same fd

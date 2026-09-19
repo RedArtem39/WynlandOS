@@ -1577,7 +1577,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             return 0;
 
         case 39: // SYS_getpid (Linux standard)
-            return 1;
+            return sched_current()->proc->pid;
 
         case 56: // SYS_clone (Linux standard)
             {
@@ -1667,6 +1667,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)-12; /* -ENOMEM */
                 }
                 child->uid = parent->uid;
+                child->ppid = parent->pid;
                 /* Heap pages themselves were already deep-copied/COW-shared
                    by vmm_cow_clone_user_pages() above (they're ordinary
                    PAGE_USER leaves in that range, same as any other); this
@@ -2490,7 +2491,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             return sched_current()->proc->uid;
 
         case 110: // SYS_getppid
-            return 1;
+            return sched_current()->proc->ppid;
 
         case 186: // SYS_gettid
             {
@@ -2702,20 +2703,30 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return 0;
             }
 
-        case 200: // SYS_tkill(tid, sig) -- 2-arg form; the unused a3
-                  // register holds UNINITIALIZED USER GARBAGE (same lesson
-                  // as case 408 -- never read unused arg registers).
+        case 200: // SYS_tkill(tid, sig) -- 2-arg form.
         case 234: // SYS_tgkill(tgid, tid, sig) -- 3-arg form.
             {
-                /* Phase 22b: raise a real pending signal on the calling
-                   thread. Delivered at this same syscall's return tail, so
-                   raise()/abort() land in the installed handler (or die by
-                   default action) right here, synchronously from the
-                   caller's point of view. Pick the signal slot by syscall
-                   NUMBER: tkill carries sig in a2, tgkill in a3. */
-                int sig = (num == 200) ? (int)a2 : (int)a3;
-                signal_raise_current(sig);
-return 0;
+                /* Phase 6: raise a real pending signal on the THREAD NAMED
+                   BY tid, not unconditionally the caller -- the previous
+                   version called signal_raise_current() regardless of what
+                   tid/tgid actually named, silently misdelivering any
+                   cross-thread tkill/tgkill to the wrong thread. Delivered
+                   at the target's own next syscall-return tail
+                   (signal_deliver_check()); for the overwhelmingly common
+                   self-targeting case (raise()/abort(), tid == caller's own
+                   tid) that's still synchronous from the caller's point of
+                   view, exactly as before. */
+                uint64_t tid, tgid;
+                int sig;
+                if (num == 200) {
+                    tid = a1; tgid = 0; sig = (int)a2;
+                } else {
+                    tgid = a1; tid = a2; sig = (int)a3;
+                }
+                if (!signal_raise_thread(tid, tgid, sig)) {
+                    return (uint64_t)-3; /* -ESRCH */
+                }
+                return 0;
             }
 
         case 204: // SYS_sched_getparam (Linux standard)

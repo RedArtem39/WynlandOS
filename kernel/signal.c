@@ -202,3 +202,26 @@ void signal_raise_current(int sig) {
     Thread *t = sched_current();
     t->sig_pending |= (1ULL << sig);
 }
+
+bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig) {
+    if (sig <= 0 || sig >= 65 || tid == 0) return false;
+
+    extern Thread *sched_get_thread_list(void);
+    Thread *start = sched_get_thread_list();
+    if (!start) return false;
+
+    Thread *t = start;
+    int guard = 0;
+    do {
+        if (t->id == tid) {
+            if (tgid != 0 && (!t->proc || t->proc->pid != tgid)) {
+                return false; /* real tgkill(2): ESRCH if tid isn't in thread group tgid */
+            }
+            t->sig_pending |= (1ULL << sig);
+            return true;
+        }
+        t = t->next;
+    } while (t != start && ++guard < 100000);
+
+    return false; /* no such tid */
+}
