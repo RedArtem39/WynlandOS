@@ -14,7 +14,20 @@
 #define PAGE_CACHE_DISABLE (1ULL << 4)  /* PCD bit */
 #define PAGE_PAT      (1ULL << 7)  /* PAT bit */
 #define PAGE_PS       (1ULL << 7)  /* Huge Page size bit on PD/PDPT */
-#define PAGE_NX       0ULL         /* Disabled to prevent hypervisor crashes when EFER.NXE is not enabled */
+/* Real NX (No-Execute, PTE bit 63). Setting bit 63 in a page table entry
+   while EFER.NXE is clear is a RESERVED-BIT violation -- the CPU page-faults
+   immediately on the very next translation through that entry, regardless
+   of whether the access was actually an instruction fetch. So this can't be
+   a compile-time constant: vmm_init() checks CPUID.80000001H:EDX.NX (bit 20)
+   and sets EFER.NXE before anything ever maps a page, storing the real bit
+   in g_page_nx_bit only if the CPU actually supports it. Every existing
+   `PAGE_NX`-using call site in the tree (vmm.c's own non-usable-memory/
+   framebuffer/MMIO mappings, kernel/heap.c, gui/compositor.c, kernel/elf.c)
+   keeps working unchanged either way: it degrades to a harmless 0 (today's
+   permanent behavior) on the vanishingly unlikely chance the CPU doesn't
+   report NX support, instead of guaranteeing an instant boot-time #PF. */
+extern uint64_t g_page_nx_bit;
+#define PAGE_NX g_page_nx_bit
 #define PAGE_COW      (1ULL << 9)  /* Software-defined bit (ignored by the CPU on x86_64 -- bits 9-11 of a
                                        present leaf entry are architecturally free for OS use). Marks a leaf
                                        that fork()'s COW sharing (vmm_cow_clone_user_pages()) mapped read-only

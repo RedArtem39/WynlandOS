@@ -481,9 +481,42 @@ static inline void write_msr(uint32_t msr, uint64_t val) {
     __asm__ volatile("wrmsr" :: "a"(low), "d"(high), "c"(msr));
 }
 
+/* See the extern declaration/comment in include/wynland/vmm.h. 0 until
+   vmm_nx_init() (called from vmm_init(), below, before any page is ever
+   mapped) confirms the CPU supports NX and enables EFER.NXE. */
+uint64_t g_page_nx_bit = 0;
+
+#define MSR_EFER_LOCAL 0xC0000080ULL
+#define EFER_NXE       (1ULL << 11)
+
+static void vmm_nx_init(void)
+{
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x80000001), "c"(0));
+
+    if (!(edx & (1u << 20))) { /* CPUID.80000001H:EDX.NX */
+        serial_write_string("VMM: CPU does not report NX support -- PAGE_NX stays a no-op.\r\n");
+        return;
+    }
+
+    uint64_t efer = read_msr(MSR_EFER_LOCAL);
+    efer |= EFER_NXE;
+    write_msr(MSR_EFER_LOCAL, efer);
+
+    g_page_nx_bit = (1ULL << 63);
+    serial_write_string("VMM: NX supported -- EFER.NXE enabled.\r\n");
+}
+
 void vmm_init(BootInfo *boot_info)
 {
     serial_write_string("VMM: Initializing paging...\r\n");
+
+    /* Must run before the very first vmm_map_page() call below: this
+       function's own non-usable-memory/framebuffer/MMIO mappings further
+       down already OR in PAGE_NX (previously a permanent no-op) -- setting
+       that bit in a live PTE before EFER.NXE is enabled would be an
+       instant reserved-bit #PF on the next translation through it. */
+    vmm_nx_init();
 
     /* Allocate and zero the root PML4 table */
     PageTable *pml4 = vmm_alloc_table();

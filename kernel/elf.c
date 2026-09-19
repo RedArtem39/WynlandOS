@@ -167,16 +167,36 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
            mprotect()/a stray write into .text/.rodata a real, correctly
            fatal page fault instead of silent success. */
         if (proc) {
+            /* Reject W+X outright rather than silently granting both --
+               every real toolchain here (gcc/clang default linker scripts,
+               musl's own ld.so) always splits code and data into separate
+               PT_LOAD segments with disjoint p_flags; a segment asking for
+               both is either a malformed/hostile binary or genuinely needs
+               a documented compatibility exception this OS doesn't have. */
+            if ((phdr.p_flags & PF_W) && (phdr.p_flags & PF_X)) {
+                serial_write_string("ELF Loader Error: segment requests both PF_W and PF_X (W^X violation) -- refusing to load.\r\n");
+                return false;
+            }
+
             uint32_t vma_prot = 0;
             if (phdr.p_flags & PF_R) vma_prot |= VMA_PROT_READ;
             if (phdr.p_flags & PF_W) vma_prot |= VMA_PROT_WRITE;
             if (phdr.p_flags & PF_X) vma_prot |= VMA_PROT_EXEC;
             vma_insert(proc, start_addr, end_addr, vma_prot, 0);
 
-            if (!(phdr.p_flags & PF_W)) {
-                for (uint64_t addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
-                    vmm_protect_page(pml4, addr, PAGE_USER);
-                }
+            /* Translate p_flags into real page-table permissions now that
+               the segment's content has been written -- every page above
+               was mapped PAGE_WRITE|PAGE_USER unconditionally just to let
+               that write happen. The W+X reject above means at most one of
+               PAGE_WRITE/PAGE_NX-absent ever applies to a given segment:
+               code stays executable and becomes read-only; data/BSS stays
+               writable and becomes non-executable. */
+            uint64_t final_flags = PAGE_USER;
+            if (phdr.p_flags & PF_W) final_flags |= PAGE_WRITE;
+            if (!(phdr.p_flags & PF_X)) final_flags |= PAGE_NX;
+
+            for (uint64_t addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
+                vmm_protect_page(pml4, addr, final_flags);
             }
         }
     }
@@ -372,7 +392,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
                 goto error_cleanup_no_file;
             }
 
-            vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
+            vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER | PAGE_NX);
             memset((void *)addr, 0, PAGE_SIZE);
         }
     }

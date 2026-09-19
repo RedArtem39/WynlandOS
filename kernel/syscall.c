@@ -1080,6 +1080,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
                 uint64_t size_aligned = pages * PAGE_SIZE;
 
+                /* Same W^X policy as mprotect()/the ELF loader (kernel/elf.c):
+                   reject outright rather than silently granting a mapping
+                   that's both writable and executable. */
+                if ((prot & 0x2) && (prot & 0x4)) {
+                    return (uint64_t)-1; /* MAP_FAILED */
+                }
+
                 // Check if mapping the framebuffer character device /dev/fb0
                 if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL && fd_table[fd]->node.first_cluster == 0xFFFFFFF0) {
                     if (!g_boot_info) return 0;
@@ -1098,7 +1105,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                          * PAGE_PAT | PAGE_WRITE_THROUGH selects PAT4 entry = Write-Combining.
                          * This ensures pixel writes reach the display immediately without CPU cache delay. */
                         vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, fb_phys + i * PAGE_SIZE,
-                                     PAGE_WRITE | PAGE_USER | PAGE_PAT | PAGE_WRITE_THROUGH);
+                                     PAGE_WRITE | PAGE_USER | PAGE_PAT | PAGE_WRITE_THROUGH | PAGE_NX);
                     }
 
                     return virt_addr;
@@ -1122,7 +1129,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     PageTable *pml4 = vmm_get_current_pml4();
                     for (uint32_t i = 0; i < shm_pages; i++) {
                         vmm_map_page(pml4, virt_addr + (uint64_t)i * PAGE_SIZE, seg->phys_addr + (uint64_t)i * PAGE_SIZE,
-                                     PAGE_WRITE | PAGE_USER);
+                                     PAGE_WRITE | PAGE_USER | PAGE_NX);
                     }
                     seg->refcount++;
 
@@ -1201,16 +1208,23 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 /* Real VMA bookkeeping + real prot: register the range so
                    mprotect()/munmap()/the page fault handler's COW path
-                   have something to look up, then drop PAGE_WRITE if the
-                   caller didn't actually ask for it. */
+                   have something to look up, then translate prot into real
+                   page-table permissions (every page above was mapped
+                   PAGE_WRITE|PAGE_USER unconditionally just to let the
+                   zero-fill/file-content read above work at all). The W^X
+                   reject above already ruled out PROT_WRITE|PROT_EXEC
+                   together, so this never grants both. */
                 Process *mmap_proc2 = sched_current()->proc;
                 uint32_t vma_prot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
                 vma_insert(mmap_proc2, virt_addr, virt_addr + size_aligned, vma_prot,
                            (flags & 0x20) ? VMA_ANON : 0);
 
-                if (!(prot & 0x2)) { // !PROT_WRITE
+                {
+                    uint64_t final_flags = PAGE_USER;
+                    if (prot & 0x2) final_flags |= PAGE_WRITE;   // PROT_WRITE
+                    if (!(prot & 0x4)) final_flags |= PAGE_NX;   // !PROT_EXEC
                     for (uint64_t i = 0; i < pages; i++) {
-                        vmm_protect_page(pml4, virt_addr + i * PAGE_SIZE, PAGE_USER);
+                        vmm_protect_page(pml4, virt_addr + i * PAGE_SIZE, final_flags);
                     }
                 }
 
@@ -1392,6 +1406,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t end = addr + ((a2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
                 uint64_t prot = a3;
 
+                /* Same W^X policy as the ELF loader (kernel/elf.c): reject
+                   outright rather than silently granting a page that's both
+                   writable and executable. */
+                if ((prot & 0x2) && (prot & 0x4)) {
+                    return (uint64_t)-13; /* -EACCES */
+                }
+
                 Process *proc = sched_current()->proc;
                 uint32_t new_prot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
                 if (!vma_protect_range(proc, addr, end, new_prot)) {
@@ -1413,6 +1434,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                            resolution on the next write, same as it would
                            without this mprotect() call. */
                         pte_flags |= (old_flags & PAGE_COW) ? PAGE_COW : PAGE_WRITE;
+                    }
+                    if (!(prot & 0x4)) { // !PROT_EXEC
+                        pte_flags |= PAGE_NX;
                     }
                     vmm_protect_page(pml4, a, pte_flags);
                 }
@@ -1514,7 +1538,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         uint64_t addr = start + mapped * PAGE_SIZE;
                         void *phys = pmm_alloc_page();
                         if (!phys) { ok = false; break; }
-                        vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER);
+                        vmm_map_page(pml4, addr, (uint64_t)(uintptr_t)phys, PAGE_WRITE | PAGE_USER | PAGE_NX);
                         memset((void *)(uintptr_t)addr, 0, PAGE_SIZE);
                     }
                     if (!ok) {
