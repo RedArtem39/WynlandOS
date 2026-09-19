@@ -22,7 +22,7 @@ dl() { [ -f "$1" ] || wget -q "$2" -O "$1"; }
 echo "== downloading =="
 dl nano-7.2.tar.gz     https://nano-editor.org/dist/v7/nano-7.2.tar.gz &
 dl ncurses-6.4.tar.gz  https://ftp.gnu.org/gnu/ncurses/ncurses-6.4.tar.gz &
-dl libressl-3.9.2.tar.gz https://cdn.openbsd.org/pub/LibreSSL/libressl-3.9.2.tar.gz &
+dl libressl-3.9.2.tar.gz https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-3.9.2.tar.gz &
 dl curl-8.11.1.tar.xz  https://curl.se/download/curl-8.11.1.tar.xz &
 dl cmake-3.28.3.tar.gz https://cmake.org/files/v3.28/cmake-3.28.3.tar.gz &
 wait
@@ -67,6 +67,14 @@ CC="$CCW" "$OUTSRC/libressl-3.9.2/configure" \
   --prefix=/usr --disable-shared --disable-tests >/dev/null
 make -j"$(nproc)" >/dev/null
 make -j"$(nproc)" install DESTDIR="$BUILDS/sysroot" >/dev/null
+# libtool bakes the *intended* final prefix (/usr/lib) into each .la file at
+# install time; since these were installed under DESTDIR instead of that
+# real path, libtool's own "library was moved" relocation logic can't find
+# them there and aborts anything downstream that resolves OpenSSL via the
+# .la (curl's build hit exactly this: "libcrypto.la is not a valid libtool
+# archive"). Static linking only needs the plain .a archives + headers, so
+# just drop the .la metadata rather than fighting libtool's relocation.
+rm -f "$BUILDS/sysroot/usr/lib"/*.la
 ls "$BUILDS/sysroot/usr/lib" | head
 
 echo "== zlib (into sysroot) =="
@@ -97,9 +105,13 @@ make -j"$(nproc)" -C src >/dev/null
 cp src/curl "$OUT/curl"
 
 echo "== pkgconf =="
-PVER=$(wget -qO- https://distfiles.ariadne.space/pkgconf/ | grep -oE 'pkgconf-[0-9.]+\.tar\.xz' | sort -V | tail -1)
+PVER=$(curl -fsSL https://distfiles.ariadne.space/pkgconf/ | grep -oE 'pkgconf-[0-9.]+\.tar\.xz' | sort -V | tail -1)
 echo "latest: $PVER"
-dl "$PVER" "https://distfiles.ariadne.space/pkgconf/$PVER"
+# wget -q silently produced a 0-byte/missing file here once (no retry, no
+# error surfaced) -- curl -f fails loudly on a bad response instead of
+# writing a truncated file, and the size check below catches anything else.
+[ -f "$PVER" ] || curl -fsSL "https://distfiles.ariadne.space/pkgconf/$PVER" -o "$PVER"
+if [ ! -s "$PVER" ]; then echo "PKGCONF DOWNLOAD FAILED: $PVER"; exit 1; fi
 PDIR="${PVER%.tar.xz}"
 [ -d "$PDIR" ] || tar xJf "$PVER"
 mkdir -p "$BUILDS/pkgconf-b" && cd "$BUILDS/pkgconf-b"
@@ -112,8 +124,8 @@ cp pkgconf "$OUT/pkgconf"
 echo "== cmake modules from pristine tarball =="
 rm -rf "$OUT/cmake-share"
 mkdir -p "$OUT/cmake-share/share"
-cp -r "$OUTSRC/cmake-3.28.3/Modules"    "$OUT/cmake-share/share/cmake-3.28_Modules"
-cp -r "$OUTSRC/cmake-3.28.3/Templates"  "$OUT/cmake-share/share/cmake-3.28_Templates"
+cp -r "$OUTSRC/cmake-3.28.3/Modules"    "$OUT/cmake-share/share/Modules"
+cp -r "$OUTSRC/cmake-3.28.3/Templates"  "$OUT/cmake-share/share/Templates"
 cp "$REPO/tools/cmake-wynlandos" "$OUT/cmake"
 chmod +x "$OUT/cmake"
 
