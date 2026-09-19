@@ -17,8 +17,19 @@
 #define EI_MAG2        2
 #define EI_MAG3        3
 #define EI_CLASS       4
+#define EI_DATA        5
+#define EI_VERSION     6
 #define ELFCLASS64     2
+#define ELFDATA2LSB    1
 #define EM_X86_64      62
+#define ET_EXEC        2
+#define ET_DYN         3
+
+/* Highest exclusive address this loader ever treats as a legitimate user
+   address -- same canonical-low-half bound kernel/usercopy.c uses. Every
+   region this loader actually places things in (stack 0x600.., PIE load
+   offset 0x500.., interpreter 0x700..) sits well inside it. */
+#define ELF_USER_ADDR_LIMIT 0x0000800000000000ULL
 
 #define PT_LOAD        1
 #define PT_INTERP      3
@@ -81,6 +92,64 @@ static void *find_mapped_page(PageTable *pml4, uint64_t virt) {
     return (void *)(uintptr_t)phys;
 }
 
+/* Validates every ELF header field this loader actually depends on being
+   sane before trusting any of it -- type, version, endianness, and the
+   header/program-header-entry sizes matching this loader's own struct
+   layout exactly (a mismatched e_phentsize would make every subsequent
+   `hdr->e_phoff + i * hdr->e_phentsize` walk the file at the wrong
+   offsets). Also validates the program header TABLE itself
+   (e_phoff/e_phnum/e_phentsize) fits within the file without overflowing
+   -- every phdr-reading loop downstream (both here and in elf_load()) is
+   safe from out-of-bounds/overflowing offsets as a direct result, since
+   each one only ever reads `e_phoff + i * e_phentsize` for i < e_phnum,
+   already covered by this same range. Magic number and ELFCLASS64/
+   EM_X86_64 are checked by callers separately (before this can even be
+   called for the interpreter, which needs its own magic check first) so
+   this only covers what's left. `file_size` is the real file size on
+   disk, so a header lying about phdr placement can't point past EOF. */
+static bool validate_elf_header(const Elf64_Ehdr *hdr, uint64_t file_size) {
+    if (hdr->e_ident[EI_DATA] != ELFDATA2LSB) {
+        serial_write_string("ELF Loader Error: not little-endian.\r\n");
+        return false;
+    }
+    if (hdr->e_ident[EI_VERSION] != 1) {
+        serial_write_string("ELF Loader Error: bad e_ident[EI_VERSION].\r\n");
+        return false;
+    }
+    if (hdr->e_version != 1) {
+        serial_write_string("ELF Loader Error: bad e_version.\r\n");
+        return false;
+    }
+    if (hdr->e_type != ET_EXEC && hdr->e_type != ET_DYN) {
+        serial_write_string("ELF Loader Error: e_type is neither ET_EXEC nor ET_DYN.\r\n");
+        return false;
+    }
+    if (hdr->e_ehsize != sizeof(Elf64_Ehdr)) {
+        serial_write_string("ELF Loader Error: e_ehsize mismatch.\r\n");
+        return false;
+    }
+    if (hdr->e_phentsize != sizeof(Elf64_Phdr)) {
+        serial_write_string("ELF Loader Error: e_phentsize mismatch.\r\n");
+        return false;
+    }
+    if (hdr->e_phnum == 0) {
+        serial_write_string("ELF Loader Error: e_phnum is zero.\r\n");
+        return false;
+    }
+
+    uint64_t phdr_table_size = (uint64_t)hdr->e_phnum * (uint64_t)hdr->e_phentsize;
+    uint64_t phdr_table_end = hdr->e_phoff + phdr_table_size;
+    if (phdr_table_end < hdr->e_phoff) { /* overflow */
+        serial_write_string("ELF Loader Error: e_phoff + e_phnum*e_phentsize overflows.\r\n");
+        return false;
+    }
+    if (phdr_table_end > file_size) {
+        serial_write_string("ELF Loader Error: program header table extends past end of file.\r\n");
+        return false;
+    }
+    return true;
+}
+
 static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset, PageTable *pml4, struct Process *proc)
 {
     for (uint16_t i = 0; i < hdr->e_phnum; i++) {
@@ -94,6 +163,46 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
 
         if (phdr.p_type != PT_LOAD) {
             continue; /* Skip non-loadable segments */
+        }
+
+        /* Validate this segment's own arithmetic before trusting any of it
+           for allocation/copy-length decisions below. */
+        if (phdr.p_filesz > phdr.p_memsz) {
+            serial_write_string("ELF Loader Error: p_filesz > p_memsz.\r\n");
+            return false;
+        }
+        if (phdr.p_filesz > 0) {
+            /* Only meaningful when something is actually read from the file
+               (p_filesz > 0) -- a BSS-only segment (p_filesz == 0) is free
+               to carry a p_offset that lands at or past EOF (commonly right
+               after the previous segment's file content ends); nothing is
+               ever seeked/read there since the copy loop below only acts
+               within [vaddr, vaddr+p_filesz), which is empty in that case. */
+            uint64_t file_end = phdr.p_offset + phdr.p_filesz;
+            if (file_end < phdr.p_offset) { /* overflow */
+                serial_write_string("ELF Loader Error: p_offset + p_filesz overflows.\r\n");
+                return false;
+            }
+            if (file_end > f->node.size) {
+                serial_write_string("ELF Loader Error: segment file range extends past end of file.\r\n");
+                return false;
+            }
+        }
+        {
+            uint64_t vaddr_with_offset = phdr.p_vaddr + load_offset;
+            if (vaddr_with_offset < phdr.p_vaddr) { /* overflow */
+                serial_write_string("ELF Loader Error: p_vaddr + load_offset overflows.\r\n");
+                return false;
+            }
+            uint64_t mem_end = vaddr_with_offset + phdr.p_memsz;
+            if (mem_end < vaddr_with_offset) { /* overflow */
+                serial_write_string("ELF Loader Error: p_vaddr + load_offset + p_memsz overflows.\r\n");
+                return false;
+            }
+            if (mem_end > ELF_USER_ADDR_LIMIT) { /* non-canonical / kernel-half */
+                serial_write_string("ELF Loader Error: segment address is non-canonical or in the kernel half.\r\n");
+                return false;
+            }
         }
 
         /* Align to page boundaries */
@@ -243,6 +352,11 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
         return false;
     }
 
+    if (!validate_elf_header(&hdr, f->node.size)) {
+        vfs_close(f);
+        return false;
+    }
+
     /* 3. Check for PT_INTERP (dynamic linker) and find PT_PHDR */
     char interp_path[256];
     bool has_interp = false;
@@ -352,6 +466,17 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             goto error_cleanup_no_file;
         }
 
+        if (interp_hdr.e_ident[EI_CLASS] != ELFCLASS64 || interp_hdr.e_machine != EM_X86_64) {
+            serial_write_string("ELF Loader Error: interpreter is not a 64-bit x86_64 ELF.\r\n");
+            vfs_close(interp_f);
+            goto error_cleanup_no_file;
+        }
+
+        if (!validate_elf_header(&interp_hdr, interp_f->node.size)) {
+            vfs_close(interp_f);
+            goto error_cleanup_no_file;
+        }
+
         if (!load_elf_segments(interp_f, &interp_hdr, interpreter_base, pml4, proc)) {
             vfs_close(interp_f);
             goto error_cleanup_no_file;
@@ -412,10 +537,25 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     uint64_t stack_top = stack_base + stack_size;
 
     /* Write strings/data at the very top of stack */
-    /* 16 random bytes */
+    /* 16 random bytes -- real (if weak: rdtsc-based, same entropy source
+       SYS_getrandom already uses, kernel/syscall.c) per-process randomness
+       instead of a fixed byte pattern. glibc/musl use AT_RANDOM to seed
+       the stack-protector canary and other ASLR-adjacent decisions, both
+       of which a constant value here defeated outright -- every process
+       got the exact same "random" bytes. */
     uint64_t random_addr = stack_top - 16;
     uint8_t *random_ptr = (uint8_t *)random_addr;
-    for (int i = 0; i < 16; i++) random_ptr[i] = 0xAB; // pseudo-random bytes
+    {
+        uint64_t rv = 0;
+        for (int i = 0; i < 16; i++) {
+            if ((i % 8) == 0) {
+                uint32_t lo, hi;
+                __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+                rv = ((uint64_t)hi << 32) | lo;
+            }
+            random_ptr[i] = (uint8_t)(rv >> ((i % 8) * 8));
+        }
+    }
 
     /* Program name string */
     uint32_t path_len = 0;
@@ -564,6 +704,14 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     const uint8_t *auxv_bytes = (const uint8_t *)auxv;
     for (uint32_t b = 0; b < ac * sizeof(Elf64_Auxv); b++) {
         sp_auxv_bytes[b] = auxv_bytes[b];
+    }
+
+    if (proc) {
+        VMA *entry_vma = vma_find(proc, entry_point);
+        if (!entry_vma || !(entry_vma->prot & VMA_PROT_EXEC)) {
+            serial_write_string("ELF Loader Error: entry point is not inside an executable mapped segment.\r\n");
+            goto error_cleanup_no_file;
+        }
     }
 
     *out_entry = entry_point;
