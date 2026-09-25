@@ -108,4 +108,9 @@ typedef struct PACKED {
 bool virtio_gpu_init(void);
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void virtio_gpu_update_cursor(uint32_t resource_id, uint32_t x, uint32_t y);
+/* Hardware cursor plane: position straight from the mouse IRQ, shape
+   0=arrow 1=hand 2=text 3=resize (pre-uploaded, switching is free). */
+void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
+void virtio_gpu_set_cursor_shape(uint32_t shape);
+void virtio_gpu_cursor_tick(void);
 bool virtio_gpu_is_active(void);

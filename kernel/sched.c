@@ -265,13 +265,17 @@ void sched_schedule(void) {
        worst-case latency is one 10ms tick. */
     {
         extern uint64_t timer_get_ticks(void);
+        extern uint64_t timer_get_ms(void);
         uint64_t now = timer_get_ticks();
+        uint64_t now_ms = timer_get_ms();
         Thread *t = thread_list;
         if (t) {
             do {
                 if (t->state == THREAD_STATE_BLOCKED &&
-                    t->wake_deadline != SCHED_NO_DEADLINE &&
-                    now >= t->wake_deadline) {
+                    ((t->wake_deadline != SCHED_NO_DEADLINE &&
+                      now >= t->wake_deadline) ||
+                     (t->wake_deadline_ms != SCHED_NO_DEADLINE &&
+                      now_ms >= t->wake_deadline_ms))) {
                     t->wake_result = -110; /* -ETIMEDOUT */
                     t->state = THREAD_STATE_READY;
                 }
@@ -384,13 +388,14 @@ Thread *sched_current(void) {
 
 /* ---- Phase 22a: real blocking primitives ---- */
 
-int64_t sched_block(void *wq, uint64_t wake_deadline) {
+static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake_deadline_ms) {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
     Thread *t = current_thread;
     t->wq = wq;
     t->wake_deadline = wake_deadline;
+    t->wake_deadline_ms = wake_deadline_ms;
     /* wake_result is written by sched_unblock()/the deadline pass BEFORE
        this thread is marked READY, so no initialization race exists: we
        cannot be scheduled until state leaves BLOCKED. */
@@ -404,6 +409,23 @@ int64_t sched_block(void *wq, uint64_t wake_deadline) {
         __asm__ volatile("sti");
     }
     return t->wake_result;
+}
+
+int64_t sched_block(void *wq, uint64_t wake_deadline) {
+    return sched_block_until(wq, wake_deadline, SCHED_NO_DEADLINE);
+}
+
+/* Genuine millisecond sleep: parks the thread (the idle thread's hlt gets
+   the CPU if nobody else is runnable) until the 1 kHz clock passes the
+   deadline. Replaces nanosleep()'s old sched_yield() spin, which kept the
+   CPU 100% busy for the whole sleep. */
+void sched_sleep_ms(uint64_t ms) {
+    extern uint64_t timer_get_ms(void);
+    if (ms == 0) {
+        sched_yield();
+        return;
+    }
+    sched_block_until(NULL, SCHED_NO_DEADLINE, timer_get_ms() + ms);
 }
 
 void sched_unblock(Thread *t, int64_t result) {

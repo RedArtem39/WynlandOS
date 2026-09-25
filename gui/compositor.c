@@ -311,7 +311,14 @@ void compositor_flip(void)
     if (x2 >= (int32_t)g_comp.fb_width) x2 = g_comp.fb_width - 1;
     if (y2 >= (int32_t)g_comp.fb_height) y2 = g_comp.fb_height - 1;
 
-    if (x1 <= x2 && y1 <= y2) {
+    extern bool virtio_gpu_is_active(void);
+    extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+    if (x1 <= x2 && y1 <= y2 && virtio_gpu_is_active()) {
+        /* virtio-gpu scans the back-buffer itself (it IS resource 1's
+           backing memory), so copying it into the unscanned GOP buffer
+           was a full wasted frame copy. Just transfer+flush the rect. */
+        virtio_gpu_flush(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
+    } else if (x1 <= x2 && y1 <= y2) {
         uint32_t pitch_pixels = g_comp.fb_pitch / 4;
         uint32_t w = g_comp.fb_width;
         uint32_t copy_width_bytes = (x2 - x1 + 1) * 4;
@@ -343,12 +350,6 @@ void compositor_flip(void)
             }
         }
 
-        /* If VirtIO-GPU driver is active, notify the host */
-        extern bool virtio_gpu_is_active(void);
-        extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
-        if (virtio_gpu_is_active()) {
-            virtio_gpu_flush(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
-        }
     }
 
     /* Reset dirty bounds */
@@ -1350,6 +1351,10 @@ void comp_draw_cursor(int32_t mx, int32_t my, uint8_t buttons)
 {
     extern bool virtio_gpu_is_active(void);
     if (virtio_gpu_is_active()) {
+        /* GPU cursor plane: position already follows the mouse IRQ; only
+           the shape needs forwarding (a no-op when unchanged). */
+        extern void virtio_gpu_set_cursor_shape(uint32_t shape);
+        virtio_gpu_set_cursor_shape(g_current_cursor_type);
         return;
     }
 

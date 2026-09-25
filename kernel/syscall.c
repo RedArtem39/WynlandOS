@@ -190,6 +190,7 @@ struct linux_stat {
 #define LINUX_O_RDONLY    0
 #define LINUX_O_WRONLY    1
 #define LINUX_O_RDWR      2
+#define LINUX_O_NONBLOCK  04000
 
 typedef struct {
     uint64_t r15;
@@ -639,6 +640,8 @@ void process_teardown(Process *proc) {
     }
 }
 
+bool g_syscall_trace = false;
+
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     /* Per-process fd namespace -- shadows the identifiers every case below
        already uses, so this is the only change needed to make fd_table/
@@ -648,7 +651,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     uint32_t  *fd_flags  = proc->fd_flags;
     uint32_t  *fd_oflags = proc->fd_oflags;
 
-    if (num != 0 && num != 1 && num != 20) { // Don't log read/write to avoid spam
+    /* Per-syscall serial trace, OFF by default: every byte written to the
+       UART is a VM exit, and the compositor/clients make thousands of
+       syscalls a second (nanosleep, clock_gettime, poll, fb_flush) -- the
+       trace alone was eating a large share of every frame. Flip
+       g_syscall_trace for debugging. */
+    if (g_syscall_trace && num != 0 && num != 1 && num != 20) {
         serial_write_string("Syscall ID: ");
         char buf[32];
         extern void uint_to_hex(uint64_t val, char *buf);
@@ -738,6 +746,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (fd_table[a1]->node.first_cluster == 0xFFFFFFFA || fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
                 uint32_t pipe_idx = fd_table[a1]->current_cluster;
                 if (pipe_idx < MAX_PIPES && g_pipes[pipe_idx] != NULL) {
+                    /* O_NONBLOCK: an empty pipe is -EAGAIN, not a sleep.
+                       Poll-driven loops (the Zerp compositor drains every
+                       client's pipe each frame) depend on this -- without
+                       it one quiet client parked the whole compositor. */
+                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && g_pipes[pipe_idx]->count == 0) {
+                        return (uint64_t)-11; /* -EAGAIN */
+                    }
                     return pipe_read(g_pipes[pipe_idx], (void *)a2, (uint32_t)a3);
                 }
                 return (uint64_t)-1;
@@ -758,6 +773,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (fd_table[a1]->node.first_cluster == PTY_FD_MASTER) {
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
+                if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && pty->s2m_count == 0) {
+                    return (uint64_t)-11; /* -EAGAIN */
+                }
                 while (pty->s2m_count == 0) {
                     waitqueue_wait(&pty->s2m_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                 }
@@ -772,6 +790,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (fd_table[a1]->node.first_cluster == PTY_FD_SLAVE) {
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
+                if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && pty->m2s_count == 0) {
+                    return (uint64_t)-11; /* -EAGAIN */
+                }
                 while (pty->m2s_count == 0) {
                     waitqueue_wait(&pty->m2s_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                 }
@@ -812,6 +833,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (fd_table[a1]->node.first_cluster == 0xFFFFFFFB || fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
                 uint32_t pipe_idx = fd_table[a1]->current_cluster;
                 if (pipe_idx < MAX_PIPES && g_pipes[pipe_idx] != NULL) {
+                    /* Non-blocking + atomic (POSIX PIPE_BUF): a small message either
+                       fits whole or fails, never a torn half-message. */
+                    uint32_t want = (uint32_t)a3 < PIPE_BUF_SIZE ? (uint32_t)a3 : PIPE_BUF_SIZE;
+                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && PIPE_BUF_SIZE - g_pipes[pipe_idx]->count < want) {
+                        return (uint64_t)-11; /* -EAGAIN */
+                    }
                     return pipe_write(g_pipes[pipe_idx], (const void *)a2, (uint32_t)a3);
                 }
                 return (uint64_t)-1;
@@ -1100,12 +1127,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         mmap_fb_ptr += size_aligned;
                     }
                     PageTable *pml4 = vmm_get_current_pml4();
+                    /* Cache type depends on what fb_phys actually is:
+                       - virtio-gpu: the compositor back-buffer in ordinary
+                         RAM, read by the host via DMA (coherent) -> plain
+                         write-back, the fastest thing there is for both
+                         reads and writes.
+                       - GOP: real video memory -> Write-Combining, which is
+                         PAT index 4 = the PAT bit ALONE (vmm_init() programs
+                         PAT4=WC). The old PAT|PWT selected index 5, which
+                         is still the power-on default Write-Through: every
+                         single pixel store went straight to memory. */
+                    extern bool virtio_gpu_is_active(void);
+                    uint64_t cache_flags = virtio_gpu_is_active() ? 0 : PAGE_PAT;
                     for (uint64_t i = 0; i < pages; i++) {
-                        /* Map framebuffer with Write-Combining (PAT4=WC via PAT MSR set in vmm_init)
-                         * PAGE_PAT | PAGE_WRITE_THROUGH selects PAT4 entry = Write-Combining.
-                         * This ensures pixel writes reach the display immediately without CPU cache delay. */
                         vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, fb_phys + i * PAGE_SIZE,
-                                     PAGE_WRITE | PAGE_USER | PAGE_PAT | PAGE_WRITE_THROUGH | PAGE_NX);
+                                     PAGE_WRITE | PAGE_USER | cache_flags | PAGE_NX);
                     }
 
                     return virt_addr;
@@ -1295,6 +1331,16 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 pipefd[0] = fd_read;
                 pipefd[1] = fd_write;
+
+                /* Fresh fds: don't inherit a previous occupant's status/
+                   close-on-exec flags. pipe2() flags apply to both ends. */
+                {
+                    uint32_t p2 = (num == 293) ? (uint32_t)a2 : 0;
+                    fd_oflags[fd_read]  = LINUX_O_RDONLY | (p2 & LINUX_O_NONBLOCK);
+                    fd_oflags[fd_write] = LINUX_O_WRONLY | (p2 & LINUX_O_NONBLOCK);
+                    fd_flags[fd_read]  = (p2 & 02000000) ? 1 : 0; /* O_CLOEXEC -> FD_CLOEXEC */
+                    fd_flags[fd_write] = (p2 & 02000000) ? 1 : 0;
+                }
 
                 serial_write_string("  Success: created read_fd=");
                 char fdbuf[16];
@@ -2055,6 +2101,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 ptyfd[0] = fd_master;
                 ptyfd[1] = fd_slave;
+                /* Fresh fds: blocking by default, whatever the slot held. */
+                fd_oflags[fd_master] = LINUX_O_RDWR;
+                fd_oflags[fd_slave]  = LINUX_O_RDWR;
                 return 0;
             }
 
@@ -2431,7 +2480,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     case F_GETFL:
                         return (fd < MAX_OPEN_FILES) ? fd_oflags[fd] : LINUX_O_RDONLY;
                     case F_SETFL:
-                        if (fd < MAX_OPEN_FILES) fd_oflags[fd] = (uint32_t)a3;
+                        /* Linux semantics: only status flags change; the
+                           access mode (low 2 bits) is fixed at open time. */
+                        if (fd < MAX_OPEN_FILES) fd_oflags[fd] = (fd_oflags[fd] & 3) | ((uint32_t)a3 & ~3u);
                         return 0;
                     case F_DUPFD: {
                         /* Find first free fd >= a3 */
@@ -2508,8 +2559,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 struct timespec *tp = (struct timespec *)a2;
                 if (tp) {
                     if (!user_prepare_write(a2, sizeof(*tp))) return (uint64_t)-14; /* -EFAULT */
-                    extern uint64_t timer_get_ticks(void);
-                    uint64_t ticks = timer_get_ticks();
+                    /* 1 kHz clock: millisecond-resolution timestamps, so
+                       frame pacing / animation code sees real deltas
+                       instead of 10ms steps. */
+                    extern uint64_t timer_get_ms(void);
+                    uint64_t ms = timer_get_ms();
                     /* CLOCK_REALTIME (0) -- real wall-clock UTC, from the
                        CMOS RTC read at boot (see kernel/rtc.c). Everything
                        else (CLOCK_MONOTONIC=1, etc.) stays uptime-based,
@@ -2518,9 +2572,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if ((int)a1 == 0) {
                         tp->tv_sec = (int64_t)rtc_get_unix_time();
                     } else {
-                        tp->tv_sec = (int64_t)(ticks / 100);
+                        tp->tv_sec = (int64_t)(ms / 1000);
                     }
-                    tp->tv_nsec = (int64_t)((ticks % 100) * 10000000);
+                    tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
                 }
                 return 0;
             }
@@ -2769,13 +2823,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 int64_t timeout_ticks;
                 if (num == 7) {
                     int timeout_ms = (int)(int32_t)a3;
-                    timeout_ticks = (timeout_ms < 0) ? -1 : (int64_t)timeout_ms / 10;
+                    timeout_ticks = (timeout_ms < 0) ? -1 : ((int64_t)timeout_ms + 9) / 10; /* round UP: a 1..9ms timeout must still block */
                 } else if (a3 == 0) {
                     timeout_ticks = -1;
                 } else {
                     struct linux_timespec { int64_t tv_sec; int64_t tv_nsec; } tmo;
                     if (copy_from_user(&tmo, (const void *)a3, sizeof(tmo)) != 0) return (uint64_t)-14;
-                    timeout_ticks = tmo.tv_sec * 100 + tmo.tv_nsec / 10000000;
+                    timeout_ticks = tmo.tv_sec * 100 + (tmo.tv_nsec + 9999999) / 10000000; /* round UP */
                 }
 
                 int ready = do_poll(fd_table, have_fds ? kfds : NULL, nfds, timeout_ticks);
@@ -3044,7 +3098,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // never user memory, so this must NOT go back through
                 // syscall_dispatcher(7, ...), which now validates its a1 as
                 // a genuine user pointer.
-                int64_t timeout_ticks = (timeout_ms < 0) ? -1 : (int64_t)timeout_ms / 10;
+                int64_t timeout_ticks = (timeout_ms < 0) ? -1 : ((int64_t)timeout_ms + 9) / 10; /* round UP: a 1..9ms timeout must still block */
                 int ready = do_poll(fd_table, pfds, inst->num_watches, timeout_ticks);
 
                 if (ready > 0) {
@@ -3093,16 +3147,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 struct timespec *req = (struct timespec *)a1;
                 if (req) {
                     if (!user_check_read(a1, sizeof(*req))) return (uint64_t)-14; /* -EFAULT */
-                    extern uint64_t timer_get_ticks(void);
-                    extern void sched_yield(void);
-                    uint64_t ticks_to_sleep = (req->tv_sec * 100) + (req->tv_nsec / 10000000);
-                    if (ticks_to_sleep == 0 && req->tv_nsec > 0) {
-                        ticks_to_sleep = 1;
+                    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000) {
+                        return (uint64_t)-22; /* -EINVAL */
                     }
-                    uint64_t start_ticks = timer_get_ticks();
-                    uint64_t end_ticks = start_ticks + ticks_to_sleep;
-                    while (timer_get_ticks() < end_ticks) {
-                        sched_yield();
+                    /* Real sleep on the 1 kHz clock (rounded UP to whole
+                       ms, like Linux never sleeping short), not a
+                       sched_yield() spin: a frame-paced loop like the
+                       compositor's used to burn a full core here. */
+                    extern uint64_t timer_get_ms(void);
+                    uint64_t ms = (uint64_t)req->tv_sec * 1000 +
+                                  ((uint64_t)req->tv_nsec + 999999) / 1000000;
+                    uint64_t end_ms = timer_get_ms() + ms;
+                    sched_sleep_ms(ms);
+                    /* An early wake (signal/unblock) sleeps out the rest. */
+                    while (ms > 0 && timer_get_ms() < end_ms) {
+                        sched_sleep_ms(end_ms - timer_get_ms());
                     }
                 }
                 return 0;

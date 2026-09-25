@@ -35,6 +35,9 @@ static int zerp_connect(int argc, char **argv, ZerpClient *zc, uint32_t shm_capa
     zc->c2s_fd = (int)zstrtol(argv[1]);
     zc->s2c_fd = (int)zstrtol(argv[2]);
     zc->shm_fd = (int)zstrtol(argv[3]);
+    /* zerp_poll_server_msg() is a non-blocking drain; clients that want
+       to wait use zpoll_in() instead. */
+    zfcntl(zc->s2c_fd, F_SETFL, O_NONBLOCK);
     zc->tile_x = zc->tile_y = 0;
     zc->tile_w = zc->tile_h = 0;
 

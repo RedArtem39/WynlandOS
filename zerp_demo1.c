@@ -36,7 +36,7 @@ int zerp_main(int argc, char **argv) {
                 redraw(&zc, color_idx);
             }
         }
-        zyield();
+        zpoll_in(zc.s2c_fd, -1); /* block until the compositor has news */
     }
 }
 

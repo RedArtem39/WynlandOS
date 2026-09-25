@@ -35,6 +35,7 @@
 #define SYS_fork       57
 
 #define F_SETFD    2
+#define F_SETFL    4
 #define FD_CLOEXEC 1
 
 #define O_RDONLY   00
@@ -121,6 +122,42 @@ static void *zmmap_shm(long fd, long size) {
     return (void *)zsys6(SYS_mmap, 0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 }
 static void zfb_flush(int x, int y, int w, int h) { zsys6(SYS_fb_flush, x, y, w, h, 0, 0); }
+
+/* ---- Timing / waiting (the kernel clock is 1 kHz: real ms resolution) ---- */
+#define SYS_poll_nr          7
+#define SYS_nanosleep_nr     35
+#define SYS_clock_gettime_nr 228
+#define ZCLOCK_MONOTONIC     1
+
+/* Monotonic milliseconds since boot. */
+static uint64_t zclock_ms(void) {
+    struct { long sec, nsec; } ts = { 0, 0 };
+    zsys3(SYS_clock_gettime_nr, ZCLOCK_MONOTONIC, (long)&ts, 0);
+    return (uint64_t)ts.sec * 1000u + (uint64_t)ts.nsec / 1000000u;
+}
+
+/* A genuine sleep (the thread is parked, not spinning). */
+static void zsleep_ms(long ms) {
+    struct { long sec, nsec; } ts = { ms / 1000, (ms % 1000) * 1000000L };
+    zsys3(SYS_nanosleep_nr, (long)&ts, 0, 0);
+}
+
+/* Block until `fd` is readable or `timeout_ms` passes (-1 = forever).
+   Single-fd poll()s sleep on the pipe's own wait queue in the kernel, so
+   an idle client costs zero CPU instead of a zyield() spin. */
+struct zpollfd { int fd; short events; short revents; };
+static long zpoll_in(int fd, long timeout_ms) {
+    struct zpollfd p = { fd, 0x0001 /* POLLIN */, 0 };
+    return zsys3(SYS_poll_nr, (long)&p, 1, timeout_ms);
+}
+
+/* Fast 32-bit pixel copy (rep movsl) for blits. */
+static inline void zcopy32(uint32_t *dst, const uint32_t *src, uint32_t count) {
+    __asm__ volatile("rep movsl" : "+D"(dst), "+S"(src), "+c"(count) : : "memory");
+}
+static inline void zfill32(uint32_t *dst, uint32_t value, uint32_t count) {
+    __asm__ volatile("rep stosl" : "+D"(dst), "+c"(count) : "a"(value) : "memory");
+}
 
 /* Phase 18: real PTY + fork()+dup2()+execve() so zerp_term.c can run a
    genuine interactive child (nano) with its stdio wired to a real PTY,

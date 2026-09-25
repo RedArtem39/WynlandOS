@@ -165,10 +165,19 @@ static void mouse_draw_cursor(void)
 
 static int mouse_hide_count = 0;
 
+/* With virtio-gpu up, the pointer lives on the GPU's cursor plane (see
+   drivers/video/virtio_gpu.c): the software cursor below would only
+   scribble into the GOP framebuffer, which isn't even being scanned out. */
+static bool mouse_hw_cursor(void)
+{
+    extern bool virtio_gpu_is_active(void);
+    return virtio_gpu_is_active();
+}
+
 void mouse_hide(void)
 {
     extern bool wm_is_gui_active(void);
-    if (wm_is_gui_active()) return;
+    if (wm_is_gui_active() || mouse_hw_cursor()) return;
 
     if (mouse_hide_count == 0 && cursor_visible) {
         mouse_restore_background();
@@ -180,7 +189,7 @@ void mouse_hide(void)
 void mouse_show(void)
 {
     extern bool wm_is_gui_active(void);
-    if (wm_is_gui_active()) return;
+    if (wm_is_gui_active() || mouse_hw_cursor()) return;
 
     mouse_hide_count--;
     if (mouse_hide_count <= 0) {
@@ -314,6 +323,13 @@ void mouse_handle_interrupt(uint8_t data)
                 mouse_x = new_x;
                 mouse_y = new_y;
                 mouse_buttons = buttons & 0x07;
+
+                /* Hardware cursor tracks the IRQ directly: moves at input
+                   rate no matter what the compositor is doing. */
+                if (mouse_hw_cursor()) {
+                    extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
+                    virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
+                }
 
                 if (gui) {
                     extern void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons);

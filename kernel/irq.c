@@ -36,8 +36,18 @@ static inline void io_wait(void)
     outb(0x80, 0);
 }
 
-/* Timer global tick count */
+/* The PIT runs at TIMER_HW_HZ (1 kHz) so sleeps, frame pacing and
+   preemption get millisecond resolution -- 100 Hz capped every
+   nanosleep()-paced loop (the compositor included) at <=100 FPS with
+   10ms jitter. timer_ticks deliberately KEEPS its historical 100 Hz unit
+   (every 10th hardware tick): futex/poll/pipe/TCP deadlines, the RTC
+   and clock code all count in it. timer_ms is the new 1 kHz clock. */
+#define TIMER_HW_HZ        1000
+#define TIMER_MS_PER_TICK  10   /* TIMER_HW_HZ / 100 */
+
+/* Timer global tick count (100 Hz) and millisecond clock (1 kHz) */
 static volatile uint64_t timer_ticks = 0;
+static volatile uint64_t timer_ms = 0;
 
 /* Keyboard ring buffer */
 #define KEYBOARD_BUFFER_SIZE 256
@@ -107,6 +117,11 @@ uint64_t timer_get_ticks(void)
     return timer_ticks;
 }
 
+uint64_t timer_get_ms(void)
+{
+    return timer_ms;
+}
+
 static void pic_remap(int offset1, int offset2)
 {
     outb(PIC1_COMMAND, 0x11);
@@ -139,9 +154,9 @@ void irq_init(void)
     serial_write_string("IRQ: Remapping PIC...\r\n");
     pic_remap(0x20, 0x28);
 
-    /* Initialize PIT (frequency 100 Hz) */
-    serial_write_string("IRQ: Initializing PIT (100 Hz)...\r\n");
-    uint32_t divisor = 1193182 / 100;
+    /* Initialize PIT (frequency 1000 Hz, see TIMER_HW_HZ) */
+    serial_write_string("IRQ: Initializing PIT (1000 Hz)...\r\n");
+    uint32_t divisor = 1193182 / TIMER_HW_HZ;
     outb(PIT_COMMAND, 0x36);
     io_wait();
     outb(PIT_CHANNEL0, (uint8_t)(divisor & 0xFF));
@@ -159,10 +174,23 @@ void irq_handler(InterruptRegisters *regs)
     uint64_t irq = regs->int_no - 32;
 
     if (irq == 0) {
-        /* Timer interrupt */
-        timer_ticks++;
+        /* Timer interrupt (1 kHz) */
+        timer_ms++;
         /* Send End of Interrupt (EOI) to PIC before yielding */
         outb(PIC1_COMMAND, PIC_EOI);
+
+        /* Re-send a hardware-cursor position the virtio-gpu cursor queue
+           had no room for when the mouse IRQ produced it. */
+        extern void virtio_gpu_cursor_tick(void);
+        virtio_gpu_cursor_tick();
+
+        if ((timer_ms % TIMER_MS_PER_TICK) != 0) {
+            /* 1ms preemption: sched_schedule()'s deadline pass is also
+               what wakes millisecond sleepers (sched_sleep_ms()). */
+            sched_preempt_tick();
+            return;
+        }
+        timer_ticks++;
         /* Phase 22d: virtio-net has no RX interrupt of its own (confirmed:
            no IRQ/MSI-X registration anywhere in drivers/net/) -- net_poll()
            draining the RX virtqueue used to happen only as a side effect of

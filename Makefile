@@ -329,6 +329,14 @@ $(BUILD)/test_raw_fb.elf: test_raw_fb.c
 	@echo "  CC(USER)   $< (FB diagnostic)"
 	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -static -O2 -o $@ $<
 
+# Zerp compositor + its default clients: freestanding, no libc (see zerp.c).
+ZERP_ELFS = $(BUILD)/zerp.elf $(BUILD)/zerp_files.elf $(BUILD)/zerp_term.elf
+ZERP_HDRS = zerp_syscalls.h zerp_protocol.h zerp_client.h zerp_entry.h zerp_png.h zerp_font.h zerp_vt100.h
+$(ZERP_ELFS): $(BUILD)/%.elf: %.c $(ZERP_HDRS)
+	@mkdir -p $(BUILD)
+	@echo "  CC(USER)   $< (Zerp)"
+	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -nostdlib -static -no-pie -fno-pie -mcmodel=large -O2 $(ZERP_CFLAGS) -Wl,-Ttext-segment=0x340000000000 -o $@ $<
+
 # Real TTF font for QFreeTypeFontDatabase (vendored inside qtbase's own 3rdparty tree)
 $(BUILD)/lib/fonts/DejaVuSans.ttf: qtbase/src/3rdparty/wasm/DejaVuSans.ttf
 	@mkdir -p $(BUILD)/lib/fonts
@@ -348,7 +356,7 @@ $(BUILD)/renderD128:
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
 PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
-$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING)
+$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS)
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

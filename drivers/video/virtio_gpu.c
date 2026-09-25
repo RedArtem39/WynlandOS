@@ -64,6 +64,12 @@ static bool initialized = false;
 static Virtqueue ctrl_q;
 static Virtqueue cursor_q;
 
+#define VQ_MAX_SIZE 256
+
+/* The device writes used->idx behind the compiler's back: every poll of it
+   must be a real load. */
+#define VQ_USED_IDX(q) (*(volatile uint16_t *)&(q).used->idx)
+
 /* Static commands/responses in contiguous kernel memory */
 static VirtioGpuResourceCreate2d      cmd_create;
 static VirtioGpuCtrlResponse          resp_create;
@@ -83,7 +89,6 @@ typedef struct PACKED {
 } CursorAttachCmd;
 
 static VirtioGpuMemEntry fb_entries[4096] __attribute__((aligned(4096)));
-static VirtioGpuMemEntry cursor_entries[4] __attribute__((aligned(4096)));
 static VirtioGpuResourceAttachBacking fb_attach_hdr     __attribute__((aligned(4096)));
 static VirtioGpuResourceAttachBacking cursor_attach_hdr __attribute__((aligned(4096)));
 static VirtioGpuCtrlResponse resp_attach;
@@ -285,6 +290,12 @@ static bool virtqueue_setup(Virtqueue *vq, uint16_t queue_idx)
         log_dec("VIRTIO-GPU: ERROR - Queue size is invalid: ", qsz);
         return false;
     }
+    /* A VirtIO 1.0 driver may shrink the queue; cap it so the per-
+       descriptor cursor command slots below always cover every index. */
+    if (qsz > VQ_MAX_SIZE) {
+        qsz = VQ_MAX_SIZE;
+        mmio_write16(VIRTIO_MODERN_QUEUE_SIZE, qsz);
+    }
 
     vq->size = qsz;
     log_dec("VIRTIO-GPU: Setup Queue index = ", queue_idx);
@@ -298,13 +309,12 @@ static bool virtqueue_setup(Virtqueue *vq, uint16_t queue_idx)
     uint32_t total_size = used_offset + used_size;
 
     uint32_t pages_needed = (total_size + 4095) / 4096;
-    uint8_t *mem = (uint8_t *)pmm_alloc_page();
+    /* One physically contiguous block: the device gets ONE base address
+       per ring, so back-to-back pmm_alloc_page() calls that merely
+       happen to be adjacent are not good enough. */
+    uint8_t *mem = (uint8_t *)pmm_alloc_contiguous(pages_needed);
     if (!mem) {
         return false;
-    }
-
-    for (uint32_t i = 1; i < pages_needed; i++) {
-        pmm_alloc_page();
     }
 
     memset(mem, 0, pages_needed * 4096);
@@ -423,7 +433,7 @@ static bool virtio_gpu_send_split_cmd(void *cmd, uint32_t cmd_len, void *data, u
 
     /* Poll for response */
     for (uint32_t i = 0; i < 100000000; i++) {
-        if (ctrl_q.used->idx != ctrl_q.last_used) {
+        if (VQ_USED_IDX(ctrl_q) != ctrl_q.last_used) {
             ctrl_q.last_used++;
             vq_free_desc(&ctrl_q, desc1);
             vq_free_desc(&ctrl_q, desc2);
@@ -479,7 +489,7 @@ static bool virtio_gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_
 
     /* Poll for response */
     for (uint32_t i = 0; i < 100000000; i++) {
-        if (ctrl_q.used->idx != ctrl_q.last_used) {
+        if (VQ_USED_IDX(ctrl_q) != ctrl_q.last_used) {
             ctrl_q.last_used++;
             vq_free_desc(&ctrl_q, desc1);
             vq_free_desc(&ctrl_q, desc2);
@@ -498,30 +508,248 @@ static bool virtio_gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_
 
 
 
-static uint32_t cursor_pixels[64 * 64] __attribute__((aligned(4096)));
+/* ============================================================
+ * Hardware Cursor
+ * ============================================================
+ * The cursor is a separate host-side plane, exactly like a real GPU's
+ * cursor plane: every shape is its own 64x64 ARGB resource uploaded ONCE
+ * at init, and a pointer move is a single tiny MOVE_CURSOR command on the
+ * dedicated cursor queue -- no framebuffer pixels are touched, nothing is
+ * re-transferred, and the position updates straight from the mouse IRQ
+ * regardless of how fast (or whether) the compositor is producing frames.
+ * QEMU hands this to the host display (GTK/SDL), which draws it as the
+ * host's own mouse cursor.
+ */
 
-/* Beautiful hardware cursor shape: classic arrow with white fill and black outline */
-static const uint8_t default_hw_cursor[32][32] = {
-    { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 2, 1, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 1, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 1, 0, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-    { 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+#define CURSOR_DIM        64
+#define CURSOR_RES_BASE   2      /* resource ids 2..2+CURSOR_SHAPE_COUNT-1 */
+#define CURSOR_SHAPE_COUNT 4     /* arrow, hand, text, resize (compositor.c's
+                                    g_current_cursor_type numbering) */
+
+static uint32_t cursor_pixels[CURSOR_SHAPE_COUNT][CURSOR_DIM * CURSOR_DIM]
+    __attribute__((aligned(4096)));
+static VirtioGpuMemEntry cursor_shape_entries[CURSOR_SHAPE_COUNT][4]
+    __attribute__((aligned(4096)));
+
+/* Hotspot (the pixel that IS the pointer position) per shape. */
+static const uint8_t cursor_hotspot[CURSOR_SHAPE_COUNT][2] = {
+    { 0, 0 },   /* arrow: tip */
+    { 7, 0 },   /* hand: index fingertip */
+    { 8, 9 },   /* text: I-beam center */
+    { 8, 8 },   /* resize: center of the diagonal */
 };
+
+/* 1 = black outline, 2 = white fill */
+static const uint8_t cursor_mask_arrow[19][18] = {
+    { 1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,2,2,1,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,2,2,2,2,1,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,2,2,2,2,2,1,0,0,0,0,0,0 },
+    { 1,2,2,2,2,2,2,1,1,1,1,1,1,0,0,0,0,0 },
+    { 1,2,2,2,1,2,2,1,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,1,0,1,2,2,1,0,0,0,0,0,0,0,0,0 },
+    { 1,2,1,0,0,1,2,2,1,0,0,0,0,0,0,0,0,0 },
+    { 1,1,0,0,0,0,1,2,2,1,0,0,0,0,0,0,0,0 },
+    { 1,0,0,0,0,0,1,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0 },
+};
+
+static const uint8_t cursor_mask_hand[19][18] = {
+    { 0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,1,2,2,2,1,0,1,1,1,0,0,0,0 },
+    { 0,0,0,1,1,1,2,2,2,1,1,2,2,2,1,0,0,0 },
+    { 0,0,1,2,2,2,1,2,2,2,2,2,2,2,2,1,0,0 },
+    { 0,1,2,2,2,2,2,1,2,2,2,2,2,2,2,2,1,0 },
+    { 0,1,2,2,2,2,2,2,1,2,2,2,2,2,2,2,1,0 },
+    { 1,2,2,2,2,2,2,2,2,1,2,2,2,2,2,2,1,0 },
+    { 1,2,2,2,2,2,2,2,2,2,1,2,2,2,2,2,1,0 },
+    { 1,2,2,2,2,2,2,2,2,2,2,1,1,1,1,1,0,0 },
+    { 1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,0,0 },
+    { 0,1,2,2,2,2,2,2,2,2,2,2,2,2,2,1,0,0 },
+    { 0,0,1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0 },
+    { 0,0,0,1,2,2,2,2,2,2,2,2,2,1,0,0,0,0 },
+    { 0,0,0,0,1,1,2,2,2,2,2,2,1,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,1,1,1,1,1,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+};
+
+static const uint8_t cursor_mask_text[19][18] = {
+    { 0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0 },
+    { 0,0,1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0 },
+    { 0,0,0,1,1,1,1,2,2,2,1,1,1,1,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,2,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,1,1,1,1,2,2,2,1,1,1,1,0,0,0,0 },
+    { 0,0,1,2,2,2,2,2,2,2,2,2,2,2,1,0,0,0 },
+    { 0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+};
+
+static const uint8_t cursor_mask_resize[19][18] = {
+    { 1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,2,1,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,2,1,2,1,0,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,2,1,0,1,2,1,0,0,0,0,0,0,0,0,0,0,0 },
+    { 1,1,0,0,0,1,2,1,0,0,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,1,2,1,0,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,1,2,1,0,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,1,2,1,0,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,1,2,1,0,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,1,2,1,0,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,1,2,1,0,0,0,0 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,1,2,1,0,0,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,1,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,1,1 },
+    { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 },
+};
+
+static const uint8_t (*const cursor_masks[CURSOR_SHAPE_COUNT])[18] = {
+    cursor_mask_arrow, cursor_mask_hand, cursor_mask_text, cursor_mask_resize,
+};
+
+/* Rasterize one mask into its 64x64 B8G8R8A8 (== 0xAARRGGBB little-endian)
+   image, with a soft drop shadow offset (+1,+2) behind it -- the shadow
+   is a 3x3-weighted blur of the shape's coverage, so it fades out instead
+   of being a hard black copy. */
+static void cursor_render_shape(uint32_t *dst, const uint8_t (*mask)[18])
+{
+    memset(dst, 0, CURSOR_DIM * CURSOR_DIM * 4);
+
+    for (int y = 0; y < 24; y++) {
+        for (int x = 0; x < 24; x++) {
+            uint32_t sum = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    int sy = y - 2 + dy;
+                    int sx = x - 1 + dx;
+                    if (sy < 0 || sy >= 19 || sx < 0 || sx >= 18) continue;
+                    if (mask[sy][sx] == 0) continue;
+                    sum += (dx == 0 && dy == 0) ? 4 : (dx == 0 || dy == 0) ? 2 : 1;
+                }
+            }
+            /* sum <= 16 -> alpha <= 0x60 */
+            uint32_t alpha = sum * 6;
+            if (alpha) dst[y * CURSOR_DIM + x] = alpha << 24;
+        }
+    }
+
+    for (int y = 0; y < 19; y++) {
+        for (int x = 0; x < 18; x++) {
+            if (mask[y][x] == 1) {
+                dst[y * CURSOR_DIM + x] = 0xFF000000; /* black outline */
+            } else if (mask[y][x] == 2) {
+                dst[y * CURSOR_DIM + x] = 0xFFFFFFFF; /* white fill */
+            }
+        }
+    }
+}
+
+/* One command slot PER DESCRIPTOR INDEX: a slot is only rewritten after
+   the device has returned its descriptor, so an in-flight command is never
+   modified under the host's feet (the old single static command was). 64-
+   byte stride keeps every slot inside one page (no split DMA buffer). */
+typedef struct {
+    VirtioGpuUpdateCursor cmd;
+    uint8_t pad[64 - sizeof(VirtioGpuUpdateCursor)];
+} CursorCmdSlot;
+
+static CursorCmdSlot cursor_slots[VQ_MAX_SIZE] __attribute__((aligned(4096)));
+
+static uint32_t cursor_shape = 0;
+static uint32_t cursor_x = 0, cursor_y = 0;
+static bool     cursor_shape_dirty = false;  /* needs UPDATE_CURSOR, not MOVE */
+static volatile bool cursor_pending = false; /* queue was full; resend on tick */
+
+static uint64_t irq_save(void)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    return rflags;
+}
+
+static void irq_restore(uint64_t rflags)
+{
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+static void cursor_reclaim(void)
+{
+    while (VQ_USED_IDX(cursor_q) != cursor_q.last_used) {
+        uint16_t used_idx = cursor_q.last_used % cursor_q.size;
+        uint32_t desc_idx = cursor_q.used->ring[used_idx].id;
+        vq_free_desc(&cursor_q, (uint16_t)desc_idx);
+        cursor_q.last_used++;
+    }
+}
+
+/* Interrupts must be off (IRQ context, or irq_save()). */
+static void cursor_submit(void)
+{
+    cursor_reclaim();
+
+    uint16_t desc = vq_alloc_desc(&cursor_q);
+    if (desc == 0xFFFF) {
+        /* Host hasn't drained the (16-entry) cursor queue yet: remember
+           the LATEST state and let virtio_gpu_cursor_tick() resend it --
+           intermediate positions are worthless anyway. */
+        cursor_pending = true;
+        return;
+    }
+
+    VirtioGpuUpdateCursor *c = &cursor_slots[desc].cmd;
+    memset(c, 0, sizeof(*c));
+    c->hdr.type = cursor_shape_dirty ? VIRTIO_GPU_CMD_UPDATE_CURSOR
+                                     : VIRTIO_GPU_CMD_MOVE_CURSOR;
+    c->pos.scanout_id = 0;
+    c->pos.x = cursor_x;
+    c->pos.y = cursor_y;
+    c->resource_id = CURSOR_RES_BASE + cursor_shape;
+    c->hot_x = cursor_hotspot[cursor_shape][0];
+    c->hot_y = cursor_hotspot[cursor_shape][1];
+
+    PageTable *pml4 = vmm_get_current_pml4();
+    cursor_q.desc[desc].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)c);
+    cursor_q.desc[desc].len   = sizeof(*c);
+    cursor_q.desc[desc].flags = 0;
+    cursor_q.desc[desc].next  = 0;
+
+    uint16_t avail_idx = cursor_q.avail->idx % cursor_q.size;
+    cursor_q.avail->ring[avail_idx] = desc;
+
+    __asm__ volatile("mfence" ::: "memory");
+    cursor_q.avail->idx++;
+    __asm__ volatile("mfence" ::: "memory");
+
+    *cursor_q_notify = CURSOR_QUEUE;
+
+    cursor_shape_dirty = false;
+    cursor_pending = false;
+}
 
 /* ============================================================
  * Public Driver Interface
@@ -688,92 +916,98 @@ bool virtio_gpu_init(void)
     }
     log_str("VIRTIO-GPU: Scanout set to Resource 1\r\n");
 
-    /* Initialize Hardware Cursor Resource (Resource 2, Size 64x64) */
-    memset(cursor_pixels, 0, sizeof(cursor_pixels));
-    for (int cy_mask = 0; cy_mask < 32; cy_mask++) {
-        for (int cx_mask = 0; cx_mask < 32; cx_mask++) {
-            uint8_t t = default_hw_cursor[cy_mask][cx_mask];
-            if (t == 1) {
-                cursor_pixels[cy_mask * 64 + cx_mask] = 0xFF000000; /* Black outline */
-            } else if (t == 2) {
-                cursor_pixels[cy_mask * 64 + cx_mask] = 0xFFFFFFFF; /* White fill */
-            }
+    /* Hardware cursor: one 64x64 resource per shape, uploaded once. */
+    for (uint32_t shape = 0; shape < CURSOR_SHAPE_COUNT; shape++) {
+        uint32_t res_id = CURSOR_RES_BASE + shape;
+        cursor_render_shape(cursor_pixels[shape], cursor_masks[shape]);
+
+        memset(&cmd_create, 0, sizeof(cmd_create));
+        cmd_create.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+        cmd_create.resource_id = res_id;
+        cmd_create.format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
+        cmd_create.width = CURSOR_DIM;
+        cmd_create.height = CURSOR_DIM;
+
+        if (!virtio_gpu_send_cmd(&cmd_create, sizeof(cmd_create), &resp_create, sizeof(resp_create)) ||
+            resp_create.type != VIRTIO_GPU_RESP_OK_NODATA) {
+            log_dec("VIRTIO-GPU: ERROR - RESOURCE_CREATE_2D failed for cursor shape ", shape);
+            return false;
+        }
+
+        /* 64*64*4 = 16KB = 4 pages; translate each page on its own rather
+           than assuming the kernel image is physically contiguous. */
+        memset(&cursor_attach_hdr, 0, sizeof(cursor_attach_hdr));
+        cursor_attach_hdr.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+        cursor_attach_hdr.resource_id = res_id;
+        cursor_attach_hdr.num_entries = 4;
+        for (uint32_t i = 0; i < 4; i++) {
+            uint64_t va = (uint64_t)(uintptr_t)cursor_pixels[shape] + (uint64_t)i * 4096;
+            cursor_shape_entries[shape][i].addr = vmm_get_phys(pml4, va);
+            cursor_shape_entries[shape][i].length = 4096;
+            cursor_shape_entries[shape][i].padding = 0;
+        }
+
+        if (!virtio_gpu_send_split_cmd(&cursor_attach_hdr, 32, cursor_shape_entries[shape],
+                                       4 * sizeof(VirtioGpuMemEntry), &resp_attach, sizeof(resp_attach)) ||
+            resp_attach.type != VIRTIO_GPU_RESP_OK_NODATA) {
+            log_hex("VIRTIO-GPU: ERROR - RESOURCE_ATTACH_BACKING for cursor failed with type: ", resp_attach.type);
+            return false;
+        }
+
+        memset(&cmd_transfer, 0, sizeof(cmd_transfer));
+        cmd_transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+        cmd_transfer.resource_id = res_id;
+        cmd_transfer.rww = CURSOR_DIM;
+        cmd_transfer.rhh = CURSOR_DIM;
+
+        if (!virtio_gpu_send_cmd((void *)&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer)) ||
+            resp_transfer.type != VIRTIO_GPU_RESP_OK_NODATA) {
+            log_str("VIRTIO-GPU: ERROR - TRANSFER_TO_HOST_2D for cursor failed!\r\n");
+            return false;
         }
     }
 
-    /* Reuse cmd_create, cmd_attach, cmd_transfer statically */
-    memset(&cmd_create, 0, sizeof(cmd_create));
-    cmd_create.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
-    cmd_create.resource_id = 2;
-    cmd_create.format = VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM;
-    cmd_create.width = 64;
-    cmd_create.height = 64;
-
-    if (!virtio_gpu_send_cmd(&cmd_create, sizeof(cmd_create), &resp_create, sizeof(resp_create)) ||
-        resp_create.type != VIRTIO_GPU_RESP_OK_NODATA) {
-        log_str("VIRTIO-GPU: ERROR - RESOURCE_CREATE_2D for Cursor failed!\r\n");
-        return false;
-    }
-
-    uint32_t cursor_page_count = 4;
-    /* Use global cursor_attach_hdr */
-    memset(&cursor_attach_hdr, 0, sizeof(cursor_attach_hdr));
-    cursor_attach_hdr.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
-    cursor_attach_hdr.resource_id = 2;
-    cursor_attach_hdr.num_entries = cursor_page_count;
-
-    uint64_t cursor_phys_addr = vmm_get_phys(pml4, (uint64_t)(uintptr_t)cursor_pixels);
-    for (uint32_t i = 0; i < cursor_page_count; i++) {
-        cursor_entries[i].addr = cursor_phys_addr + (uint64_t)i * 4096;
-        cursor_entries[i].length = 4096;
-        cursor_entries[i].padding = 0;
-    }
-
-    log_hex("VIRTIO-GPU: Cursor first physical page = ", cursor_phys_addr);
-
-    log_str("VIRTIO-GPU: Debug Cursor Attach Command Bytes:\r\n");
-    uint32_t *c_ptr = (uint32_t *)&cursor_attach_hdr;
-    for (int idx = 0; idx < 8; idx++) {
-        log_hex("  Word ", c_ptr[idx]);
-    }
-
-    uint32_t cursor_data_len = cursor_page_count * sizeof(VirtioGpuMemEntry);
-    if (!virtio_gpu_send_split_cmd(&cursor_attach_hdr, 32, cursor_entries, cursor_data_len, &resp_attach, sizeof(resp_attach)) ||
-        resp_attach.type != VIRTIO_GPU_RESP_OK_NODATA) {
-        log_hex("VIRTIO-GPU: ERROR - RESOURCE_ATTACH_BACKING for Cursor failed with type: ", resp_attach.type);
-        return false;
-    }
-
-    memset(&cmd_transfer, 0, sizeof(cmd_transfer));
-    cmd_transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
-    cmd_transfer.resource_id = 2;
-    cmd_transfer.rxx = 0;
-    cmd_transfer.ryy = 0;
-    cmd_transfer.rww = 64;
-    cmd_transfer.rhh = 64;
-    cmd_transfer.offset = 0;
-
-    if (!virtio_gpu_send_cmd((void *)&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer)) ||
-        resp_transfer.type != VIRTIO_GPU_RESP_OK_NODATA) {
-        log_str("VIRTIO-GPU: ERROR - TRANSFER_TO_HOST_2D for Cursor failed!\r\n");
-        return false;
-    }
-
-    /* Move cursor initially off-screen or top-left */
+    /* Show the arrow wherever the PS/2 driver already thinks the pointer is. */
     initialized = true;
-    virtio_gpu_update_cursor(2, 0, 0);
+    {
+        extern int32_t mouse_get_x(void);
+        extern int32_t mouse_get_y(void);
+        uint64_t fl = irq_save();
+        cursor_shape = 0;
+        cursor_x = (uint32_t)mouse_get_x();
+        cursor_y = (uint32_t)mouse_get_y();
+        cursor_shape_dirty = true;
+        cursor_submit();
+        irq_restore(fl);
+    }
 
     log_str("VIRTIO-GPU: Initialization and Hardware Cursor completed successfully!\r\n");
     return true;
 }
 
 
+/* Serializes framebuffer flushes: the TRANSFER/FLUSH command buffers
+   below are shared statics, and a caller can be preempted mid-wait. */
+static volatile int flush_busy = 0;
+
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     if (!initialized) return;
 
-    /* 1. Transfer dirty rect back-buffer contents to Host Resource 1 */
+    /* Clip to the scanout: a bogus rect from a Ring-3 SYS_fb_flush caller
+       would otherwise make the host reject the command (or copy junk). */
     uint32_t scr_w = comp_get_width();
+    uint32_t scr_h = comp_get_height();
+    if (x >= scr_w || y >= scr_h || w == 0 || h == 0) return;
+    if (w > scr_w - x) w = scr_w - x;
+    if (h > scr_h - y) h = scr_h - y;
+
+    while (__sync_lock_test_and_set(&flush_busy, 1)) {
+        extern void sched_yield(void);
+        sched_yield();
+    }
+
+    /* 1. Transfer the dirty rect of the back-buffer into Host Resource 1 */
     memset(&cmd_transfer, 0, sizeof(cmd_transfer));
     cmd_transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     cmd_transfer.resource_id = 1;
@@ -781,9 +1015,9 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_transfer.ryy = y;
     cmd_transfer.rww = w;
     cmd_transfer.rhh = h;
-    cmd_transfer.offset = (uint64_t)(y * scr_w + x) * 4;
+    cmd_transfer.offset = ((uint64_t)y * scr_w + x) * 4;
 
-    /* 2. Flush updated host VRAM resource contents onto host scanout display window */
+    /* 2. Flush it onto the host scanout */
     memset(&cmd_flush, 0, sizeof(cmd_flush));
     cmd_flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd_flush.resource_id = 1;
@@ -792,8 +1026,64 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_flush.rww = w;
     cmd_flush.rhh = h;
 
-    virtio_gpu_send_cmd((void *)&cmd_transfer, sizeof(cmd_transfer), &resp_transfer, sizeof(resp_transfer));
-    virtio_gpu_send_cmd((void *)&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
+    /* Both commands go into the ring together behind ONE notify (one VM
+       exit instead of two) and we wait once for both -- the device runs
+       its control queue in order, so the flush always sees the transfer. */
+    uint16_t d[4];
+    for (int i = 0; i < 4; i++) {
+        d[i] = vq_alloc_desc(&ctrl_q);
+        if (d[i] == 0xFFFF) {
+            for (int j = 0; j < i; j++) vq_free_desc(&ctrl_q, d[j]);
+            __sync_lock_release(&flush_busy);
+            return;
+        }
+    }
+
+    PageTable *pml4 = vmm_get_current_pml4();
+
+    ctrl_q.desc[d[0]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_transfer);
+    ctrl_q.desc[d[0]].len   = sizeof(cmd_transfer);
+    ctrl_q.desc[d[0]].flags = VIRTQ_DESC_F_NEXT;
+    ctrl_q.desc[d[0]].next  = d[1];
+
+    ctrl_q.desc[d[1]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&resp_transfer);
+    ctrl_q.desc[d[1]].len   = sizeof(resp_transfer);
+    ctrl_q.desc[d[1]].flags = VIRTQ_DESC_F_WRITE;
+    ctrl_q.desc[d[1]].next  = 0;
+
+    ctrl_q.desc[d[2]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_flush);
+    ctrl_q.desc[d[2]].len   = sizeof(cmd_flush);
+    ctrl_q.desc[d[2]].flags = VIRTQ_DESC_F_NEXT;
+    ctrl_q.desc[d[2]].next  = d[3];
+
+    ctrl_q.desc[d[3]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&resp_flush);
+    ctrl_q.desc[d[3]].len   = sizeof(resp_flush);
+    ctrl_q.desc[d[3]].flags = VIRTQ_DESC_F_WRITE;
+    ctrl_q.desc[d[3]].next  = 0;
+
+    uint16_t avail = ctrl_q.avail->idx;
+    ctrl_q.avail->ring[avail % ctrl_q.size]       = d[0];
+    ctrl_q.avail->ring[(avail + 1) % ctrl_q.size] = d[2];
+
+    __asm__ volatile("mfence" ::: "memory");
+    ctrl_q.avail->idx = (uint16_t)(avail + 2);
+    __asm__ volatile("mfence" ::: "memory");
+
+    *ctrl_q_notify = CTRL_QUEUE;
+
+    uint16_t target = (uint16_t)(ctrl_q.last_used + 2);
+    for (uint32_t i = 0; i < 100000000; i++) {
+        if (VQ_USED_IDX(ctrl_q) == target) break;
+        __asm__ volatile("pause" ::: "memory");
+    }
+    if (VQ_USED_IDX(ctrl_q) != target) {
+        log_str("VIRTIO-GPU: flush timeout!\r\n");
+    }
+    ctrl_q.last_used = VQ_USED_IDX(ctrl_q);
+
+    for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, d[i]);
+
+    __sync_lock_release(&flush_busy);
 }
 
 bool virtio_gpu_is_active(void)
@@ -801,44 +1091,47 @@ bool virtio_gpu_is_active(void)
     return initialized;
 }
 
-static VirtioGpuUpdateCursor cmd_cursor;
+/* Called from the mouse IRQ on every pointer move. */
+void virtio_gpu_move_cursor(uint32_t x, uint32_t y)
+{
+    if (!initialized) return;
+    uint64_t fl = irq_save();
+    cursor_x = x;
+    cursor_y = y;
+    cursor_submit();
+    irq_restore(fl);
+}
 
+/* 0 arrow, 1 hand, 2 text, 3 resize. Switching shape is one UPDATE_CURSOR
+   pointing at an already-uploaded resource -- no pixel transfer. */
+void virtio_gpu_set_cursor_shape(uint32_t shape)
+{
+    if (!initialized || shape >= CURSOR_SHAPE_COUNT) return;
+    uint64_t fl = irq_save();
+    if (shape != cursor_shape) {
+        cursor_shape = shape;
+        cursor_shape_dirty = true;
+        cursor_submit();
+    }
+    irq_restore(fl);
+}
+
+/* Timer IRQ hook (1 kHz): resend the latest cursor state if the cursor
+   queue was full when the mouse IRQ tried to send it. */
+void virtio_gpu_cursor_tick(void)
+{
+    if (!initialized || !cursor_pending) return;
+    uint64_t fl = irq_save();
+    if (cursor_pending) cursor_submit();
+    irq_restore(fl);
+}
+
+/* Legacy entry point: position (and shape via resource id) in one go. */
 void virtio_gpu_update_cursor(uint32_t resource_id, uint32_t x, uint32_t y)
 {
     if (!initialized) return;
-
-    /* Reclaim completed descriptors lazily */
-    while (cursor_q.used->idx != cursor_q.last_used) {
-        uint16_t used_idx = cursor_q.last_used % cursor_q.size;
-        uint32_t desc_idx = cursor_q.used->ring[used_idx].id;
-        vq_free_desc(&cursor_q, (uint16_t)desc_idx);
-        cursor_q.last_used++;
+    if (resource_id >= CURSOR_RES_BASE && resource_id < CURSOR_RES_BASE + CURSOR_SHAPE_COUNT) {
+        virtio_gpu_set_cursor_shape(resource_id - CURSOR_RES_BASE);
     }
-
-    memset(&cmd_cursor, 0, sizeof(cmd_cursor));
-    cmd_cursor.hdr.type = VIRTIO_GPU_CMD_UPDATE_CURSOR;
-    cmd_cursor.pos.x = x;
-    cmd_cursor.pos.y = y;
-    cmd_cursor.resource_id = resource_id;
-    cmd_cursor.hot_x = 0;
-    cmd_cursor.hot_y = 0;
-
-    uint16_t desc = vq_alloc_desc(&cursor_q);
-    if (desc == 0xFFFF) return;
-
-    /* Translate virtual address to physical for DMA */
-    PageTable *pml4 = vmm_get_current_pml4();
-    cursor_q.desc[desc].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_cursor);
-    cursor_q.desc[desc].len   = sizeof(cmd_cursor);
-    cursor_q.desc[desc].flags = 0;
-    cursor_q.desc[desc].next  = 0;
-
-    uint16_t avail_idx = cursor_q.avail->idx % cursor_q.size;
-    cursor_q.avail->ring[avail_idx] = desc;
-
-    __asm__ volatile("mfence" ::: "memory");
-    cursor_q.avail->idx++;
-
-    /* Notify cursor queue (queue index 1) */
-    *cursor_q_notify = CURSOR_QUEUE;
+    virtio_gpu_move_cursor(x, y);
 }

@@ -299,6 +299,8 @@ static void cmd_nano(const char *path) {
     ws.ws_xpixel = 0;
     ws.ws_ypixel = 0;
     zioctl(master, TIOCSWINSZ, &ws);
+    /* The main loop drains the master every frame: must not block. */
+    zfcntl(master, F_SETFL, O_NONBLOCK);
 
     char pathbuf[128];
     str_copy_n(pathbuf, path, sizeof(pathbuf));
@@ -360,6 +362,8 @@ static void cmd_pty_exec(const char *app, const char *args) {
     ws.ws_xpixel = 0;
     ws.ws_ypixel = 0;
     zioctl(master, TIOCSWINSZ, &ws);
+    /* The main loop drains the master every frame: must not block. */
+    zfcntl(master, F_SETFL, O_NONBLOCK);
 
     /* tokenize args (spaces) -- max 7 */
     const char *argv2[9];
@@ -525,7 +529,13 @@ int zerp_main(int argc, char **argv) {
         }
 
         if (dirty) redraw(&zc);
-        zyield();
+
+        /* Sleep instead of spinning. Normal mode only ever reacts to
+           compositor messages, so block on that pipe (the kernel wakes us
+           the moment one arrives). PTY mode also has the child's output to
+           watch, so nap 1ms and re-check both. */
+        if (g_mode == MODE_PTY) zsleep_ms(1);
+        else                    zpoll_in(zc.s2c_fd, 100);
     }
 }
 

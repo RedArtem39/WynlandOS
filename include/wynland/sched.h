@@ -41,6 +41,10 @@ typedef struct Thread {
     struct Thread *wq_next;   /* intrusive FIFO link within that queue */
     uint64_t wake_deadline;   /* absolute timer ticks after which the scheduler
                                  unblocks with -ETIMEDOUT; SCHED_NO_DEADLINE */
+    uint64_t wake_deadline_ms; /* same, on the 1 kHz timer_get_ms() clock
+                                  (sched_sleep_ms()); SCHED_NO_DEADLINE.
+                                  Only read while BLOCKED, and every block
+                                  path sets it, so it needs no init. */
     int64_t wake_result;      /* value sched_block() returns once resumed */
     uint32_t *clear_tid;      /* CLONE_CHILD_CLEARTID / set_tid_address target:
                                  on this thread's death the kernel writes 0 here
@@ -82,3 +86,6 @@ bool sched_kill_thread(uint64_t id);
    from any context with interrupts disabled internally. */
 int64_t sched_block(void *wq, uint64_t wake_deadline);
 void sched_unblock(Thread *t, int64_t result);
+/* Park the current thread for `ms` milliseconds of the 1 kHz clock
+   (0 = plain yield). Not a spin: the CPU is free for the whole sleep. */
+void sched_sleep_ms(uint64_t ms);

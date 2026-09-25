@@ -148,7 +148,8 @@ int zerp_main(int argc, char **argv) {
                 }
             }
         }
-        zyield();
+        /* Block until Zerp sends something: an idle window costs no CPU. */
+        zpoll_in(zc.s2c_fd, -1);
     }
 }
 
