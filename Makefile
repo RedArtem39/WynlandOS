@@ -437,12 +437,22 @@ run: all
 # -vga none: otherwise q35 adds a second (std VGA) display, the window shows
 # that one, and everything drawn through virtio-gpu lands on a hidden tab.
 # GPU_ADAPTER picks the host adapter (default NVIDIA; e.g. GPU_ADAPTER=AMD).
+# UI picks QEMU's window: gtk (menus, but under WSLg it may ignore input),
+# sdl (plain SDL window over Wayland; Ctrl+Alt releases the pointer).
 GPU_ADAPTER ?= NVIDIA
+UI ?= gtk
+ifeq ($(UI),sdl)
+QEMU_UI = SDL_VIDEODRIVER=wayland
+QEMU_DISPLAY = sdl,gl=es
+else
+QEMU_UI =
+QEMU_DISPLAY = gtk,gl=on,zoom-to-fit=off
+endif
 run-gl: all
 	@echo ""
-	@echo "  Launching WynlandOS in QEMU (KVM, virgl 3D on $(GPU_ADAPTER))..."
+	@echo "  Launching WynlandOS in QEMU (KVM, virgl 3D on $(GPU_ADAPTER), $(UI) window)..."
 	@echo ""
-	GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=$(GPU_ADAPTER) \
+	$(QEMU_UI) GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=$(GPU_ADAPTER) \
 	qemu-system-x86_64                                    \
 		-machine q35,accel=kvm                            \
 		-cpu host                                         \
@@ -451,7 +461,7 @@ run-gl: all
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-gpu-gl-pci                         \
-		-display gtk,gl=on,zoom-to-fit=off                \
+		-display $(QEMU_DISPLAY)                          \
 		-device virtio-net-pci,netdev=net0                \
 		-netdev user,id=net0                              \
 		-serial stdio                                     \
