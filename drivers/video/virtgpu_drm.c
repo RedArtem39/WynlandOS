@@ -1035,7 +1035,7 @@ static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t 
         ss.resource_id = bo->res_id;
         uint32_t rt = 0;
         bool ok = send_sync(&ss, sizeof(ss), &rt);
-        if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) dbg_num("DRM: SET_SCANOUT failed, resp=", ok ? rt : -1);
+        if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) dbg_num("DRM: SET_SCANOUT failed, resp=", ok ? (int64_t)rt : -1);
         if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) return false;
         g_scan_fb = fb->id;
     }
