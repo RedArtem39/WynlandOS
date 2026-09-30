@@ -490,12 +490,9 @@ extern uint64_t timer_get_ms(void);
    a local in the calling syscall_dispatcher() invocation (per-process,
    see the top of that function), not a global this can reach on its own. */
 static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ms) {
-    /* The deadline is kept on the 1 kHz clock, so a timeout never expires
-       early (a deadline of "N 100 Hz ticks from now" could be up to 10ms
-       short). Sleeps still end on 100 Hz tick boundaries, so it may run
-       up to one tick late. */
+    /* Deadline and sleeps both on the 1 kHz clock: a timeout expires
+       neither early nor up to a 100 Hz tick late. */
     uint64_t deadline_ms = (timeout_ms < 0) ? SCHED_NO_DEADLINE : timer_get_ms() + (uint64_t)timeout_ms;
-    uint64_t deadline = (timeout_ms < 0) ? SCHED_NO_DEADLINE : (deadline_ms + 9) / 10; /* first tick at/after it */
 
     for (;;) {
         if (fds) {
@@ -570,8 +567,8 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
         if (ready > 0) return ready;
         if (timeout_ms == 0) return 0; // caller asked for an immediate check only
 
-        if (deadline_ms != SCHED_NO_DEADLINE && timer_get_ms() >= deadline_ms) return 0; // real timeout
-        uint64_t now = timer_get_ticks();
+        uint64_t now_ms = timer_get_ms();
+        if (deadline_ms != SCHED_NO_DEADLINE && now_ms >= deadline_ms) return 0; // real timeout
 
         /* Genuinely sleep instead of spinning. Single watched fd
            with a real wait queue -> wake instantly on data via
@@ -581,11 +578,11 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
            for the multi-fd case, honestly short of "real epoll"
            but a genuine sleep, not the old single-yield). */
         if (single_wq && nfds == 1) {
-            waitqueue_wait(single_wq, deadline);
+            waitqueue_wait_ms(single_wq, deadline_ms);
         } else {
-            uint64_t nap_deadline = now + 5;
-            if (deadline != SCHED_NO_DEADLINE && nap_deadline > deadline) nap_deadline = deadline;
-            sched_block(NULL, nap_deadline);
+            uint64_t nap_deadline = now_ms + 50;
+            if (deadline_ms != SCHED_NO_DEADLINE && nap_deadline > deadline_ms) nap_deadline = deadline_ms;
+            sched_block_ms(NULL, nap_deadline);
         }
     }
 }
@@ -1014,8 +1011,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return (uint64_t)-1;
             }
             /* The next open()/socket() reusing this number must not inherit
-               this fd's O_NONBLOCK (only pipe()/pty_create() set oflags). */
+               this fd's O_NONBLOCK or FD_CLOEXEC (only some creators set
+               them). */
             fd_oflags[a1] = 0;
+            fd_flags[a1] = 0;
             if (fd_table[a1]->node.first_cluster == 0xFFFFFFFA ||
                 fd_table[a1]->node.first_cluster == 0xFFFFFFFB ||
                 fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
@@ -2128,19 +2127,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return 0;
             }
 
-        case 412: // SYS_mouse_state(int32_t out[3]) -- the kernel's own
-                   // integrated pointer {x, y, buttons}. The PS/2 IRQ is the
-                   // single source of truth for where the pointer is (it
-                   // drives the virtio-gpu cursor plane); Zerp reads this
-                   // instead of integrating packets itself, so hit-testing
-                   // can't drift from what's drawn on screen.
+        case 412: // SYS_mouse_events(MouseEvent *buf, int max) -- the
+                   // kernel's own absolute pointer events {x, y, buttons},
+                   // one per PS/2 packet (see drivers/input/mouse.c). The
+                   // IRQ is the single integrator (it also drives the
+                   // virtio-gpu cursor plane), so the compositor's hit-
+                   // testing can't drift from what's on screen. Exclusive:
+                   // the first caller owns the stream until it exits (like
+                   // an input grab) -- other processes get -EBUSY instead
+                   // of reading someone else's pointer. The owner's first
+                   // read starts with the current position.
             {
-                if (!a1 || !user_prepare_write(a1, 3 * sizeof(int32_t))) return (uint64_t)-14; /* -EFAULT */
-                int32_t *out = (int32_t *)a1;
-                out[0] = mouse_get_x();
-                out[1] = mouse_get_y();
-                out[2] = (int32_t)mouse_get_buttons();
-                return 0;
+                static uint64_t mouse_owner_pid = 0;
+                if (mouse_owner_pid != proc->pid) {
+                    Process *owner = mouse_owner_pid ? process_find_by_pid(mouse_owner_pid) : NULL;
+                    if (owner && !owner->exited) return (uint64_t)-16; /* -EBUSY */
+                    mouse_owner_pid = proc->pid;
+                    mouse_events_attach();
+                }
+                int64_t max = (int64_t)a2;
+                if (max <= 0) return 0;
+                if (max > 64) max = 64;
+                if (!a1 || !user_prepare_write(a1, (uint64_t)max * sizeof(MouseEvent))) return (uint64_t)-14; /* -EFAULT */
+                return (uint64_t)mouse_events_read((MouseEvent *)a1, (int)max);
             }
 
         case 411: // SYS_process_alive(pid) -- Phase 18. Lets zerp_term.c

@@ -3,9 +3,10 @@
  * ============================================================
  * A real Ring-3 process, not kernel code -- the whole point of this
  * project. Opens /dev/fb0 (the same proven path test_raw_fb.elf uses,
- * see Phase 2's fb_active_phys_addr() writeup) plus /dev/input/mice and
- * /dev/input/kbd, and is the ONLY process that should touch them
- * (documented convention, not kernel-enforced, same as Phase 1/2).
+ * see Phase 2's fb_active_phys_addr() writeup) plus /dev/input/kbd, and
+ * is the ONLY process that should touch them (documented convention, not
+ * kernel-enforced, same as Phase 1/2). Pointer input comes from the
+ * kernel's SYS_mouse_events stream, which IS exclusive to one process.
  *
  * Spawns a small hardcoded set of client demos, each with a fresh pipe
  * pair (control messages, see zerp_protocol.h) and SHM segment (pixel
@@ -38,6 +39,8 @@
 #define TILE_GAP          6
 #define TITLE_H           20
 
+#define ZERP_OUTBOX 128
+
 typedef struct {
     int c2s_read_fd;
     int s2c_write_fd;
@@ -57,7 +60,7 @@ typedef struct {
     /* s2c is non-blocking too: messages the pipe can't take right now
        wait here instead of being dropped (a lost button-up or key-up
        means a stuck button/key). Pure pointer motion is coalesced. */
-    ZerpMsg out[64];
+    ZerpMsg out[ZERP_OUTBOX];
     uint32_t out_head, out_count;
     int out_tail_motion; /* newest queued message is pure motion */
 } ClientSlot;
@@ -169,9 +172,40 @@ static void client_flush_out(ClientSlot *c) {
     while (c->out_count > 0) {
         if (zwrite(c->s2c_write_fd, &c->out[c->out_head], sizeof(ZerpMsg)) != (long)sizeof(ZerpMsg))
             return;
-        c->out_head = (c->out_head + 1) % 64;
+        c->out_head = (c->out_head + 1) % ZERP_OUTBOX;
         c->out_count--;
     }
+}
+
+static ZerpMsg *outbox_at(ClientSlot *c, uint32_t k) {
+    return &c->out[(c->out_head + k) % ZERP_OUTBOX];
+}
+
+static void outbox_remove(ClientSlot *c, uint32_t k) {
+    for (; k + 1 < c->out_count; k++) *outbox_at(c, k) = *outbox_at(c, k + 1);
+    c->out_count--;
+}
+
+/* Outbox full (the client hasn't read in a long time): free one slot,
+   losing as little as possible -- the oldest mouse message first (only
+   its position is lost: the next one carries the button state), then a
+   TILE_RECT superseded by a newer one. Key events and the newest
+   TILE_RECT are never evicted; if nothing else is left, returns 0. */
+static int outbox_evict(ClientSlot *c) {
+    /* A queued message is superseded if a later one of the same type
+       follows it (mouse: carries the newer button mask; TILE_RECT: the
+       newer tile). Mouse first. */
+    static const uint32_t order[2] = { ZERP_MSG_INPUT_MOUSE, ZERP_MSG_TILE_RECT };
+    for (int t = 0; t < 2; t++) {
+        for (uint32_t k = 0; k < c->out_count; k++) {
+            if (outbox_at(c, k)->type != order[t]) continue;
+            for (uint32_t l = k + 1; l < c->out_count; l++) {
+                if (outbox_at(c, l)->type == order[t]) { outbox_remove(c, k); return 1; }
+            }
+            break; /* the oldest of this type has no successor: none do */
+        }
+    }
+    return 0;
 }
 
 /* `motion` = pure pointer motion (no button change). Replacing a
@@ -180,16 +214,18 @@ static void client_flush_out(ClientSlot *c) {
    a click is delivered at the position it happened at. */
 static void client_send_ex(ClientSlot *c, const ZerpMsg *m, int motion) {
     if (motion && c->out_count > 0 && c->out_tail_motion) {
-        c->out[(c->out_head + c->out_count - 1) % 64] = *m;
+        *outbox_at(c, c->out_count - 1) = *m;
+        client_flush_out(c);
         return;
     }
-    if (c->out_count == 64) {
-        /* Client hasn't read anything in a long time: make room by
-           dropping the oldest queued message. */
-        c->out_head = (c->out_head + 1) % 64;
-        c->out_count--;
+    if (c->out_count == ZERP_OUTBOX && !outbox_evict(c)) {
+        /* Only key events queued: the client is wedged. Dropping this new
+           message (not an old one) at least keeps every queued key-down
+           paired with whatever key-up already follows it. */
+        if (m->type != ZERP_MSG_TILE_RECT) return;
+        outbox_remove(c, 0);
     }
-    c->out[(c->out_head + c->out_count) % 64] = *m;
+    *outbox_at(c, c->out_count) = *m;
     c->out_count++;
     c->out_tail_motion = motion;
     client_flush_out(c);
@@ -417,8 +453,17 @@ static void set_focus(int new_focus, int *focused) {
 }
 
 /* Focus-follows-mouse + forward the pointer to the focused client. */
+/* Buttons held as of the last delivered mouse message. While any is held
+   the pointer is grabbed by the client it was pressed in (like X11's
+   implicit grab): no focus change, and the release goes to that client
+   too -- otherwise dragging out of a window left it with a button that
+   never came up. */
+static uint8_t g_mouse_held = 0;
+
 static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int motion, int *focused) {
-    for (int i = 0; i < g_client_count; i++) {
+    int grabbed = g_mouse_held != 0;
+    g_mouse_held = buttons;
+    for (int i = 0; !grabbed && i < g_client_count; i++) {
         ClientSlot *c = &g_clients[i];
         if (!c->alive) continue;
         if ((uint32_t)mx >= c->tile_x && (uint32_t)mx < c->tile_x + c->tile_w &&
@@ -469,7 +514,6 @@ int zerp_main(int argc, char **argv) {
     g_fb = (uint32_t *)zsys6(SYS_mmap, 0, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fb_fd, 0);
     if ((long)g_fb <= 0) { zwrite(1, "[zerp] FATAL: mmap /dev/fb0 failed\n", 36); zexit(1); }
 
-    long mice_fd = zopen("/dev/input/mice", O_RDONLY);
     long kbd_fd  = zopen("/dev/input/kbd", O_RDONLY);
 
     /* Screen-sized wallpaper buffer (an anonymous SHM segment is this
@@ -536,19 +580,17 @@ int zerp_main(int argc, char **argv) {
     screen_present();
     zwrite(1, "[zerp] clients spawned and tiled\n", 34);
 
-    /* The kernel's PS/2 driver owns the pointer position (it drives the
-       hardware cursor plane from the IRQ and has been integrating since
-       boot). Start from its value, and re-sync to it after every batch
-       below, so hit-testing always matches what's drawn on screen. */
-    int32_t cursor_x = (int32_t)(g_screen_w / 2);
-    int32_t cursor_y = (int32_t)(g_screen_h / 2);
-    {
-        int32_t ms[3];
-        if (zmouse_state(ms) == 0) { cursor_x = ms[0]; cursor_y = ms[1]; }
-    }
-    uint8_t mouse_buf[3];
-    int mouse_cycle = 0;
+    /* Pointer input comes from the kernel as absolute events (x, y,
+       buttons after each PS/2 packet): the same IRQ drives the hardware
+       cursor plane, so hit-testing always matches what's on screen. The
+       first event is the pointer's current position. */
     uint8_t last_buttons = 0;
+    /* Which client got each key's make code (index = scancode & 0x7F,
+       +128 for E0-prefixed keys), so its break code goes to the same
+       client even after focus moved; -1 = none. */
+    int8_t key_owner[256];
+    for (int k = 0; k < 256; k++) key_owner[k] = -1;
+    int kbd_e0 = 0;
     int focused = 0;
     uint64_t next_frame = 0; /* in 1/ZERP_HZ ms units */
 #if ZERP_STATS
@@ -557,65 +599,61 @@ int zerp_main(int argc, char **argv) {
 #endif
 
     for (;;) {
-        /* -- mouse: decode standard 3-byte PS/2 packets (same sign/Y
-           inversion as drivers/input/mouse.c), read in bulk rather than a
-           syscall per byte. Pure motion is coalesced into ONE message per
-           iteration; a button change is delivered immediately with the
-           position it happened at, so no click is ever lost. */
+        /* -- mouse: absolute events from the kernel. Pure motion is
+           coalesced into ONE message per iteration; a button change is
+           delivered immediately with the position it happened at, so no
+           click is ever lost or misplaced. */
         {
             int moved = 0;
-            uint8_t mb[192];
+            int32_t mx = 0, my = 0;
+            ZMouseEvent ev[64];
             long n;
-            while ((n = zread((int)mice_fd, mb, sizeof(mb))) > 0) {
+            while ((n = zmouse_events(ev, 64)) > 0) {
                 for (long k = 0; k < n; k++) {
-                    /* Byte 0 of every packet has bit 3 set: skip until one
-                       shows up, so a lost byte can't shift all later packets. */
-                    if (mouse_cycle == 0 && !(mb[k] & 0x08)) continue;
-                    mouse_buf[mouse_cycle++] = mb[k];
-                    if (mouse_cycle < 3) continue;
-                    mouse_cycle = 0;
-
-                    uint8_t buttons = mouse_buf[0];
-                    int32_t rel_x = (int32_t)mouse_buf[1];
-                    int32_t rel_y = (int32_t)mouse_buf[2];
-                    if (buttons & 0x10) rel_x |= ~0xFF;
-                    if (buttons & 0x20) rel_y |= ~0xFF;
-
-                    cursor_x += rel_x;
-                    cursor_y -= rel_y;
-                    if (cursor_x < 0) cursor_x = 0;
-                    if (cursor_x >= (int32_t)g_screen_w) cursor_x = (int32_t)g_screen_w - 1;
-                    if (cursor_y < 0) cursor_y = 0;
-                    if (cursor_y >= (int32_t)g_screen_h) cursor_y = (int32_t)g_screen_h - 1;
-                    moved = 1;
-
-                    if ((buttons & 0x07) != last_buttons) {
-                        last_buttons = buttons & 0x07;
-                        deliver_mouse(cursor_x, cursor_y, last_buttons, 0, &focused);
+                    uint8_t b = (uint8_t)(ev[k].buttons & 0x07);
+                    mx = ev[k].x; my = ev[k].y;
+                    if (b != last_buttons) {
+                        last_buttons = b;
+                        deliver_mouse(mx, my, b, 0, &focused);
                         moved = 0;
+                    } else {
+                        moved = 1;
                     }
                 }
-                if (n < (long)sizeof(mb)) break;
+                if (n < 64) break;
             }
-            if (moved) {
-                /* Local integration only places clicks inside the batch;
-                   the kernel's value is authoritative. */
-                int32_t ms[3];
-                if (zmouse_state(ms) == 0) { cursor_x = ms[0]; cursor_y = ms[1]; }
-                deliver_mouse(cursor_x, cursor_y, last_buttons, 1, &focused);
-            }
+            if (moved) deliver_mouse(mx, my, last_buttons, 1, &focused);
         }
 
-        /* -- keyboard: forward raw scancodes to the focused client only. */
-        if (g_client_count > 0 && g_clients[focused].alive) {
+        /* -- keyboard: raw set-1 scancodes. A make code goes to the
+           focused client; its break code goes wherever the make went, so
+           a key held while focus moves still gets released. */
+        {
             uint8_t kb[64];
             long n;
             while ((n = zread((int)kbd_fd, kb, sizeof(kb))) > 0) {
                 for (long k = 0; k < n; k++) {
-                    ZerpMsg kmsg;
-                    kmsg.type = ZERP_MSG_INPUT_KEY;
-                    kmsg.x = kb[k]; kmsg.y = 0; kmsg.w = 0; kmsg.h = 0;
-                    client_send(&g_clients[focused], &kmsg);
+                    uint8_t sc = kb[k];
+                    if (sc == 0xE0) { kbd_e0 = 1; continue; }
+                    int key = (sc & 0x7F) + (kbd_e0 ? 128 : 0);
+                    int target = focused;
+                    if (sc == 0xE1 || sc == 0xFA || sc == 0xFE) {
+                        /* Pause prefix / controller replies: pass through */
+                    } else if (sc & 0x80) {
+                        if (key_owner[key] >= 0) target = key_owner[key];
+                        key_owner[key] = -1;
+                    } else {
+                        key_owner[key] = (int8_t)focused;
+                    }
+                    if (target < g_client_count && g_clients[target].alive) {
+                        ZerpMsg kmsg;
+                        kmsg.type = ZERP_MSG_INPUT_KEY;
+                        kmsg.y = 0; kmsg.w = 0; kmsg.h = 0;
+                        if (kbd_e0) { kmsg.x = 0xE0; client_send(&g_clients[target], &kmsg); }
+                        kmsg.x = sc;
+                        client_send(&g_clients[target], &kmsg);
+                    }
+                    kbd_e0 = 0;
                 }
                 if (n < (long)sizeof(kb)) break;
             }
@@ -691,6 +729,8 @@ int zerp_main(int argc, char **argv) {
 
         if (need_retile) {
             compact_clients();
+            /* client indices shift: held keys now release to the focus */
+            for (int k = 0; k < 256; k++) key_owner[k] = -1;
             if (focused >= g_client_count) focused = g_client_count > 0 ? g_client_count - 1 : 0;
             g_focused_client = focused;
             retile();

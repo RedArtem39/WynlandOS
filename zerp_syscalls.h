@@ -30,7 +30,7 @@
 #define SYS_wynland_elevate 409
 #define SYS_pty_create 410
 #define SYS_process_alive 411
-#define SYS_mouse_state 412
+#define SYS_mouse_events 412
 #define SYS_dup2       33
 #define SYS_execve     59
 #define SYS_fork       57
@@ -152,8 +152,10 @@ static long zpoll_in(int fd, long timeout_ms) {
     return zsys3(SYS_poll_nr, (long)&p, 1, timeout_ms);
 }
 
-/* Kernel's integrated pointer: out[0]=x, out[1]=y, out[2]=buttons. */
-static long zmouse_state(int32_t out[3]) { return zsys3(SYS_mouse_state, (long)out, 0, 0); }
+/* Absolute pointer events from the kernel (x, y, button mask after each
+   PS/2 packet). Exclusive to the first caller; returns the number read. */
+typedef struct { int32_t x, y; uint32_t buttons; } ZMouseEvent;
+static long zmouse_events(ZMouseEvent *buf, long max) { return zsys3(SYS_mouse_events, (long)buf, max, 0); }
 
 /* Fast 32-bit pixel copy (rep movsl) for blits. */
 static inline void zcopy32(uint32_t *dst, const uint32_t *src, uint32_t count) {

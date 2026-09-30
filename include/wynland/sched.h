@@ -86,6 +86,8 @@ bool sched_kill_thread(uint64_t id);
    from any context with interrupts disabled internally. */
 int64_t sched_block(void *wq, uint64_t wake_deadline);
 void sched_unblock(Thread *t, int64_t result);
+/* sched_block() with the deadline on the 1 kHz timer_get_ms() clock. */
+int64_t sched_block_ms(void *wq, uint64_t wake_deadline_ms);
 /* Park the current thread for `ms` milliseconds of the 1 kHz clock
    (0 = plain yield). Not a spin: the CPU is free for the whole sleep. */
 void sched_sleep_ms(uint64_t ms);

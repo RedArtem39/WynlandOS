@@ -39,6 +39,14 @@ int64_t waitqueue_wait(WaitQueue *q, uint64_t deadline) {
     return result;
 }
 
+int64_t waitqueue_wait_ms(WaitQueue *q, uint64_t deadline_ms) {
+    Thread *t = sched_current();
+    queue_push(q, t);
+    int64_t result = sched_block_ms((void *)q, deadline_ms);
+    self_unlink(q, t);
+    return result;
+}
+
 void waitqueue_wake_all(WaitQueue *q) {
     Thread *t = q->head;
     while (t) {

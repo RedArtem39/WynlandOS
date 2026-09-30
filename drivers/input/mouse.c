@@ -258,6 +258,60 @@ static void mouse_queue_push(uint8_t val)
     }
 }
 
+/* Absolute pointer events for the Ring-3 compositor: the position the
+   kernel computed AFTER each packet, so the compositor never integrates
+   packets itself and can't drift from the hardware cursor (which this
+   same IRQ drives). Only recorded while a reader is attached. */
+#define MOUSE_EVENT_RING 256
+static MouseEvent mouse_events[MOUSE_EVENT_RING];
+static uint32_t mouse_ev_head = 0, mouse_ev_count = 0;
+static bool mouse_ev_enabled = false;
+
+/* Interrupts must be off. */
+static void mouse_event_push(void)
+{
+    if (!mouse_ev_enabled) return;
+    MouseEvent ev = { mouse_x, mouse_y, mouse_buttons };
+    if (mouse_ev_count > 0) {
+        MouseEvent *last = &mouse_events[(mouse_ev_head + mouse_ev_count - 1) % MOUSE_EVENT_RING];
+        if (mouse_ev_count == MOUSE_EVENT_RING && last->buttons == ev.buttons) {
+            *last = ev; /* full: fold pure motion into the newest event */
+            return;
+        }
+    }
+    if (mouse_ev_count == MOUSE_EVENT_RING) {
+        /* Full and a button change: make room at the old end. */
+        mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
+        mouse_ev_count--;
+    }
+    mouse_events[(mouse_ev_head + mouse_ev_count) % MOUSE_EVENT_RING] = ev;
+    mouse_ev_count++;
+}
+
+void mouse_events_attach(void)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    mouse_ev_head = mouse_ev_count = 0;
+    mouse_ev_enabled = true;
+    mouse_event_push(); /* first event = where the pointer is right now */
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+int mouse_events_read(MouseEvent *buf, int max)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    int n = 0;
+    while (n < max && mouse_ev_count > 0) {
+        buf[n++] = mouse_events[mouse_ev_head];
+        mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
+        mouse_ev_count--;
+    }
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return n;
+}
+
 int mouse_read_queue(uint8_t *buf, int size)
 {
     int read_bytes = 0;
@@ -323,6 +377,7 @@ void mouse_handle_interrupt(uint8_t data)
                 mouse_x = new_x;
                 mouse_y = new_y;
                 mouse_buttons = buttons & 0x07;
+                mouse_event_push();
 
                 /* Hardware cursor tracks the IRQ directly: moves at input
                    rate no matter what the compositor is doing. */

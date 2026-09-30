@@ -415,6 +415,10 @@ int64_t sched_block(void *wq, uint64_t wake_deadline) {
     return sched_block_until(wq, wake_deadline, SCHED_NO_DEADLINE);
 }
 
+int64_t sched_block_ms(void *wq, uint64_t wake_deadline_ms) {
+    return sched_block_until(wq, SCHED_NO_DEADLINE, wake_deadline_ms);
+}
+
 /* Genuine millisecond sleep: parks the thread (the idle thread's hlt gets
    the CPU if nobody else is runnable) until the 1 kHz clock passes the
    deadline. Replaces nanosleep()'s old sched_yield() spin, which kept the

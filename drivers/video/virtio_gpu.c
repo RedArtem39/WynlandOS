@@ -1010,6 +1010,32 @@ static volatile int flush_busy = 0;
 static bool     flush_stuck = false;
 static uint16_t flush_stuck_target;
 static uint16_t flush_stuck_desc[4];
+static uint32_t flush_stuck_drops = 0;
+
+/* Bounding box of every rect dropped (or timed out) while stuck: callers
+   have already cleared their own damage, so it is re-sent together with
+   the first flush after the host recovers. dropped_x2/y2 exclusive. */
+static bool     dropped_any = false;
+static uint32_t dropped_x1, dropped_y1, dropped_x2, dropped_y2;
+
+static void flush_remember_dropped(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!dropped_any) {
+        dropped_x1 = x; dropped_y1 = y; dropped_x2 = x + w; dropped_y2 = y + h;
+        dropped_any = true;
+        return;
+    }
+    if (x < dropped_x1) dropped_x1 = x;
+    if (y < dropped_y1) dropped_y1 = y;
+    if (x + w > dropped_x2) dropped_x2 = x + w;
+    if (y + h > dropped_y2) dropped_y2 = y + h;
+}
+
+/* Waiting for the host happens with interrupts OFF (syscall context), so
+   the budget is kept short -- the timer, mouse IRQ and scheduler are all
+   frozen for as long as it runs. A timeout is recoverable (flush_stuck
+   below), so there's no need to wait out a long host stall here. */
+#define FLUSH_SPIN_LIMIT 2000000
 
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
@@ -1030,13 +1056,30 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 
     if (flush_stuck) {
         if ((int16_t)(VQ_USED_IDX(ctrl_q) - flush_stuck_target) < 0) {
-            __sync_lock_release(&flush_busy); /* host still busy: drop this frame */
+            /* host still busy: drop this frame, re-send its area later */
+            flush_remember_dropped(x, y, w, h);
+            if ((++flush_stuck_drops % 1000) == 0) {
+                log_dec("VIRTIO-GPU: host still not responding, dropped frames = ", flush_stuck_drops);
+            }
+            __sync_lock_release(&flush_busy);
             return;
         }
         ctrl_q.last_used = flush_stuck_target;
         for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, flush_stuck_desc[i]);
         flush_stuck = false;
+        flush_stuck_drops = 0;
         log_str("VIRTIO-GPU: stuck flush completed, resuming\r\n");
+    }
+
+    if (dropped_any) {
+        /* Everything dropped while stuck goes out with this flush. */
+        uint32_t x2 = x + w, y2 = y + h;
+        if (dropped_x1 < x) x = dropped_x1;
+        if (dropped_y1 < y) y = dropped_y1;
+        if (dropped_x2 > x2) x2 = dropped_x2;
+        if (dropped_y2 > y2) y2 = dropped_y2;
+        w = x2 - x; h = y2 - y;
+        dropped_any = false;
     }
 
     /* 1. Transfer the dirty rect of the back-buffer into Host Resource 1 */
@@ -1104,7 +1147,7 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     *ctrl_q_notify = CTRL_QUEUE;
 
     uint16_t target = (uint16_t)(ctrl_q.last_used + 2);
-    for (uint32_t i = 0; i < 100000000; i++) {
+    for (uint32_t i = 0; i < FLUSH_SPIN_LIMIT; i++) {
         if (VQ_USED_IDX(ctrl_q) == target) break;
         __asm__ volatile("pause" ::: "memory");
     }
@@ -1112,6 +1155,8 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
         log_str("VIRTIO-GPU: flush timeout!\r\n");
         flush_stuck = true;
         flush_stuck_target = target;
+        /* The host may never apply this rect: send it again on recovery. */
+        flush_remember_dropped(x, y, w, h);
         for (int i = 0; i < 4; i++) flush_stuck_desc[i] = d[i];
         __sync_lock_release(&flush_busy);
         return;

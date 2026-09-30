@@ -26,6 +26,8 @@ typedef struct WaitQueue {
    race can also return 0 spuriously close to the deadline (same contract
    sched_block() already documents). */
 int64_t waitqueue_wait(WaitQueue *q, uint64_t deadline);
+/* Same, with the deadline on the 1 kHz timer_get_ms() clock. */
+int64_t waitqueue_wait_ms(WaitQueue *q, uint64_t deadline_ms);
 
 /* Wakes every thread currently parked on `q`. Safe to call from a normal
    thread (producer just wrote/read something) or from interrupt context
