@@ -143,6 +143,16 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
                     uint64_t virt = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
                     if (i4 & 0x100) virt |= 0xFFFF000000000000ULL;
 
+                    if (pte & PAGE_SHARED_MAP) {
+                        /* MAP_SHARED / device memory: the child sees the
+                           same frame, writable as before, never COW. Not
+                           refcounted by the pmm -- its owner object
+                           (SHM segment, DRM BO, ...) decides its lifetime. */
+                        vmm_map_page(child_pml4, virt, phys,
+                                     (pte & ~PAGE_ADDR_MASK) & ~PAGE_PRESENT);
+                        continue;
+                    }
+
                     /* If this leaf was writable, it's a real COW candidate:
                        both sides lose PAGE_WRITE and gain PAGE_COW, and a
                        write fault from either resolves through the page
@@ -199,6 +209,7 @@ void vmm_free_user_mappings(PageTable *pml4)
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
                     if (!(pte & PAGE_PRESENT)) continue;
+                    if (pte & PAGE_SHARED_MAP) continue; /* owned by its SHM/BO/fb object */
                     /* Refcount-aware: a leaf still COW-shared with a sibling
                        process (fork()'d, never written since) just drops
                        this owner's share here instead of freeing outright. */
@@ -407,6 +418,21 @@ bool vmm_resolve_cow_page(PageTable *pml4, uint64_t page_addr)
     vmm_map_page(pml4, page_addr, (uint64_t)(uintptr_t)new_phys, (flags & ~PAGE_COW) | PAGE_WRITE);
     pmm_free_page((void *)(uintptr_t)phys); /* drop this owner's share of the old, still-shared frame */
     return true;
+}
+
+uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt)
+{
+    PageTableEntry e = pml4->entries[PML4_INDEX(virt)];
+    if (!(e & PAGE_PRESENT)) return 0;
+    PageTable *pdpt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+    e = pdpt->entries[PDPT_INDEX(virt)];
+    if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return 0;
+    PageTable *pd = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+    e = pd->entries[PD_INDEX(virt)];
+    if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return 0;
+    PageTable *pt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+    e = pt->entries[PT_INDEX(virt)];
+    return (e & PAGE_PRESENT) ? e : 0;
 }
 
 uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)

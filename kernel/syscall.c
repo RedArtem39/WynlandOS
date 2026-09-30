@@ -1161,7 +1161,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t cache_flags = virtio_gpu_is_active() ? 0 : PAGE_PAT;
                     for (uint64_t i = 0; i < pages; i++) {
                         vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, fb_phys + i * PAGE_SIZE,
-                                     PAGE_WRITE | PAGE_USER | cache_flags | PAGE_NX);
+                                     PAGE_WRITE | PAGE_USER | cache_flags | PAGE_NX | PAGE_SHARED_MAP);
                     }
 
                     return virt_addr;
@@ -1185,7 +1185,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     PageTable *pml4 = vmm_get_current_pml4();
                     for (uint32_t i = 0; i < shm_pages; i++) {
                         vmm_map_page(pml4, virt_addr + (uint64_t)i * PAGE_SIZE, seg->phys_addr + (uint64_t)i * PAGE_SIZE,
-                                     PAGE_WRITE | PAGE_USER | PAGE_NX);
+                                     PAGE_WRITE | PAGE_USER | PAGE_NX | PAGE_SHARED_MAP);
                     }
                     seg->refcount++;
 
@@ -1219,10 +1219,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     Process *mmap_proc = sched_current()->proc;
                     PageTable *cur_pml4 = vmm_get_current_pml4();
                     for (uint64_t off = 0; off < size_aligned; off += PAGE_SIZE) {
-                        uint64_t old_phys = vmm_get_phys(cur_pml4, virt_addr + off);
-                        if (old_phys) {
+                        uint64_t old_pte = vmm_get_pte(cur_pml4, virt_addr + off);
+                        if (old_pte) {
                             vmm_unmap_page(cur_pml4, virt_addr + off);
-                            pmm_free_page((void *)(uintptr_t)old_phys);
+                            if (!(old_pte & PAGE_SHARED_MAP)) /* owned by its object, see munmap */
+                                pmm_free_page((void *)(uintptr_t)(old_pte & PAGE_ADDR_MASK));
                         }
                     }
                     vma_unmap_range(mmap_proc, virt_addr, virt_addr + size_aligned);
@@ -1517,10 +1518,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 Process *proc = sched_current()->proc;
                 PageTable *pml4 = vmm_get_current_pml4();
                 for (uint64_t a = addr; a < end; a += PAGE_SIZE) {
-                    uint64_t phys = vmm_get_phys(pml4, a);
-                    if (phys) {
+                    uint64_t pte = vmm_get_pte(pml4, a);
+                    if (pte) {
                         vmm_unmap_page(pml4, a);
-                        pmm_free_page((void *)(uintptr_t)phys);
+                        /* fb0/SHM/memfd/DRM pages belong to their object,
+                           not to this mapping */
+                        if (!(pte & PAGE_SHARED_MAP))
+                            pmm_free_page((void *)(uintptr_t)(pte & PAGE_ADDR_MASK));
                     }
                 }
                 vma_unmap_range(proc, addr, end);

@@ -33,6 +33,11 @@ extern uint64_t g_page_nx_bit;
                                        that fork()'s COW sharing (vmm_cow_clone_user_pages()) mapped read-only
                                        into two-or-more processes; the page fault handler (kernel/idt.c) checks
                                        this bit before falling back to its fatal path on a write fault. */
+#define PAGE_SHARED_MAP (1ULL << 10) /* Software-defined bit: this leaf maps memory the process does NOT own
+                                       (/dev/fb0, SHM segments, memfd, DRM buffer objects). Its lifetime
+                                       belongs to that object, so munmap() and process teardown only unmap it
+                                       (never pmm_free it), and fork() shares it as-is -- writable, same
+                                       frame, no COW -- which is what MAP_SHARED means. */
 #define PAGE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
 
@@ -69,6 +74,10 @@ PageTable *vmm_new_process_pml4(void);
 
 /* Get physical address of a virtual address by traversing page tables */
 uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt);
+
+/* Raw leaf PTE for a 4 KB mapping (flags + frame), 0 if not mapped or if
+   it's part of a huge page. */
+uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt);
 
 /* True if the mapping at virt has PAGE_USER set (i.e. genuinely owned by
    this process, not an aliased kernel-identity-map page it happens to
