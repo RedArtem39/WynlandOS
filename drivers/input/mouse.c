@@ -272,17 +272,28 @@ static void mouse_event_push(void)
 {
     if (!mouse_ev_enabled) return;
     MouseEvent ev = { mouse_x, mouse_y, mouse_buttons };
-    if (mouse_ev_count > 0) {
-        MouseEvent *last = &mouse_events[(mouse_ev_head + mouse_ev_count - 1) % MOUSE_EVENT_RING];
-        if (mouse_ev_count == MOUSE_EVENT_RING && last->buttons == ev.buttons) {
-            *last = ev; /* full: fold pure motion into the newest event */
-            return;
-        }
-    }
     if (mouse_ev_count == MOUSE_EVENT_RING) {
-        /* Full and a button change: make room at the old end. */
-        mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
-        mouse_ev_count--;
+        /* Full (reader stalled): drop the oldest event whose successor has
+           the same buttons -- only a position is lost, never a press or
+           release. If every event is a button change, fold into the newest
+           when this one doesn't change buttons, else drop the oldest. */
+        uint32_t k;
+        for (k = 0; k + 1 < mouse_ev_count; k++) {
+            MouseEvent *a = &mouse_events[(mouse_ev_head + k) % MOUSE_EVENT_RING];
+            MouseEvent *b = &mouse_events[(mouse_ev_head + k + 1) % MOUSE_EVENT_RING];
+            if (a->buttons == b->buttons) break;
+        }
+        if (k + 1 < mouse_ev_count) {
+            for (; k + 1 < mouse_ev_count; k++)
+                mouse_events[(mouse_ev_head + k) % MOUSE_EVENT_RING] =
+                    mouse_events[(mouse_ev_head + k + 1) % MOUSE_EVENT_RING];
+            mouse_ev_count--;
+        } else {
+            MouseEvent *last = &mouse_events[(mouse_ev_head + mouse_ev_count - 1) % MOUSE_EVENT_RING];
+            if (last->buttons == ev.buttons) { *last = ev; return; }
+            mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
+            mouse_ev_count--;
+        }
     }
     mouse_events[(mouse_ev_head + mouse_ev_count) % MOUSE_EVENT_RING] = ev;
     mouse_ev_count++;

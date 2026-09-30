@@ -179,10 +179,10 @@ void irq_handler(InterruptRegisters *regs)
         /* Send End of Interrupt (EOI) to PIC before yielding */
         outb(PIC1_COMMAND, PIC_EOI);
 
-        /* Re-send a hardware-cursor position the virtio-gpu cursor queue
-           had no room for when the mouse IRQ produced it. */
-        extern void virtio_gpu_cursor_tick(void);
-        virtio_gpu_cursor_tick();
+        /* virtio-gpu housekeeping: pending cursor update, TSC
+           calibration, re-sending frame areas a stalled host missed. */
+        extern void virtio_gpu_tick(void);
+        virtio_gpu_tick();
 
         if ((timer_ms % TIMER_MS_PER_TICK) != 0) {
             /* 1ms preemption: sched_schedule()'s deadline pass is also

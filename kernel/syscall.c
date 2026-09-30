@@ -2139,16 +2139,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    // read starts with the current position.
             {
                 static uint64_t mouse_owner_pid = 0;
+                int64_t max = (int64_t)a2;
+                if (max <= 0) return (uint64_t)-22; /* -EINVAL */
+                if (max > 64) max = 64;
+                /* validate before claiming: a bad call must not take the stream */
+                if (!a1 || !user_prepare_write(a1, (uint64_t)max * sizeof(MouseEvent))) return (uint64_t)-14; /* -EFAULT */
                 if (mouse_owner_pid != proc->pid) {
                     Process *owner = mouse_owner_pid ? process_find_by_pid(mouse_owner_pid) : NULL;
                     if (owner && !owner->exited) return (uint64_t)-16; /* -EBUSY */
                     mouse_owner_pid = proc->pid;
                     mouse_events_attach();
                 }
-                int64_t max = (int64_t)a2;
-                if (max <= 0) return 0;
-                if (max > 64) max = 64;
-                if (!a1 || !user_prepare_write(a1, (uint64_t)max * sizeof(MouseEvent))) return (uint64_t)-14; /* -EFAULT */
                 return (uint64_t)mouse_events_read((MouseEvent *)a1, (int)max);
             }
 

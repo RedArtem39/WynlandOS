@@ -722,7 +722,7 @@ static void cursor_submit(void)
     uint16_t desc = vq_alloc_desc(&cursor_q);
     if (desc == 0xFFFF) {
         /* Host hasn't drained the (16-entry) cursor queue yet: remember
-           the LATEST state and let virtio_gpu_cursor_tick() resend it --
+           the LATEST state and let virtio_gpu_tick() resend it --
            intermediate positions are worthless anyway. */
         cursor_pending = true;
         return;
@@ -1002,19 +1002,22 @@ bool virtio_gpu_init(void)
    below are shared statics, and a caller can be preempted mid-wait. */
 static volatile int flush_busy = 0;
 
-/* A flush the host didn't complete within the timeout. Its descriptors
-   and the static cmd_/resp_ buffers still belong to the device, so they
-   are neither freed nor reused until its completions actually arrive --
-   reusing them would let a late completion satisfy the NEXT flush's wait
-   while that flush's commands are still in flight. */
-static bool     flush_stuck = false;
-static uint16_t flush_stuck_target;
-static uint16_t flush_stuck_desc[4];
+/* A flush whose completion hasn't been collected yet: one that timed
+   out, or one submitted asynchronously by virtio_gpu_tick(). Its
+   descriptors and the static cmd_/resp_ buffers still belong to the
+   device, so they are neither freed nor reused until its completions
+   actually arrive -- reusing them would let a late completion satisfy the
+   NEXT flush's wait while that flush's commands are still in flight. */
+static bool     flush_inflight = false;
+static bool     flush_timed_out = false; /* inflight because of a timeout */
+static uint16_t flush_inflight_target;
+static uint16_t flush_inflight_desc[4];
 static uint32_t flush_stuck_drops = 0;
 
-/* Bounding box of every rect dropped (or timed out) while stuck: callers
-   have already cleared their own damage, so it is re-sent together with
-   the first flush after the host recovers. dropped_x2/y2 exclusive. */
+/* Bounding box of every rect dropped (or timed out) while a flush was in
+   flight: callers have already cleared their own damage, so it is re-sent
+   by the next flush or, if none comes, by virtio_gpu_tick(). x2/y2
+   exclusive. */
 static bool     dropped_any = false;
 static uint32_t dropped_x1, dropped_y1, dropped_x2, dropped_y2;
 
@@ -1033,56 +1036,63 @@ static void flush_remember_dropped(uint32_t x, uint32_t y, uint32_t w, uint32_t 
 
 /* Waiting for the host happens with interrupts OFF (syscall context), so
    the budget is kept short -- the timer, mouse IRQ and scheduler are all
-   frozen for as long as it runs. A timeout is recoverable (flush_stuck
-   below), so there's no need to wait out a long host stall here. */
-#define FLUSH_SPIN_LIMIT 2000000
+   frozen for as long as it runs, which also means timer_get_ms() can't
+   measure it: the TSC does, calibrated against the 1 kHz tick in
+   virtio_gpu_tick(). A timeout is recoverable (flush_inflight), so there's
+   no need to wait out a long host stall here. */
+#define FLUSH_TIMEOUT_MS  20
+#define FLUSH_SPIN_LIMIT  2000000 /* fallback until the TSC is calibrated */
+static uint64_t tsc_per_ms = 0;
+static uint64_t tsc_last_tick = 0;
 
-void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+static inline uint64_t rdtsc(void)
 {
-    if (!initialized) return;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
-    /* Clip to the scanout: a bogus rect from a Ring-3 SYS_fb_flush caller
-       would otherwise make the host reject the command (or copy junk). */
-    uint32_t scr_w = comp_get_width();
-    uint32_t scr_h = comp_get_height();
-    if (x >= scr_w || y >= scr_h || w == 0 || h == 0) return;
-    if (w > scr_w - x) w = scr_w - x;
-    if (h > scr_h - y) h = scr_h - y;
-
-    while (__sync_lock_test_and_set(&flush_busy, 1)) {
-        extern void sched_yield(void);
-        sched_yield();
-    }
-
-    if (flush_stuck) {
-        if ((int16_t)(VQ_USED_IDX(ctrl_q) - flush_stuck_target) < 0) {
-            /* host still busy: drop this frame, re-send its area later */
-            flush_remember_dropped(x, y, w, h);
-            if ((++flush_stuck_drops % 1000) == 0) {
-                log_dec("VIRTIO-GPU: host still not responding, dropped frames = ", flush_stuck_drops);
-            }
-            __sync_lock_release(&flush_busy);
-            return;
-        }
-        ctrl_q.last_used = flush_stuck_target;
-        for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, flush_stuck_desc[i]);
-        flush_stuck = false;
+/* Collect an in-flight flush if the host has finished it. Returns false
+   while it's still pending. flush_busy must be held. */
+static bool flush_reclaim(void)
+{
+    if (!flush_inflight) return true;
+    if ((int16_t)(VQ_USED_IDX(ctrl_q) - flush_inflight_target) < 0) return false;
+    ctrl_q.last_used = flush_inflight_target;
+    for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, flush_inflight_desc[i]);
+    flush_inflight = false;
+    if (flush_timed_out) {
+        flush_timed_out = false;
         flush_stuck_drops = 0;
         log_str("VIRTIO-GPU: stuck flush completed, resuming\r\n");
     }
+    return true;
+}
 
-    if (dropped_any) {
-        /* Everything dropped while stuck goes out with this flush. */
-        uint32_t x2 = x + w, y2 = y + h;
-        if (dropped_x1 < x) x = dropped_x1;
-        if (dropped_y1 < y) y = dropped_y1;
-        if (dropped_x2 > x2) x2 = dropped_x2;
-        if (dropped_y2 > y2) y2 = dropped_y2;
-        w = x2 - x; h = y2 - y;
-        dropped_any = false;
-    }
+/* Fold the dropped area into (x, y, w, h). */
+static void flush_take_dropped(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *h)
+{
+    if (!dropped_any) return;
+    uint32_t x2 = *x + *w, y2 = *y + *h;
+    if (dropped_x1 < *x) *x = dropped_x1;
+    if (dropped_y1 < *y) *y = dropped_y1;
+    if (dropped_x2 > x2) x2 = dropped_x2;
+    if (dropped_y2 > y2) y2 = dropped_y2;
+    *w = x2 - *x; *h = y2 - *y;
+    dropped_any = false;
+}
 
-    /* 1. Transfer the dirty rect of the back-buffer into Host Resource 1 */
+/* Queue TRANSFER_TO_HOST_2D + RESOURCE_FLUSH for the rect behind one
+   notify. Both commands go into the ring together (one VM exit instead of
+   two) and complete in order -- the device runs its control queue in
+   order, so the flush always sees the transfer. On success fills d[] and
+   returns the used-index both completions will have reached.
+   flush_busy must be held and no flush may be in flight. */
+static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                         uint16_t d[4], uint16_t *target)
+{
+    uint32_t scr_w = comp_get_width();
+
     memset(&cmd_transfer, 0, sizeof(cmd_transfer));
     cmd_transfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
     cmd_transfer.resource_id = 1;
@@ -1092,7 +1102,6 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_transfer.rhh = h;
     cmd_transfer.offset = ((uint64_t)y * scr_w + x) * 4;
 
-    /* 2. Flush it onto the host scanout */
     memset(&cmd_flush, 0, sizeof(cmd_flush));
     cmd_flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
     cmd_flush.resource_id = 1;
@@ -1101,16 +1110,11 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     cmd_flush.rww = w;
     cmd_flush.rhh = h;
 
-    /* Both commands go into the ring together behind ONE notify (one VM
-       exit instead of two) and we wait once for both -- the device runs
-       its control queue in order, so the flush always sees the transfer. */
-    uint16_t d[4];
     for (int i = 0; i < 4; i++) {
         d[i] = vq_alloc_desc(&ctrl_q);
         if (d[i] == 0xFFFF) {
             for (int j = 0; j < i; j++) vq_free_desc(&ctrl_q, d[j]);
-            __sync_lock_release(&flush_busy);
-            return;
+            return false;
         }
     }
 
@@ -1146,18 +1150,69 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 
     *ctrl_q_notify = CTRL_QUEUE;
 
-    uint16_t target = (uint16_t)(ctrl_q.last_used + 2);
-    for (uint32_t i = 0; i < FLUSH_SPIN_LIMIT; i++) {
-        if (VQ_USED_IDX(ctrl_q) == target) break;
-        __asm__ volatile("pause" ::: "memory");
+    *target = (uint16_t)(ctrl_q.last_used + 2);
+    return true;
+}
+
+static void flush_mark_inflight(const uint16_t d[4], uint16_t target, bool timed_out)
+{
+    flush_inflight = true;
+    flush_timed_out = timed_out;
+    flush_inflight_target = target;
+    for (int i = 0; i < 4; i++) flush_inflight_desc[i] = d[i];
+}
+
+void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!initialized) return;
+
+    /* Clip to the scanout: a bogus rect from a Ring-3 SYS_fb_flush caller
+       would otherwise make the host reject the command (or copy junk). */
+    uint32_t scr_w = comp_get_width();
+    uint32_t scr_h = comp_get_height();
+    if (x >= scr_w || y >= scr_h || w == 0 || h == 0) return;
+    if (w > scr_w - x) w = scr_w - x;
+    if (h > scr_h - y) h = scr_h - y;
+
+    while (__sync_lock_test_and_set(&flush_busy, 1)) {
+        extern void sched_yield(void);
+        sched_yield();
+    }
+
+    if (!flush_reclaim()) {
+        /* host still busy with an earlier flush: drop this frame, its
+           area goes out with the next flush or tick */
+        flush_remember_dropped(x, y, w, h);
+        if (flush_timed_out && (++flush_stuck_drops % 1000) == 0) {
+            log_dec("VIRTIO-GPU: host still not responding, dropped frames = ", flush_stuck_drops);
+        }
+        __sync_lock_release(&flush_busy);
+        return;
+    }
+
+    flush_take_dropped(&x, &y, &w, &h);
+
+    uint16_t d[4], target;
+    if (!flush_submit(x, y, w, h, d, &target)) {
+        flush_remember_dropped(x, y, w, h);
+        __sync_lock_release(&flush_busy);
+        return;
+    }
+
+    if (tsc_per_ms) {
+        uint64_t limit = tsc_per_ms * FLUSH_TIMEOUT_MS;
+        uint64_t t0 = rdtsc();
+        while (VQ_USED_IDX(ctrl_q) != target && rdtsc() - t0 < limit)
+            __asm__ volatile("pause" ::: "memory");
+    } else {
+        for (uint32_t i = 0; i < FLUSH_SPIN_LIMIT && VQ_USED_IDX(ctrl_q) != target; i++)
+            __asm__ volatile("pause" ::: "memory");
     }
     if (VQ_USED_IDX(ctrl_q) != target) {
         log_str("VIRTIO-GPU: flush timeout!\r\n");
-        flush_stuck = true;
-        flush_stuck_target = target;
+        flush_mark_inflight(d, target, true);
         /* The host may never apply this rect: send it again on recovery. */
         flush_remember_dropped(x, y, w, h);
-        for (int i = 0; i < 4; i++) flush_stuck_desc[i] = d[i];
         __sync_lock_release(&flush_busy);
         return;
     }
@@ -1198,14 +1253,44 @@ void virtio_gpu_set_cursor_shape(uint32_t shape)
     irq_restore(fl);
 }
 
-/* Timer IRQ hook (1 kHz): resend the latest cursor state if the cursor
-   queue was full when the mouse IRQ tried to send it. */
-void virtio_gpu_cursor_tick(void)
+/* Timer IRQ hook (1 kHz):
+   - calibrates the TSC against the tick (for virtio_gpu_flush()'s
+     time-based timeout; the smallest gap seen is the true 1 ms, longer
+     ones are ticks delayed by interrupts-off stretches);
+   - resends the latest cursor state if the cursor queue was full when
+     the mouse IRQ tried to send it;
+   - collects a finished in-flight flush and pushes out any area dropped
+     meanwhile WITHOUT waiting for it, so the screen catches up even when
+     nobody calls virtio_gpu_flush() again (an idle window's last frame). */
+void virtio_gpu_tick(void)
 {
-    if (!initialized || !cursor_pending) return;
-    uint64_t fl = irq_save();
-    if (cursor_pending) cursor_submit();
-    irq_restore(fl);
+    if (!initialized) return;
+
+    uint64_t now = rdtsc();
+    if (tsc_last_tick) {
+        uint64_t delta = now - tsc_last_tick;
+        if (delta > 1000 && (tsc_per_ms == 0 || delta < tsc_per_ms)) tsc_per_ms = delta;
+    }
+    tsc_last_tick = now;
+
+    if (cursor_pending) {
+        uint64_t fl = irq_save();
+        if (cursor_pending) cursor_submit();
+        irq_restore(fl);
+    }
+
+    if (!dropped_any) return;
+    /* Only try-lock: a preempted flush holder must not be spun on here. */
+    if (__sync_lock_test_and_set(&flush_busy, 1)) return;
+    if (flush_reclaim() && dropped_any) {
+        uint32_t x = dropped_x1, y = dropped_y1;
+        uint32_t w = dropped_x2 - dropped_x1, h = dropped_y2 - dropped_y1;
+        dropped_any = false;
+        uint16_t d[4], target;
+        if (flush_submit(x, y, w, h, d, &target)) flush_mark_inflight(d, target, false);
+        else flush_remember_dropped(x, y, w, h);
+    }
+    __sync_lock_release(&flush_busy);
 }
 
 /* Legacy entry point: position (and shape via resource id) in one go. */

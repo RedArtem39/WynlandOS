@@ -120,13 +120,18 @@ int zerp_main(int argc, char **argv) {
     list_directory();
     redraw(&zc);
 
+    uint32_t prev_buttons = 0;
     for (;;) {
         ZerpMsg msg;
         while (zerp_poll_server_msg(&zc, &msg)) {
             if (msg.type == ZERP_MSG_TILE_RECT) {
                 redraw(&zc);
             } else if (msg.type == ZERP_MSG_INPUT_MOUSE) {
-                if (msg.w & 0x01) { /* left click */
+                /* A click is the press itself (0 -> 1), not every message
+                   sent while the button stays held (drag motion). */
+                int pressed = (msg.w & 0x01) && !(prev_buttons & 0x01);
+                prev_buttons = msg.w;
+                if (pressed) { /* left click */
                     int clicked_row = (int)(msg.y / ROW_H);
                     if (clicked_row == 0) continue; /* clicked the path header */
                     int has_up = (zstrlen(g_path) > 1);

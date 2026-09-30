@@ -63,6 +63,10 @@ typedef struct {
     ZerpMsg out[ZERP_OUTBOX];
     uint32_t out_head, out_count;
     int out_tail_motion; /* newest queued message is pure motion */
+    /* Latest TILE_RECT that didn't fit a full, un-evictable outbox; sent
+       as soon as the outbox drains. */
+    ZerpMsg tile_pending;
+    int has_tile_pending;
 } ClientSlot;
 
 static ClientSlot g_clients[MAX_CLIENTS];
@@ -147,6 +151,7 @@ static int spawn_client(const char *path, uint32_t shm_bytes) {
     g_clients[idx].rx_len = 0;
     g_clients[idx].out_head = g_clients[idx].out_count = 0;
     g_clients[idx].out_tail_motion = 0;
+    g_clients[idx].has_tile_pending = 0;
     g_client_count++;
     return idx;
 }
@@ -175,6 +180,9 @@ static void client_flush_out(ClientSlot *c) {
         c->out_head = (c->out_head + 1) % ZERP_OUTBOX;
         c->out_count--;
     }
+    if (c->has_tile_pending &&
+        zwrite(c->s2c_write_fd, &c->tile_pending, sizeof(ZerpMsg)) == (long)sizeof(ZerpMsg))
+        c->has_tile_pending = 0;
 }
 
 static ZerpMsg *outbox_at(ClientSlot *c, uint32_t k) {
@@ -218,12 +226,17 @@ static void client_send_ex(ClientSlot *c, const ZerpMsg *m, int motion) {
         client_flush_out(c);
         return;
     }
+    if (m->type == ZERP_MSG_TILE_RECT && c->has_tile_pending) {
+        c->tile_pending = *m; /* keep its place after the queued input */
+        client_flush_out(c);
+        return;
+    }
     if (c->out_count == ZERP_OUTBOX && !outbox_evict(c)) {
-        /* Only key events queued: the client is wedged. Dropping this new
-           message (not an old one) at least keeps every queued key-down
-           paired with whatever key-up already follows it. */
-        if (m->type != ZERP_MSG_TILE_RECT) return;
-        outbox_remove(c, 0);
+        /* Only key events queued: the client is wedged. A TILE_RECT
+           waits in its own slot; anything else is dropped (key events
+           go through client_send_key(), which never gets here). */
+        if (m->type == ZERP_MSG_TILE_RECT) { c->tile_pending = *m; c->has_tile_pending = 1; }
+        return;
     }
     *outbox_at(c, c->out_count) = *m;
     c->out_count++;
@@ -232,6 +245,22 @@ static void client_send_ex(ClientSlot *c, const ZerpMsg *m, int motion) {
 }
 
 static void client_send(ClientSlot *c, const ZerpMsg *m) { client_send_ex(c, m, 0); }
+
+/* One scancode, E0-prefixed or not, queued all-or-nothing so the prefix
+   can never be separated from its code. If a wedged client's outbox has
+   no room even after eviction, the key is dropped as a unit. */
+static void client_send_key(ClientSlot *c, int e0, uint8_t sc) {
+    uint32_t need = e0 ? 2 : 1;
+    while (ZERP_OUTBOX - c->out_count < need) {
+        if (!outbox_evict(c)) return;
+    }
+    ZerpMsg k = { ZERP_MSG_INPUT_KEY, 0xE0, 0, 0, 0 };
+    if (e0) { *outbox_at(c, c->out_count) = k; c->out_count++; }
+    k.x = sc;
+    *outbox_at(c, c->out_count) = k; c->out_count++;
+    c->out_tail_motion = 0;
+    client_flush_out(c);
+}
 
 /* Dwindle-style tiling: recompute every live client's rect from scratch
    (not incremental merge/split bookkeeping -- only runs on membership
@@ -473,10 +502,20 @@ static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int motion, i
         }
     }
     if (g_client_count > 0 && g_clients[*focused].alive) {
+        ClientSlot *c = &g_clients[*focused];
+        /* Clamp into the tile: the pointer can be outside it (dragged out
+           under the grab, or over a gap), and the unsigned wire fields
+           would turn "left of the tile" into a huge x. */
+        int32_t rx = mx - (int32_t)c->tile_x;
+        int32_t ry = my - (int32_t)c->tile_y;
+        if (rx < 0) rx = 0;
+        if (ry < 0) ry = 0;
+        if (c->tile_w > 0 && rx >= (int32_t)c->tile_w) rx = (int32_t)c->tile_w - 1;
+        if (c->tile_h > 0 && ry >= (int32_t)c->tile_h) ry = (int32_t)c->tile_h - 1;
         ZerpMsg mmsg;
         mmsg.type = ZERP_MSG_INPUT_MOUSE;
-        mmsg.x = (uint32_t)mx - g_clients[*focused].tile_x;
-        mmsg.y = (uint32_t)my - g_clients[*focused].tile_y;
+        mmsg.x = (uint32_t)rx;
+        mmsg.y = (uint32_t)ry;
         mmsg.w = buttons;
         mmsg.h = 0;
         client_send_ex(&g_clients[*focused], &mmsg, motion);
@@ -585,6 +624,7 @@ int zerp_main(int argc, char **argv) {
        cursor plane, so hit-testing always matches what's on screen. The
        first event is the pointer's current position. */
     uint8_t last_buttons = 0;
+    int mouse_err_logged = 0;
     /* Which client got each key's make code (index = scancode & 0x7F,
        +128 for E0-prefixed keys), so its break code goes to the same
        client even after focus moved; -1 = none. */
@@ -622,6 +662,11 @@ int zerp_main(int argc, char **argv) {
                 }
                 if (n < 64) break;
             }
+            if (n < 0 && !mouse_err_logged) {
+                /* -EBUSY: another process owns the pointer stream */
+                zwrite(1, "[zerp] no pointer input: SYS_mouse_events failed (pointer owned by another process?)\n", 85);
+                mouse_err_logged = 1;
+            }
             if (moved) deliver_mouse(mx, my, last_buttons, 1, &focused);
         }
 
@@ -642,16 +687,15 @@ int zerp_main(int argc, char **argv) {
                     } else if (sc & 0x80) {
                         if (key_owner[key] >= 0) target = key_owner[key];
                         key_owner[key] = -1;
+                    } else if (key_owner[key] >= 0) {
+                        /* typematic repeat of a held key: stays with the
+                           client that got the first make */
+                        target = key_owner[key];
                     } else {
                         key_owner[key] = (int8_t)focused;
                     }
                     if (target < g_client_count && g_clients[target].alive) {
-                        ZerpMsg kmsg;
-                        kmsg.type = ZERP_MSG_INPUT_KEY;
-                        kmsg.y = 0; kmsg.w = 0; kmsg.h = 0;
-                        if (kbd_e0) { kmsg.x = 0xE0; client_send(&g_clients[target], &kmsg); }
-                        kmsg.x = sc;
-                        client_send(&g_clients[target], &kmsg);
+                        client_send_key(&g_clients[target], kbd_e0, sc);
                     }
                     kbd_e0 = 0;
                 }
