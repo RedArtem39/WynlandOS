@@ -451,7 +451,7 @@ run-gl: all
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-gpu-gl-pci                         \
-		-display gtk,gl=on                                \
+		-display gtk,gl=on,zoom-to-fit=off                \
 		-device virtio-net-pci,netdev=net0                \
 		-netdev user,id=net0                              \
 		-serial stdio                                     \
