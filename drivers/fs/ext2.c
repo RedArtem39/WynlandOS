@@ -32,6 +32,7 @@
  * packing mistake fail the build instead of silently misreading disk.
  */
 
+#include <wynland/virtgpu_drm.h>
 #include <wynland/vfs.h>
 #include <wynland/ahci.h>
 #include <wynland/heap.h>
@@ -747,7 +748,17 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
         if (chunk > len - bytes_read) chunk = len - bytes_read;
 
         uint32_t phys_block = ext2_resolve_block((Ext2Inode *)inode, logical_block, false);
-        if (phys_block == 0) break; /* hole or beyond extent -- treat as EOF */
+        if (phys_block == 0) {
+            /* A hole (sparse file -- debugfs `write`, which builds the
+               image, stores all-zero blocks that way), NOT end of file:
+               len is already clamped to i_size above. Treating it as EOF
+               silently truncated every read spanning a hole; ld.so's
+               whole-file first mmap of a large library then saw zeros
+               where its .dynamic section is and crashed. */
+            for (uint32_t i = 0; i < chunk; i++) out[bytes_read + i] = 0;
+            bytes_read += chunk;
+            continue;
+        }
 
         if (!ext2_read_block(phys_block, block_buf)) break;
 
@@ -1438,6 +1449,13 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     if (str_compare(path, "/dev/input/kbd") == 0 || path_ends_with(path, "/dev/input/kbd") || path_ends_with(path, "dev/input/kbd")) {
         return alloc_device_file("kbd", 0, false, DEV_KBD, flags);
     }
+    /* DRM nodes (drivers/video/virtgpu_drm.c): ioctl/mmap-only devices */
+    if (str_compare(path, "/dev/dri/renderD128") == 0) {
+        return alloc_device_file("renderD128", 0, false, DRM_DEV_RENDER, flags);
+    }
+    if (str_compare(path, "/dev/dri/card0") == 0) {
+        return alloc_device_file("card0", 0, false, DRM_DEV_CARD, flags);
+    }
     if (str_compare(path, "/dev/tty") == 0 || path_ends_with(path, "/dev/tty") || path_ends_with(path, "dev/tty")) {
         return alloc_device_file("tty", 0, false, DEV_TTY, flags);
     }
@@ -1528,6 +1546,7 @@ void vfs_close(VfsFile *file) {
 
 int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (!file || !buf) return -1;
+    if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* always EOF */
@@ -1648,6 +1667,7 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
 
 int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     if (!file || !buf) return -1;
+    if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* discard everything */

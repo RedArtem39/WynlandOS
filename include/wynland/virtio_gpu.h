@@ -156,6 +156,84 @@ typedef struct {
     uint32_t max_size;
 } VirtioGpuCapsetInfo;
 
+/* hdr.flags: the device answers this command only once the host GPU
+   has finished it (virgl fence retire) -- that IS our completion signal */
+#define VIRTIO_GPU_FLAG_FENCE 1u
+
+#define VIRTIO_GPU_CMD_RESOURCE_UNREF_ID VIRTIO_GPU_CMD_RESOURCE_UNREF
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t nlen;
+    uint32_t context_init;
+    char     debug_name[64];
+} VirtioGpuCtxCreate;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t resource_id;
+    uint32_t padding;
+} VirtioGpuCtxResource;   /* CTX_ATTACH/DETACH_RESOURCE, RESOURCE_UNREF */
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t resource_id;
+    uint32_t target;
+    uint32_t format;
+    uint32_t bind;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t array_size;
+    uint32_t last_level;
+    uint32_t nr_samples;
+    uint32_t flags;
+    uint32_t padding;
+} VirtioGpuResourceCreate3d;
+
+typedef struct PACKED {
+    uint32_t x, y, z, w, h, d;
+} VirtioGpuBox;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    VirtioGpuBox box;
+    uint64_t offset;
+    uint32_t resource_id;
+    uint32_t level;
+    uint32_t stride;
+    uint32_t layer_stride;
+} VirtioGpuTransferHost3d;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t size;
+    uint32_t padding;
+} VirtioGpuCmdSubmit;     /* followed by `size` bytes of virgl command stream */
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t resource_id;
+    uint32_t nr_entries;
+    VirtioGpuMemEntry entry; /* one physically contiguous range */
+} VirtioGpuAttachBacking1;
+
+/* Control-queue request ticket (see virtio_gpu.c's "Control queue"). */
+typedef struct {
+    uint16_t head;
+    uint64_t seq;
+} VgpuTicket;
+
+/* Queue one command: `cmd` then optional `data` (device-readable), then
+   `resp` (device-writable). Buffers must stay valid until the ticket is
+   done. Interrupts must be off (syscall context). */
+bool vgpu_submit(const void *cmd, uint32_t cmd_len, const void *data, uint32_t data_len,
+                 void *resp, uint32_t resp_len, VgpuTicket *t);
+bool vgpu_done(VgpuTicket t);   /* reaps first */
+uint32_t vgpu_alloc_resource_id(void);
+uint32_t vgpu_alloc_ctx_id(void);
+uint64_t vgpu_next_fence_id(void);
+
 #define VIRTIO_GPU_MAX_CAPSETS 8
 #define VIRTIO_GPU_CAPSET_BUF  4096
 

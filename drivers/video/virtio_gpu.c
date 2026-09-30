@@ -421,10 +421,7 @@ typedef struct {
     bool     device_writes; /* response buffer */
 } CtrlSeg;
 
-typedef struct {
-    uint16_t head;
-    uint64_t seq;
-} CtrlTicket;
+typedef VgpuTicket CtrlTicket; /* public name: include/wynland/virtio_gpu.h */
 
 static uint64_t ctrl_seq = 0;
 static uint64_t ctrl_done_seq[VQ_MAX_SIZE];
@@ -544,6 +541,34 @@ static bool ctrlq_wait_spin(CtrlTicket t, uint32_t ms)
         __asm__ volatile("pause" ::: "memory");
     }
 }
+
+/* ---- API for the DRM render node (drivers/video/virtgpu_drm.c) ---- */
+
+bool vgpu_submit(const void *cmd, uint32_t cmd_len, const void *data, uint32_t data_len,
+                 void *resp, uint32_t resp_len, VgpuTicket *t)
+{
+    CtrlSeg segs[CTRLQ_MAX_SEGS];
+    int n = ctrlq_add_buf(segs, 0, cmd, cmd_len, false);
+    if (n > 0 && data && data_len) n = ctrlq_add_buf(segs, n, data, data_len, false);
+    if (n > 0) n = ctrlq_add_buf(segs, n, resp, resp_len, true);
+    if (n <= 0) return false;
+    return ctrlq_submit(segs, n, t);
+}
+
+bool vgpu_done(VgpuTicket t)
+{
+    ctrlq_reap();
+    return ctrlq_done(t);
+}
+
+/* Resource ids 1 (scanout) and 2..5 (cursor shapes) are the driver's own. */
+static uint32_t next_resource_id = 0x100;
+static uint32_t next_ctx_id = 1;
+static uint64_t next_fence_id = 1;
+
+uint32_t vgpu_alloc_resource_id(void) { return next_resource_id++; }
+uint32_t vgpu_alloc_ctx_id(void)      { return next_ctx_id++; }
+uint64_t vgpu_next_fence_id(void)     { return next_fence_id++; }
 
 /* Synchronous command with one command and one response buffer (init-time
    and other rare paths). */

@@ -14,6 +14,7 @@
 #include <wynland/elf.h>
 #include <wynland/waitqueue.h>
 #include <wynland/usercopy.h>
+#include <wynland/virtgpu_drm.h>
 #include <wynland/mouse.h>
 
 extern uint64_t timer_get_ticks(void);
@@ -419,6 +420,12 @@ static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
     if (file->node.first_cluster == 0xFFFFFFF0) {
         st->st_mode = S_IFCHR | 0666;
         st->st_rdev = ((uint64_t)29 << 8) | 0; /* major 29, minor 0 */
+    } else if (file->node.first_cluster == DRM_DEV_RENDER) {
+        st->st_mode = S_IFCHR | 0666;
+        st->st_rdev = ((uint64_t)226 << 8) | 128;
+    } else if (file->node.first_cluster == DRM_DEV_CARD) {
+        st->st_mode = S_IFCHR | 0666;
+        st->st_rdev = ((uint64_t)226 << 8) | 0;
     } else if (str_compare(file->node.name, "renderd1") == 0) {
         st->st_mode = S_IFCHR | 0666;
         st->st_rdev = ((uint64_t)226 << 8) | 128;
@@ -614,6 +621,10 @@ void process_teardown(Process *proc) {
         } else if (fc == SOCK_FD_UDP) {
             udp_socket_close((int)f->current_cluster);
             kfree(f);
+        } else if (IS_DRM_DEV(fc)) {
+            /* can't wait for the host from here: deferred to the next ioctl */
+            drm_release(f->current_cluster, proc->pid, false);
+            vfs_close(f);
         } else if (fc == 0xFFFFFFFD) { /* SHM segment */
             int seg_idx = (int)f->current_cluster;
             if (seg_idx >= 0 && seg_idx < MAX_SHM_SEGMENTS && g_shm_segments[seg_idx].refcount > 0) {
@@ -1010,6 +1021,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
             }
+            if (IS_DRM_DEV(fd_table[a1]->node.first_cluster))
+                drm_release(fd_table[a1]->current_cluster, proc->pid, true);
             /* The next open()/socket() reusing this number must not inherit
                this fd's O_NONBLOCK or FD_CLOEXEC (only some creators set
                them). */
@@ -1164,6 +1177,25 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                                      PAGE_WRITE | PAGE_USER | cache_flags | PAGE_NX | PAGE_SHARED_MAP);
                     }
 
+                    return virt_addr;
+                }
+
+                // DRM buffer object (VIRTGPU_MAP offset): the BO owns the pages
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    IS_DRM_DEV(fd_table[fd]->node.first_cluster)) {
+                    uint64_t bo_phys;
+                    if (drm_mmap_lookup(fd_table[fd]->current_cluster, offset, size_aligned, &bo_phys) != 0)
+                        return (uint64_t)-22; /* -EINVAL */
+                    uint64_t virt_addr = addr & ~(uint64_t)(PAGE_SIZE - 1);
+                    if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                        static uint64_t mmap_drm_ptr = 0x640000000000; // own slot, after anon mmap (0x63..)
+                        virt_addr = mmap_drm_ptr;
+                        mmap_drm_ptr += size_aligned;
+                    }
+                    uint64_t pflags = PAGE_USER | PAGE_NX | PAGE_SHARED_MAP | ((prot & 0x2) ? PAGE_WRITE : 0);
+                    PageTable *pml4 = vmm_get_current_pml4();
+                    for (uint64_t i = 0; i < pages; i++)
+                        vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, bo_phys + i * PAGE_SIZE, pflags);
                     return virt_addr;
                 }
 
@@ -1857,13 +1889,44 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
                 exec_proc->brk_current = exec_proc->brk_start;
 
+                /* Check the target BEFORE the point of no return below: a
+                   missing or non-ELF file must still fail with an error the
+                   caller can see, in its intact old image. */
+                {
+                    VfsFile *probe = vfs_open(kernel_path);
+                    unsigned char ident[20];
+                    bool looks_ok = probe && vfs_read(probe, ident, sizeof(ident)) == (int)sizeof(ident) &&
+                                    ident[0] == 0x7F && ident[1] == 'E' && ident[2] == 'L' && ident[3] == 'F' &&
+                                    ident[4] == 2 /* ELFCLASS64 */ && ident[18] == 62 /* EM_X86_64 */;
+                    if (probe) vfs_close(probe);
+                    if (!looks_ok) {
+                        for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
+                        for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
+                        return (uint64_t)-2; /* -ENOENT / -ENOEXEC */
+                    }
+                }
+
+                /* Point of no return: drop the WHOLE old user address space
+                   (segments, libraries, stack, mmaps), not just its VMAs and
+                   heap. elf_load() writes the new image through these same
+                   virtual addresses; a page left over from the old image
+                   (e.g. exec of the same binary: its read-only text sits
+                   exactly where the new text goes) made that write fault in
+                   the kernel. argv/envp/path are already in kernel buffers. */
+                vmm_free_user_mappings(pml4);
+                __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+                /* Like Linux's exec: the clear-tid word lived in the old image */
+                sched_current()->clear_tid = NULL;
+
                 bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4,
                                           have_argv_e ? kargv_e : NULL, have_envp_e ? kenvp_e : NULL, exec_proc);
                 for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
                 for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
                 if (!execve_ok) {
-                    serial_write_string("SYS_execve: elf_load failed!\r\n");
-                    return (uint64_t)-2; /* -ENOENT */
+                    /* The old image is gone: nothing to return to. */
+                    serial_write_string("SYS_execve: elf_load failed after teardown, exiting\r\n");
+                    thread_exit();
+                    return (uint64_t)-2;
                 }
 
                 // Update syscall regs to jump to the new entry point on return
@@ -2259,6 +2322,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint64_t request = a2;
                 void *argp = (void *)a3;
 
+                /* DRM render/card node: straight to the virtio-gpu DRM layer
+                   (hot path -- EXECBUFFER per draw batch -- so before the
+                   per-call serial log below). */
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    IS_DRM_DEV(fd_table[fd]->node.first_cluster)) {
+                    return (uint64_t)drm_ioctl(&fd_table[fd]->current_cluster, request, a3);
+                }
+
                 {
                     char fd_str[32], req_str[32];
                     uint_to_hex(fd, fd_str);
@@ -2403,62 +2474,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)-25; /* -ENOTTY */
                 }
 
-                // DRM device ioctl handling
-                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL) {
-                    uint32_t cl = fd_table[fd]->node.first_cluster;
-                    // card0 = 0xFB0E, renderD128 = 0xFB0F
-                    if (cl == 0xFB0E || cl == 0xFB0F) {
-                        // DRM_IOCTL_VERSION = 0xC0406400
-                        if ((request & 0xFFFF) == 0x6400) {
-                            struct drm_version {
-                                int version_major;
-                                int version_minor;
-                                int version_patchlevel;
-                                uint64_t name_len;
-                                uint64_t name;
-                                uint64_t date_len;
-                                uint64_t date;
-                                uint64_t desc_len;
-                                uint64_t desc;
-                            } *v = (struct drm_version *)argp;
-                            if (v) {
-                                if (!user_prepare_write(a3, sizeof(*v))) return (uint64_t)-14;
-                                v->version_major = 1;
-                                v->version_minor = 0;
-                                v->version_patchlevel = 0;
-                                if (v->name && v->name_len > 0 && user_prepare_write(v->name, v->name_len)) {
-                                    char *n = (char *)(uintptr_t)v->name;
-                                    const char *drv = "virtio_gpu";
-                                    for (int ki = 0; drv[ki] && (uint64_t)ki < v->name_len - 1; ki++) n[ki] = drv[ki];
-                                }
-                                if (v->date && v->date_len > 0 && user_prepare_write(v->date, 5)) { char *d = (char *)(uintptr_t)v->date; d[0]='2'; d[1]='0'; d[2]='2'; d[3]='4'; d[4]=0; }
-                                if (v->desc && v->desc_len > 0 && user_prepare_write(v->desc, 5)) { char *d = (char *)(uintptr_t)v->desc; d[0]='V'; d[1]='G'; d[2]='P'; d[3]='U'; d[4]=0; }
-                            }
-                            return 0;
-                        }
-                        // DRM_IOCTL_GET_UNIQUE = 0xC0106401
-                        if ((request & 0xFFFF) == 0x6401) { return 0; }
-                        // DRM_IOCTL_GET_MAGIC = 0x80046402
-                        if ((request & 0xFFFF) == 0x6402) { return 0; }
-                        // DRM_IOCTL_GET_CAP = 0xC010640C
-                        if ((request & 0xFFFF) == 0x640C) {
-                            uint64_t *cap_pair = (uint64_t *)argp;
-                            if (cap_pair && user_prepare_write(a3, 2 * sizeof(uint64_t))) { cap_pair[1] = 0; } // cap value = 0
-                            return 0;
-                        }
-                        // DRM_IOCTL_SET_CLIENT_CAP = 0x4010641D
-                        if ((request & 0xFFFF) == 0x641D) { return 0; }
-                        // DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D
-                        if ((request & 0xFFFF) == 0x642D) { return 0; }
-                        // DRM_IOCTL_PRIME_FD_TO_HANDLE = 0xC00C642E
-                        if ((request & 0xFFFF) == 0x642E) { return 0; }
-                        // Catch-all for DRM ioctls (0x64xx) — return success
-                        if (((request >> 8) & 0xFF) == 0x64) { return 0; }
-                        // virtio-gpu specific ioctls (0x76xx)
-                        if (((request >> 8) & 0xFF) == 0x76) { return 0; }
-                        return 0; // return success for unknown DRM ioctls
-                    }
-                }
                 return (uint64_t)-25;
             }
 

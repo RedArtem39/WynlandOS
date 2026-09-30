@@ -2667,6 +2667,14 @@ void kernel_main(BootInfo *boot_info)
     console_print_string(boot_info, "Auto-launching Zerp...\n", 0x0000FF00, term_bg_color);
     process_spawn("/zerp.elf", NULL, 1000);
 
+    /* virgl end-to-end check (tests/gltest.c): only when the host actually
+       offers 3D, so 2D-only boots stay quiet. Prints [gltest] lines. */
+    {
+        extern bool g_virgl;
+        if (g_virgl) process_spawn("/dlsymtest.elf", NULL, 1000);
+        if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
+    }
+
     static bool was_gui_active = false;
     while (1) {
         extern bool wm_is_gui_active(void);

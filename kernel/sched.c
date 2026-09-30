@@ -6,6 +6,7 @@
 #include <wynland/heap.h>
 #include <wynland/irq.h>
 #include <wynland/process.h>
+#include <wynland/usercopy.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void thread_trampoline(void);
@@ -182,8 +183,15 @@ void thread_exit(void) {
        pthread_create blocked forever on __tl_lock(). */
     if (current_thread->clear_tid) {
         extern void futex_wake_user(uint64_t uaddr, uint32_t n);
-        *current_thread->clear_tid = 0;
-        futex_wake_user((uint64_t)(uintptr_t)current_thread->clear_tid, 1);
+        /* The address came from user space (set_tid_address / clone
+           CHILD_CLEARTID): validate it like any other user write. A bogus
+           or since-unmapped pointer used to be a raw kernel store --
+           i.e. any process could panic the kernel just by exiting. */
+        uint64_t ua = (uint64_t)(uintptr_t)current_thread->clear_tid;
+        if ((ua & 3) == 0 && user_prepare_write(ua, sizeof(uint32_t))) {
+            *current_thread->clear_tid = 0;
+            futex_wake_user(ua, 1);
+        }
         current_thread->clear_tid = NULL;
     }
 

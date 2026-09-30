@@ -33,6 +33,9 @@ D /usr/bin
 D /usr/share
 D /usr/share/glvnd
 D /usr/share/glvnd/egl_vendor.d
+D /usr/lib
+D /usr/lib/x86_64-linux-gnu
+D /usr/lib/x86_64-linux-gnu/gbm
 D /etc/ssl
 
 # ---- test/regression binaries ----
@@ -53,6 +56,8 @@ F  /lib/ld-dummy.so     build/interp.elf
 
 # ---- Zerp compositor + default clients (GUI desktop) ----
 Fo /zerp.elf            build/zerp.elf
+Fo /gltest.elf          build/gltest.elf
+Fo /dlsymtest.elf       build/dlsymtest.elf
 Fo /zerp_files.elf      build/zerp_files.elf
 Fo /zerp_term.elf       build/zerp_term.elf
 Fo /wall.png            build/wall.png
@@ -133,6 +138,9 @@ F  /lib64/libwayland-client.so.0    /usr/lib/x86_64-linux-gnu/libwayland-client.
 F  /lib64/libEGL_mesa.so.0          /usr/lib/x86_64-linux-gnu/libEGL_mesa.so.0
 F  /lib64/libpciaccess.so.0         /usr/lib/x86_64-linux-gnu/libpciaccess.so.0
 F  /lib64/libX11.so.6               /usr/lib/x86_64-linux-gnu/libX11.so.6
+F  /lib64/libxcb.so.1               /usr/lib/x86_64-linux-gnu/libxcb.so.1
+# libgbm dlopen()s its backend from its compiled-in ${libdir}/gbm
+F  /usr/lib/x86_64-linux-gnu/gbm/dri_gbm.so /usr/lib/x86_64-linux-gnu/gbm/dri_gbm.so
 F  /lib64/libdrm_intel.so.1         /usr/lib/x86_64-linux-gnu/libdrm_intel.so.1
 F  /lib64/libxml2.so.16             /usr/lib/x86_64-linux-gnu/libxml2.so.16
 F  /lib64/libz.so.1                 /usr/lib/x86_64-linux-gnu/libz.so.1
@@ -145,7 +153,6 @@ F  /dev/dri/card0                   build/card0
 F  /dev/dri/renderD128              build/renderD128
 
 # ---- GLVND vendor config ----
-F  /etc/glvnd/egl_vendor.d/50_mesa.json     /usr/share/glvnd/egl_vendor.d/50_mesa.json
 F  /usr/share/glvnd/egl_vendor.d/50_mesa.json /usr/share/glvnd/egl_vendor.d/50_mesa.json
 
 # ---- Userspace software ported in Phases 13-19 ----

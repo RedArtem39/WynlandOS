@@ -337,6 +337,18 @@ $(ZERP_ELFS): $(BUILD)/%.elf: %.c $(ZERP_HDRS)
 	@echo "  CC(USER)   $< (Zerp)"
 	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -nostdlib -static -no-pie -fno-pie -mcmodel=large -O2 $(ZERP_CFLAGS) -Wl,-Ttext-segment=0x340000000000 -o $@ $<
 
+# virgl end-to-end test: a host-built glibc binary against the /lib64 Mesa
+# the image already ships (EGL/GBM/GLESv2) -- see tests/gltest.c.
+$(BUILD)/gltest.elf: tests/gltest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, virgl test)"
+	@gcc -O2 -o $@ $< -lEGL -lGLESv2 -lgbm
+
+$(BUILD)/dlsymtest.elf: tests/dlsymtest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, dlsym diagnostic)"
+	@gcc -O2 -o $@ $<
+
 # Real TTF font for QFreeTypeFontDatabase (vendored inside qtbase's own 3rdparty tree)
 $(BUILD)/lib/fonts/DejaVuSans.ttf: qtbase/src/3rdparty/wasm/DejaVuSans.ttf
 	@mkdir -p $(BUILD)/lib/fonts
@@ -356,7 +368,7 @@ $(BUILD)/renderD128:
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
 PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
-$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS)
+$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 
