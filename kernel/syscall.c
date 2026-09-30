@@ -459,6 +459,32 @@ static int get_free_fd(VfsFile **fd_table) {
     return -1;
 }
 
+/* dma-buf (PRIME) fds for drivers/video/virtgpu_drm.c */
+int drm_install_prime_fd(uint32_t idx, bool cloexec)
+{
+    Process *p = sched_current()->proc;
+    int fd = get_free_fd(p->fd_table);
+    if (fd < 0) return -24; /* -EMFILE */
+    VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+    if (!f) return -12;
+    memset(f, 0, sizeof(VfsFile));
+    str_copy(f->node.name, "dmabuf");
+    f->node.first_cluster = DRM_PRIME_FD;
+    f->current_cluster = idx;
+    p->fd_table[fd] = f;
+    p->fd_flags[fd] = cloexec ? 1 : 0;
+    p->fd_oflags[fd] = LINUX_O_RDWR;
+    return fd;
+}
+
+uint32_t drm_prime_fd_bo(int fd)
+{
+    Process *p = sched_current()->proc;
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !p->fd_table[fd]) return 0;
+    if (p->fd_table[fd]->node.first_cluster != DRM_PRIME_FD) return 0;
+    return p->fd_table[fd]->current_cluster;
+}
+
 /* Copies up to max_entries strings out of a NULL-terminated user array of
    user string pointers at `uarray` (e.g. argv/envp) into freshly kmalloc'd
    kernel buffers (each up to MAX_PATH-1 bytes). Every level is validated:
@@ -626,6 +652,17 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
             }
             VfsFile *file = fd_table[fd];
 
+            if (IS_DRM_DEV(file->node.first_cluster)) {
+                /* readable = a page-flip event is waiting */
+                if (drm_poll_ready(file->current_cluster)) {
+                    if (fds && (fds[i].events & 0x0001)) { fds[i].revents |= 0x0001; ready++; }
+                } else {
+                    single_wq = drm_event_wq(file->current_cluster);
+                }
+                if (fds && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
+                continue;
+            }
+
             if (file->node.first_cluster == 0xFFFFFFFA || // Pipe Read
                 file->node.first_cluster == 0xFFFFFFFC)   // Eventfd
             {
@@ -740,6 +777,7 @@ void kfile_get(VfsFile *f) {
     if (fc == USOCK_FD) usock_ref((int)f->current_cluster);
     else if (fc == MEMFD_FD) memfd_ref((int)f->current_cluster);
     else if (fc == TIMERFD_FD) timerfd_ref((int)f->current_cluster);
+    else if (fc == DRM_PRIME_FD) drm_prime_get(f->current_cluster);
     else if (fc == 0xFFFFFFFD) { /* SHM segment: keep close()'s decrement balanced */
         int seg_idx = (int)f->current_cluster;
         if (seg_idx >= 0 && seg_idx < MAX_SHM_SEGMENTS) g_shm_segments[seg_idx].refcount++;
@@ -782,6 +820,9 @@ void kfile_close(VfsFile *f) {
         kfree(f);
     } else if (fc == TIMERFD_FD) {
         timerfd_unref((int)f->current_cluster);
+        kfree(f);
+    } else if (fc == DRM_PRIME_FD) {
+        drm_prime_put(f->current_cluster); /* never sleeps: BO freed later */
         kfree(f);
     } else if (fc == 0xFFFFFFFA || fc == 0xFFFFFFFB || fc == 0xFFFFFFFC ||
                fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) {
@@ -1035,6 +1076,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                "return 0". */
             if (a3 != 0 && !user_prepare_write(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
+            }
+            if (a1 < MAX_OPEN_FILES && fd_table[a1] && IS_DRM_DEV(fd_table[a1]->node.first_cluster)) {
+                return (uint64_t)drm_read(fd_table[a1]->current_cluster, a2, a3,
+                                          (fd_oflags[a1] & LINUX_O_NONBLOCK) != 0);
             }
             if (a1 == 0 && fd_table[0] == NULL) { // stdin
                 if (a3 == 0 || !a2) return 0;
@@ -1504,6 +1549,25 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                                      PAGE_WRITE | PAGE_USER | cache_flags | PAGE_NX | PAGE_SHARED_MAP);
                     }
 
+                    return virt_addr;
+                }
+
+                // dma-buf (PRIME fd): the same BO pages, from offset 0
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    fd_table[fd]->node.first_cluster == DRM_PRIME_FD) {
+                    uint64_t bo_phys;
+                    if (drm_prime_mmap_lookup(fd_table[fd]->current_cluster, offset, size_aligned, &bo_phys) != 0)
+                        return (uint64_t)-22; /* -EINVAL */
+                    uint64_t virt_addr = addr & ~(uint64_t)(PAGE_SIZE - 1);
+                    if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                        static uint64_t mmap_dmabuf_ptr = 0x660000000000; // own slot (0x65 DRM)
+                        virt_addr = mmap_dmabuf_ptr;
+                        mmap_dmabuf_ptr += size_aligned;
+                    }
+                    uint64_t pflags = PAGE_USER | PAGE_NX | PAGE_SHARED_MAP | ((prot & 0x2) ? PAGE_WRITE : 0);
+                    PageTable *pml4 = vmm_get_current_pml4();
+                    for (uint64_t i = 0; i < pages; i++)
+                        vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, bo_phys + i * PAGE_SIZE, pflags);
                     return virt_addr;
                 }
 

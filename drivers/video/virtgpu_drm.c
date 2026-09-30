@@ -6,7 +6,15 @@
  *
  *   GETPARAM, GET_CAPS, RESOURCE_CREATE, RESOURCE_INFO, MAP (+ mmap),
  *   EXECBUFFER, TRANSFER_TO_HOST, TRANSFER_FROM_HOST, WAIT, GEM_CLOSE
- *   plus the generic DRM_IOCTL_VERSION / GET_CAP.
+ *   plus the generic DRM_IOCTL_VERSION / GET_CAP,
+ * and the pieces of the generic DRM/KMS uAPI a GPU compositor needs:
+ *   PRIME (dma-buf fds: HANDLE_TO_FD / FD_TO_HANDLE, mmap), dumb buffers,
+ *   and legacy modesetting on one virtual connector/encoder/CRTC --
+ *   GETRESOURCES / GETCONNECTOR / GETENCODER / GETCRTC / SETCRTC, ADDFB,
+ *   ADDFB2, RMFB, DIRTYFB, PAGE_FLIP with flip-complete events read()
+ *   from the DRM fd. A framebuffer goes on screen by SET_SCANOUT of its
+ *   own host resource: a GPU-rendered frame is displayed without ever
+ *   being copied through the CPU.
  *
  * Design:
  * - One DrmClient per open() of the node (VfsFile.current_cluster holds its
@@ -36,6 +44,7 @@
 #include <wynland/usercopy.h>
 #include <wynland/sched.h>
 #include <wynland/process.h>
+#include <wynland/waitqueue.h>
 
 extern void serial_write_string(const char *str);
 extern uint64_t timer_get_ms(void);
@@ -68,6 +77,7 @@ static void dbg_num(const char *pre, int64_t v)
 #define EINTR   4
 #define EFAULT  14
 #define EBUSY   16
+#define EAGAIN  11
 #define ENODEV  19
 #define EINVAL  22
 #define ENOMEM  12
@@ -85,6 +95,37 @@ static void dbg_num(const char *pre, int64_t v)
 #define DRM_NR_GEM_CLOSE        0x09
 #define DRM_NR_GET_CAP          0x0c
 #define DRM_NR_SET_CLIENT_CAP   0x0d
+#define DRM_NR_SET_MASTER       0x1e
+#define DRM_NR_DROP_MASTER      0x1f
+#define DRM_NR_PRIME_HANDLE_TO_FD 0x2d
+#define DRM_NR_PRIME_FD_TO_HANDLE 0x2e
+#define DRM_NR_MODE_GETRESOURCES  0xA0
+#define DRM_NR_MODE_GETCRTC       0xA1
+#define DRM_NR_MODE_SETCRTC       0xA2
+#define DRM_NR_MODE_CURSOR        0xA3
+#define DRM_NR_MODE_GETENCODER    0xA6
+#define DRM_NR_MODE_GETCONNECTOR  0xA7
+#define DRM_NR_MODE_GETPROPERTY   0xAA
+#define DRM_NR_MODE_ADDFB         0xAE
+#define DRM_NR_MODE_RMFB          0xAF
+#define DRM_NR_MODE_PAGE_FLIP     0xB0
+#define DRM_NR_MODE_DIRTYFB       0xB1
+#define DRM_NR_MODE_CREATE_DUMB   0xB2
+#define DRM_NR_MODE_MAP_DUMB      0xB3
+#define DRM_NR_MODE_DESTROY_DUMB  0xB4
+#define DRM_NR_MODE_GETPLANERESOURCES 0xB5
+#define DRM_NR_MODE_ADDFB2        0xB8
+#define DRM_NR_MODE_OBJ_GETPROPERTIES 0xB9
+
+/* KMS object ids (one of each; ids are unique across object types) */
+#define KMS_CONNECTOR_ID 10
+#define KMS_ENCODER_ID   20
+#define KMS_CRTC_ID      30
+
+#define DRM_FORMAT_XRGB8888 0x34325258 /* 'XR24' */
+#define DRM_FORMAT_ARGB8888 0x34325241 /* 'AR24' */
+#define DRM_FORMAT_XBGR8888 0x34324258 /* 'XB24' */
+#define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
 
 #define VIRTGPU_MAP             0x01
 #define VIRTGPU_EXECBUFFER      0x02
@@ -117,6 +158,50 @@ struct drm_version_u {
 };
 
 struct drm_get_cap_u   { uint64_t capability; uint64_t value; };
+struct drm_set_client_cap_u { uint64_t capability; uint64_t value; };
+struct drm_prime_handle_u { uint32_t handle; uint32_t flags; int32_t fd; };
+
+struct drm_mode_modeinfo_u {
+    uint32_t clock;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal, hskew;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal, vscan;
+    uint32_t vrefresh, flags, type;
+    char     name[32];
+};
+struct drm_mode_card_res_u {
+    uint64_t fb_id_ptr, crtc_id_ptr, connector_id_ptr, encoder_id_ptr;
+    uint32_t count_fbs, count_crtcs, count_connectors, count_encoders;
+    uint32_t min_width, max_width, min_height, max_height;
+};
+struct drm_mode_crtc_u {
+    uint64_t set_connectors_ptr;
+    uint32_t count_connectors, crtc_id, fb_id, x, y, gamma_size, mode_valid;
+    struct drm_mode_modeinfo_u mode;
+};
+struct drm_mode_get_encoder_u { uint32_t encoder_id, encoder_type, crtc_id, possible_crtcs, possible_clones; };
+struct drm_mode_get_connector_u {
+    uint64_t encoders_ptr, modes_ptr, props_ptr, prop_values_ptr;
+    uint32_t count_modes, count_props, count_encoders;
+    uint32_t encoder_id, connector_id, connector_type, connector_type_id;
+    uint32_t connection, mm_width, mm_height, subpixel, pad;
+};
+struct drm_mode_fb_cmd_u  { uint32_t fb_id, width, height, pitch, bpp, depth, handle; };
+struct drm_mode_fb_cmd2_u {
+    uint32_t fb_id, width, height, pixel_format, flags;
+    uint32_t handles[4], pitches[4], offsets[4];
+    uint64_t modifier[4];
+};
+struct drm_mode_crtc_page_flip_u { uint32_t crtc_id, fb_id, flags, reserved; uint64_t user_data; };
+struct drm_mode_fb_dirty_cmd_u   { uint32_t fb_id, flags, color, num_clips; uint64_t clips_ptr; };
+struct drm_mode_create_dumb_u    { uint32_t height, width, bpp, flags, handle, pitch; uint64_t size; };
+struct drm_mode_map_dumb_u       { uint32_t handle, pad; uint64_t offset; };
+struct drm_mode_get_plane_res_u  { uint64_t plane_id_ptr; uint32_t count_planes; };
+struct drm_mode_obj_get_properties_u { uint64_t props_ptr, prop_values_ptr; uint32_t count_props, obj_id, obj_type; };
+struct drm_event_vblank_u {
+    uint32_t type, length;
+    uint64_t user_data;
+    uint32_t tv_sec, tv_usec, sequence, crtc_id;
+};
 struct drm_gem_close_u { uint32_t handle; uint32_t pad; };
 
 struct virtgpu_map_u      { uint64_t offset; uint32_t handle; uint32_t pad; };
@@ -167,16 +252,36 @@ struct virtgpu_get_caps_u { uint32_t cap_set_id; uint32_t cap_set_ver; uint64_t 
 #define DRM_MAX_CMDBUF   (1024u * 1024u) /* virgl caps its stream at 256 KB; generous */
 #define DRM_WAIT_MS      10000
 
+#define DRM_MAX_EVENTS 8
+
+typedef struct {
+    bool       used;
+    uint64_t   user_data;
+    VgpuTicket t;        /* the flip's RESOURCE_FLUSH: delivered once done */
+} DrmEvent;
+
 typedef struct {
     bool     used;
     uint64_t pid;       /* opener */
     uint32_t ctx_id;    /* 0 until the first 3D call */
     bool     orphaned;  /* opener exited; free from the next ioctl */
+    DrmEvent events[DRM_MAX_EVENTS]; /* pending page-flip events, FIFO by seq */
+    uint32_t ev_seq;
+    WaitQueue ev_wq;    /* read()/poll() sleepers; woken from drm_tick() */
 } DrmClient;
 
+/* A buffer object: one host resource + its guest backing. Shared by every
+   client that holds a handle to it (bit (slot-1) in `clients`: the
+   creator, plus importers via PRIME) and kept alive by `refs` (dma-buf
+   fds, framebuffers). Destroyed -- from syscall context, since that waits
+   for the host -- once both drop to zero. */
 typedef struct {
     bool       used;
-    uint32_t   client;  /* owning client slot */
+    uint32_t   clients;
+    uint32_t   refs;
+    bool       zombie;  /* clients == refs == 0: destroy from pending_gc() */
+    bool       is_3d;   /* virgl resource (vs a 2D dumb buffer) */
+    uint32_t   width, height, stride; /* dumb buffers */
     uint32_t   res_id;
     uint64_t   phys;
     uint32_t   pages;
@@ -184,6 +289,16 @@ typedef struct {
     bool       has_last;
     VgpuTicket last;    /* last host request touching this BO */
 } DrmBo;
+
+#define DRM_MAX_FBS 64
+
+typedef struct {
+    bool     used;
+    uint32_t id;
+    uint32_t bo;        /* BO index + 1 */
+    uint32_t owner;     /* client slot */
+    uint32_t width, height, pitch, format;
+} DrmFb;
 
 typedef struct {
     void      *mem;
@@ -193,15 +308,24 @@ typedef struct {
 static DrmClient  g_clients[DRM_MAX_CLIENTS];
 static DrmBo      g_bos[DRM_MAX_BOS];       /* GEM handle = index + 1 */
 static DrmPending g_pending[DRM_MAX_PENDING];
+static DrmFb      g_fbs[DRM_MAX_FBS];
+static uint32_t   g_next_fb_id = 100;
+static uint32_t   g_scan_fb;    /* fb on the CRTC; 0 = the kernel console (resource 1) */
+static uint32_t   g_scan_owner; /* client slot that put it there */
 
 /* ---- helpers ---- */
 
 static void client_free(uint32_t slot);
+static void bo_destroy(DrmBo *bo);
+static void fb_remove(DrmFb *fb);
 
 static void pending_gc(void)
 {
     for (uint32_t i = 0; i < DRM_MAX_CLIENTS; i++) {
         if (g_clients[i].used && g_clients[i].orphaned) client_free(i + 1);
+    }
+    for (uint32_t i = 0; i < DRM_MAX_BOS; i++) {
+        if (g_bos[i].used && g_bos[i].zombie) bo_destroy(&g_bos[i]);
     }
     for (int i = 0; i < DRM_MAX_PENDING; i++) {
         if (g_pending[i].mem && vgpu_done(g_pending[i].t)) {
@@ -319,24 +443,40 @@ static bool client_ensure_ctx(DrmClient *c)
 
 static DrmBo *bo_lookup(uint32_t client_slot, uint32_t handle)
 {
-    if (handle == 0 || handle > DRM_MAX_BOS) return NULL;
+    if (handle == 0 || handle > DRM_MAX_BOS || client_slot == 0) return NULL;
     DrmBo *bo = &g_bos[handle - 1];
-    if (!bo->used || bo->client != client_slot) return NULL;
+    if (!bo->used || bo->zombie || !(bo->clients & (1u << (client_slot - 1)))) return NULL;
     return bo;
 }
 
-static void bo_destroy(DrmClient *c, DrmBo *bo)
+/* No holder left: destroy it later from pending_gc() (process teardown
+   and dma-buf close can't wait for the host). */
+static void bo_put(DrmBo *bo)
 {
-    if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
+    if (bo->used && bo->clients == 0 && bo->refs == 0) bo->zombie = true;
+}
 
-    VirtioGpuCtxResource cmd;
-    memset(&cmd, 0, sizeof(cmd));
-    if (c && c->ctx_id) {
+/* Client `slot` drops its handle: detach from its virgl context. */
+static void bo_release_client(uint32_t slot, DrmClient *c, DrmBo *bo)
+{
+    if (bo->is_3d && c && c->ctx_id) {
+        VirtioGpuCtxResource cmd;
+        memset(&cmd, 0, sizeof(cmd));
         cmd.hdr.type = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
         cmd.hdr.ctx_id = c->ctx_id;
         cmd.resource_id = bo->res_id;
         send_sync(&cmd, sizeof(cmd), NULL);
     }
+    bo->clients &= ~(1u << (slot - 1));
+    bo_put(bo);
+}
+
+/* Final destruction: host resource and guest pages. Sleeps. */
+static void bo_destroy(DrmBo *bo)
+{
+    if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
+
+    VirtioGpuCtxResource cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = bo->res_id;
@@ -451,7 +591,8 @@ static int64_t ioctl_resource_create(uint32_t slot, DrmClient *c, uint64_t argp)
     DrmBo *bo = &g_bos[h];
     memset(bo, 0, sizeof(*bo));
     bo->used = true;
-    bo->client = slot;
+    bo->clients = 1u << (slot - 1);
+    bo->is_3d = true;
     bo->res_id = vgpu_alloc_resource_id();
     bo->phys = phys;
     bo->pages = pages;
@@ -492,7 +633,7 @@ static int64_t ioctl_resource_create(uint32_t slot, DrmClient *c, uint64_t argp)
     at.resource_id = bo->res_id;
     if (!send_sync(&ab, sizeof(ab), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA ||
         !send_sync(&at, sizeof(at), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA) {
-        bo_destroy(c, bo);
+        bo_destroy(bo);
         return -EINVAL;
     }
 
@@ -633,7 +774,7 @@ static int64_t ioctl_gem_close(uint32_t slot, DrmClient *c, uint64_t argp)
     if (copy_from_user(&gc, (void *)argp, sizeof(gc))) return -EFAULT;
     DrmBo *bo = bo_lookup(slot, gc.handle);
     if (!bo) return -EINVAL;
-    bo_destroy(c, bo);
+    bo_release_client(slot, c, bo);
     return 0;
 }
 
@@ -641,9 +782,515 @@ static int64_t ioctl_get_cap(uint64_t argp)
 {
     struct drm_get_cap_u cap;
     if (copy_from_user(&cap, (void *)argp, sizeof(cap))) return -EFAULT;
-    cap.value = 0; /* no PRIME, no syncobj, no dumb buffers yet */
+    switch (cap.capability) {
+    case 0x1:  cap.value = 1;  break;  /* DRM_CAP_DUMB_BUFFER */
+    case 0x5:  cap.value = 3;  break;  /* DRM_CAP_PRIME: import | export */
+    case 0x6:  cap.value = 1;  break;  /* DRM_CAP_TIMESTAMP_MONOTONIC */
+    case 0x8:  cap.value = 64; break;  /* DRM_CAP_CURSOR_WIDTH */
+    case 0x9:  cap.value = 64; break;  /* DRM_CAP_CURSOR_HEIGHT */
+    case 0x12: cap.value = 1;  break;  /* DRM_CAP_CRTC_IN_VBLANK_EVENT */
+    default:   cap.value = 0;  break;  /* no syncobj, async flip, modifiers */
+    }
     if (copy_to_user((void *)argp, &cap, sizeof(cap))) return -EFAULT;
     return 0;
+}
+
+/* ============================================================
+ * PRIME (dma-buf)
+ * ============================================================ */
+
+static int64_t ioctl_prime_handle_to_fd(uint32_t slot, uint64_t argp)
+{
+    struct drm_prime_handle_u ph;
+    if (copy_from_user(&ph, (void *)argp, sizeof(ph))) return -EFAULT;
+    DrmBo *bo = bo_lookup(slot, ph.handle);
+    if (!bo) return -ENOENT;
+    int fd = drm_install_prime_fd((uint32_t)(bo - g_bos) + 1, (ph.flags & 02000000) != 0 /* O_CLOEXEC */);
+    if (fd < 0) return fd;
+    bo->refs++;
+    ph.fd = fd;
+    if (copy_to_user((void *)argp, &ph, sizeof(ph))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_prime_fd_to_handle(uint32_t slot, DrmClient *c, uint64_t argp)
+{
+    struct drm_prime_handle_u ph;
+    if (copy_from_user(&ph, (void *)argp, sizeof(ph))) return -EFAULT;
+    uint32_t idx = drm_prime_fd_bo(ph.fd);
+    if (idx == 0 || idx > DRM_MAX_BOS || !g_bos[idx - 1].used || g_bos[idx - 1].zombie) return -EINVAL;
+    DrmBo *bo = &g_bos[idx - 1];
+    uint32_t bit = 1u << (slot - 1);
+    if (!(bo->clients & bit)) {
+        /* the importer's virgl context must know the resource too */
+        if (bo->is_3d) {
+            if (!client_ensure_ctx(c)) return -ENODEV;
+            VirtioGpuCtxResource at;
+            memset(&at, 0, sizeof(at));
+            at.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+            at.hdr.ctx_id = c->ctx_id;
+            at.resource_id = bo->res_id;
+            uint32_t rt = 0;
+            if (!send_sync(&at, sizeof(at), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA) return -EINVAL;
+        }
+        bo->clients |= bit;
+    }
+    ph.handle = idx;
+    if (copy_to_user((void *)argp, &ph, sizeof(ph))) return -EFAULT;
+    return 0;
+}
+
+void drm_prime_get(uint32_t idx)
+{
+    if (idx && idx <= DRM_MAX_BOS && g_bos[idx - 1].used) g_bos[idx - 1].refs++;
+}
+
+void drm_prime_put(uint32_t idx)
+{
+    if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used) return;
+    DrmBo *bo = &g_bos[idx - 1];
+    if (bo->refs) bo->refs--;
+    bo_put(bo);
+}
+
+int drm_prime_mmap_lookup(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *phys)
+{
+    if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used || g_bos[idx - 1].zombie) return -EINVAL;
+    DrmBo *bo = &g_bos[idx - 1];
+    if (offset & (PAGE_SZ - 1) || offset + len > bo->size) return -EINVAL;
+    *phys = bo->phys + offset;
+    return 0;
+}
+
+/* ============================================================
+ * Dumb buffers (2D, CPU-drawn)
+ * ============================================================ */
+
+static int64_t ioctl_create_dumb(uint32_t slot, uint64_t argp)
+{
+    struct drm_mode_create_dumb_u cd;
+    if (copy_from_user(&cd, (void *)argp, sizeof(cd))) return -EFAULT;
+    if (cd.bpp != 32 || cd.width == 0 || cd.height == 0 || cd.width > 8192 || cd.height > 8192) return -EINVAL;
+    uint32_t pitch = cd.width * 4;
+    uint32_t size = pitch * cd.height;
+    uint32_t pages = (size + PAGE_SZ - 1) / PAGE_SZ;
+
+    uint32_t h;
+    for (h = 0; h < DRM_MAX_BOS && g_bos[h].used; h++) {}
+    if (h == DRM_MAX_BOS) return -ENOSPC;
+    void *mem = pmm_alloc_contiguous(pages);
+    if (!mem) return -ENOMEM;
+    uint64_t phys = (uint64_t)(uintptr_t)mem;
+    memset((void *)(uintptr_t)phys, 0, (size_t)pages * PAGE_SZ);
+
+    DrmBo *bo = &g_bos[h];
+    memset(bo, 0, sizeof(*bo));
+    bo->used = true;
+    bo->clients = 1u << (slot - 1);
+    bo->res_id = vgpu_alloc_resource_id();
+    bo->phys = phys;
+    bo->pages = pages;
+    bo->size = pages * PAGE_SZ;
+    bo->width = cd.width;
+    bo->height = cd.height;
+    bo->stride = pitch;
+
+    VirtioGpuResourceCreate2d cr;
+    memset(&cr, 0, sizeof(cr));
+    cr.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    cr.resource_id = bo->res_id;
+    cr.format = VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM; /* = DRM XRGB8888 in memory */
+    cr.width = cd.width;
+    cr.height = cd.height;
+    VirtioGpuAttachBacking1 ab;
+    memset(&ab, 0, sizeof(ab));
+    ab.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    ab.resource_id = bo->res_id;
+    ab.nr_entries = 1;
+    ab.entry.addr = phys;
+    ab.entry.length = bo->size;
+    uint32_t rt = 0;
+    if (!send_sync(&cr, sizeof(cr), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA ||
+        !send_sync(&ab, sizeof(ab), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA) {
+        bo->clients = 0;
+        bo_destroy(bo);
+        return -EINVAL;
+    }
+    cd.handle = h + 1;
+    cd.pitch = pitch;
+    cd.size = size;
+    if (copy_to_user((void *)argp, &cd, sizeof(cd))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_map_dumb(uint32_t slot, uint64_t argp)
+{
+    struct drm_mode_map_dumb_u md;
+    if (copy_from_user(&md, (void *)argp, sizeof(md))) return -EFAULT;
+    if (!bo_lookup(slot, md.handle)) return -ENOENT;
+    md.offset = (uint64_t)md.handle << 32; /* same scheme as VIRTGPU_MAP */
+    if (copy_to_user((void *)argp, &md, sizeof(md))) return -EFAULT;
+    return 0;
+}
+
+/* ============================================================
+ * KMS: one connector -> encoder -> CRTC, scanout 0
+ * ============================================================ */
+
+extern uint32_t comp_get_width(void);
+extern uint32_t comp_get_height(void);
+
+static void kms_mode(struct drm_mode_modeinfo_u *m)
+{
+    uint32_t w = comp_get_width(), h = comp_get_height();
+    memset(m, 0, sizeof(*m));
+    m->hdisplay = (uint16_t)w; m->hsync_start = (uint16_t)(w + 16);
+    m->hsync_end = (uint16_t)(w + 32); m->htotal = (uint16_t)(w + 48);
+    m->vdisplay = (uint16_t)h; m->vsync_start = (uint16_t)(h + 3);
+    m->vsync_end = (uint16_t)(h + 6); m->vtotal = (uint16_t)(h + 10);
+    m->vrefresh = 60;
+    m->clock = (uint32_t)((uint64_t)m->htotal * m->vtotal * 60 / 1000);
+    m->type = 0x48; /* DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER */
+    /* name "WxH" */
+    char tmp[12]; int n = 0, k = 0;
+    uint32_t v[2] = { w, h };
+    for (int i = 0; i < 2; i++) {
+        uint32_t x = v[i]; n = 0;
+        do { tmp[n++] = (char)('0' + x % 10); x /= 10; } while (x && n < 11);
+        while (n && k < 30) m->name[k++] = tmp[--n];
+        if (i == 0) m->name[k++] = 'x';
+    }
+}
+
+static DrmFb *fb_find(uint32_t id)
+{
+    for (uint32_t i = 0; i < DRM_MAX_FBS; i++)
+        if (g_fbs[i].used && g_fbs[i].id == id) return &g_fbs[i];
+    return NULL;
+}
+
+/* Put the kernel's own framebuffer (resource 1) back on screen. */
+static void kms_restore_console(void)
+{
+    VirtioGpuSetScanout ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    ss.rww = comp_get_width();
+    ss.rhh = comp_get_height();
+    ss.scanout_id = 0;
+    ss.resource_id = 1;
+    send_sync(&ss, sizeof(ss), NULL);
+    g_scan_fb = 0;
+    g_scan_owner = 0;
+    extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+    virtio_gpu_flush(0, 0, comp_get_width(), comp_get_height());
+}
+
+static void fb_remove(DrmFb *fb)
+{
+    if (g_scan_fb == fb->id) kms_restore_console();
+    DrmBo *bo = &g_bos[fb->bo - 1];
+    if (bo->refs) bo->refs--;
+    bo_put(bo);
+    memset(fb, 0, sizeof(*fb));
+}
+
+/* Queue an async command whose buffer is freed once it completes. */
+static bool send_async(const void *cmd, uint32_t len, VgpuTicket *t)
+{
+    uint8_t *mem = (uint8_t *)kmalloc(len + sizeof(VirtioGpuCtrlResponse));
+    if (!mem) return false;
+    memcpy(mem, cmd, len);
+    memset(mem + len, 0, sizeof(VirtioGpuCtrlResponse));
+    return submit_owned(mem, len, 0, 0, len, t);
+}
+
+/* Show `fb` on scanout 0 (if not already) and push it to the display.
+   Returns the RESOURCE_FLUSH ticket: flip completion. */
+static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, VgpuTicket *done)
+{
+    DrmBo *bo = &g_bos[fb->bo - 1];
+    /* Never scan out a frame the GPU is still drawing: wait for the last
+       submission that touched this buffer. */
+    if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
+
+    if (!bo->is_3d) {
+        VirtioGpuTransferToHost2d tr;
+        memset(&tr, 0, sizeof(tr));
+        tr.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+        tr.resource_id = bo->res_id;
+        tr.rxx = x; tr.ryy = y; tr.rww = w; tr.rhh = h;
+        tr.offset = (uint64_t)y * fb->pitch + (uint64_t)x * 4;
+        VgpuTicket t;
+        if (!send_async(&tr, sizeof(tr), &t)) return false;
+    }
+    if (g_scan_fb != fb->id) {
+        VirtioGpuSetScanout ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+        ss.rww = fb->width;
+        ss.rhh = fb->height;
+        ss.scanout_id = 0;
+        ss.resource_id = bo->res_id;
+        VgpuTicket t;
+        if (!send_async(&ss, sizeof(ss), &t)) return false;
+        g_scan_fb = fb->id;
+    }
+    VirtioGpuResourceFlush rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    rf.resource_id = bo->res_id;
+    rf.rxx = x; rf.ryy = y; rf.rww = w; rf.rhh = h;
+    return send_async(&rf, sizeof(rf), done);
+}
+
+static int64_t ioctl_getresources(uint64_t argp)
+{
+    struct drm_mode_card_res_u r;
+    if (copy_from_user(&r, (void *)argp, sizeof(r))) return -EFAULT;
+    uint32_t one[1];
+    if (r.count_crtcs >= 1 && r.crtc_id_ptr) { one[0] = KMS_CRTC_ID; if (copy_to_user((void *)r.crtc_id_ptr, one, 4)) return -EFAULT; }
+    if (r.count_connectors >= 1 && r.connector_id_ptr) { one[0] = KMS_CONNECTOR_ID; if (copy_to_user((void *)r.connector_id_ptr, one, 4)) return -EFAULT; }
+    if (r.count_encoders >= 1 && r.encoder_id_ptr) { one[0] = KMS_ENCODER_ID; if (copy_to_user((void *)r.encoder_id_ptr, one, 4)) return -EFAULT; }
+    r.count_fbs = 0;
+    r.count_crtcs = r.count_connectors = r.count_encoders = 1;
+    r.min_width = r.min_height = 1;
+    r.max_width = r.max_height = 8192;
+    if (copy_to_user((void *)argp, &r, sizeof(r))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_getconnector(uint64_t argp)
+{
+    struct drm_mode_get_connector_u c;
+    if (copy_from_user(&c, (void *)argp, sizeof(c))) return -EFAULT;
+    if (c.connector_id != KMS_CONNECTOR_ID) return -ENOENT;
+    if (c.count_modes >= 1 && c.modes_ptr) {
+        struct drm_mode_modeinfo_u m;
+        kms_mode(&m);
+        if (copy_to_user((void *)c.modes_ptr, &m, sizeof(m))) return -EFAULT;
+    }
+    if (c.count_encoders >= 1 && c.encoders_ptr) {
+        uint32_t e = KMS_ENCODER_ID;
+        if (copy_to_user((void *)c.encoders_ptr, &e, 4)) return -EFAULT;
+    }
+    c.count_modes = 1;
+    c.count_props = 0;
+    c.count_encoders = 1;
+    c.encoder_id = KMS_ENCODER_ID;
+    c.connector_type = 15;       /* DRM_MODE_CONNECTOR_VIRTUAL */
+    c.connector_type_id = 1;
+    c.connection = 1;            /* connected */
+    c.mm_width = comp_get_width() * 254 / 960;   /* ~96 dpi */
+    c.mm_height = comp_get_height() * 254 / 960;
+    c.subpixel = 1;              /* unknown */
+    if (copy_to_user((void *)argp, &c, sizeof(c))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_getencoder(uint64_t argp)
+{
+    struct drm_mode_get_encoder_u e;
+    if (copy_from_user(&e, (void *)argp, sizeof(e))) return -EFAULT;
+    if (e.encoder_id != KMS_ENCODER_ID) return -ENOENT;
+    e.encoder_type = 5;          /* DRM_MODE_ENCODER_VIRTUAL */
+    e.crtc_id = KMS_CRTC_ID;
+    e.possible_crtcs = 1;
+    e.possible_clones = 0;
+    if (copy_to_user((void *)argp, &e, sizeof(e))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_getcrtc(uint64_t argp)
+{
+    struct drm_mode_crtc_u c;
+    if (copy_from_user(&c, (void *)argp, sizeof(c))) return -EFAULT;
+    if (c.crtc_id != KMS_CRTC_ID) return -ENOENT;
+    c.fb_id = g_scan_fb;
+    c.x = c.y = 0;
+    c.gamma_size = 0;
+    c.mode_valid = 1;
+    kms_mode(&c.mode);
+    if (copy_to_user((void *)argp, &c, sizeof(c))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_setcrtc(uint32_t slot, uint64_t argp)
+{
+    struct drm_mode_crtc_u c;
+    if (copy_from_user(&c, (void *)argp, sizeof(c))) return -EFAULT;
+    if (c.crtc_id != KMS_CRTC_ID) return -ENOENT;
+    if (c.fb_id == 0) {                     /* disable: the console comes back */
+        if (g_scan_fb) kms_restore_console();
+        return 0;
+    }
+    DrmFb *fb = fb_find(c.fb_id);
+    if (!fb || fb->owner != slot) return -ENOENT;
+    VgpuTicket t;
+    if (!kms_present(fb, 0, 0, fb->width, fb->height, &t)) return -ENOMEM;
+    g_scan_owner = slot;
+    return 0;
+}
+
+static int64_t fb_create(uint32_t slot, uint32_t handle, uint32_t w, uint32_t h,
+                         uint32_t pitch, uint32_t format, uint32_t *out_id)
+{
+    DrmBo *bo = bo_lookup(slot, handle);
+    if (!bo) return -ENOENT;
+    if (format != DRM_FORMAT_XRGB8888 && format != DRM_FORMAT_ARGB8888 &&
+        format != DRM_FORMAT_XBGR8888 && format != DRM_FORMAT_ABGR8888) return -EINVAL;
+    if (w == 0 || h == 0 || (uint64_t)pitch * h > bo->size) return -EINVAL;
+    for (uint32_t i = 0; i < DRM_MAX_FBS; i++) {
+        if (g_fbs[i].used) continue;
+        DrmFb *fb = &g_fbs[i];
+        fb->used = true;
+        fb->id = g_next_fb_id++;
+        fb->bo = (uint32_t)(bo - g_bos) + 1;
+        fb->owner = slot;
+        fb->width = w; fb->height = h; fb->pitch = pitch; fb->format = format;
+        bo->refs++;
+        *out_id = fb->id;
+        return 0;
+    }
+    return -ENOSPC;
+}
+
+static int64_t ioctl_addfb(uint32_t slot, uint64_t argp)
+{
+    struct drm_mode_fb_cmd_u f;
+    if (copy_from_user(&f, (void *)argp, sizeof(f))) return -EFAULT;
+    if (f.bpp != 32) return -EINVAL;
+    uint32_t fmt = f.depth == 32 ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
+    int64_t r = fb_create(slot, f.handle, f.width, f.height, f.pitch, fmt, &f.fb_id);
+    if (r) return r;
+    if (copy_to_user((void *)argp, &f, sizeof(f))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_addfb2(uint32_t slot, uint64_t argp)
+{
+    struct drm_mode_fb_cmd2_u f;
+    if (copy_from_user(&f, (void *)argp, sizeof(f))) return -EFAULT;
+    if (f.offsets[0] != 0) return -EINVAL;
+    int64_t r = fb_create(slot, f.handles[0], f.width, f.height, f.pitches[0], f.pixel_format, &f.fb_id);
+    if (r) return r;
+    if (copy_to_user((void *)argp, &f, sizeof(f))) return -EFAULT;
+    return 0;
+}
+
+static int64_t ioctl_rmfb(uint32_t slot, uint64_t argp)
+{
+    uint32_t id;
+    if (copy_from_user(&id, (void *)argp, sizeof(id))) return -EFAULT;
+    DrmFb *fb = fb_find(id);
+    if (!fb || fb->owner != slot) return -ENOENT;
+    fb_remove(fb);
+    return 0;
+}
+
+static int64_t ioctl_dirtyfb(uint32_t slot, uint64_t argp)
+{
+    struct drm_mode_fb_dirty_cmd_u d;
+    if (copy_from_user(&d, (void *)argp, sizeof(d))) return -EFAULT;
+    DrmFb *fb = fb_find(d.fb_id);
+    if (!fb || fb->owner != slot) return -ENOENT;
+    if (g_scan_fb != fb->id) return 0; /* not on screen: nothing to push */
+    VgpuTicket t;
+    return kms_present(fb, 0, 0, fb->width, fb->height, &t) ? 0 : -ENOMEM;
+}
+
+static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
+{
+    struct drm_mode_crtc_page_flip_u p;
+    if (copy_from_user(&p, (void *)argp, sizeof(p))) return -EFAULT;
+    if (p.crtc_id != KMS_CRTC_ID) return -ENOENT;
+    DrmFb *fb = fb_find(p.fb_id);
+    if (!fb || fb->owner != slot) return -ENOENT;
+    DrmEvent *ev = NULL;
+    if (p.flags & 0x01) { /* DRM_MODE_PAGE_FLIP_EVENT */
+        for (uint32_t i = 0; i < DRM_MAX_EVENTS && !ev; i++)
+            if (!c->events[i].used) ev = &c->events[i];
+        if (!ev) return -EBUSY; /* a flip is already pending per Linux rules */
+    }
+    VgpuTicket t;
+    if (!kms_present(fb, 0, 0, fb->width, fb->height, &t)) return -ENOMEM;
+    g_scan_owner = slot;
+    if (ev) {
+        ev->used = true;
+        ev->user_data = p.user_data;
+        ev->t = t;
+    }
+    return 0;
+}
+
+/* ============================================================
+ * Events: read() / poll() on the DRM fd
+ * ============================================================ */
+
+static bool event_ready(DrmClient *c)
+{
+    for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++)
+        if (c->events[i].used && vgpu_done(c->events[i].t)) return true;
+    return false;
+}
+
+bool drm_poll_ready(uint32_t slot)
+{
+    if (slot == 0 || slot > DRM_MAX_CLIENTS || !g_clients[slot - 1].used) return false;
+    return event_ready(&g_clients[slot - 1]);
+}
+
+WaitQueue *drm_event_wq(uint32_t slot)
+{
+    if (slot == 0 || slot > DRM_MAX_CLIENTS || !g_clients[slot - 1].used) return NULL;
+    return &g_clients[slot - 1].ev_wq;
+}
+
+int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
+{
+    if (slot == 0 || slot > DRM_MAX_CLIENTS || !g_clients[slot - 1].used) return -EAGAIN;
+    DrmClient *c = &g_clients[slot - 1];
+    if (len < sizeof(struct drm_event_vblank_u)) return -EINVAL;
+    while (!event_ready(c)) {
+        bool any = false;
+        for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++) any |= c->events[i].used;
+        if (nonblock || !any) return -EAGAIN;
+        waitqueue_wait_ms(&c->ev_wq, timer_get_ms() + 5);
+    }
+    uint64_t done = 0;
+    for (uint32_t i = 0; i < DRM_MAX_EVENTS && done + sizeof(struct drm_event_vblank_u) <= len; i++) {
+        DrmEvent *e = &c->events[i];
+        if (!e->used || !vgpu_done(e->t)) continue;
+        uint64_t ms = timer_get_ms();
+        struct drm_event_vblank_u v;
+        v.type = 0x02;                 /* DRM_EVENT_FLIP_COMPLETE */
+        v.length = sizeof(v);
+        v.user_data = e->user_data;
+        v.tv_sec = (uint32_t)(ms / 1000);
+        v.tv_usec = (uint32_t)((ms % 1000) * 1000);
+        v.sequence = ++c->ev_seq;
+        v.crtc_id = KMS_CRTC_ID;
+        if (copy_to_user((void *)(ubuf + done), &v, sizeof(v))) return done ? (int64_t)done : -EFAULT;
+        done += sizeof(v);
+        e->used = false;
+    }
+    return (int64_t)done;
+}
+
+/* Timer hook (IRQ context, no sleeping): wake event readers whose flip
+   finished. */
+void drm_tick(void)
+{
+    for (uint32_t s = 0; s < DRM_MAX_CLIENTS; s++) {
+        DrmClient *c = &g_clients[s];
+        if (!c->used) continue;
+        for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++) {
+            if (c->events[i].used && vgpu_done(c->events[i].t)) {
+                waitqueue_wake_all(&c->ev_wq);
+                break;
+            }
+        }
+    }
 }
 
 static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp);
@@ -676,8 +1323,55 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp)
     case DRM_NR_VERSION:        return ioctl_version(argp);
     case DRM_NR_GET_UNIQUE:     return 0;
     case DRM_NR_GET_CAP:        return ioctl_get_cap(argp);
-    case DRM_NR_SET_CLIENT_CAP: return -EINVAL;
+    case DRM_NR_SET_CLIENT_CAP: {
+        struct drm_set_client_cap_u cc;
+        if (copy_from_user(&cc, (void *)argp, sizeof(cc))) return -EFAULT;
+        /* no universal planes / atomic yet: clients fall back to legacy KMS */
+        return cc.capability == 4 /* ASPECT_RATIO */ ? 0 : -EINVAL;
+    }
+    case DRM_NR_SET_MASTER:
+    case DRM_NR_DROP_MASTER:    return 0;
+    case DRM_NR_MODE_GETRESOURCES: return ioctl_getresources(argp);
+    case DRM_NR_MODE_GETCONNECTOR: return ioctl_getconnector(argp);
+    case DRM_NR_MODE_GETENCODER:   return ioctl_getencoder(argp);
+    case DRM_NR_MODE_GETCRTC:      return ioctl_getcrtc(argp);
+    case DRM_NR_MODE_GETPLANERESOURCES: {
+        struct drm_mode_get_plane_res_u pr;
+        if (copy_from_user(&pr, (void *)argp, sizeof(pr))) return -EFAULT;
+        pr.count_planes = 0;
+        return copy_to_user((void *)argp, &pr, sizeof(pr)) ? -EFAULT : 0;
+    }
+    case DRM_NR_MODE_OBJ_GETPROPERTIES: {
+        struct drm_mode_obj_get_properties_u op;
+        if (copy_from_user(&op, (void *)argp, sizeof(op))) return -EFAULT;
+        op.count_props = 0;
+        return copy_to_user((void *)argp, &op, sizeof(op)) ? -EFAULT : 0;
+    }
+    case DRM_NR_MODE_GETPROPERTY:
+    case DRM_NR_MODE_CURSOR:    return -EINVAL; /* no properties / KMS cursor yet */
     default: break;
+    }
+    if (!virtio_gpu_is_active()) return -ENODEV;
+
+    /* KMS + dumb buffers + PRIME work on 2D-only hosts too */
+    {
+        DrmClient *kc = client_get(slot);
+        if (!kc) return -ENOMEM;
+        switch (nr) {
+        case DRM_NR_MODE_SETCRTC:      return ioctl_setcrtc(*slot, argp);
+        case DRM_NR_MODE_ADDFB:        return ioctl_addfb(*slot, argp);
+        case DRM_NR_MODE_ADDFB2:       return ioctl_addfb2(*slot, argp);
+        case DRM_NR_MODE_RMFB:         return ioctl_rmfb(*slot, argp);
+        case DRM_NR_MODE_DIRTYFB:      return ioctl_dirtyfb(*slot, argp);
+        case DRM_NR_MODE_PAGE_FLIP:    return ioctl_page_flip(*slot, kc, argp);
+        case DRM_NR_MODE_CREATE_DUMB:  return ioctl_create_dumb(*slot, argp);
+        case DRM_NR_MODE_MAP_DUMB:     return ioctl_map_dumb(*slot, argp);
+        case DRM_NR_MODE_DESTROY_DUMB: return ioctl_gem_close(*slot, kc, argp); /* same layout: u32 handle */
+        case DRM_NR_PRIME_HANDLE_TO_FD: return ioctl_prime_handle_to_fd(*slot, argp);
+        case DRM_NR_PRIME_FD_TO_HANDLE: return ioctl_prime_fd_to_handle(*slot, kc, argp);
+        case DRM_NR_GEM_CLOSE:         return ioctl_gem_close(*slot, kc, argp);
+        default: break;
+        }
     }
     if (!g_virgl) return -ENODEV;
 
@@ -715,8 +1409,16 @@ static void client_free(uint32_t slot)
 {
     DrmClient *c = &g_clients[slot - 1];
     c->orphaned = false; /* bo_destroy() -> pending_gc() must not recurse here */
+    /* its framebuffers (and the screen, if it had it) */
+    for (uint32_t i = 0; i < DRM_MAX_FBS; i++) {
+        if (g_fbs[i].used && g_fbs[i].owner == slot) fb_remove(&g_fbs[i]);
+    }
     for (uint32_t i = 0; i < DRM_MAX_BOS; i++) {
-        if (g_bos[i].used && g_bos[i].client == slot) bo_destroy(c, &g_bos[i]);
+        if (g_bos[i].used && (g_bos[i].clients & (1u << (slot - 1))))
+            bo_release_client(slot, c, &g_bos[i]);
+    }
+    for (uint32_t i = 0; i < DRM_MAX_BOS; i++) {
+        if (g_bos[i].used && g_bos[i].zombie) bo_destroy(&g_bos[i]);
     }
     if (c->ctx_id) {
         VirtioGpuCtrlHeader d;

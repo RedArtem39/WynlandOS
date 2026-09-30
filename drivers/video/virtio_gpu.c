@@ -1480,6 +1480,10 @@ void virtio_gpu_tick(void)
     /* Retire finished control requests even when nobody is waiting on
        them (async 3D submissions, a flush the tick sent). */
     ctrlq_reap();
+    {
+        extern void drm_tick(void); /* wake page-flip event readers */
+        drm_tick();
+    }
 
     if (!dropped_any) return;
     /* Only try-lock: a preempted flush holder must not be spun on here. */

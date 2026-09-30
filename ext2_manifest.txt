@@ -60,6 +60,7 @@ Fo /zerp.elf            build/zerp.elf
 Fo /gltest.elf          build/gltest.elf
 Fo /dlsymtest.elf       build/dlsymtest.elf
 Fo /forktest.elf        build/forktest.elf
+Fo /kmstest.elf         build/kmstest.elf
 Fo /zerp_files.elf      build/zerp_files.elf
 Fo /zerp_term.elf       build/zerp_term.elf
 Fo /wall.png            build/wall.png

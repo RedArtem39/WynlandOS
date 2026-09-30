@@ -729,15 +729,84 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
  * File data read
  * ============================================================ */
 
+/* Read-only block mapping with the indirect tables cached for the whole
+   read: ext2_resolve_block() re-reads its single/double indirect table from
+   disk on every call -- up to three disk reads per data block of a large
+   file. Returns the physical block, 0 for a hole. */
+typedef struct {
+    uint32_t l1_blk;   /* cached singly-indirect table (i_block[12]) */
+    uint32_t dind_blk; /* cached doubly-indirect top table (i_block[13]) */
+    uint32_t l2_blk;   /* cached second-level table under it */
+    uint32_t *l1, *dind, *l2;
+} Ext2MapCache;
+
+static uint32_t ext2_map_ro(const Ext2Inode *inode, uint32_t logical, Ext2MapCache *mc)
+{
+    uint32_t ppb = g_block_size / 4;
+    if (logical < 12) return inode->i_block[logical];
+    uint32_t l1_end = 12 + ppb;
+    if (logical < l1_end) {
+        uint32_t tb = inode->i_block[12];
+        if (!tb) return 0;
+        if (mc->l1_blk != tb) {
+            if (!ext2_read_block(tb, mc->l1)) return 0;
+            mc->l1_blk = tb;
+        }
+        return mc->l1[logical - 12];
+    }
+    uint32_t l2_end = l1_end + ppb * ppb;
+    if (logical < l2_end) {
+        uint32_t top = inode->i_block[13];
+        if (!top) return 0;
+        if (mc->dind_blk != top) {
+            if (!ext2_read_block(top, mc->dind)) return 0;
+            mc->dind_blk = top;
+        }
+        uint32_t rel = logical - l1_end;
+        uint32_t outer = mc->dind[rel / ppb];
+        if (!outer) return 0;
+        if (mc->l2_blk != outer) {
+            if (!ext2_read_block(outer, mc->l2)) return 0;
+            mc->l2_blk = outer;
+        }
+        return mc->l2[rel % ppb];
+    }
+    return 0; /* triple-indirect: not supported (see ext2_resolve_block) */
+}
+
+/* Physically contiguous bounce buffer for multi-block DMA reads. */
+#define EXT2_RUN_BLOCKS 64
+static uint8_t *g_run_buf = NULL;
+static uint32_t g_run_cap = 0; /* bytes */
+
 uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t len, void *buf) {
     if (!inode || !buf || len == 0) return 0;
     if (offset >= inode->i_size) return 0;
     if (offset + len > inode->i_size) len = inode->i_size - offset;
 
+    if (!g_run_buf) {
+        extern void *pmm_alloc_contiguous(uint32_t count);
+        uint32_t bytes = EXT2_RUN_BLOCKS * g_block_size;
+        g_run_buf = (uint8_t *)pmm_alloc_contiguous((bytes + 4095) / 4096); /* identity-mapped */
+        g_run_cap = g_run_buf ? bytes : 0;
+    }
+
+    Ext2MapCache mc;
+    memset(&mc, 0, sizeof(mc));
+    mc.l1 = (uint32_t *)kmalloc(g_block_size);
+    mc.dind = (uint32_t *)kmalloc(g_block_size);
+    mc.l2 = (uint32_t *)kmalloc(g_block_size);
+    uint8_t *block_buf = (uint8_t *)kmalloc(g_block_size);
+    if (!mc.l1 || !mc.dind || !mc.l2 || !block_buf) {
+        if (mc.l1) kfree(mc.l1);
+        if (mc.dind) kfree(mc.dind);
+        if (mc.l2) kfree(mc.l2);
+        if (block_buf) kfree(block_buf);
+        return 0;
+    }
+
     uint8_t *out = (uint8_t *)buf;
     uint32_t bytes_read = 0;
-    uint8_t *block_buf = (uint8_t *)kmalloc(g_block_size);
-    if (!block_buf) return 0;
 
     /* i_dir_acl doubles as the size-high word for regular files; this
        OS never stores >4GB files, and VfsNode.size is 32-bit anyway. */
@@ -748,7 +817,7 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
         uint32_t chunk = g_block_size - block_offset;
         if (chunk > len - bytes_read) chunk = len - bytes_read;
 
-        uint32_t phys_block = ext2_resolve_block((Ext2Inode *)inode, logical_block, false);
+        uint32_t phys_block = ext2_map_ro(inode, logical_block, &mc);
         if (phys_block == 0) {
             /* A hole (sparse file -- debugfs `write`, which builds the
                image, stores all-zero blocks that way), NOT end of file:
@@ -761,12 +830,37 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
             continue;
         }
 
+        /* Whole blocks from a block boundary: extend over physically
+           consecutive blocks and fetch the run with ONE disk command
+           (it was one command per 4 KB block). */
+        if (block_offset == 0 && g_run_buf && len - bytes_read >= g_block_size) {
+            uint32_t want = (len - bytes_read) / g_block_size;
+            if (want > EXT2_RUN_BLOCKS) want = EXT2_RUN_BLOCKS;
+            uint32_t run = 1;
+            while (run < want && ext2_map_ro(inode, logical_block + run, &mc) == phys_block + run) run++;
+            if (run > 1) {
+                /* the bounce buffer is shared: no preemption while in use */
+                uint64_t rflags;
+                __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+                bool ok = ahci_read(mbr_root_partition_lba() + phys_block * g_sectors_per_block,
+                                    run * g_sectors_per_block, g_run_buf);
+                if (ok) memcpy(out + bytes_read, g_run_buf, run * g_block_size);
+                if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+                if (!ok) break;
+                bytes_read += run * g_block_size;
+                continue;
+            }
+        }
+
         if (!ext2_read_block(phys_block, block_buf)) break;
 
         for (uint32_t i = 0; i < chunk; i++) out[bytes_read + i] = block_buf[block_offset + i];
         bytes_read += chunk;
     }
     kfree(block_buf);
+    kfree(mc.l1);
+    kfree(mc.dind);
+    kfree(mc.l2);
 
     return bytes_read;
 }
