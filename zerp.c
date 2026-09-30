@@ -49,6 +49,17 @@ typedef struct {
        x2/y2 exclusive; blitted once per frame (not once per message) */
     int dmg;
     uint32_t dmg_x1, dmg_y1, dmg_x2, dmg_y2;
+    /* c2s is non-blocking: bytes are accumulated here and only WHOLE
+       messages are parsed, so a message that isn't all there yet waits
+       for the next iteration instead of desyncing the stream. */
+    uint8_t rx[512];
+    uint32_t rx_len;
+    /* s2c is non-blocking too: messages the pipe can't take right now
+       wait here instead of being dropped (a lost button-up or key-up
+       means a stuck button/key). Pure pointer motion is coalesced. */
+    ZerpMsg out[64];
+    uint32_t out_head, out_count;
+    int out_tail_motion; /* newest queued message is pure motion */
 } ClientSlot;
 
 static ClientSlot g_clients[MAX_CLIENTS];
@@ -130,6 +141,9 @@ static int spawn_client(const char *path, uint32_t shm_bytes) {
     g_clients[idx].alive = 1;
     g_clients[idx].pid = pid;
     g_clients[idx].dmg = 0;
+    g_clients[idx].rx_len = 0;
+    g_clients[idx].out_head = g_clients[idx].out_count = 0;
+    g_clients[idx].out_tail_motion = 0;
     g_client_count++;
     return idx;
 }
@@ -148,6 +162,40 @@ static void compact_clients(void) {
     }
     g_client_count = w;
 }
+
+/* Push as much of the outbox into the s2c pipe as it takes. Each ZerpMsg
+   goes whole or not at all (kernel pipes are PIPE_BUF-atomic). */
+static void client_flush_out(ClientSlot *c) {
+    while (c->out_count > 0) {
+        if (zwrite(c->s2c_write_fd, &c->out[c->out_head], sizeof(ZerpMsg)) != (long)sizeof(ZerpMsg))
+            return;
+        c->out_head = (c->out_head + 1) % 64;
+        c->out_count--;
+    }
+}
+
+/* `motion` = pure pointer motion (no button change). Replacing a
+   still-queued pure-motion message loses nothing -- only the latest
+   position matters -- but a button change always keeps its own slot, so
+   a click is delivered at the position it happened at. */
+static void client_send_ex(ClientSlot *c, const ZerpMsg *m, int motion) {
+    if (motion && c->out_count > 0 && c->out_tail_motion) {
+        c->out[(c->out_head + c->out_count - 1) % 64] = *m;
+        return;
+    }
+    if (c->out_count == 64) {
+        /* Client hasn't read anything in a long time: make room by
+           dropping the oldest queued message. */
+        c->out_head = (c->out_head + 1) % 64;
+        c->out_count--;
+    }
+    c->out[(c->out_head + c->out_count) % 64] = *m;
+    c->out_count++;
+    c->out_tail_motion = motion;
+    client_flush_out(c);
+}
+
+static void client_send(ClientSlot *c, const ZerpMsg *m) { client_send_ex(c, m, 0); }
 
 /* Dwindle-style tiling: recompute every live client's rect from scratch
    (not incremental merge/split bookkeeping -- only runs on membership
@@ -199,7 +247,7 @@ static void retile(void) {
         msg.x = ccx; msg.y = ccy;
         msg.w = (ccw > 8) ? ccw : 8;
         msg.h = (cch > 8) ? cch : 8;
-        zwrite(c->s2c_write_fd, &msg, sizeof(msg));
+        client_send(c, &msg);
     }
 }
 
@@ -369,7 +417,7 @@ static void set_focus(int new_focus, int *focused) {
 }
 
 /* Focus-follows-mouse + forward the pointer to the focused client. */
-static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int *focused) {
+static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int motion, int *focused) {
     for (int i = 0; i < g_client_count; i++) {
         ClientSlot *c = &g_clients[i];
         if (!c->alive) continue;
@@ -386,7 +434,7 @@ static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int *focused)
         mmsg.y = (uint32_t)my - g_clients[*focused].tile_y;
         mmsg.w = buttons;
         mmsg.h = 0;
-        zwrite(g_clients[*focused].s2c_write_fd, &mmsg, sizeof(mmsg));
+        client_send_ex(&g_clients[*focused], &mmsg, motion);
     }
 }
 
@@ -488,11 +536,16 @@ int zerp_main(int argc, char **argv) {
     screen_present();
     zwrite(1, "[zerp] clients spawned and tiled\n", 34);
 
-    /* Same start point and clamping as the kernel's PS/2 driver, which
-       drives the hardware cursor plane from the IRQ -- both integrate the
-       same packet stream, so this stays in lockstep with what's on screen. */
+    /* The kernel's PS/2 driver owns the pointer position (it drives the
+       hardware cursor plane from the IRQ and has been integrating since
+       boot). Start from its value, and re-sync to it after every batch
+       below, so hit-testing always matches what's drawn on screen. */
     int32_t cursor_x = (int32_t)(g_screen_w / 2);
     int32_t cursor_y = (int32_t)(g_screen_h / 2);
+    {
+        int32_t ms[3];
+        if (zmouse_state(ms) == 0) { cursor_x = ms[0]; cursor_y = ms[1]; }
+    }
     uint8_t mouse_buf[3];
     int mouse_cycle = 0;
     uint8_t last_buttons = 0;
@@ -515,6 +568,9 @@ int zerp_main(int argc, char **argv) {
             long n;
             while ((n = zread((int)mice_fd, mb, sizeof(mb))) > 0) {
                 for (long k = 0; k < n; k++) {
+                    /* Byte 0 of every packet has bit 3 set: skip until one
+                       shows up, so a lost byte can't shift all later packets. */
+                    if (mouse_cycle == 0 && !(mb[k] & 0x08)) continue;
                     mouse_buf[mouse_cycle++] = mb[k];
                     if (mouse_cycle < 3) continue;
                     mouse_cycle = 0;
@@ -535,13 +591,19 @@ int zerp_main(int argc, char **argv) {
 
                     if ((buttons & 0x07) != last_buttons) {
                         last_buttons = buttons & 0x07;
-                        deliver_mouse(cursor_x, cursor_y, last_buttons, &focused);
+                        deliver_mouse(cursor_x, cursor_y, last_buttons, 0, &focused);
                         moved = 0;
                     }
                 }
                 if (n < (long)sizeof(mb)) break;
             }
-            if (moved) deliver_mouse(cursor_x, cursor_y, last_buttons, &focused);
+            if (moved) {
+                /* Local integration only places clicks inside the batch;
+                   the kernel's value is authoritative. */
+                int32_t ms[3];
+                if (zmouse_state(ms) == 0) { cursor_x = ms[0]; cursor_y = ms[1]; }
+                deliver_mouse(cursor_x, cursor_y, last_buttons, 1, &focused);
+            }
         }
 
         /* -- keyboard: forward raw scancodes to the focused client only. */
@@ -553,58 +615,77 @@ int zerp_main(int argc, char **argv) {
                     ZerpMsg kmsg;
                     kmsg.type = ZERP_MSG_INPUT_KEY;
                     kmsg.x = kb[k]; kmsg.y = 0; kmsg.w = 0; kmsg.h = 0;
-                    zwrite(g_clients[focused].s2c_write_fd, &kmsg, sizeof(kmsg));
+                    client_send(&g_clients[focused], &kmsg);
                 }
                 if (n < (long)sizeof(kb)) break;
             }
         }
 
         /* -- client control messages: DAMAGE/CLOSE/SPAWN. Every message
-           starts with a 4-byte type field; read that first, then read the
-           REST of the message at a size depending on what the type turned
-           out to be (ZerpMsg's 16 remaining bytes, or ZerpSpawnMsg's 252
-           path bytes) -- see zerp_protocol.h's ZerpSpawnMsg comment for
-           why this split-read is safe here (sender always writes one
-           struct in a single zwrite(), never a partial one). DAMAGE is
-           only RECORDED here; the blit happens once per frame below. */
+           starts with a 4-byte type field that fixes its size (ZerpMsg, or
+           ZerpSpawnMsg for SPAWN). c2s is non-blocking, so bytes are
+           accumulated in the client's rx buffer and only whole messages
+           are parsed; a partial tail waits for the next iteration. DAMAGE
+           is only RECORDED here; the blit happens once per frame below. */
         int need_retile = 0;
         for (int i = 0; i < g_client_count; i++) {
             ClientSlot *c = &g_clients[i];
             if (!c->alive) continue;
-            uint32_t type;
-            while (zread(c->c2s_read_fd, &type, sizeof(type)) == (long)sizeof(type)) {
-                if (type == ZERP_MSG_SPAWN) {
-                    char path[252];
-                    zread(c->c2s_read_fd, path, sizeof(path));
-                    path[sizeof(path) - 1] = '\0';
-                    zwrite(1, "[zerp] SPAWN request for: ", 27);
-                    zwrite(1, path, zstrlen(path));
-                    zwrite(1, "\n", 1);
-                    int new_idx = spawn_client(path, g_shm_bytes);
-                    zwrite(1, "[zerp] spawn_client returned idx=", 34);
-                    { char nb[8]; znum_to_str(new_idx, nb); zwrite(1, nb, zstrlen(nb)); }
-                    zwrite(1, "\n", 1);
-                    if (new_idx >= 0) {
-                        need_retile = 1;
-                        /* Focus-follows-new-window: a launcher (rofi) or any
-                           other client that spawns something expects the new
-                           window to be immediately ready for keyboard input,
-                           same as any real WM. */
-                        focused = new_idx; g_focused_client = focused;
-                    }
-                } else {
-                    uint32_t rest[4];
-                    zread(c->c2s_read_fd, rest, sizeof(rest));
-                    if (type == ZERP_MSG_DAMAGE) {
-                        client_add_damage(c, rest[0], rest[1], rest[2], rest[3]);
+            client_flush_out(c);
+            for (;;) {
+                long n = zread(c->c2s_read_fd, c->rx + c->rx_len, sizeof(c->rx) - c->rx_len);
+                if (n <= 0) break;
+                c->rx_len += (uint32_t)n;
+
+                uint32_t off = 0;
+                while (c->alive && c->rx_len - off >= sizeof(uint32_t)) {
+                    uint32_t type;
+                    memcpy(&type, c->rx + off, sizeof(type));
+                    uint32_t size = (type == ZERP_MSG_SPAWN) ? sizeof(ZerpSpawnMsg) : sizeof(ZerpMsg);
+                    if (c->rx_len - off < size) break;
+                    const uint8_t *body = c->rx + off + sizeof(uint32_t);
+                    off += size;
+
+                    if (type == ZERP_MSG_SPAWN) {
+                        char path[252];
+                        memcpy(path, body, sizeof(path));
+                        path[sizeof(path) - 1] = '\0';
+                        zwrite(1, "[zerp] SPAWN request for: ", 27);
+                        zwrite(1, path, zstrlen(path));
+                        zwrite(1, "\n", 1);
+                        int new_idx = spawn_client(path, g_shm_bytes);
+                        zwrite(1, "[zerp] spawn_client returned idx=", 34);
+                        { char nb[8]; znum_to_str(new_idx, nb); zwrite(1, nb, zstrlen(nb)); }
+                        zwrite(1, "\n", 1);
+                        if (new_idx >= 0) {
+                            need_retile = 1;
+                            /* Focus-follows-new-window: a launcher (rofi) or any
+                               other client that spawns something expects the new
+                               window to be immediately ready for keyboard input,
+                               same as any real WM. */
+                            focused = new_idx; g_focused_client = focused;
+                        }
+                    } else {
+                        uint32_t rest[4];
+                        memcpy(rest, body, sizeof(rest));
+                        if (type == ZERP_MSG_DAMAGE) {
+                            client_add_damage(c, rest[0], rest[1], rest[2], rest[3]);
 #if ZERP_STATS
-                        stat_damage++;
+                            stat_damage++;
 #endif
-                    } else if (type == ZERP_MSG_CLOSE) {
-                        c->alive = 0;
-                        need_retile = 1;
+                        } else if (type == ZERP_MSG_CLOSE) {
+                            c->alive = 0;
+                            need_retile = 1;
+                        }
                     }
                 }
+                /* keep the unparsed tail at the front */
+                if (off > 0) {
+                    uint32_t left = c->rx_len - off;
+                    for (uint32_t k = 0; k < left; k++) c->rx[k] = c->rx[off + k];
+                    c->rx_len = left;
+                }
+                if (!c->alive) break;
             }
         }
 

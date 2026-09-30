@@ -18,6 +18,7 @@ void rtc_init(void);
 /* Real, current UTC epoch seconds -- rtc_init()'s reading plus elapsed
    ticks since. This is what SYS_clock_gettime(CLOCK_REALTIME) returns. */
 uint64_t rtc_get_unix_time(void);
+uint64_t rtc_get_unix_time_ms(void);
 
 /* Best-effort: fetches the caller's current UTC offset from a plain-HTTP
    IP-geolocation service (no hardcoded location anywhere in this

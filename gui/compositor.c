@@ -316,7 +316,9 @@ void compositor_flip(void)
     if (x1 <= x2 && y1 <= y2 && virtio_gpu_is_active()) {
         /* virtio-gpu scans the back-buffer itself (it IS resource 1's
            backing memory), so copying it into the unscanned GOP buffer
-           was a full wasted frame copy. Just transfer+flush the rect. */
+           was a full wasted frame copy. Just transfer+flush the rect.
+           g_sys_brightness is not applied on this path (it never was:
+           the host always read back_buffer, not front_buffer). */
         virtio_gpu_flush(x1, y1, x2 - x1 + 1, y2 - y1 + 1);
     } else if (x1 <= x2 && y1 <= y2) {
         uint32_t pitch_pixels = g_comp.fb_pitch / 4;

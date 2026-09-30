@@ -338,9 +338,13 @@ void mouse_handle_interrupt(uint8_t data)
                     mouse_show();
                 }
             }
-            mouse_queue_push(mouse_packet[0]);
-            mouse_queue_push(mouse_packet[1]);
-            mouse_queue_push(mouse_packet[2]);
+            /* Whole packets only: dropping one byte of a full queue would
+               shift every packet after it for /dev/input/mice readers. */
+            if ((mouse_queue_tail + MOUSE_QUEUE_SIZE - mouse_queue_head - 1) % MOUSE_QUEUE_SIZE >= 3) {
+                mouse_queue_push(mouse_packet[0]);
+                mouse_queue_push(mouse_packet[1]);
+                mouse_queue_push(mouse_packet[2]);
+            }
             break;
     }
 }

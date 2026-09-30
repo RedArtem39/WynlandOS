@@ -30,6 +30,7 @@
 #define SYS_wynland_elevate 409
 #define SYS_pty_create 410
 #define SYS_process_alive 411
+#define SYS_mouse_state 412
 #define SYS_dup2       33
 #define SYS_execve     59
 #define SYS_fork       57
@@ -104,7 +105,7 @@ static long zsys6(long num, long a1, long a2, long a3, long a4, long a5, long a6
     return ret;
 }
 
-static void zwrite(int fd, const void *buf, long len) { zsys3(SYS_write, fd, (long)buf, len); }
+static long zwrite(int fd, const void *buf, long len) { return zsys3(SYS_write, fd, (long)buf, len); }
 static long zread(int fd, void *buf, long len) { return zsys3(SYS_read, fd, (long)buf, len); }
 static long zpipe(int *pfd) { return zsys3(SYS_pipe, (long)pfd, 0, 0); }
 static long zopen(const char *path, long flags) { return zsys3(SYS_open, (long)path, flags, 0); }
@@ -150,6 +151,9 @@ static long zpoll_in(int fd, long timeout_ms) {
     struct zpollfd p = { fd, 0x0001 /* POLLIN */, 0 };
     return zsys3(SYS_poll_nr, (long)&p, 1, timeout_ms);
 }
+
+/* Kernel's integrated pointer: out[0]=x, out[1]=y, out[2]=buttons. */
+static long zmouse_state(int32_t out[3]) { return zsys3(SYS_mouse_state, (long)out, 0, 0); }
 
 /* Fast 32-bit pixel copy (rep movsl) for blits. */
 static inline void zcopy32(uint32_t *dst, const uint32_t *src, uint32_t count) {

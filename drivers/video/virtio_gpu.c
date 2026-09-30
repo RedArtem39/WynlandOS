@@ -679,6 +679,10 @@ typedef struct {
 } CursorCmdSlot;
 
 static CursorCmdSlot cursor_slots[VQ_MAX_SIZE] __attribute__((aligned(4096)));
+/* Physical address of each slot, resolved once at init: cursor_submit()
+   runs in the mouse IRQ, so it shouldn't walk whatever CR3 happens to be
+   loaded on every pointer move. */
+static uint64_t cursor_slot_phys[VQ_MAX_SIZE];
 
 static uint32_t cursor_shape = 0;
 static uint32_t cursor_x = 0, cursor_y = 0;
@@ -700,6 +704,9 @@ static void irq_restore(uint64_t rflags)
 static void cursor_reclaim(void)
 {
     while (VQ_USED_IDX(cursor_q) != cursor_q.last_used) {
+        /* ring[] entries are only valid once idx says so: don't let the
+           compiler hoist the (non-volatile) ring read above the idx load. */
+        __asm__ volatile("" ::: "memory");
         uint16_t used_idx = cursor_q.last_used % cursor_q.size;
         uint32_t desc_idx = cursor_q.used->ring[used_idx].id;
         vq_free_desc(&cursor_q, (uint16_t)desc_idx);
@@ -732,8 +739,7 @@ static void cursor_submit(void)
     c->hot_x = cursor_hotspot[cursor_shape][0];
     c->hot_y = cursor_hotspot[cursor_shape][1];
 
-    PageTable *pml4 = vmm_get_current_pml4();
-    cursor_q.desc[desc].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)c);
+    cursor_q.desc[desc].addr  = cursor_slot_phys[desc];
     cursor_q.desc[desc].len   = sizeof(*c);
     cursor_q.desc[desc].flags = 0;
     cursor_q.desc[desc].next  = 0;
@@ -818,6 +824,12 @@ bool virtio_gpu_init(void)
         log_str("VIRTIO-GPU: ERROR - Failed to setup Cursor Queue!\r\n");
         mmio_write8(VIRTIO_MODERN_STATUS, VIRTIO_STATUS_FAILED);
         return false;
+    }
+
+    {
+        PageTable *pml4 = vmm_get_current_pml4();
+        for (uint32_t i = 0; i < VQ_MAX_SIZE; i++)
+            cursor_slot_phys[i] = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cursor_slots[i].cmd);
     }
 
     /* 4. Set DRIVER_OK preserving FEATURES_OK */
@@ -990,6 +1002,15 @@ bool virtio_gpu_init(void)
    below are shared statics, and a caller can be preempted mid-wait. */
 static volatile int flush_busy = 0;
 
+/* A flush the host didn't complete within the timeout. Its descriptors
+   and the static cmd_/resp_ buffers still belong to the device, so they
+   are neither freed nor reused until its completions actually arrive --
+   reusing them would let a late completion satisfy the NEXT flush's wait
+   while that flush's commands are still in flight. */
+static bool     flush_stuck = false;
+static uint16_t flush_stuck_target;
+static uint16_t flush_stuck_desc[4];
+
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     if (!initialized) return;
@@ -1005,6 +1026,17 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     while (__sync_lock_test_and_set(&flush_busy, 1)) {
         extern void sched_yield(void);
         sched_yield();
+    }
+
+    if (flush_stuck) {
+        if ((int16_t)(VQ_USED_IDX(ctrl_q) - flush_stuck_target) < 0) {
+            __sync_lock_release(&flush_busy); /* host still busy: drop this frame */
+            return;
+        }
+        ctrl_q.last_used = flush_stuck_target;
+        for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, flush_stuck_desc[i]);
+        flush_stuck = false;
+        log_str("VIRTIO-GPU: stuck flush completed, resuming\r\n");
     }
 
     /* 1. Transfer the dirty rect of the back-buffer into Host Resource 1 */
@@ -1078,8 +1110,13 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
     }
     if (VQ_USED_IDX(ctrl_q) != target) {
         log_str("VIRTIO-GPU: flush timeout!\r\n");
+        flush_stuck = true;
+        flush_stuck_target = target;
+        for (int i = 0; i < 4; i++) flush_stuck_desc[i] = d[i];
+        __sync_lock_release(&flush_busy);
+        return;
     }
-    ctrl_q.last_used = VQ_USED_IDX(ctrl_q);
+    ctrl_q.last_used = target;
 
     for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, d[i]);
 

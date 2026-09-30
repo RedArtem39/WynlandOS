@@ -147,6 +147,16 @@ uint64_t rtc_get_unix_time(void) {
     return g_boot_unix_time + elapsed_ticks / 100;
 }
 
+/* Same clock in milliseconds, from the 1 kHz timer: seconds and the
+   sub-second part come from ONE value, so they can't disagree about
+   when a second boundary is (clock_gettime(CLOCK_REALTIME) stays
+   monotonic between RTC reads). */
+uint64_t rtc_get_unix_time_ms(void) {
+    extern uint64_t timer_get_ms(void);
+    uint64_t elapsed_ms = timer_get_ms() - g_boot_tick_baseline * 10;
+    return g_boot_unix_time * 1000 + elapsed_ms;
+}
+
 /* ---------------- timezone auto-detection ---------------- */
 
 void tz_auto_detect(void) {

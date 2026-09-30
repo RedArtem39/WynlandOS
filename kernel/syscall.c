@@ -14,6 +14,7 @@
 #include <wynland/elf.h>
 #include <wynland/waitqueue.h>
 #include <wynland/usercopy.h>
+#include <wynland/mouse.h>
 
 extern uint64_t timer_get_ticks(void);
 
@@ -292,7 +293,12 @@ static ShmSegment g_shm_segments[MAX_SHM_SEGMENTS];
 
 static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
     const uint8_t *src = (const uint8_t *)buf;
-    while (pipe->count >= PIPE_BUF_SIZE) {
+    /* POSIX PIPE_BUF atomicity: a write of <= PIPE_BUF_SIZE bytes waits
+       until it fits WHOLE. Writing whatever fits would split fixed-size
+       records (Zerp's 20-byte messages don't divide 4096) and desync
+       every reader that parses them. Larger writes may still be split. */
+    uint32_t need = size <= PIPE_BUF_SIZE ? size : 1;
+    while (PIPE_BUF_SIZE - pipe->count < need) {
         waitqueue_wait(&pipe->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
     }
     uint32_t written = 0;
@@ -469,9 +475,10 @@ static EpollInstance* get_epoll_instance(int fd) {
 #define POLL_MAX_LOCAL 256
 
 struct wl_pollfd { int fd; short events; short revents; };
+extern uint64_t timer_get_ms(void);
 
 /* Poll `nfds` KERNEL-owned wl_pollfd entries for readiness, genuinely
-   blocking (not spinning) until at least one is ready or `timeout_ticks`
+   blocking (not spinning) until at least one is ready or `timeout_ms`
    elapses (-1 = block forever, 0 = one immediate check, >0 = real tick
    budget). Shared by SYS_poll/SYS_ppoll (case 7/271 below, which copy the
    user-supplied array in/out around this) and SYS_epoll_wait (case
@@ -482,8 +489,13 @@ struct wl_pollfd { int fd; short events; short revents; };
    stack address is never PAGE_USER). Takes fd_table explicitly since it's
    a local in the calling syscall_dispatcher() invocation (per-process,
    see the top of that function), not a global this can reach on its own. */
-static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ticks) {
-    uint64_t deadline = (timeout_ticks < 0) ? SCHED_NO_DEADLINE : timer_get_ticks() + (uint64_t)timeout_ticks;
+static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ms) {
+    /* The deadline is kept on the 1 kHz clock, so a timeout never expires
+       early (a deadline of "N 100 Hz ticks from now" could be up to 10ms
+       short). Sleeps still end on 100 Hz tick boundaries, so it may run
+       up to one tick late. */
+    uint64_t deadline_ms = (timeout_ms < 0) ? SCHED_NO_DEADLINE : timer_get_ms() + (uint64_t)timeout_ms;
+    uint64_t deadline = (timeout_ms < 0) ? SCHED_NO_DEADLINE : (deadline_ms + 9) / 10; /* first tick at/after it */
 
     for (;;) {
         if (fds) {
@@ -556,10 +568,10 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
         }
 
         if (ready > 0) return ready;
-        if (timeout_ticks == 0) return 0; // caller asked for an immediate check only
+        if (timeout_ms == 0) return 0; // caller asked for an immediate check only
 
+        if (deadline_ms != SCHED_NO_DEADLINE && timer_get_ms() >= deadline_ms) return 0; // real timeout
         uint64_t now = timer_get_ticks();
-        if (deadline != SCHED_NO_DEADLINE && now >= deadline) return 0; // real timeout
 
         /* Genuinely sleep instead of spinning. Single watched fd
            with a real wait queue -> wake instantly on data via
@@ -834,12 +846,18 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint32_t pipe_idx = fd_table[a1]->current_cluster;
                 if (pipe_idx < MAX_PIPES && g_pipes[pipe_idx] != NULL) {
                     /* Non-blocking + atomic (POSIX PIPE_BUF): a small message either
-                       fits whole or fails, never a torn half-message. */
-                    uint32_t want = (uint32_t)a3 < PIPE_BUF_SIZE ? (uint32_t)a3 : PIPE_BUF_SIZE;
+                       fits whole or fails, never a torn half-message; a larger
+                       one writes what fits, or fails only if nothing does.
+                       Check and write can't be separated: syscalls run with
+                       IF=0 (SFMASK) and pipe_write() only sleeps when it
+                       can't proceed, which these checks rule out. */
+                    if (a3 == 0) return 0;
+                    uint32_t len = a3 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)a3;
+                    uint32_t want = len <= PIPE_BUF_SIZE ? len : 1;
                     if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && PIPE_BUF_SIZE - g_pipes[pipe_idx]->count < want) {
                         return (uint64_t)-11; /* -EAGAIN */
                     }
-                    return pipe_write(g_pipes[pipe_idx], (const void *)a2, (uint32_t)a3);
+                    return pipe_write(g_pipes[pipe_idx], (const void *)a2, len);
                 }
                 return (uint64_t)-1;
             }
@@ -995,6 +1013,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
                 return (uint64_t)-1;
             }
+            /* The next open()/socket() reusing this number must not inherit
+               this fd's O_NONBLOCK (only pipe()/pty_create() set oflags). */
+            fd_oflags[a1] = 0;
             if (fd_table[a1]->node.first_cluster == 0xFFFFFFFA ||
                 fd_table[a1]->node.first_cluster == 0xFFFFFFFB ||
                 fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
@@ -2107,6 +2128,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return 0;
             }
 
+        case 412: // SYS_mouse_state(int32_t out[3]) -- the kernel's own
+                   // integrated pointer {x, y, buttons}. The PS/2 IRQ is the
+                   // single source of truth for where the pointer is (it
+                   // drives the virtio-gpu cursor plane); Zerp reads this
+                   // instead of integrating packets itself, so hit-testing
+                   // can't drift from what's drawn on screen.
+            {
+                if (!a1 || !user_prepare_write(a1, 3 * sizeof(int32_t))) return (uint64_t)-14; /* -EFAULT */
+                int32_t *out = (int32_t *)a1;
+                out[0] = mouse_get_x();
+                out[1] = mouse_get_y();
+                out[2] = (int32_t)mouse_get_buttons();
+                return 0;
+            }
+
         case 411: // SYS_process_alive(pid) -- Phase 18. Lets zerp_term.c
                    // poll whether a forked-and-exec'd child (nano) has
                    // exited yet, so it knows when to leave MODE_PTY. Reads
@@ -2569,11 +2605,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        else (CLOCK_MONOTONIC=1, etc.) stays uptime-based,
                        matching real Linux semantics: monotonic clocks are
                        never supposed to jump with wall-clock adjustments. */
-                    if ((int)a1 == 0) {
-                        tp->tv_sec = (int64_t)rtc_get_unix_time();
-                    } else {
-                        tp->tv_sec = (int64_t)(ms / 1000);
-                    }
+                    if ((int)a1 == 0) ms = rtc_get_unix_time_ms();
+                    tp->tv_sec = (int64_t)(ms / 1000);
                     tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
                 }
                 return 0;
@@ -2819,20 +2852,23 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    then-yield-then-return-0 (which silently ignored
                    whatever timeout the caller asked for). -1 = block
                    forever, 0 = poll once and return immediately, >0 =
-                   real tick budget. Timer runs at 100Hz (kernel/irq.c). */
-                int64_t timeout_ticks;
+                   real millisecond budget. */
+                int64_t timeout_ms;
                 if (num == 7) {
-                    int timeout_ms = (int)(int32_t)a3;
-                    timeout_ticks = (timeout_ms < 0) ? -1 : ((int64_t)timeout_ms + 9) / 10; /* round UP: a 1..9ms timeout must still block */
+                    int t = (int)(int32_t)a3;
+                    timeout_ms = (t < 0) ? -1 : (int64_t)t;
                 } else if (a3 == 0) {
-                    timeout_ticks = -1;
+                    timeout_ms = -1;
                 } else {
                     struct linux_timespec { int64_t tv_sec; int64_t tv_nsec; } tmo;
                     if (copy_from_user(&tmo, (const void *)a3, sizeof(tmo)) != 0) return (uint64_t)-14;
-                    timeout_ticks = tmo.tv_sec * 100 + (tmo.tv_nsec + 9999999) / 10000000; /* round UP */
+                    if (tmo.tv_sec < 0 || tmo.tv_nsec < 0 || tmo.tv_nsec >= 1000000000) return (uint64_t)-22; /* -EINVAL */
+                    /* ~292 million years in ms fits int64; beyond that, forever */
+                    timeout_ms = (tmo.tv_sec > 9000000000000000LL / 1000) ? -1
+                               : tmo.tv_sec * 1000 + (tmo.tv_nsec + 999999) / 1000000; /* round UP */
                 }
 
-                int ready = do_poll(fd_table, have_fds ? kfds : NULL, nfds, timeout_ticks);
+                int ready = do_poll(fd_table, have_fds ? kfds : NULL, nfds, timeout_ms);
 
                 if (have_fds && nfds > 0 && copy_to_user((void *)a1, kfds, nfds * sizeof(struct wl_pollfd)) != 0) {
                     return (uint64_t)-14; /* -EFAULT */
@@ -3098,8 +3134,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 // never user memory, so this must NOT go back through
                 // syscall_dispatcher(7, ...), which now validates its a1 as
                 // a genuine user pointer.
-                int64_t timeout_ticks = (timeout_ms < 0) ? -1 : ((int64_t)timeout_ms + 9) / 10; /* round UP: a 1..9ms timeout must still block */
-                int ready = do_poll(fd_table, pfds, inst->num_watches, timeout_ticks);
+                int ready = do_poll(fd_table, pfds, inst->num_watches, timeout_ms < 0 ? -1 : (int64_t)timeout_ms);
 
                 if (ready > 0) {
                     int ev_count = 0;
@@ -3155,11 +3190,16 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        sched_yield() spin: a frame-paced loop like the
                        compositor's used to burn a full core here. */
                     extern uint64_t timer_get_ms(void);
-                    uint64_t ms = (uint64_t)req->tv_sec * 1000 +
+                    /* Clamp to ~31,000 years so tv_sec*1000 and now+ms
+                       can't wrap into a short sleep. */
+                    uint64_t sec = (uint64_t)req->tv_sec;
+                    if (sec > 1000000000000ull) sec = 1000000000000ull;
+                    uint64_t ms = sec * 1000 +
                                   ((uint64_t)req->tv_nsec + 999999) / 1000000;
                     uint64_t end_ms = timer_get_ms() + ms;
                     sched_sleep_ms(ms);
-                    /* An early wake (signal/unblock) sleeps out the rest. */
+                    /* Defensive: if the sleeper is ever woken early (e.g. a
+                       future signal-interrupt path), sleep out the rest. */
                     while (ms > 0 && timer_get_ms() < end_ms) {
                         sched_sleep_ms(end_ms - timer_get_ms());
                     }
