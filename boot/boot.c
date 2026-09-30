@@ -128,10 +128,9 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
             continue;
         }
 
-        /* Skip modes that are PixelBltOnly */
-        if (modeInfo->PixelFormat == PixelBltOnly) {
-            continue;
-        }
+        /* PixelBltOnly modes are fine: a BLT-only GOP (OVMF's virtio-gpu)
+           gets a RAM framebuffer below. Skipping them left no mode at all
+           and fell back to mode 0 (640x480). */
 
         UINT32 w = modeInfo->HorizontalResolution;
         UINT32 h = modeInfo->VerticalResolution;
@@ -204,6 +203,28 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         info->fb_format = 1; /* BGR */
     } else {
         info->fb_format = 0; /* RGB */
+    }
+
+    /* A BLT-only GOP (OVMF's virtio-gpu driver, e.g. QEMU with -vga none)
+       has no linear framebuffer: FrameBufferBase is 0. The kernel would
+       then identity-map "the framebuffer" over physical 0.. -- right over
+       its own code at 1 MB, with NX -- and die on the CR3 switch. Give it
+       a RAM framebuffer instead (EfiReservedMemoryType: the kernel's page
+       allocator never hands it out). Nothing scans it out until the
+       virtio-gpu driver takes over the display. */
+    if (gop->Mode->Info->PixelFormat == PixelBltOnly || gop->Mode->FrameBufferBase == 0) {
+        UINTN fbPages = (UINTN)(((UINT64)info->fb_pitch * info->fb_height + 4095) / 4096);
+        EFI_PHYSICAL_ADDRESS fbAddr = 0;
+        status = gBS->AllocatePages(AllocateAnyPages, EfiReservedMemoryType, fbPages, &fbAddr);
+        if (EFI_IS_ERROR(status)) {
+            Print(L"  ERROR: BLT-only GOP and no memory for a framebuffer\r\n");
+            return status;
+        }
+        UINT8 *p = (UINT8 *)(UINTN)fbAddr;
+        for (UINTN k = 0; k < fbPages * 4096; k++) p[k] = 0;
+        info->fb_addr = fbAddr;
+        info->fb_format = 1; /* BGR, like every virtio-gpu 2D format we use */
+        Print(L"  GOP is BLT-only: using a RAM framebuffer\r\n");
     }
 
     /* Print selected resolution */

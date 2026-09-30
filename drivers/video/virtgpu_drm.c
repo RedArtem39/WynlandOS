@@ -972,6 +972,7 @@ static DrmFb *fb_find(uint32_t id)
 /* Put the kernel's own framebuffer (resource 1) back on screen. */
 static void kms_restore_console(void)
 {
+    dbg_num("DRM: console restored at ms=", (int64_t)timer_get_ms());
     VirtioGpuSetScanout ss;
     memset(&ss, 0, sizeof(ss));
     ss.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
@@ -1032,8 +1033,10 @@ static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t 
         ss.rhh = fb->height;
         ss.scanout_id = 0;
         ss.resource_id = bo->res_id;
-        VgpuTicket t;
-        if (!send_async(&ss, sizeof(ss), &t)) return false;
+        uint32_t rt = 0;
+        bool ok = send_sync(&ss, sizeof(ss), &rt);
+        if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) dbg_num("DRM: SET_SCANOUT failed, resp=", ok ? rt : -1);
+        if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) return false;
         g_scan_fb = fb->id;
     }
     VirtioGpuResourceFlush rf;

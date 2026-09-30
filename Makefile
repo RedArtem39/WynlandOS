@@ -434,6 +434,8 @@ run: all
 
 # 3D: virtio-gpu with virgl, rendered by the host GPU through WSLg (D3D12).
 # KVM is required: under TCG, QEMU 10.2 deadlocks in virtio-gpu-gl reset.
+# -vga none: otherwise q35 adds a second (std VGA) display, the window shows
+# that one, and everything drawn through virtio-gpu lands on a hidden tab.
 # GPU_ADAPTER picks the host adapter (default NVIDIA; e.g. GPU_ADAPTER=AMD).
 GPU_ADAPTER ?= NVIDIA
 run-gl: all
@@ -445,6 +447,7 @@ run-gl: all
 		-machine q35,accel=kvm                            \
 		-cpu host                                         \
 		-m 2048M                                          \
+		-vga none                                         \
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-gpu-gl-pci                         \
