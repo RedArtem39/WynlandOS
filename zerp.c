@@ -195,23 +195,29 @@ static void outbox_remove(ClientSlot *c, uint32_t k) {
 }
 
 /* Outbox full (the client hasn't read in a long time): free one slot,
-   losing as little as possible -- the oldest mouse message first (only
-   its position is lost: the next one carries the button state), then a
-   TILE_RECT superseded by a newer one. Key events and the newest
-   TILE_RECT are never evicted; if nothing else is left, returns 0. */
+   losing as little as possible. A mouse message may go only if the next
+   queued mouse message has the SAME button mask -- then only a position
+   is lost, never a press or release (dropping a press followed by its
+   release would lose the click). Otherwise a TILE_RECT superseded by a
+   newer one. Key events and the newest TILE_RECT are never evicted; if
+   nothing qualifies, returns 0. */
 static int outbox_evict(ClientSlot *c) {
-    /* A queued message is superseded if a later one of the same type
-       follows it (mouse: carries the newer button mask; TILE_RECT: the
-       newer tile). Mouse first. */
-    static const uint32_t order[2] = { ZERP_MSG_INPUT_MOUSE, ZERP_MSG_TILE_RECT };
-    for (int t = 0; t < 2; t++) {
-        for (uint32_t k = 0; k < c->out_count; k++) {
-            if (outbox_at(c, k)->type != order[t]) continue;
-            for (uint32_t l = k + 1; l < c->out_count; l++) {
-                if (outbox_at(c, l)->type == order[t]) { outbox_remove(c, k); return 1; }
-            }
-            break; /* the oldest of this type has no successor: none do */
+    for (uint32_t k = 0; k < c->out_count; k++) {
+        ZerpMsg *a = outbox_at(c, k);
+        if (a->type != ZERP_MSG_INPUT_MOUSE) continue;
+        for (uint32_t l = k + 1; l < c->out_count; l++) {
+            ZerpMsg *b = outbox_at(c, l);
+            if (b->type != ZERP_MSG_INPUT_MOUSE) continue;
+            if (b->w == a->w) { outbox_remove(c, k); return 1; }
+            break;
         }
+    }
+    for (uint32_t k = 0; k < c->out_count; k++) {
+        if (outbox_at(c, k)->type != ZERP_MSG_TILE_RECT) continue;
+        for (uint32_t l = k + 1; l < c->out_count; l++) {
+            if (outbox_at(c, l)->type == ZERP_MSG_TILE_RECT) { outbox_remove(c, k); return 1; }
+        }
+        break; /* the oldest TILE_RECT has no successor: none do */
     }
     return 0;
 }
@@ -248,7 +254,9 @@ static void client_send(ClientSlot *c, const ZerpMsg *m) { client_send_ex(c, m, 
 
 /* One scancode, E0-prefixed or not, queued all-or-nothing so the prefix
    can never be separated from its code. If a wedged client's outbox has
-   no room even after eviction, the key is dropped as a unit. */
+   no room even after eviction, the key is dropped as a unit -- which can
+   still split a make from its break (a stuck key in that client). That is
+   accepted: it takes 128 queued key events the client never read. */
 static void client_send_key(ClientSlot *c, int e0, uint8_t sc) {
     uint32_t need = e0 ? 2 : 1;
     while (ZERP_OUTBOX - c->out_count < need) {
@@ -503,15 +511,20 @@ static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int motion, i
     }
     if (g_client_count > 0 && g_clients[*focused].alive) {
         ClientSlot *c = &g_clients[*focused];
-        /* Clamp into the tile: the pointer can be outside it (dragged out
-           under the grab, or over a gap), and the unsigned wire fields
-           would turn "left of the tile" into a huge x. */
-        int32_t rx = mx - (int32_t)c->tile_x;
-        int32_t ry = my - (int32_t)c->tile_y;
+        /* Relative to the CONTENT rect -- the area the client actually
+           renders (its SHM buffer), what TILE_RECT told it -- not to the
+           tile, whose gap and titlebar belong to the compositor. Clamped
+           into it: the pointer can be outside (dragged out under the grab,
+           over the titlebar or a gap), and the unsigned wire fields would
+           turn "left of it" into a huge x. */
+        uint32_t cx, cy, cw, ch;
+        content_rect(c, &cx, &cy, &cw, &ch);
+        int32_t rx = mx - (int32_t)cx;
+        int32_t ry = my - (int32_t)cy;
         if (rx < 0) rx = 0;
         if (ry < 0) ry = 0;
-        if (c->tile_w > 0 && rx >= (int32_t)c->tile_w) rx = (int32_t)c->tile_w - 1;
-        if (c->tile_h > 0 && ry >= (int32_t)c->tile_h) ry = (int32_t)c->tile_h - 1;
+        if (cw > 0 && rx >= (int32_t)cw) rx = (int32_t)cw - 1;
+        if (ch > 0 && ry >= (int32_t)ch) ry = (int32_t)ch - 1;
         ZerpMsg mmsg;
         mmsg.type = ZERP_MSG_INPUT_MOUSE;
         mmsg.x = (uint32_t)rx;

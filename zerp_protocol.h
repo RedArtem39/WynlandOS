@@ -19,7 +19,7 @@
 /* compositor -> client (over the client's s2c pipe) */
 #define ZERP_MSG_TILE_RECT   3   /* x,y,w,h = this client's newly (re)assigned screen tile */
 #define ZERP_MSG_INPUT_KEY   4   /* x = scancode, rest unused */
-#define ZERP_MSG_INPUT_MOUSE 5   /* x,y = position within the client's tile, w = buttons mask */
+#define ZERP_MSG_INPUT_MOUSE 5   /* x,y = position within the client's content rect (the TILE_RECT area it renders), clamped into it; w = buttons mask */
 
 typedef struct {
     uint32_t type;

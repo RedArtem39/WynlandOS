@@ -101,6 +101,7 @@ static VirtioGpuCtrlResponse          resp_transfer;
 
 static VirtioGpuResourceFlush    cmd_flush;
 static VirtioGpuCtrlResponse          resp_flush;
+static void flush_resolve_phys(void);
 
 /* MMIO Register Access Helpers */
 static inline void mmio_write8(uint32_t offset, uint8_t val) {
@@ -830,6 +831,7 @@ bool virtio_gpu_init(void)
         PageTable *pml4 = vmm_get_current_pml4();
         for (uint32_t i = 0; i < VQ_MAX_SIZE; i++)
             cursor_slot_phys[i] = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cursor_slots[i].cmd);
+        flush_resolve_phys();
     }
 
     /* 4. Set DRIVER_OK preserving FEATURES_OK */
@@ -1043,7 +1045,17 @@ static void flush_remember_dropped(uint32_t x, uint32_t y, uint32_t w, uint32_t 
 #define FLUSH_TIMEOUT_MS  20
 #define FLUSH_SPIN_LIMIT  2000000 /* fallback until the TSC is calibrated */
 static uint64_t tsc_per_ms = 0;
-static uint64_t tsc_last_tick = 0;
+/* Calibration window: TSC and timer_ms at its start. Rate = cycles per
+   elapsed ms over >= TSC_CAL_WINDOW_MS, so late/bunched ticks cancel out
+   (a per-tick minimum only ever drifted DOWN on jitter). Ticks LOST during
+   long interrupts-off stretches make a window read high, i.e. a longer
+   timeout -- the safe direction; the smallest of the last few windows is
+   used to shed those. */
+#define TSC_CAL_WINDOW_MS 100
+#define TSC_CAL_KEEP      4
+static uint64_t tsc_win_start = 0, tsc_win_ms = 0;
+static uint64_t tsc_win_rate[TSC_CAL_KEEP];
+static uint32_t tsc_win_n = 0;
 
 static inline uint64_t rdtsc(void)
 {
@@ -1051,6 +1063,10 @@ static inline uint64_t rdtsc(void)
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
+
+/* Set when a timed-out flush was collected from the tick (IRQ context,
+   where we don't log); the next virtio_gpu_flush() reports it. */
+static bool flush_resumed_unlogged = false;
 
 /* Collect an in-flight flush if the host has finished it. Returns false
    while it's still pending. flush_busy must be held. */
@@ -1064,9 +1080,25 @@ static bool flush_reclaim(void)
     if (flush_timed_out) {
         flush_timed_out = false;
         flush_stuck_drops = 0;
-        log_str("VIRTIO-GPU: stuck flush completed, resuming\r\n");
+        flush_resumed_unlogged = true;
     }
     return true;
+}
+
+/* Physical addresses of the static flush buffers, resolved once (by the
+   first flush, always from syscall/kernel context, before the tick can
+   submit anything) so flush_submit() never walks page tables from the
+   timer IRQ on top of whatever process is current. */
+static uint64_t phys_cmd_transfer, phys_resp_transfer, phys_cmd_flush, phys_resp_flush;
+
+static void flush_resolve_phys(void)
+{
+    if (phys_cmd_transfer) return;
+    PageTable *pml4 = vmm_get_current_pml4();
+    phys_cmd_transfer  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_transfer);
+    phys_resp_transfer = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&resp_transfer);
+    phys_cmd_flush     = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_flush);
+    phys_resp_flush    = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&resp_flush);
 }
 
 /* Fold the dropped area into (x, y, w, h). */
@@ -1118,24 +1150,24 @@ static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
         }
     }
 
-    PageTable *pml4 = vmm_get_current_pml4();
+    flush_resolve_phys();
 
-    ctrl_q.desc[d[0]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_transfer);
+    ctrl_q.desc[d[0]].addr  = phys_cmd_transfer;
     ctrl_q.desc[d[0]].len   = sizeof(cmd_transfer);
     ctrl_q.desc[d[0]].flags = VIRTQ_DESC_F_NEXT;
     ctrl_q.desc[d[0]].next  = d[1];
 
-    ctrl_q.desc[d[1]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&resp_transfer);
+    ctrl_q.desc[d[1]].addr  = phys_resp_transfer;
     ctrl_q.desc[d[1]].len   = sizeof(resp_transfer);
     ctrl_q.desc[d[1]].flags = VIRTQ_DESC_F_WRITE;
     ctrl_q.desc[d[1]].next  = 0;
 
-    ctrl_q.desc[d[2]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&cmd_flush);
+    ctrl_q.desc[d[2]].addr  = phys_cmd_flush;
     ctrl_q.desc[d[2]].len   = sizeof(cmd_flush);
     ctrl_q.desc[d[2]].flags = VIRTQ_DESC_F_NEXT;
     ctrl_q.desc[d[2]].next  = d[3];
 
-    ctrl_q.desc[d[3]].addr  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)&resp_flush);
+    ctrl_q.desc[d[3]].addr  = phys_resp_flush;
     ctrl_q.desc[d[3]].len   = sizeof(resp_flush);
     ctrl_q.desc[d[3]].flags = VIRTQ_DESC_F_WRITE;
     ctrl_q.desc[d[3]].next  = 0;
@@ -1152,6 +1184,21 @@ static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 
     *target = (uint16_t)(ctrl_q.last_used + 2);
     return true;
+}
+
+/* Spin (interrupts are off in syscall context) until the control queue's
+   used index reaches `target` or FLUSH_TIMEOUT_MS pass. */
+static void flush_wait_used(uint16_t target)
+{
+    if (tsc_per_ms) {
+        uint64_t limit = tsc_per_ms * FLUSH_TIMEOUT_MS;
+        uint64_t t0 = rdtsc();
+        while ((int16_t)(VQ_USED_IDX(ctrl_q) - target) < 0 && rdtsc() - t0 < limit)
+            __asm__ volatile("pause" ::: "memory");
+    } else {
+        for (uint32_t i = 0; i < FLUSH_SPIN_LIMIT && (int16_t)(VQ_USED_IDX(ctrl_q) - target) < 0; i++)
+            __asm__ volatile("pause" ::: "memory");
+    }
 }
 
 static void flush_mark_inflight(const uint16_t d[4], uint16_t target, bool timed_out)
@@ -1179,6 +1226,12 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
         sched_yield();
     }
 
+    /* An async flush from the tick is normally done within a few ms:
+       wait it out (same budget as our own wait) rather than drop a frame.
+       After a real timeout the host is known-stuck -- don't wait again. */
+    if (flush_inflight && !flush_timed_out) {
+        flush_wait_used(flush_inflight_target);
+    }
     if (!flush_reclaim()) {
         /* host still busy with an earlier flush: drop this frame, its
            area goes out with the next flush or tick */
@@ -1190,6 +1243,11 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
         return;
     }
 
+    if (flush_resumed_unlogged) {
+        flush_resumed_unlogged = false;
+        log_str("VIRTIO-GPU: stuck flush completed, resuming\r\n");
+    }
+
     flush_take_dropped(&x, &y, &w, &h);
 
     uint16_t d[4], target;
@@ -1199,15 +1257,7 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
         return;
     }
 
-    if (tsc_per_ms) {
-        uint64_t limit = tsc_per_ms * FLUSH_TIMEOUT_MS;
-        uint64_t t0 = rdtsc();
-        while (VQ_USED_IDX(ctrl_q) != target && rdtsc() - t0 < limit)
-            __asm__ volatile("pause" ::: "memory");
-    } else {
-        for (uint32_t i = 0; i < FLUSH_SPIN_LIMIT && VQ_USED_IDX(ctrl_q) != target; i++)
-            __asm__ volatile("pause" ::: "memory");
-    }
+    flush_wait_used(target);
     if (VQ_USED_IDX(ctrl_q) != target) {
         log_str("VIRTIO-GPU: flush timeout!\r\n");
         flush_mark_inflight(d, target, true);
@@ -1254,9 +1304,8 @@ void virtio_gpu_set_cursor_shape(uint32_t shape)
 }
 
 /* Timer IRQ hook (1 kHz):
-   - calibrates the TSC against the tick (for virtio_gpu_flush()'s
-     time-based timeout; the smallest gap seen is the true 1 ms, longer
-     ones are ticks delayed by interrupts-off stretches);
+   - calibrates the TSC against the 1 kHz clock over 100 ms windows
+     (for virtio_gpu_flush()'s time-based timeout);
    - resends the latest cursor state if the cursor queue was full when
      the mouse IRQ tried to send it;
    - collects a finished in-flight flush and pushes out any area dropped
@@ -1266,12 +1315,22 @@ void virtio_gpu_tick(void)
 {
     if (!initialized) return;
 
-    uint64_t now = rdtsc();
-    if (tsc_last_tick) {
-        uint64_t delta = now - tsc_last_tick;
-        if (delta > 1000 && (tsc_per_ms == 0 || delta < tsc_per_ms)) tsc_per_ms = delta;
+    {
+        extern uint64_t timer_get_ms(void);
+        uint64_t now = rdtsc(), ms = timer_get_ms();
+        if (tsc_win_start == 0) {
+            tsc_win_start = now; tsc_win_ms = ms;
+        } else if (ms - tsc_win_ms >= TSC_CAL_WINDOW_MS) {
+            tsc_win_rate[tsc_win_n % TSC_CAL_KEEP] = (now - tsc_win_start) / (ms - tsc_win_ms);
+            tsc_win_n++;
+            uint32_t have = tsc_win_n < TSC_CAL_KEEP ? tsc_win_n : TSC_CAL_KEEP;
+            uint64_t best = tsc_win_rate[0];
+            for (uint32_t i = 1; i < have; i++)
+                if (tsc_win_rate[i] < best) best = tsc_win_rate[i];
+            tsc_per_ms = best;
+            tsc_win_start = now; tsc_win_ms = ms;
+        }
     }
-    tsc_last_tick = now;
 
     if (cursor_pending) {
         uint64_t fl = irq_save();
