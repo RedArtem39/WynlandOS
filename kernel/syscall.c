@@ -366,6 +366,77 @@ extern void kfree(void *ptr);
    unchanged; only helpers declared outside syscall_dispatcher (like
    get_free_fd()) need the table passed in explicitly. */
 
+/* ---- process lifecycle helpers (wait4/waitid/kill/exit_group) ---- */
+
+/* Set by the clone() process path right before it runs the fork code for a
+   vfork (CLONE_VM|CLONE_VFORK); consumed there. Syscalls run with
+   interrupts off on one CPU, so nothing can observe it in between. */
+static bool g_fork_share_mm = false;
+
+#define LNX_ECHILD 10
+#define LNX_EINTR  4
+#define LNX_ESRCH  3
+#define LNX_EPERM  1
+#define LNX_EINVAL 22
+
+/* Does child `c` of `caller` match a wait4()-style pid selector? */
+static bool wait_matches(Process *caller, Process *c, int64_t pid)
+{
+    if (c->ppid != caller->pid || c->reaped || c == caller) return false;
+    if (pid > 0)   return c->pid == (uint64_t)pid;
+    if (pid == -1) return true;
+    if (pid == 0)  return c->pgid == caller->pgid;
+    return c->pgid == (uint64_t)(-pid);
+}
+
+/* Find (and unless !consume, reap) an exited child matching `pid`.
+   Returns its pid, 0 for WNOHANG-and-none-yet, or -errno. Sleeps on the
+   caller's child_wq otherwise; a deliverable signal interrupts (-EINTR). */
+static int64_t do_wait(int64_t pid, bool nohang, bool consume, Process **found)
+{
+    extern uint64_t timer_get_ms(void);
+    Process *caller = sched_current()->proc;
+    for (;;) {
+        bool have_child = false;
+        for (Process *c = process_list_head(); c; c = c->next) {
+            if (!wait_matches(caller, c, pid)) continue;
+            have_child = true;
+            if (c->exited) {
+                if (consume) c->reaped = true;
+                *found = c;
+                return (int64_t)c->pid;
+            }
+        }
+        if (!have_child) return -LNX_ECHILD;
+        if (nohang) return 0;
+        Thread *t = sched_current();
+        if (t->sig_pending & ~t->sig_mask) return -LNX_EINTR;
+        /* short slices: a wake can race the scan above */
+        waitqueue_wait_ms(&caller->child_wq, timer_get_ms() + 50);
+    }
+}
+
+/* May the caller signal `p`? root, or same uid (the real-uid rule). */
+static bool may_signal(Process *p)
+{
+    Process *me = sched_current()->proc;
+    return me->uid == 0 || me->uid == p->uid;
+}
+
+/* Deliver `sig` to process `p` (its main thread); sig 0 = existence
+   check only. A sleeping target is woken so the signal is seen promptly. */
+static int64_t signal_process(Process *p, int sig)
+{
+    if (p->pid == 0) return -LNX_EPERM;
+    if (!may_signal(p)) return -LNX_EPERM;
+    if (sig == 0 || p->exited) return 0; /* zombies exist until reaped */
+    Thread *t = p->main_thread;
+    if (!t || t->state == THREAD_STATE_TERMINATED) return 0;
+    signal_raise_thread(t->id, p->pid, sig);
+    if (t->state == THREAD_STATE_BLOCKED) sched_unblock(t, -LNX_EINTR);
+    return 0;
+}
+
 /* Unmap one user page and drop what the mapping owned: a private frame is
    freed; a shared one (PAGE_SHARED_MAP: fb0, SHM, DRM BO) is left to its
    owner, except that a mapping holding its own reference
@@ -914,7 +985,9 @@ void process_teardown(Process *proc) {
        every leaf frame and private page-table page this process owns,
        then the PML4 root itself. Never touches the shared kernel/RAM/
        framebuffer identity map every process's PML4 aliases by pointer. */
-    if (proc->pml4) {
+    if (proc->pml4 && proc->vfork_shared) {
+        proc->pml4 = NULL; /* the parent's, borrowed by a vfork child */
+    } else if (proc->pml4) {
         vmm_destroy_process_pml4(proc->pml4);
         proc->pml4 = NULL;
     }
@@ -1989,9 +2062,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    lost (the parent then sees success and a child that
                    exits with 127). */
                 if ((a1 & 0x00100000) && a3 && !user_prepare_write(a3, sizeof(int))) return (uint64_t)-14;
+                /* CLONE_VM|CLONE_VFORK (vfork(), glibc's posix_spawn): a
+                   real vfork -- the child runs in OUR address space, so what
+                   it writes (posix_spawn's exec error code) is what we read,
+                   and we sleep until it execve()s or exits. Plain CLONE_VM
+                   without VFORK stays a copy. */
+                bool vfork_mode = (a1 & 0x00000100) && (a1 & 0x00004000);
                 uint64_t saved_rsp = regs->rsp;
                 if (a2) regs->rsp = a2;           /* child runs on the given stack */
+                g_fork_share_mm = vfork_mode;
                 uint64_t cpid = syscall_dispatcher(57, 0, 0, 0, 0, 0, regs);
+                g_fork_share_mm = false;
                 regs->rsp = saved_rsp;
                 if ((int64_t)cpid < 0) return cpid;
                 Process *cp = process_find_by_pid(cpid);
@@ -2002,10 +2083,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if (a1 & 0x00200000) ct->clear_tid = (uint32_t *)a4;             /* CLONE_CHILD_CLEARTID */
                     if ((a1 & 0x00100000) && a3) *(int *)(uintptr_t)a3 = (int)ctidv; /* CLONE_PARENT_SETTID */
                 }
+                if (vfork_mode && cp) {
+                    extern uint64_t timer_get_ms(void);
+                    while (!cp->vfork_released)
+                        waitqueue_wait_ms(&cp->vfork_wq, timer_get_ms() + 20);
+                }
                 return cpid;
             }
             {
-                bool want_parent_tid = (a1 & 0x00000100) != 0; // CLONE_PARENT_SETTID
+                bool want_parent_tid = (a1 & 0x00100000) != 0; // CLONE_PARENT_SETTID (0x100 is CLONE_VM)
                 bool want_child_tid  = (a1 & 0x01000000) != 0; // CLONE_CHILD_SETTID
                 /* Validate BEFORE creating the thread -- a bad ptid/ctid
                    pointer should fail the whole clone(), not leave an
@@ -2042,7 +2128,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (want_child_tid && a4) {
                     *(int *)(uintptr_t)a4 = (int)t->id;
                 }
-                if (a1 & 0x00080000) { // CLONE_CHILD_CLEARTID
+                if (a1 & 0x00200000) { // CLONE_CHILD_CLEARTID (0x80000 is CLONE_SETTLS)
                     /* Phase 22a: on this thread's death the kernel must zero
                        this word and futex-wake it. musl's thread-list lock is
                        cloned with ctid = &__thread_list_lock precisely so a
@@ -2072,10 +2158,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    entire address space at every fork() call. */
                 Process *parent = sched_current()->proc;
 
-                PageTable *child_pml4 = vmm_new_process_pml4();
+                /* vfork: the child borrows the parent's address space as-is
+                   (no copy, no COW) -- see Process.vfork_shared. */
+                bool share_mm = g_fork_share_mm;
+                g_fork_share_mm = false;
+                PageTable *child_pml4 = share_mm ? parent->pml4 : vmm_new_process_pml4();
                 if (!child_pml4) return (uint64_t)-12; /* -ENOMEM */
 
-                if (!vmm_cow_clone_user_pages(parent->pml4, child_pml4)) {
+                if (!share_mm && !vmm_cow_clone_user_pages(parent->pml4, child_pml4)) {
                     /* Unwinds whatever pages THIS call managed to
                        COW-share before hitting OOM (each was refcounted
                        on both sides -- freeing here drops the child's
@@ -2090,11 +2180,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 Process *child = process_create(child_pml4);
                 if (!child) {
-                    vmm_destroy_process_pml4(child_pml4);
+                    if (!share_mm) vmm_destroy_process_pml4(child_pml4);
                     return (uint64_t)-12; /* -ENOMEM */
                 }
                 child->uid = parent->uid;
                 child->ppid = parent->pid;
+                child->pgid = parent->pgid;
+                child->sid = parent->sid;
+                child->vfork_shared = share_mm;
+                child->vfork_released = !share_mm;
+                /* signal dispositions are inherited across fork() */
+                memcpy(child->sig_acts, parent->sig_acts, sizeof(parent->sig_acts));
                 /* Heap pages themselves were already deep-copied/COW-shared
                    by vmm_cow_clone_user_pages() above (they're ordinary
                    PAGE_USER leaves in that range, same as any other); this
@@ -2193,6 +2289,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    stale/overlapping records for mprotect()/munmap() to trip
                    over later. */
                 Process *exec_proc = sched_current()->proc;
+                /* A vfork child is still running in its PARENT's address
+                   space: don't touch a single page of it. It gets a fresh
+                   one of its own below, after the target check. */
+                bool exec_vfork = exec_proc->vfork_shared;
                 for (VMA *v = exec_proc->vma_list; v; ) {
                     VMA *next_v = v->next;
                     kfree(v);
@@ -2206,7 +2306,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    physical frames -- reset the metadata AND actually give
                    the frames back, or every execve() would leak the exiting
                    image's entire heap forever. */
-                for (uint64_t a = exec_proc->brk_start; a < exec_proc->brk_current; a += PAGE_SIZE) {
+                for (uint64_t a = exec_proc->brk_start; !exec_vfork && a < exec_proc->brk_current; a += PAGE_SIZE) {
                     uint64_t phys = vmm_get_phys(pml4, a);
                     if (phys) {
                         vmm_unmap_page(pml4, a);
@@ -2239,15 +2339,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    (e.g. exec of the same binary: its read-only text sits
                    exactly where the new text goes) made that write fault in
                    the kernel. argv/envp/path are already in kernel buffers. */
-                vmm_free_user_mappings(pml4);
-                __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+                if (exec_vfork) {
+                    PageTable *own = vmm_new_process_pml4();
+                    if (!own) {
+                        for (int k = 0; k < argc_e; k++) kfree(argv_bufs_e[k]);
+                        for (int k = 0; k < envc_e; k++) kfree(envp_bufs_e[k]);
+                        return (uint64_t)-12; /* -ENOMEM, parent's memory untouched */
+                    }
+                    exec_proc->pml4 = own;
+                    exec_proc->vfork_shared = false;
+                    pml4 = own;
+                    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)own) : "memory");
+                    /* the parent may run again: we no longer use its memory */
+                    exec_proc->vfork_released = true;
+                    waitqueue_wake_all(&exec_proc->vfork_wq);
+                } else {
+                    vmm_free_user_mappings(pml4);
+                    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+                }
                 /* Like Linux's exec: the clear-tid word lived in the old image */
                 sched_current()->clear_tid = NULL;
-                /* ...and the new image starts from a clean FPU/SSE state */
-                {
-                    uint32_t mxcsr = 0x1F80;
-                    __asm__ volatile("fninit; ldmxcsr %0" :: "m"(mxcsr));
-                }
+                /* ...and the new image starts from a clean FPU/SSE state (the
+                   syscall exit path FXRSTORs this image) */
+                thread_fx_default(thread_fx_user(sched_current()));
 
                 bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4,
                                           have_argv_e ? kargv_e : NULL, have_envp_e ? kenvp_e : NULL, exec_proc);
@@ -2291,6 +2405,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             }
 
         case 60: // SYS_exit (Linux standard)
+            /* This OS's model: the main thread's exit is the process's
+               exit, so remember the code for its wait status. */
+            if (proc->main_thread == sched_current()) proc->exit_code = (int)a1;
             thread_exit();
             return 0;
 
@@ -2316,9 +2433,29 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return (uint64_t)-1;
             }
 
-        case 231: // SYS_exit_group (Linux standard)
-            thread_exit();
-            return 0;
+        case 231: // SYS_exit_group (Linux standard) -- the whole process
+            {
+                proc->exit_code = (int)a1;
+                /* Every other thread of the process dies too: SIGKILL
+                   pending + woken if asleep; the syscall-return path or the
+                   timer (for one running user code) terminates it. It used
+                   to end only the calling thread, so glibc's exit() from a
+                   helper thread left the rest of the program running. */
+                extern Thread *sched_get_thread_list(void);
+                Thread *start = sched_get_thread_list(), *it = start;
+                int guard = 0;
+                if (it) do {
+                    if (it->proc == proc && it != sched_current() &&
+                        it->state != THREAD_STATE_TERMINATED) {
+                        it->sig_pending |= 1ULL << 9;
+                        if (it->state == THREAD_STATE_BLOCKED) sched_unblock(it, -LNX_EINTR);
+                    }
+                    it = it->next;
+                } while (it != start && ++guard < 100000);
+                process_mark_exited(proc, ((int)a1 & 0xFF) << 8);
+                thread_exit();
+                return 0;
+            }
 
         case 202: // SYS_futex -- Phase 22a: REAL sleep/wake queues. The old
                    // EAGAIN+yield approximation is gone: FUTEX_WAIT now
@@ -2950,16 +3087,36 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 97: // SYS_getrlimit (Linux standard) — stub
         case 302: // SYS_prlimit64
             {
-                /* Return generous defaults for RLIMIT queries */
+                /* prlimit64(pid, resource, new, old): report the limits this
+                   kernel really has. It used to answer 1 MB for EVERY
+                   resource, so RLIMIT_NOFILE said 1048576 while the fd table
+                   holds MAX_OPEN_FILES -- programs that close "all" fds or
+                   size tables by it did a million times too much work.
+                   Setting limits is accepted but not enforced. */
                 struct rlimit64 {
                     uint64_t rlim_cur;
                     uint64_t rlim_max;
                 };
-                if (num == 302 && a3) {
-                    if (!user_prepare_write(a3, sizeof(struct rlimit64))) return (uint64_t)-14; /* -EFAULT */
-                    struct rlimit64 *out = (struct rlimit64 *)a3;
-                    out->rlim_cur = 0x100000; /* 1 MB stack */
-                    out->rlim_max = 0x100000;
+                const uint64_t INF = ~0ULL;
+                /* getrlimit(resource, old) vs prlimit64(pid, resource, new, old) */
+                int      res  = (num == 97) ? (int)a1 : (int)a2;
+                uint64_t newp = (num == 97) ? 0 : a3;
+                uint64_t oldp = (num == 97) ? a2 : a4;
+                if (res < 0 || res >= 16) return (uint64_t)-22; /* -EINVAL */
+                if (newp) {
+                    struct rlimit64 ignored;
+                    if (copy_from_user(&ignored, (const void *)newp, sizeof(ignored)) != 0)
+                        return (uint64_t)-14;
+                }
+                if (oldp) {
+                    if (!user_prepare_write(oldp, sizeof(struct rlimit64))) return (uint64_t)-14; /* -EFAULT */
+                    struct rlimit64 *out = (struct rlimit64 *)oldp;
+                    switch (res) {
+                    case 3:  out->rlim_cur = 8ULL << 20; out->rlim_max = INF; break;      /* RLIMIT_STACK */
+                    case 7:  out->rlim_cur = out->rlim_max = MAX_OPEN_FILES; break;       /* RLIMIT_NOFILE */
+                    case 4:  out->rlim_cur = 0; out->rlim_max = INF; break;               /* RLIMIT_CORE */
+                    default: out->rlim_cur = out->rlim_max = INF; break;
+                    }
                 }
                 return 0;
             }
@@ -2972,6 +3129,126 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                No separate GID model -- gid mirrors uid, matching the
                convention that root (uid 0) is also "group 0". */
             return sched_current()->proc->uid;
+
+        case 61: // SYS_wait4(pid, int *wstatus, options, struct rusage *)
+            {
+                int options = (int)a3;
+                if (options & ~(1 | 2 | 8 | 0x20000000 | 0x40000000 | (int)0x80000000)) return (uint64_t)-LNX_EINVAL;
+                if (a2 && !user_prepare_write(a2, sizeof(int))) return (uint64_t)-14;
+                if (a4 && !user_prepare_write(a4, 144)) return (uint64_t)-14;
+                Process *c = NULL;
+                int64_t r = do_wait((int64_t)a1, (options & 1) /* WNOHANG */, true, &c);
+                if (r > 0) {
+                    if (a2) *(int *)(uintptr_t)a2 = c->wait_status;
+                    if (a4) memset((void *)(uintptr_t)a4, 0, 144); /* no resource accounting */
+                }
+                return (uint64_t)r;
+            }
+
+        case 247: // SYS_waitid(idtype, id, siginfo_t *, options, struct rusage *)
+            {
+                int options = (int)a4;
+                if (!(options & (4 | 2 | 8))) return (uint64_t)-LNX_EINVAL; /* WEXITED|WSTOPPED|WCONTINUED */
+                int64_t pid;
+                if (a1 == 0)      pid = -1;                                   /* P_ALL */
+                else if (a1 == 1) { if ((int64_t)a2 <= 0) return (uint64_t)-LNX_EINVAL; pid = (int64_t)a2; } /* P_PID */
+                else if (a1 == 2) pid = a2 ? -(int64_t)a2 : 0;              /* P_PGID */
+                else return (uint64_t)-LNX_EINVAL;                            /* P_PIDFD: not supported */
+                if (a3 && !user_prepare_write(a3, 128)) return (uint64_t)-14;
+                if (a5 && !user_prepare_write(a5, 144)) return (uint64_t)-14;
+                if (!(options & 4)) {
+                    /* only stopped/continued children asked for: none ever are */
+                    Process *dummy = NULL;
+                    int64_t any = do_wait(pid, true, false, &dummy);
+                    if (any < 0) return (uint64_t)any;
+                    if (a3) memset((void *)(uintptr_t)a3, 0, 128);
+                    return 0;
+                }
+                Process *c = NULL;
+                int64_t r = do_wait(pid, (options & 1) /* WNOHANG */,
+                                    !(options & 0x01000000) /* WNOWAIT */, &c);
+                if (r < 0) return (uint64_t)r;
+                if (a3) {
+                    int32_t *si = (int32_t *)(uintptr_t)a3;
+                    memset(si, 0, 128);
+                    if (r > 0) {
+                        bool killed = (c->wait_status & 0x7F) != 0;
+                        si[0] = 17;                                   /* si_signo = SIGCHLD */
+                        si[2] = killed ? 2 : 1;                       /* si_code: CLD_KILLED / CLD_EXITED */
+                        si[4] = (int32_t)c->pid;                      /* si_pid */
+                        si[5] = (int32_t)c->uid;                      /* si_uid */
+                        si[6] = killed ? (c->wait_status & 0x7F)      /* si_status */
+                                       : ((c->wait_status >> 8) & 0xFF);
+                    }
+                }
+                if (a5) memset((void *)(uintptr_t)a5, 0, 144);
+                return 0;
+            }
+
+        case 62: // SYS_kill(pid, sig)
+            {
+                int64_t pid = (int64_t)a1;
+                int sig = (int)a2;
+                if (sig < 0 || sig > 64) return (uint64_t)-LNX_EINVAL;
+                if (pid > 0) {
+                    Process *p = process_find_by_pid((uint64_t)pid);
+                    if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
+                    return (uint64_t)signal_process(p, sig);
+                }
+                /* groups (0: ours, < -1: -pid) and -1 (everyone we may
+                   signal except init-ish pid 0/1 and ourselves) */
+                uint64_t grp = pid == 0 ? proc->pgid : (uint64_t)(-pid);
+                bool any = false, perm = false;
+                for (Process *p = process_list_head(); p; p = p->next) {
+                    if (p->pid == 0 || p->reaped) continue;
+                    if (pid == -1) {
+                        if (p->pid == 1 || p == proc) continue;
+                    } else if (p->pgid != grp) {
+                        continue;
+                    }
+                    any = true;
+                    if (signal_process(p, sig) == 0) perm = true;
+                }
+                if (!any) return (uint64_t)-LNX_ESRCH;
+                return perm ? 0 : (uint64_t)-LNX_EPERM;
+            }
+
+        case 109: // SYS_setpgid(pid, pgid)
+            {
+                Process *p = a1 ? process_find_by_pid(a1) : proc;
+                if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
+                if (p != proc && p->ppid != proc->pid) return (uint64_t)-LNX_ESRCH; /* self or a child */
+                if ((int64_t)a2 < 0) return (uint64_t)-LNX_EINVAL;
+                if (p->sid != proc->sid) return (uint64_t)-LNX_EPERM;
+                if (p->pid == p->sid) return (uint64_t)-LNX_EPERM;                 /* session leader */
+                p->pgid = a2 ? a2 : p->pid;
+                return 0;
+            }
+
+        case 121: // SYS_getpgid(pid)
+            {
+                Process *p = a1 ? process_find_by_pid(a1) : proc;
+                if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
+                return p->pgid;
+            }
+
+        case 111: // SYS_getpgrp
+            return proc->pgid;
+
+        case 112: // SYS_setsid
+            if (proc->pgid == proc->pid) return (uint64_t)-LNX_EPERM; /* already a group leader */
+            proc->sid = proc->pgid = proc->pid;
+            return proc->sid;
+
+        case 124: // SYS_getsid(pid)
+            {
+                Process *p = a1 ? process_find_by_pid(a1) : proc;
+                if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
+                return p->sid;
+            }
+
+        case 58: // SYS_vfork: clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
+            return syscall_dispatcher(56, 0x00000100 | 0x00004000 | 17, 0, 0, 0, 0, regs);
 
         case 110: // SYS_getppid
             return sched_current()->proc->ppid;
@@ -4099,6 +4376,33 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         sched_sleep_ms(end_ms - timer_get_ms());
                     }
                 }
+                return 0;
+            }
+
+        case 230: // SYS_clock_nanosleep(clockid, flags, req, rem)
+            {
+                /* glibc's nanosleep()/usleep()/sleep() all come here; it was
+                   missing, so every sleep returned at once with ENOSYS. */
+                extern uint64_t timer_get_ms(void);
+                int clk = (int)a1;
+                if (clk != 0 /* REALTIME */ && clk != 1 /* MONOTONIC */ &&
+                    clk != 7 /* BOOTTIME */ && clk != 4 /* MONOTONIC_RAW */) return (uint64_t)-22;
+                struct { int64_t tv_sec, tv_nsec; } ts;
+                if (copy_from_user(&ts, (const void *)a3, sizeof(ts)) != 0) return (uint64_t)-14;
+                if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000) return (uint64_t)-22;
+                uint64_t sec = (uint64_t)ts.tv_sec;
+                if (sec > 1000000000000ull) sec = 1000000000000ull;
+                uint64_t req_ms = sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
+                uint64_t now = timer_get_ms();
+                uint64_t end;
+                if (a2 & 1) { /* TIMER_ABSTIME: target on that clock */
+                    uint64_t clock_now = now;
+                    if (clk == 0) clock_now = rtc_get_unix_time_ms();
+                    end = req_ms > clock_now ? now + (req_ms - clock_now) : now;
+                } else {
+                    end = now + req_ms;
+                }
+                while (timer_get_ms() < end) sched_sleep_ms(end - timer_get_ms());
                 return 0;
             }
 

@@ -28,6 +28,9 @@ Process *process_create(PageTable *pml4) {
     p->main_thread = NULL;
     p->brk_start = HEAP_BASE;
     p->brk_current = HEAP_BASE;
+    /* own group and session until fork()/spawn() says otherwise */
+    p->pgid = p->pid;
+    p->sid = p->pid;
     p->next = g_process_list;
     g_process_list = p;
     return p;
@@ -43,6 +46,31 @@ void process_init(void) {
     g_kernel_process->main_thread = sched_current();
     sched_current()->proc = g_kernel_process;
     serial_write_string("Process: kernel Process 0 initialized.\r\n");
+}
+
+Process *process_list_head(void) {
+    return g_process_list;
+}
+
+void process_mark_exited(Process *p, int wait_status) {
+    if (!p || p->exited) return;
+    p->wait_status = wait_status;
+    p->exited = true;
+
+    /* a vfork parent sleeping until we exec or die */
+    if (p->vfork_shared || !p->vfork_released) {
+        p->vfork_released = true;
+        waitqueue_wake_all(&p->vfork_wq);
+    }
+
+    Process *parent = process_find_by_pid(p->ppid);
+    if (parent && !parent->exited) {
+        waitqueue_wake_all(&parent->child_wq);
+        /* SIGCHLD (17): ignored unless the parent installed a handler */
+        extern bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig);
+        if (parent->main_thread && parent->pid != 0)
+            signal_raise_thread(parent->main_thread->id, parent->pid, 17);
+    }
 }
 
 Process *process_kernel(void) {
@@ -92,6 +120,11 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        avoids. */
     p->uid = (uid == PROC_UID_INHERIT) ? sched_current()->proc->uid : uid;
     p->ppid = sched_current()->proc->pid;
+    if (sched_current()->proc->pid != 0) {
+        p->pgid = sched_current()->proc->pgid;
+        p->sid  = sched_current()->proc->sid;
+    }
+    p->vfork_released = true; /* not a vfork child */
 
     /* fd inheritance -- mirrors real execve() semantics: everything the
        caller has open carries over to the new process at the same fd
@@ -200,6 +233,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        CALLER's page tables still loaded). */
     Thread *t = thread_create_ex(user_exec_wrapper, earg, p);
     p->main_thread = t;
+    if (t) thread_fx_default(thread_fx_user(t)); /* a fresh program image */
     p->thread_count = 1;
 
     return p;

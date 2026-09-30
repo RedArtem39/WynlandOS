@@ -2,6 +2,7 @@ global syscall_entry
 extern syscall_dispatcher
 extern current_kernel_stack
 extern signal_deliver_check
+extern current_fx_user
 
 section .data
 user_stack_temp: dq 0
@@ -40,7 +41,13 @@ syscall_entry:
     push r13
     push r14
     push r15
-    
+
+    ; 2b. Save the caller's x87/SSE state: kernel C code uses SSE registers
+    ; too, and user code (glibc) relies on them surviving a syscall. RBX was
+    ; saved above and is free here; RAX (the syscall number) is untouched.
+    mov rbx, [rel current_fx_user]
+    fxsave64 [rbx]
+
     ; 3. Setup arguments for syscall_dispatcher(num, a1, a2, a3, a4, a5)
     mov r9, r8         ; a5 (User R8 -> R9)
     mov r8, r10        ; a4 (User R10 -> R8)
@@ -57,13 +64,19 @@ syscall_entry:
     ; the saved user context is popped back -- so it can patch that context
     ; in place and sysret lands straight in a signal handler. Only RDI/RBX/
     ; RAX/EFLAGS are touched here; every other register is dead anyway
-    ; (popped back from the struct below). On delivery, live RAX keeps the
-    ; dispatcher's return value -- meaningless inside a handler (Linux also
-    ; enters handlers with syscall-result garbage in RAX), documented.
+    ; (popped back from the struct below). The syscall's result goes along
+    ; as the 2nd argument: a delivered handler's frame keeps it, and
+    ; rt_sigreturn hands it back in RAX to the interrupted code.
     mov rbx, rax              ; stash syscall return value
     mov rdi, rsp              ; SyscallRegs*
+    mov rsi, rax              ; syscall result
     call signal_deliver_check
     mov rax, rbx              ; syscall result back in RAX either way
+
+    ; 3c. The user's x87/SSE state back (possibly replaced by rt_sigreturn or
+    ; reset by execve). RDI is restored from the stack below.
+    mov rdi, [rel current_fx_user]
+    fxrstor64 [rdi]
 
     ; 4. Restore all registers
     pop r15

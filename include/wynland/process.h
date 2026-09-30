@@ -11,6 +11,7 @@
  */
 #pragma once
 
+#include <wynland/waitqueue.h>
 #include <wynland/types.h>
 #include <wynland/vmm.h>
 #include <wynland/vfs.h>
@@ -85,6 +86,23 @@ typedef struct Process {
        back to brk_start for the new image. */
     uint64_t brk_start;
     uint64_t brk_current;
+    /* ---- process lifecycle: exit status, wait4/waitid, vfork ---- */
+    int        exit_code;    /* exit()/exit_group() argument, kept until death */
+    int        wait_status;  /* Linux wait status once exited: code<<8, or the
+                                terminating signal number */
+    bool       reaped;       /* already collected by wait4()/waitid() */
+    uint64_t   pgid;         /* process group */
+    uint64_t   sid;          /* session */
+    WaitQueue  child_wq;     /* this process sleeps here in wait4()/waitid();
+                                a child's death wakes it */
+    /* vfork (and clone(CLONE_VM|CLONE_VFORK), what glibc's posix_spawn uses):
+       the child runs in the PARENT's address space (pml4 is shared, not
+       copied) until it execve()s or exits; the parent sleeps on vfork_wq
+       until vfork_released. While vfork_shared, nothing may free or replace
+       this pml4 on the child's behalf. */
+    bool       vfork_shared;
+    volatile bool vfork_released;
+    WaitQueue  vfork_wq;
     struct Process *next;
 } Process;
 
@@ -94,6 +112,12 @@ typedef struct Process {
 #define PROC_UID_INHERIT ((uint32_t)-1)
 
 void      process_init(void);          /* Creates Process 0 (kernel), uid = 0 */
+/* The process died with Linux wait status `wait_status` (code<<8 for a
+   normal exit, the signal number for a fatal signal). Idempotent: the
+   first call wins. Marks it exited, releases a vfork parent, wakes the
+   parent's wait4()/waitid() and sends it SIGCHLD. */
+void      process_mark_exited(Process *p, int wait_status);
+Process  *process_list_head(void);      /* walk with ->next */
 Process  *process_create(PageTable *pml4);
 Process  *process_kernel(void);         /* Process 0 -- pml4 = boot snapshot */
 Process  *process_find_by_pid(uint64_t pid); /* Phase 18: NULL if never existed. Never freed once created (see g_process_list), so safe to hold across calls -- check ->exited, don't assume liveness from non-NULL alone. */

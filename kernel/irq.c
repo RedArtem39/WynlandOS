@@ -3,6 +3,7 @@
  */
 
 #include <wynland/irq.h>
+#include <wynland/process.h>
 #include <wynland/sched.h>
 
 
@@ -178,6 +179,22 @@ void irq_handler(InterruptRegisters *regs)
         timer_ms++;
         /* Send End of Interrupt (EOI) to PIC before yielding */
         outb(PIC1_COMMAND, PIC_EOI);
+
+        /* Signals are otherwise delivered only on the way out of a
+           syscall, so a thread busy in user code would outlive a kill -9
+           or its process's exit_group(). Interrupted user code of a
+           thread whose process is dead, or that has SIGKILL pending,
+           dies right here (the interrupted context is simply dropped). */
+        if ((regs->cs & 3) == 3) {
+            Thread *t = sched_current();
+            if (t && t->proc && t->proc->pid != 0 &&
+                (t->proc->exited || (t->sig_pending & (1ULL << 9)))) {
+                extern void process_mark_exited(struct Process *p, int wait_status);
+                extern void thread_exit(void);
+                process_mark_exited(t->proc, 9); /* no-op if already dead */
+                thread_exit();                    /* never returns */
+            }
+        }
 
         /* virtio-gpu housekeeping: pending cursor update, TSC
            calibration, re-sending frame areas a stalled host missed. */

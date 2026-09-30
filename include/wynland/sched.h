@@ -56,18 +56,36 @@ typedef struct Thread {
     uint64_t sig_pending;     /* bitmask, bit N = signal N pending */
     uint64_t sig_mask;        /* blocked-set (9 KILL / 19 STOP unblockable) */
     void *sig_frame;          /* kernel-side frame copy for SYS_rt_sigreturn */
-    /* x87/SSE register file (FXSAVE image, 512 bytes, needs 16-byte
-       alignment -- use thread_fx_area()). The kernel itself is built with
-       -mno-sse, so these registers only ever hold user state; the
-       scheduler saves/restores them on every switch. Last field on purpose:
-       nothing before it moves. */
+    /* Two x87/SSE register images (FXSAVE, 512 bytes, 16-byte aligned via
+       the accessors below). Kernel C code uses SSE too (it is NOT built
+       with -mno-sse: GUI/OpenGL/QuickJS need floating point), so:
+       - fx_user: the thread's USER state, saved on every entry into the
+         kernel from user mode (syscall, interrupt, exception) and restored
+         on the way back -- what Linux guarantees to user code;
+       - fx_raw: the live state at a context switch, i.e. whatever kernel
+         code was doing with the registers when it got preempted.
+       Last fields on purpose: nothing before them moves. */
     uint8_t fx_raw[512 + 16];
+    uint8_t fx_user_raw[512 + 16];
 } Thread;
 
 static inline uint8_t *thread_fx_area(Thread *t)
 {
     return (uint8_t *)(((uintptr_t)t->fx_raw + 15) & ~(uintptr_t)15);
 }
+
+static inline uint8_t *thread_fx_user(Thread *t)
+{
+    return (uint8_t *)(((uintptr_t)t->fx_user_raw + 15) & ~(uintptr_t)15);
+}
+
+/* The running thread's fx_user image: the syscall/interrupt entry stubs
+   FXSAVE into it on entry from user mode and FXRSTOR from it on return. */
+extern uint8_t *current_fx_user;
+
+/* Power-on-like user FPU state: x87 control word 0x37F, MXCSR 0x1F80
+   (all exceptions masked), everything else zero. */
+void thread_fx_default(uint8_t *area);
 
 void sched_init(void);
 Thread *thread_create(void (*entry)(void*), void *arg);

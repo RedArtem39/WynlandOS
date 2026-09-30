@@ -9,6 +9,15 @@
 #include <wynland/usercopy.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
+
+uint8_t *current_fx_user = NULL;
+
+void thread_fx_default(uint8_t *area)
+{
+    memset(area, 0, 512);
+    *(uint16_t *)(area + 0)  = 0x037F; /* FCW: all x87 exceptions masked */
+    *(uint32_t *)(area + 24) = 0x1F80; /* MXCSR: all SSE exceptions masked */
+}
 extern void thread_trampoline(void);
 extern void serial_write_string(const char *str);
 extern void console_print_string(BootInfo *info, const char *str, uint32_t fg, uint32_t bg);
@@ -46,6 +55,8 @@ void sched_init(void) {
        IA32_FS_BASE on every switch -- a non-canonical value is a #GP on
        real hardware / KVM (TCG never checked, so it went unnoticed). */
     memset(current_thread, 0, sizeof(Thread));
+    thread_fx_default(thread_fx_user(current_thread));
+    current_fx_user = thread_fx_user(current_thread);
     current_thread->id = 0;
     current_thread->rsp = 0; // Will be set on context switch
     current_thread->stack_orig = NULL; // Main stack is not dynamically allocated by us
@@ -72,6 +83,8 @@ void sched_init(void) {
         disable_interrupts();
         Thread *t = (Thread *)kmalloc(sizeof(Thread));
         memset(t, 0, sizeof(Thread));
+        thread_fx_default(thread_fx_area(t));
+        thread_fx_default(thread_fx_user(t));
         t->id = next_thread_id++;
         t->state = THREAD_STATE_READY;
         t->tls_base = 0;
@@ -141,10 +154,15 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
 
     Thread *t = (Thread *)kmalloc(sizeof(Thread));
     memset(t, 0, sizeof(Thread));
-    /* The creator's live x87/SSE registers are its user state (the kernel
-       never touches them): the new thread starts from a copy, like
-       fork()/clone() on Linux. */
-    __asm__ volatile("fxsave (%0)" :: "r"(thread_fx_area(t)) : "memory");
+    /* Kernel-side state: a clean image. User state: a copy of the
+       creator's user registers (saved when it entered this syscall), like
+       fork()/clone() on Linux; a kernel creator has none -- defaults.
+       process_spawn()/execve() reset it for a fresh program image. */
+    thread_fx_default(thread_fx_area(t));
+    if (current_thread && current_thread->proc && current_thread->proc->pid != 0)
+        memcpy(thread_fx_user(t), thread_fx_user(current_thread), 512);
+    else
+        thread_fx_default(thread_fx_user(t));
     t->id = next_thread_id++;
     t->state = THREAD_STATE_READY;
     t->tls_base = tls_base;
@@ -219,7 +237,8 @@ void thread_exit(void) {
        exit; helper threads are just threads. */
     if (current_thread->proc &&
         current_thread->proc->main_thread == current_thread) {
-        current_thread->proc->exited = true;
+        /* normal exit: wait status = exit code << 8 */
+        process_mark_exited(current_thread->proc, (current_thread->proc->exit_code & 0xFF) << 8);
     }
 
     sched_schedule();
@@ -384,14 +403,16 @@ void sched_schedule(void) {
         __asm__ volatile("mov %0, %%cr3" :: "r"(new_cr3) : "memory");
     }
 
-    /* Per-thread x87/SSE state. Without this every process shared one
-       register file: a preemption in the middle of glibc's SSE memcpy/
-       strcmp handed the next process's values to the first -- random
-       corruption (ld.so version checks failing, bad string compares).
-       Safe to restore before the stack switch: kernel code is -mno-sse. */
+    /* Per-thread x87/SSE state at the switch point (kernel code uses SSE
+       too). Without this every thread shared one register file: a
+       preemption in the middle of an SSE memcpy handed the next thread's
+       values to the first. User state is separate (fx_user, saved/restored
+       by the entry stubs). No SSE is used between here and the stack
+       switch. */
     if (prev_thread != next_thread) {
         __asm__ volatile("fxsave (%0)"  :: "r"(thread_fx_area(prev_thread)) : "memory");
         __asm__ volatile("fxrstor (%0)" :: "r"(thread_fx_area(next_thread)) : "memory");
+        current_fx_user = thread_fx_user(next_thread);
     }
     context_switch(&prev_thread->rsp, next_thread->rsp);
 }

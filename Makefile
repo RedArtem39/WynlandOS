@@ -353,6 +353,11 @@ $(BUILD)/gltest.elf: tests/gltest.c
 	@echo "  CC(HOST)   $< (glibc, virgl test)"
 	@gcc -O2 -o $@ $< -lEGL -lGLESv2 -lgbm
 
+$(BUILD)/forktest.elf: tests/forktest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, process lifecycle test)"
+	@gcc -O2 -pthread -o $@ $<
+
 $(BUILD)/dlsymtest.elf: tests/dlsymtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, dlsym diagnostic)"
@@ -377,7 +382,7 @@ $(BUILD)/renderD128:
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
 PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
-$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/test_afunix.elf
+$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/test_afunix.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

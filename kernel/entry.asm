@@ -125,6 +125,7 @@ kernel_stack_top:
 ; ============================================================
 section .text
 
+extern current_fx_user
 extern exception_handler
 
 isr_common_stub:
@@ -145,11 +146,27 @@ isr_common_stub:
     push r14
     push r15
 
+    ; Interrupted USER code: save its x87/SSE state (kernel C code uses
+    ; SSE). CS sits after 15 saved GPRs + vector + error code + RIP.
+    test qword [rsp + 144], 3
+    jz .exception_handler_nosave
+    mov rax, [rel current_fx_user]
+    fxsave64 [rax]
+.exception_handler_nosave:
+
     ; First argument to System V ABI is RDI (pointer to registers on stack)
     mov rdi, rsp
 
     ; Call the C exception handler
     call exception_handler
+
+    ; back to user code: its x87/SSE state (current_fx_user is this
+    ; thread's again even if we were switched away meanwhile)
+    test qword [rsp + 144], 3
+    jz .exception_handler_norestore
+    mov rax, [rel current_fx_user]
+    fxrstor64 [rax]
+.exception_handler_norestore:
 
     ; Restore all registers
     pop r15
@@ -248,11 +265,27 @@ irq_common_stub:
     push r14
     push r15
 
+    ; Interrupted USER code: save its x87/SSE state (kernel C code uses
+    ; SSE). CS sits after 15 saved GPRs + vector + error code + RIP.
+    test qword [rsp + 144], 3
+    jz .irq_handler_nosave
+    mov rax, [rel current_fx_user]
+    fxsave64 [rax]
+.irq_handler_nosave:
+
     ; First argument to System V ABI is RDI (pointer to registers on stack)
     mov rdi, rsp
 
     ; Call the C IRQ handler
     call irq_handler
+
+    ; back to user code: its x87/SSE state (current_fx_user is this
+    ; thread's again even if we were switched away meanwhile)
+    test qword [rsp + 144], 3
+    jz .irq_handler_norestore
+    mov rax, [rel current_fx_user]
+    fxrstor64 [rax]
+.irq_handler_norestore:
 
     ; Restore all registers
     pop r15

@@ -37,7 +37,7 @@ void signal_init(void);
    handler entry -- caller must then load live RAX from offset 0 of the
    block's rax slot (pre-signal user value) instead of the syscall result.
    Returns 0 normally. */
-int signal_deliver_check(void *regs);
+int signal_deliver_check(void *regs, uint64_t sysret);
 
 /* SYS_rt_sigaction(13): act_ptr/oldact_ptr are kernel_sigaction
    {handler,flags,restorer,mask}; sigsetsize must be 8. */

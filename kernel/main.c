@@ -2672,6 +2672,7 @@ void kernel_main(BootInfo *boot_info)
     {
         extern bool g_virgl;
         if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
+        process_spawn("/forktest.elf", NULL, 1000);
     }
 
     static bool was_gui_active = false;

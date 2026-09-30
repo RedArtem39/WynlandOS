@@ -7,6 +7,7 @@
 #include <wynland/heap.h>
 #include <wynland/sched.h>
 #include <wynland/process.h>
+#include <wynland/usercopy.h>
 
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
@@ -19,6 +20,10 @@ typedef struct SignalFrame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rdx, rsi, rdi, rbx, rbp, rip, rflags, rsp;
     int sig;
+    uint64_t rax; /* the interrupted syscall's result: handed back by
+                     rt_sigreturn so the code after the handler sees it */
+    uint8_t fx[512]; /* the interrupted code's x87/SSE state: the handler may
+                        use those registers; rt_sigreturn puts it back */
 } SignalFrame;
 
 /* signal numbers with default-ignore semantics (everything else with no
@@ -31,7 +36,7 @@ void signal_init(void) {
     /* state lives in Process/Thread structs; nothing global to set up */
 }
 
-int signal_deliver_check(void *regs_v) {
+int signal_deliver_check(void *regs_v, uint64_t sysret) {
     typedef struct {
         uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
         uint64_t rdx, rsi, rdi, rbx, rbp, rip, rflags, rsp;
@@ -52,6 +57,7 @@ int signal_deliver_check(void *regs_v) {
 
     SigAct *act = &t->proc->sig_acts[sig];
 
+    if (act->handler == 1) return 0; /* SIG_IGN: used to be "called" at address 1 */
     if (act->handler == 0) {
         if (default_ignored(sig)) return 0;
         /* fatal by default: terminate the whole process. Mark every thread
@@ -61,7 +67,8 @@ int signal_deliver_check(void *regs_v) {
            are not reaped here yet (Phase 23's wait4/reaping lands that);
            non-current victims' clear-tid words are not written either,
            since their address spaces are not loaded in this context. */
-        t->proc->exited = true;
+        /* killed by `sig`: that is its wait status */
+        process_mark_exited(t->proc, sig & 0x7F);
         extern Thread *sched_get_thread_list(void);
         Thread *it = sched_get_thread_list();
         if (it) {
@@ -85,10 +92,27 @@ int signal_deliver_check(void *regs_v) {
     if (!kf) return 0; /* out of memory: drop the signal, keep running */
     memcpy(&kf->r15, regs, 16 * 8);
     kf->sig = sig;
+    kf->rax = sysret;
+    memcpy(kf->fx, thread_fx_user(t), 512);
     t->sig_frame = (void *)kf;
 
-    uint64_t sp = regs->rsp & ~0xFULL;
-    sp -= 8;
+    /* Skip the 128-byte red zone below the interrupted RSP first (SysV
+       x86-64 ABI: leaf code keeps live locals there without moving RSP).
+       Writing the return address straight under RSP clobbered them --
+       glibc saw it as "*** stack smashing detected ***" when a SIGCHLD
+       handler ran on the way back from wait4(). */
+    uint64_t sp = (regs->rsp - 128) & ~0xFULL;
+    sp -= 8; /* handler entry: RSP = 8 mod 16, as after a CALL */
+    if (!user_prepare_write(sp, sizeof(uint64_t))) {
+        /* no usable user stack for the handler: like Linux, the process
+           dies of SIGSEGV instead of the kernel faulting on the store */
+        t->sig_frame = NULL;
+        kfree(kf);
+        process_mark_exited(t->proc, 11);
+        t->state = THREAD_STATE_TERMINATED;
+        sched_schedule();
+        while (1) __asm__ volatile("cli; hlt");
+    }
     *(uint64_t *)(uintptr_t)sp = act->restorer; /* handler's RET target */
 
     regs->rip = act->handler;
@@ -114,20 +138,22 @@ uint64_t signal_do_sigaction(int sig, uint64_t act_ptr, uint64_t oldact_ptr) {
         uint64_t mask;
     } KSigAction;
 
+    /* User pointers go through copy_from_user/copy_to_user: they used to be
+       dereferenced raw, i.e. any process could read (act) or write (oldact)
+       kernel memory through this call. The new action is read BEFORE the
+       old one is written -- act and oldact may be the same buffer. */
+    KSigAction na;
+    if (act_ptr && copy_from_user(&na, (const void *)act_ptr, sizeof(na)) != 0)
+        return (uint64_t)-14; /* -EFAULT */
     if (oldact_ptr) {
-        KSigAction *o = (KSigAction *)oldact_ptr;
-        o->handler = slot->handler;
-        o->flags = slot->flags;
-        o->restorer = slot->restorer;
-        o->mask = slot->mask;
+        KSigAction o = { slot->handler, slot->flags, slot->restorer, slot->mask };
+        if (copy_to_user((void *)oldact_ptr, &o, sizeof(o)) != 0) return (uint64_t)-14;
     }
-
     if (act_ptr) {
-        KSigAction *a = (KSigAction *)act_ptr;
-        slot->handler = a->handler;
-        slot->flags = a->flags;
-        slot->restorer = a->restorer;
-        slot->mask = a->mask;
+        slot->handler = na.handler;
+        slot->flags = na.flags;
+        slot->restorer = na.restorer;
+        slot->mask = na.mask;
     }
     return 0;
 }
@@ -148,9 +174,17 @@ uint64_t signal_do_procmask(int how, uint64_t set_ptr, uint64_t oldset_ptr) {
        blocks SIGSEGV instead and every masked-delivery test fails while
        looking like a scheduler bug. Signals >= 64 have no kernel bit
        (uint64 mask) and are dropped on the floor, documented. */
-    uint64_t newbits = set_ptr ? ((*(uint64_t *)set_ptr) << 1) : 0;
+    /* copy_from_user/copy_to_user: both pointers used to be dereferenced
+       raw (arbitrary kernel read/write from user space). */
+    uint64_t uset = 0;
+    if (set_ptr && copy_from_user(&uset, (const void *)set_ptr, sizeof(uset)) != 0)
+        return (uint64_t)-14; /* -EFAULT */
+    uint64_t newbits = uset << 1;
 
-    if (oldset_ptr) *(uint64_t *)oldset_ptr = (t->sig_mask >> 1);
+    if (oldset_ptr) {
+        uint64_t old = t->sig_mask >> 1;
+        if (copy_to_user((void *)oldset_ptr, &old, sizeof(old)) != 0) return (uint64_t)-14;
+    }
     if (!set_ptr) return 0;
 
     switch (how) {
@@ -176,7 +210,7 @@ uint64_t signal_rt_return(void *regs_v) {
     if (!f) {
         /* rt_sigreturn with no frame: the program jumped somewhere hostile.
            Treat like a fatal signal -- terminate rather than corrupt. */
-        t->proc->exited = true;
+        process_mark_exited(t->proc, 11 /* as if SIGSEGV */);
         t->state = THREAD_STATE_TERMINATED;
         serial_write_string("[signal] rt_sigreturn without frame\r\n");
         sched_schedule();
@@ -184,17 +218,15 @@ uint64_t signal_rt_return(void *regs_v) {
     }
     memcpy(regs, &f->r15, 16 * 8);
     t->sig_frame = NULL;
-    uint64_t saved_rax = f->r15; /* placeholder, replaced below */
     /* rax is not part of SyscallRegs (it travels in the dispatcher's return
-       register); the interrupted user rax was NOT saved in the frame --
-       real kernels restart-or-return specially. v1 contract: handlers are
-       entered via a syscall boundary whose result is meaningless, so we
-       restore rax as 0. Documented divergence. */
-    (void)saved_rax;
-    int sig = f->sig;
+       register): the syscall the handler interrupted had its result saved
+       in the frame at delivery -- returning it here puts it back in RAX.
+       Restoring 0 instead (the old v1 contract) made e.g. waitpid() report
+       0 whenever SIGCHLD's handler ran on its way back. */
+    uint64_t rax = f->rax;
+    memcpy(thread_fx_user(t), f->fx, 512); /* restored by the syscall exit path */
     kfree(f);
-    (void)sig;
-    return 0;
+    return rax;
 }
 
 void signal_raise_current(int sig) {
