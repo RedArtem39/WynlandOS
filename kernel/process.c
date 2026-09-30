@@ -10,6 +10,7 @@
 #include <wynland/vmm.h>
 #include <wynland/elf.h>
 #include <wynland/heap.h>
+#include <wynland/kfile.h>
 
 extern void serial_write_string(const char *str);
 
@@ -127,6 +128,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
                entirely, just without the crash). */
             if (!copy) break;
             *copy = *caller->fd_table[i];
+            kfile_get(copy); /* sockets/memfds count their fds (kfile.h) */
             p->fd_table[i]  = copy;
             p->fd_flags[i]  = caller->fd_flags[i];
             p->fd_oflags[i] = caller->fd_oflags[i];

@@ -33,6 +33,7 @@ extern uint64_t g_page_nx_bit;
                                        that fork()'s COW sharing (vmm_cow_clone_user_pages()) mapped read-only
                                        into two-or-more processes; the page fault handler (kernel/idt.c) checks
                                        this bit before falling back to its fatal path on a write fault. */
+#define PAGE_SHARED_MAP (1ULL << 10)
 #define PAGE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
 
