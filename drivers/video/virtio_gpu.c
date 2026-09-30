@@ -395,125 +395,185 @@ static void vq_free_desc(Virtqueue *vq, uint16_t idx)
 }
 
 /* ============================================================
- * Command Submission
- * ============================================================ */
+ * Control queue: asynchronous requests
+ * ============================================================
+ * Every command is a request: a descriptor chain whose head index names it.
+ * ctrlq_submit() queues it and returns a ticket; ctrlq_reap() walks the used
+ * ring and retires completed chains BY HEAD INDEX (the device may complete
+ * out of submission order once 3D fences are involved -- a SUBMIT_3D with a
+ * fence is answered only when the host GPU is done with it, while later
+ * 2D commands already complete). Nothing may assume "N submitted, so used
+ * idx + N means mine are done" any more.
+ *
+ * Tickets are (head, seq): seq grows by one per submission and
+ * ctrl_done_seq[head] records the seq of the last request retired through
+ * that head -- monotonic, so "done_seq[head] >= my seq" stays true even
+ * after the head is reused.
+ *
+ * Callers run with interrupts off (syscall context, or irq_save()); the
+ * timer tick also reaps. Uniprocessor: interrupts-off IS the lock. */
+
+#define CTRLQ_MAX_SEGS 72 /* 256 KB command buffer in 4 KB pages + hdr + resp */
+
+typedef struct {
+    uint64_t phys;
+    uint32_t len;
+    bool     device_writes; /* response buffer */
+} CtrlSeg;
+
+typedef struct {
+    uint16_t head;
+    uint64_t seq;
+} CtrlTicket;
+
+static uint64_t ctrl_seq = 0;
+static uint64_t ctrl_done_seq[VQ_MAX_SIZE];
+static uint64_t ctrl_inflight_seq[VQ_MAX_SIZE]; /* seq of the chain at head */
+static uint8_t  ctrl_chain_len[VQ_MAX_SIZE];
+
+static uint64_t irq_save(void);
+static void irq_restore(uint64_t rflags);
+
+/* Retire every chain the device has returned. */
+static void ctrlq_reap(void)
+{
+    uint64_t fl = irq_save();
+    while (VQ_USED_IDX(ctrl_q) != ctrl_q.last_used) {
+        __asm__ volatile("" ::: "memory"); /* ring entry valid once idx says so */
+        uint16_t slot = ctrl_q.last_used % ctrl_q.size;
+        uint16_t head = (uint16_t)ctrl_q.used->ring[slot].id;
+        uint16_t d = head;
+        for (uint8_t i = 0; i < ctrl_chain_len[head]; i++) {
+            uint16_t next = ctrl_q.desc[d].next;
+            vq_free_desc(&ctrl_q, d);
+            d = next;
+        }
+        ctrl_done_seq[head] = ctrl_inflight_seq[head];
+        ctrl_q.last_used++;
+    }
+    irq_restore(fl);
+}
+
+static bool ctrlq_done(CtrlTicket t)
+{
+    return ctrl_done_seq[t.head] >= t.seq;
+}
+
+/* Queue one request. Returns false (nothing queued) if the ring doesn't
+   have enough free descriptors even after reaping. */
+static bool ctrlq_submit(const CtrlSeg *segs, int n, CtrlTicket *out)
+{
+    if (n <= 0 || n > CTRLQ_MAX_SEGS) return false;
+    uint64_t fl = irq_save();
+    if (ctrl_q.num_free < n) {
+        irq_restore(fl);
+        ctrlq_reap();
+        fl = irq_save();
+        if (ctrl_q.num_free < n) { irq_restore(fl); return false; }
+    }
+
+    uint16_t d[CTRLQ_MAX_SEGS];
+    for (int i = 0; i < n; i++) d[i] = vq_alloc_desc(&ctrl_q);
+    for (int i = 0; i < n; i++) {
+        ctrl_q.desc[d[i]].addr  = segs[i].phys;
+        ctrl_q.desc[d[i]].len   = segs[i].len;
+        ctrl_q.desc[d[i]].flags = (segs[i].device_writes ? VIRTQ_DESC_F_WRITE : 0) |
+                                  (i + 1 < n ? VIRTQ_DESC_F_NEXT : 0);
+        ctrl_q.desc[d[i]].next  = (i + 1 < n) ? d[i + 1] : 0;
+    }
+    uint16_t head = d[0];
+    ctrl_chain_len[head] = (uint8_t)n;
+    ctrl_inflight_seq[head] = ++ctrl_seq;
+
+    uint16_t avail = ctrl_q.avail->idx;
+    ctrl_q.avail->ring[avail % ctrl_q.size] = head;
+    __asm__ volatile("mfence" ::: "memory");
+    ctrl_q.avail->idx = (uint16_t)(avail + 1);
+    __asm__ volatile("mfence" ::: "memory");
+    *ctrl_q_notify = CTRL_QUEUE;
+
+    out->head = head;
+    out->seq = ctrl_seq;
+    irq_restore(fl);
+    return true;
+}
+
+/* Append the pages backing kernel buffer [buf, buf+len) as segments --
+   a kernel virtual range needn't be physically contiguous past a page. */
+static int ctrlq_add_buf(CtrlSeg *segs, int n, const void *buf, uint32_t len, bool device_writes)
+{
+    PageTable *pml4 = vmm_get_current_pml4();
+    uint64_t va = (uint64_t)(uintptr_t)buf;
+    while (len > 0) {
+        if (n >= CTRLQ_MAX_SEGS) return -1;
+        uint32_t chunk = 4096 - (uint32_t)(va & 4095);
+        if (chunk > len) chunk = len;
+        segs[n].phys = vmm_get_phys(pml4, va);
+        segs[n].len = chunk;
+        segs[n].device_writes = device_writes;
+        n++;
+        va += chunk;
+        len -= chunk;
+    }
+    return n;
+}
+
+/* TSC, calibrated against the 1 kHz clock in virtio_gpu_tick(): the only
+   clock that runs while interrupts are off. */
+static uint64_t tsc_per_ms = 0;
+
+static inline uint64_t rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+#define CTRLQ_SPIN_FALLBACK 2000000 /* iterations per ms-equivalent until calibrated */
+
+/* Spin (interrupts off) until the ticket completes or `ms` pass. */
+static bool ctrlq_wait_spin(CtrlTicket t, uint32_t ms)
+{
+    uint64_t t0 = rdtsc();
+    uint64_t limit = tsc_per_ms * ms;
+    for (uint64_t i = 0;; i++) {
+        ctrlq_reap();
+        if (ctrlq_done(t)) return true;
+        if (tsc_per_ms ? (rdtsc() - t0 >= limit) : (i >= (uint64_t)CTRLQ_SPIN_FALLBACK * ms / 20))
+            return false;
+        __asm__ volatile("pause" ::: "memory");
+    }
+}
+
+/* Synchronous command with one command and one response buffer (init-time
+   and other rare paths). */
+static bool virtio_gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len)
+{
+    CtrlSeg segs[CTRLQ_MAX_SEGS];
+    int n = ctrlq_add_buf(segs, 0, cmd, cmd_len, false);
+    if (n > 0) n = ctrlq_add_buf(segs, n, resp, resp_len, true);
+    CtrlTicket t;
+    if (n <= 0 || !ctrlq_submit(segs, n, &t)) return false;
+    if (!ctrlq_wait_spin(t, 5000)) {
+        log_str("VIRTIO-GPU: Command execution timeout!\r\n");
+        return false;
+    }
+    return true;
+}
 
 static bool virtio_gpu_send_split_cmd(void *cmd, uint32_t cmd_len, void *data, uint32_t data_len, void *resp, uint32_t resp_len)
 {
-    uint16_t desc1 = vq_alloc_desc(&ctrl_q);
-    uint16_t desc2 = vq_alloc_desc(&ctrl_q);
-    uint16_t desc3 = vq_alloc_desc(&ctrl_q);
-    if (desc1 == 0xFFFF || desc2 == 0xFFFF || desc3 == 0xFFFF) {
-        if (desc1 != 0xFFFF) vq_free_desc(&ctrl_q, desc1);
-        if (desc2 != 0xFFFF) vq_free_desc(&ctrl_q, desc2);
-        if (desc3 != 0xFFFF) vq_free_desc(&ctrl_q, desc3);
+    CtrlSeg segs[CTRLQ_MAX_SEGS];
+    int n = ctrlq_add_buf(segs, 0, cmd, cmd_len, false);
+    if (n > 0) n = ctrlq_add_buf(segs, n, data, data_len, false);
+    if (n > 0) n = ctrlq_add_buf(segs, n, resp, resp_len, true);
+    CtrlTicket t;
+    if (n <= 0 || !ctrlq_submit(segs, n, &t)) return false;
+    if (!ctrlq_wait_spin(t, 5000)) {
+        log_str("VIRTIO-GPU: Command execution timeout!\r\n");
         return false;
     }
-
-    PageTable *pml4 = vmm_get_current_pml4();
-    uint64_t cmd_phys  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)cmd);
-    uint64_t data_phys = vmm_get_phys(pml4, (uint64_t)(uintptr_t)data);
-    uint64_t resp_phys = vmm_get_phys(pml4, (uint64_t)(uintptr_t)resp);
-
-    /* Descriptor 1: command header (32 bytes) */
-    ctrl_q.desc[desc1].addr  = cmd_phys;
-    ctrl_q.desc[desc1].len   = cmd_len;
-    ctrl_q.desc[desc1].flags = VIRTQ_DESC_F_NEXT;
-    ctrl_q.desc[desc1].next  = desc2;
-
-    /* Descriptor 2: entries data (nr_entries * 16 bytes) */
-    ctrl_q.desc[desc2].addr  = data_phys;
-    ctrl_q.desc[desc2].len   = data_len;
-    ctrl_q.desc[desc2].flags = VIRTQ_DESC_F_NEXT;
-    ctrl_q.desc[desc2].next  = desc3;
-
-    /* Descriptor 3: response (24 bytes) */
-    ctrl_q.desc[desc3].addr  = resp_phys;
-    ctrl_q.desc[desc3].len   = resp_len;
-    ctrl_q.desc[desc3].flags = VIRTQ_DESC_F_WRITE;
-    ctrl_q.desc[desc3].next  = 0;
-
-    /* Add head of chain to available ring */
-    uint16_t avail_idx = ctrl_q.avail->idx % ctrl_q.size;
-    ctrl_q.avail->ring[avail_idx] = desc1;
-
-    __asm__ volatile("mfence" ::: "memory");
-    ctrl_q.avail->idx++;
-
-    /* Notify control queue (queue index 0) */
-    *ctrl_q_notify = CTRL_QUEUE;
-
-    /* Poll for response */
-    for (uint32_t i = 0; i < 100000000; i++) {
-        if (VQ_USED_IDX(ctrl_q) != ctrl_q.last_used) {
-            ctrl_q.last_used++;
-            vq_free_desc(&ctrl_q, desc1);
-            vq_free_desc(&ctrl_q, desc2);
-            vq_free_desc(&ctrl_q, desc3);
-            return true;
-        }
-        __asm__ volatile("pause");
-    }
-
-    log_str("VIRTIO-GPU: Command execution timeout!\r\n");
-    vq_free_desc(&ctrl_q, desc1);
-    vq_free_desc(&ctrl_q, desc2);
-    vq_free_desc(&ctrl_q, desc3);
-    return false;
-}
-
-static bool virtio_gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len)
-{
-    uint16_t desc1 = vq_alloc_desc(&ctrl_q);
-    uint16_t desc2 = vq_alloc_desc(&ctrl_q);
-    if (desc1 == 0xFFFF || desc2 == 0xFFFF) {
-        if (desc1 != 0xFFFF) vq_free_desc(&ctrl_q, desc1);
-        if (desc2 != 0xFFFF) vq_free_desc(&ctrl_q, desc2);
-        return false;
-    }
-
-    /* Translate virtual addresses to physical for DMA */
-    PageTable *pml4 = vmm_get_current_pml4();
-    uint64_t cmd_phys  = vmm_get_phys(pml4, (uint64_t)(uintptr_t)cmd);
-    uint64_t resp_phys = vmm_get_phys(pml4, (uint64_t)(uintptr_t)resp);
-
-    /* Out descriptor: command request */
-    ctrl_q.desc[desc1].addr  = cmd_phys;
-    ctrl_q.desc[desc1].len   = cmd_len;
-    ctrl_q.desc[desc1].flags = VIRTQ_DESC_F_NEXT;
-    ctrl_q.desc[desc1].next  = desc2;
-
-    /* In descriptor: device response */
-    ctrl_q.desc[desc2].addr  = resp_phys;
-    ctrl_q.desc[desc2].len   = resp_len;
-    ctrl_q.desc[desc2].flags = VIRTQ_DESC_F_WRITE;
-    ctrl_q.desc[desc2].next  = 0;
-
-    /* Add head of chain to available ring */
-    uint16_t avail_idx = ctrl_q.avail->idx % ctrl_q.size;
-    ctrl_q.avail->ring[avail_idx] = desc1;
-
-    __asm__ volatile("mfence" ::: "memory");
-    ctrl_q.avail->idx++;
-
-    /* Notify control queue (queue index 0) */
-    *ctrl_q_notify = CTRL_QUEUE;
-
-    /* Poll for response */
-    for (uint32_t i = 0; i < 100000000; i++) {
-        if (VQ_USED_IDX(ctrl_q) != ctrl_q.last_used) {
-            ctrl_q.last_used++;
-            vq_free_desc(&ctrl_q, desc1);
-            vq_free_desc(&ctrl_q, desc2);
-            return true;
-        }
-        __asm__ volatile("pause");
-    }
-
-    log_str("VIRTIO-GPU: Command execution timeout!\r\n");
-    vq_free_desc(&ctrl_q, desc1);
-    vq_free_desc(&ctrl_q, desc2);
-    return false;
+    return true;
 }
 
 
@@ -1107,16 +1167,17 @@ bool virtio_gpu_init(void)
 static volatile int flush_busy = 0;
 
 /* A flush whose completion hasn't been collected yet: one that timed
-   out, or one submitted asynchronously by virtio_gpu_tick(). Its
-   descriptors and the static cmd_/resp_ buffers still belong to the
-   device, so they are neither freed nor reused until its completions
-   actually arrive -- reusing them would let a late completion satisfy the
-   NEXT flush's wait while that flush's commands are still in flight. */
-static bool     flush_inflight = false;
-static bool     flush_timed_out = false; /* inflight because of a timeout */
-static uint16_t flush_inflight_target;
-static uint16_t flush_inflight_desc[4];
-static uint32_t flush_stuck_drops = 0;
+   out, or one submitted asynchronously by virtio_gpu_tick(). The static
+   cmd_/resp_ buffers below still belong to the device until it completes,
+   so no new flush is built while one is in flight. */
+static bool       flush_inflight = false;
+static bool       flush_timed_out = false; /* inflight because of a timeout */
+static CtrlTicket flush_ticket;            /* the RESOURCE_FLUSH request */
+static uint32_t   flush_stuck_drops = 0;
+
+/* Set when a timed-out flush was collected from the tick (IRQ context,
+   where we don't log); the next virtio_gpu_flush() reports it. */
+static bool flush_resumed_unlogged = false;
 
 /* Bounding box of every rect dropped (or timed out) while a flush was in
    flight: callers have already cleared their own damage, so it is re-sent
@@ -1140,44 +1201,28 @@ static void flush_remember_dropped(uint32_t x, uint32_t y, uint32_t w, uint32_t 
 
 /* Waiting for the host happens with interrupts OFF (syscall context), so
    the budget is kept short -- the timer, mouse IRQ and scheduler are all
-   frozen for as long as it runs, which also means timer_get_ms() can't
-   measure it: the TSC does, calibrated against the 1 kHz tick in
-   virtio_gpu_tick(). A timeout is recoverable (flush_inflight), so there's
-   no need to wait out a long host stall here. */
+   frozen for as long as it runs. A timeout is recoverable (flush_inflight),
+   so there's no need to wait out a long host stall here. */
 #define FLUSH_TIMEOUT_MS  20
-#define FLUSH_SPIN_LIMIT  2000000 /* fallback until the TSC is calibrated */
-static uint64_t tsc_per_ms = 0;
+
 /* Calibration window: TSC and timer_ms at its start. Rate = cycles per
-   elapsed ms over >= TSC_CAL_WINDOW_MS, so late/bunched ticks cancel out
-   (a per-tick minimum only ever drifted DOWN on jitter). Ticks LOST during
-   long interrupts-off stretches make a window read high, i.e. a longer
-   timeout -- the safe direction; the smallest of the last few windows is
-   used to shed those. */
+   elapsed ms over >= TSC_CAL_WINDOW_MS, so late/bunched ticks cancel out.
+   Ticks LOST during long interrupts-off stretches make a window read high,
+   i.e. a longer timeout -- the safe direction; the smallest of the last
+   few windows is used to shed those. */
 #define TSC_CAL_WINDOW_MS 100
 #define TSC_CAL_KEEP      4
 static uint64_t tsc_win_start = 0, tsc_win_ms = 0;
 static uint64_t tsc_win_rate[TSC_CAL_KEEP];
 static uint32_t tsc_win_n = 0;
 
-static inline uint64_t rdtsc(void)
-{
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
-
-/* Set when a timed-out flush was collected from the tick (IRQ context,
-   where we don't log); the next virtio_gpu_flush() reports it. */
-static bool flush_resumed_unlogged = false;
-
 /* Collect an in-flight flush if the host has finished it. Returns false
    while it's still pending. flush_busy must be held. */
 static bool flush_reclaim(void)
 {
     if (!flush_inflight) return true;
-    if ((int16_t)(VQ_USED_IDX(ctrl_q) - flush_inflight_target) < 0) return false;
-    ctrl_q.last_used = flush_inflight_target;
-    for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, flush_inflight_desc[i]);
+    ctrlq_reap();
+    if (!ctrlq_done(flush_ticket)) return false;
     flush_inflight = false;
     if (flush_timed_out) {
         flush_timed_out = false;
@@ -1187,10 +1232,9 @@ static bool flush_reclaim(void)
     return true;
 }
 
-/* Physical addresses of the static flush buffers, resolved once (by the
-   first flush, always from syscall/kernel context, before the tick can
-   submit anything) so flush_submit() never walks page tables from the
-   timer IRQ on top of whatever process is current. */
+/* Physical addresses of the static flush buffers, resolved once at init so
+   flush_submit() never walks page tables from the timer IRQ on top of
+   whatever process is current. */
 static uint64_t phys_cmd_transfer, phys_resp_transfer, phys_cmd_flush, phys_resp_flush;
 
 static void flush_resolve_phys(void)
@@ -1217,13 +1261,11 @@ static void flush_take_dropped(uint32_t *x, uint32_t *y, uint32_t *w, uint32_t *
 }
 
 /* Queue TRANSFER_TO_HOST_2D + RESOURCE_FLUSH for the rect behind one
-   notify. Both commands go into the ring together (one VM exit instead of
-   two) and complete in order -- the device runs its control queue in
-   order, so the flush always sees the transfer. On success fills d[] and
-   returns the used-index both completions will have reached.
-   flush_busy must be held and no flush may be in flight. */
-static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
-                         uint16_t d[4], uint16_t *target)
+   notify each. The device runs its control queue in order for 2D
+   commands, so the flush always sees the transfer, and the flush's
+   completion implies the transfer's. flush_busy must be held and no flush
+   may be in flight. */
+static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, CtrlTicket *flush_t)
 {
     uint32_t scr_w = comp_get_width();
 
@@ -1244,71 +1286,21 @@ static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
     cmd_flush.rww = w;
     cmd_flush.rhh = h;
 
-    for (int i = 0; i < 4; i++) {
-        d[i] = vq_alloc_desc(&ctrl_q);
-        if (d[i] == 0xFFFF) {
-            for (int j = 0; j < i; j++) vq_free_desc(&ctrl_q, d[j]);
-            return false;
-        }
-    }
-
     flush_resolve_phys();
-
-    ctrl_q.desc[d[0]].addr  = phys_cmd_transfer;
-    ctrl_q.desc[d[0]].len   = sizeof(cmd_transfer);
-    ctrl_q.desc[d[0]].flags = VIRTQ_DESC_F_NEXT;
-    ctrl_q.desc[d[0]].next  = d[1];
-
-    ctrl_q.desc[d[1]].addr  = phys_resp_transfer;
-    ctrl_q.desc[d[1]].len   = sizeof(resp_transfer);
-    ctrl_q.desc[d[1]].flags = VIRTQ_DESC_F_WRITE;
-    ctrl_q.desc[d[1]].next  = 0;
-
-    ctrl_q.desc[d[2]].addr  = phys_cmd_flush;
-    ctrl_q.desc[d[2]].len   = sizeof(cmd_flush);
-    ctrl_q.desc[d[2]].flags = VIRTQ_DESC_F_NEXT;
-    ctrl_q.desc[d[2]].next  = d[3];
-
-    ctrl_q.desc[d[3]].addr  = phys_resp_flush;
-    ctrl_q.desc[d[3]].len   = sizeof(resp_flush);
-    ctrl_q.desc[d[3]].flags = VIRTQ_DESC_F_WRITE;
-    ctrl_q.desc[d[3]].next  = 0;
-
-    uint16_t avail = ctrl_q.avail->idx;
-    ctrl_q.avail->ring[avail % ctrl_q.size]       = d[0];
-    ctrl_q.avail->ring[(avail + 1) % ctrl_q.size] = d[2];
-
-    __asm__ volatile("mfence" ::: "memory");
-    ctrl_q.avail->idx = (uint16_t)(avail + 2);
-    __asm__ volatile("mfence" ::: "memory");
-
-    *ctrl_q_notify = CTRL_QUEUE;
-
-    *target = (uint16_t)(ctrl_q.last_used + 2);
-    return true;
-}
-
-/* Spin (interrupts are off in syscall context) until the control queue's
-   used index reaches `target` or FLUSH_TIMEOUT_MS pass. */
-static void flush_wait_used(uint16_t target)
-{
-    if (tsc_per_ms) {
-        uint64_t limit = tsc_per_ms * FLUSH_TIMEOUT_MS;
-        uint64_t t0 = rdtsc();
-        while ((int16_t)(VQ_USED_IDX(ctrl_q) - target) < 0 && rdtsc() - t0 < limit)
-            __asm__ volatile("pause" ::: "memory");
-    } else {
-        for (uint32_t i = 0; i < FLUSH_SPIN_LIMIT && (int16_t)(VQ_USED_IDX(ctrl_q) - target) < 0; i++)
-            __asm__ volatile("pause" ::: "memory");
-    }
-}
-
-static void flush_mark_inflight(const uint16_t d[4], uint16_t target, bool timed_out)
-{
-    flush_inflight = true;
-    flush_timed_out = timed_out;
-    flush_inflight_target = target;
-    for (int i = 0; i < 4; i++) flush_inflight_desc[i] = d[i];
+    CtrlSeg tseg[2] = {
+        { phys_cmd_transfer,  sizeof(cmd_transfer),  false },
+        { phys_resp_transfer, sizeof(resp_transfer), true  },
+    };
+    CtrlSeg fseg[2] = {
+        { phys_cmd_flush,  sizeof(cmd_flush),  false },
+        { phys_resp_flush, sizeof(resp_flush), true  },
+    };
+    /* Both or neither: reserve room for four descriptors first. */
+    ctrlq_reap();
+    if (ctrl_q.num_free < 4) return false;
+    CtrlTicket tt;
+    if (!ctrlq_submit(tseg, 2, &tt)) return false;
+    return ctrlq_submit(fseg, 2, flush_t);
 }
 
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
@@ -1332,7 +1324,7 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
        wait it out (same budget as our own wait) rather than drop a frame.
        After a real timeout the host is known-stuck -- don't wait again. */
     if (flush_inflight && !flush_timed_out) {
-        flush_wait_used(flush_inflight_target);
+        ctrlq_wait_spin(flush_ticket, FLUSH_TIMEOUT_MS);
     }
     if (!flush_reclaim()) {
         /* host still busy with an earlier flush: drop this frame, its
@@ -1352,25 +1344,21 @@ void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 
     flush_take_dropped(&x, &y, &w, &h);
 
-    uint16_t d[4], target;
-    if (!flush_submit(x, y, w, h, d, &target)) {
+    CtrlTicket t;
+    if (!flush_submit(x, y, w, h, &t)) {
         flush_remember_dropped(x, y, w, h);
         __sync_lock_release(&flush_busy);
         return;
     }
 
-    flush_wait_used(target);
-    if (VQ_USED_IDX(ctrl_q) != target) {
+    if (!ctrlq_wait_spin(t, FLUSH_TIMEOUT_MS)) {
         log_str("VIRTIO-GPU: flush timeout!\r\n");
-        flush_mark_inflight(d, target, true);
+        flush_inflight = true;
+        flush_timed_out = true;
+        flush_ticket = t;
         /* The host may never apply this rect: send it again on recovery. */
         flush_remember_dropped(x, y, w, h);
-        __sync_lock_release(&flush_busy);
-        return;
     }
-    ctrl_q.last_used = target;
-
-    for (int i = 0; i < 4; i++) vq_free_desc(&ctrl_q, d[i]);
 
     __sync_lock_release(&flush_busy);
 }
@@ -1440,6 +1428,10 @@ void virtio_gpu_tick(void)
         irq_restore(fl);
     }
 
+    /* Retire finished control requests even when nobody is waiting on
+       them (async 3D submissions, a flush the tick sent). */
+    ctrlq_reap();
+
     if (!dropped_any) return;
     /* Only try-lock: a preempted flush holder must not be spun on here. */
     if (__sync_lock_test_and_set(&flush_busy, 1)) return;
@@ -1447,9 +1439,14 @@ void virtio_gpu_tick(void)
         uint32_t x = dropped_x1, y = dropped_y1;
         uint32_t w = dropped_x2 - dropped_x1, h = dropped_y2 - dropped_y1;
         dropped_any = false;
-        uint16_t d[4], target;
-        if (flush_submit(x, y, w, h, d, &target)) flush_mark_inflight(d, target, false);
-        else flush_remember_dropped(x, y, w, h);
+        CtrlTicket t;
+        if (flush_submit(x, y, w, h, &t)) {
+            flush_inflight = true;
+            flush_timed_out = false;
+            flush_ticket = t;
+        } else {
+            flush_remember_dropped(x, y, w, h);
+        }
     }
     __sync_lock_release(&flush_busy);
 }
