@@ -182,7 +182,7 @@ EXT2_MANIFEST  = ext2_manifest.txt
 # Targets
 # ============================================================================
 
-.PHONY: all bootloader kernel image run debug clean dirs check-tools
+.PHONY: all bootloader kernel image run run-gl debug clean dirs check-tools
 
 # Default target
 all: check-tools $(DISK_IMAGE)
@@ -416,6 +416,29 @@ run: all
 		-m 1024M                                          \
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \
+		-device virtio-net-pci,netdev=net0                \
+		-netdev user,id=net0                              \
+		-serial stdio                                     \
+		-no-reboot                                        \
+		-no-shutdown
+
+# 3D: virtio-gpu with virgl, rendered by the host GPU through WSLg (D3D12).
+# KVM is required: under TCG, QEMU 10.2 deadlocks in virtio-gpu-gl reset.
+# GPU_ADAPTER picks the host adapter (default NVIDIA; e.g. GPU_ADAPTER=AMD).
+GPU_ADAPTER ?= NVIDIA
+run-gl: all
+	@echo ""
+	@echo "  Launching WynlandOS in QEMU (KVM, virgl 3D on $(GPU_ADAPTER))..."
+	@echo ""
+	GALLIUM_DRIVER=d3d12 MESA_D3D12_DEFAULT_ADAPTER_NAME=$(GPU_ADAPTER) \
+	qemu-system-x86_64                                    \
+		-machine q35,accel=kvm                            \
+		-cpu host                                         \
+		-m 2048M                                          \
+		-bios $(OVMF_FW)                                  \
+		-drive file=$(DISK_IMAGE),format=raw              \
+		-device virtio-gpu-gl-pci                         \
+		-display gtk,gl=on                                \
 		-device virtio-net-pci,netdev=net0                \
 		-netdev user,id=net0                              \
 		-serial stdio                                     \
