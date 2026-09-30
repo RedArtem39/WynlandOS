@@ -392,13 +392,23 @@ $(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STA
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 
 # ESP partition image: FAT32, firmware-loadable content only.
-$(ESP_PART_IMG): $(BOOTLOADER_EFI) $(KERNEL_ELF)
+# Screen size the bootloader asks the firmware for (boot/boot.c reads
+# \resolution.cfg from the ESP): make RESOLUTION=2560x1440 ...
+RESOLUTION ?= 1920x1080
+$(BUILD)/resolution.cfg: FORCE
+	@mkdir -p $(BUILD)
+	@echo "$(RESOLUTION)" | cmp -s - $@ || echo "$(RESOLUTION)" > $@
+
+FORCE:
+
+$(ESP_PART_IMG): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/resolution.cfg
 	@echo "  IMG        Building FAT32 ESP partition..."
 	@mformat -i $@ -C -T $$(( $(ESP_SIZE_MB) * 2048 )) -F -v WYNLAND ::
 	@mmd -i $@ ::/EFI
 	@mmd -i $@ ::/EFI/BOOT
 	@mcopy -o -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -o -i $@ $(KERNEL_ELF) ::/kernel.elf
+	@mcopy -o -i $@ $(BUILD)/resolution.cfg ::/resolution.cfg
 
 # Final assembly: zeroed disk <- MBR sector <- ESP @1MiB <- ext2 root @1MiB+ESP.
 $(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG)

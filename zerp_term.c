@@ -42,6 +42,14 @@ static const char SCANCODE_TO_ASCII[59] = {
     '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
 };
 
+/* Same keys with Shift held (US layout). */
+static const char SCANCODE_TO_ASCII_SHIFT[59] = {
+    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
+    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' '
+};
+
 static char g_lines[MAX_LINES][MAX_LINE_LEN];
 static int  g_line_count = 0; /* total ever added; ring-indexed mod MAX_LINES */
 
@@ -136,15 +144,34 @@ static void redraw(ZerpClient *zc) {
     }
 
     uint32_t visible = rows - 1; /* last row reserved for input/password */
-    int total = g_line_count < MAX_LINES ? g_line_count : MAX_LINES;
-    int start = g_line_count > (int)visible ? g_line_count - (int)visible : 0;
-    uint32_t row = 0;
-    for (int i = start; i < g_line_count && row < visible; i++) {
-        int idx = i % MAX_LINES;
-        zerp_draw_string_bg(zc, 2, row * ROW_H, g_lines[idx], TEXT_COLOR, BG_COLOR);
-        row++;
+    /* Long lines wrap at the tile width (they used to run off the right
+       edge). Walk back from the newest line, counting wrapped rows, to find
+       where the screen starts; then draw forward. */
+    int cols = (int)((zc->tile_w > 4 ? zc->tile_w - 4 : 0) / ZERP_FONT_WIDTH);
+    if (cols < 1) cols = 1;
+    int oldest = g_line_count > MAX_LINES ? g_line_count - MAX_LINES : 0;
+    int first = g_line_count, skip = 0, used = 0;
+    while (first > oldest) {
+        int len = (int)zstrlen(g_lines[(first - 1) % MAX_LINES]);
+        int wr = len ? (len + cols - 1) / cols : 1;
+        if (used + wr > (int)visible) { skip = used + wr - (int)visible; first--; used = (int)visible; break; }
+        used += wr;
+        first--;
     }
-    (void)total;
+    uint32_t row = 0;
+    for (int i = first; i < g_line_count && row < visible; i++) {
+        const char *ln = g_lines[i % MAX_LINES];
+        int len = (int)zstrlen(ln);
+        int wr = len ? (len + cols - 1) / cols : 1;
+        for (int w = (i == first ? skip : 0); w < wr && row < visible; w++) {
+            char piece[MAX_LINE_LEN];
+            int k = 0;
+            for (int c = w * cols; c < len && k < cols && k < MAX_LINE_LEN - 1; c++) piece[k++] = ln[c];
+            piece[k] = '\0';
+            zerp_draw_string_bg(zc, 2, row * ROW_H, piece, TEXT_COLOR, BG_COLOR);
+            row++;
+        }
+    }
 
     if (g_mode == MODE_PASSWORD) {
         char line[MAX_LINE_LEN] = "Password: ";
@@ -153,9 +180,11 @@ static void redraw(ZerpClient *zc) {
         line[p] = '\0';
         zerp_draw_string_bg(zc, 2, visible * ROW_H, line, PROMPT_COLOR, BG_COLOR);
     } else {
-        char line[MAX_LINE_LEN] = "> ";
+        char line[MAX_LINE_LEN + 4] = "> ";
         int p = 2;
-        for (int i = 0; i < g_input_len && p < MAX_LINE_LEN - 1; i++) line[p++] = g_input[i];
+        /* input longer than the row: show its tail, where the cursor is */
+        int from = g_input_len + 2 > cols ? g_input_len + 2 - cols : 0;
+        for (int i = from; i < g_input_len && p < MAX_LINE_LEN - 1; i++) line[p++] = g_input[i];
         line[p] = '\0';
         zerp_draw_string_bg(zc, 2, visible * ROW_H, line, PROMPT_COLOR, BG_COLOR);
     }
@@ -419,7 +448,7 @@ static void run_command(const char *line) {
     else if (str_eq(cmd, "write")) cmd_write(args);
     else if (str_eq(cmd, "nano")) cmd_nano(args);
     else if (str_eq(cmd, "clear")) { g_line_count = 0; g_png_pending = 0; }
-    else if (str_eq(cmd, "sudo")) {
+    else if (str_eq(cmd, "ary")) { /* WynlandOS's sudo */
         g_mode = MODE_PASSWORD;
         g_password_len = 0;
     } else if (str_eq(cmd, "rofi")) {
@@ -428,7 +457,7 @@ static void run_command(const char *line) {
         zerp_send_spawn(g_zc, "/zerp_rofi.elf");
         add_line("launching rofi...", TEXT_COLOR);
     } else if (str_eq(cmd, "help")) {
-        add_line("built-ins: ls cd pwd cat whoami write nano sudo rofi clear help", TEXT_COLOR);
+        add_line("built-ins: ls cd pwd cat whoami write nano ary rofi clear help", TEXT_COLOR);
         add_line("/usr/bin: curl cmake nano pkgconf (run directly, e.g. 'curl --version')", TEXT_COLOR);
     } else {
         /* not a built-in: try /usr/bin/<cmd> on a PTY (curl, cmake, ...) */
@@ -436,15 +465,35 @@ static void run_command(const char *line) {
     }
 }
 
+static int g_shift_l, g_shift_r, g_caps, g_e0;
+
 static void handle_key(uint8_t scancode) {
-    /* Left Ctrl (0x1D press / 0x9D release) maps to 0 in SCANCODE_TO_ASCII
-       (it's not a printable key) -- intercept it here, before the table
-       lookup below, purely to track modifier state for MODE_PTY. */
+    /* 0xE0 prefixes the next code (arrows, right Ctrl, keypad /, ...).
+       Those are not text; only right Ctrl is tracked. */
+    if (scancode == 0xE0) { g_e0 = 1; return; }
+    if (g_e0) {
+        g_e0 = 0;
+        if (scancode == 0x1D) g_ctrl_held = 1;
+        else if (scancode == 0x9D) g_ctrl_held = 0;
+        return;
+    }
+    /* Modifiers map to 0 in the tables -- track their state here. */
     if (scancode == 0x1D) { g_ctrl_held = 1; return; }
     if (scancode == 0x9D) { g_ctrl_held = 0; return; }
+    if (scancode == 0x2A) { g_shift_l = 1; return; }
+    if (scancode == 0xAA) { g_shift_l = 0; return; }
+    if (scancode == 0x36) { g_shift_r = 1; return; }
+    if (scancode == 0xB6) { g_shift_r = 0; return; }
+    if (scancode == 0x3A) { g_caps = !g_caps; return; }
     if (scancode & 0x80) return; /* key release, ignore */
     if (scancode >= 59) return;
-    char ch = SCANCODE_TO_ASCII[scancode];
+    int shift = g_shift_l || g_shift_r;
+    char ch = shift ? SCANCODE_TO_ASCII_SHIFT[scancode] : SCANCODE_TO_ASCII[scancode];
+    /* Caps Lock flips the case of letters only */
+    if (g_caps) {
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        else if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+    }
     if (ch == 0) return;
 
     if (g_mode == MODE_PTY) {
@@ -454,6 +503,7 @@ static void handle_key(uint8_t scancode) {
            the alphabet (Ctrl+A=0x01 .. Ctrl+Z=0x1A), i.e. ch & 0x1F. */
         uint8_t out = (uint8_t)ch;
         if (g_ctrl_held && ch >= 'a' && ch <= 'z') out = (uint8_t)(ch - 'a' + 1);
+        if (g_ctrl_held && ch >= 'A' && ch <= 'Z') out = (uint8_t)(ch - 'A' + 1);
         zwrite(g_pty_master, &out, 1);
         return;
     }
@@ -464,7 +514,7 @@ static void handle_key(uint8_t scancode) {
         if (ch == '\n' || ch == '\r') {
             g_password_buf[g_password_len] = '\0';
             long ok = zelevate(g_password_buf);
-            add_line(ok == 0 ? "sudo: elevated to root" : "sudo: incorrect password",
+            add_line(ok == 0 ? "ary: elevated to root" : "ary: incorrect password",
                      ok == 0 ? TEXT_COLOR : ERR_COLOR);
             g_mode = MODE_NORMAL;
             g_password_len = 0;

@@ -93,6 +93,43 @@ static int CompareGuid(EFI_GUID *a, EFI_GUID *b) {
  * InitGraphics - locate GOP protocol and set best video mode
  * ============================================================ */
 
+/*
+ * ReadResolution - the wanted screen size from \resolution.cfg on the boot
+ * volume ("1920x1080"). Defaults to 1920x1080 when the file is missing or
+ * unreadable. Uses the same boot-volume access LoadKernel() does.
+ */
+static void ReadResolution(UINT32 *want_w, UINT32 *want_h) {
+    *want_w = 1920;
+    *want_h = 1080;
+
+    EFI_LOADED_IMAGE_PROTOCOL *loadedImage;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fileSystem;
+    EFI_FILE_PROTOCOL *rootDir, *f;
+    EFI_GUID loadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+    EFI_GUID fileSystemGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(gImageHandle, &loadedImageGuid, (VOID**)&loadedImage))) return;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(loadedImage->DeviceHandle, &fileSystemGuid, (VOID**)&fileSystem))) return;
+    if (EFI_IS_ERROR(fileSystem->OpenVolume(fileSystem, &rootDir))) return;
+    if (EFI_IS_ERROR(rootDir->Open(rootDir, &f, L"\\resolution.cfg", EFI_FILE_MODE_READ, 0))) {
+        rootDir->Close(rootDir);
+        return;
+    }
+    UINT8 buf[32];
+    UINTN n = sizeof(buf) - 1;
+    if (!EFI_IS_ERROR(f->Read(f, &n, buf))) {
+        buf[n] = 0;
+        UINT32 w = 0, h = 0, *cur = &w;
+        for (UINTN i = 0; i < n; i++) {
+            if (buf[i] >= '0' && buf[i] <= '9') *cur = *cur * 10 + (UINT32)(buf[i] - '0');
+            else if ((buf[i] == 'x' || buf[i] == 'X') && cur == &w) cur = &h;
+            else if (cur == &h && h) break;
+        }
+        if (w >= 640 && h >= 480 && w <= 7680 && h <= 4320) { *want_w = w; *want_h = h; }
+    }
+    f->Close(f);
+    rootDir->Close(rootDir);
+}
+
 static EFI_STATUS InitGraphics(BootInfo *info) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
     EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
@@ -162,7 +199,25 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         }
     }
 
-    if (found1024) {
+    /* \resolution.cfg (default 1920x1080): that exact mode, else the
+       largest one that fits inside it; the fixed preference list below is
+       only the fallback when nothing fits. */
+    UINT32 wantW, wantH, cfgMode = 0, cfgW = 0, cfgH = 0;
+    ReadResolution(&wantW, &wantH);
+    for (modeNum = 0; modeNum < gop->Mode->MaxMode; modeNum++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi;
+        UINTN miSize;
+        if (EFI_IS_ERROR(gop->QueryMode(gop, modeNum, &miSize, &mi))) continue;
+        UINT32 w = mi->HorizontalResolution, h = mi->VerticalResolution;
+        if (w > wantW || h > wantH) continue;
+        if ((UINT64)w * h > (UINT64)cfgW * cfgH) { cfgMode = modeNum; cfgW = w; cfgH = h; }
+    }
+
+    if (cfgW) {
+        bestMode = cfgMode;
+        bestWidth = cfgW;
+        bestHeight = cfgH;
+    } else if (found1024) {
         bestMode = mode1024;
         bestWidth = 1024;
         bestHeight = 768;
