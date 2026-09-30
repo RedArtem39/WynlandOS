@@ -38,6 +38,11 @@ extern uint64_t g_page_nx_bit;
                                        belongs to that object, so munmap() and process teardown only unmap it
                                        (never pmm_free it), and fork() shares it as-is -- writable, same
                                        frame, no COW -- which is what MAP_SHARED means. */
+#define PAGE_SHARED_REF (1ULL << 11) /* Software-defined bit, only with PAGE_SHARED_MAP: this mapping holds
+                                       its own pmm reference on the frame (memfd: the memfd's last close must
+                                       not free frames still mapped). munmap()/teardown drop that reference;
+                                       fork() takes one more for the child's mapping. fb0/SHM/DRM mappings
+                                       don't set it -- their owner object alone decides the lifetime. */
 #define PAGE_ADDR_MASK 0x000FFFFFFFFFF000ULL
 
 

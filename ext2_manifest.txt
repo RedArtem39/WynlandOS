@@ -51,6 +51,7 @@ F  /test_qt.elf         build/test_qt.elf
 F  /t_clone.elf         build/t_clone.elf
 Fo /qtreal.elf          build/test_qt_real.elf
 F  /test_raw_fb.elf     build/test_raw_fb.elf
+F  /test_afunix.elf     build/test_afunix.elf
 F  /t_dyn.elf           build/main_dynamic.elf
 F  /lib/ld-dummy.so     build/interp.elf
 

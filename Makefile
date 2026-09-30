@@ -329,6 +329,15 @@ $(BUILD)/test_raw_fb.elf: test_raw_fb.c
 	@echo "  CC(USER)   $< (FB diagnostic)"
 	@tools/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc -static -O2 -o $@ $<
 
+# AF_UNIX / SCM_RIGHTS / memfd test: a plain HOST-gcc glibc binary,
+# dynamically linked against the /lib64 glibc the image already ships
+# (same as the other /lib64 software). PIE: the loader places ET_DYN
+# images above the shared kernel range. Run from the shell: exec /test_afunix.elf
+$(BUILD)/test_afunix.elf: test_afunix.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(GLIBC)  $< (AF_UNIX test)"
+	@gcc -O2 -Wall -Wno-unused-result -fPIE -pie -o $@ $<
+
 # Zerp compositor + its default clients: freestanding, no libc (see zerp.c).
 ZERP_ELFS = $(BUILD)/zerp.elf $(BUILD)/zerp_files.elf $(BUILD)/zerp_term.elf
 ZERP_HDRS = zerp_syscalls.h zerp_protocol.h zerp_client.h zerp_entry.h zerp_png.h zerp_font.h zerp_vt100.h
@@ -368,7 +377,7 @@ $(BUILD)/renderD128:
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
 PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
-$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf
+$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/test_afunix.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

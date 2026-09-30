@@ -145,9 +145,12 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
 
                     if (pte & PAGE_SHARED_MAP) {
                         /* MAP_SHARED / device memory: the child sees the
-                           same frame, writable as before, never COW. Not
-                           refcounted by the pmm -- its owner object
-                           (SHM segment, DRM BO, ...) decides its lifetime. */
+                           same frame, writable as before, never COW. Its
+                           owner object (SHM segment, DRM BO, memfd)
+                           decides its lifetime; a mapping that holds its
+                           own pmm reference (PAGE_SHARED_REF) takes one
+                           more for the child's copy. */
+                        if (pte & PAGE_SHARED_REF) pmm_page_incref((void *)(uintptr_t)phys);
                         vmm_map_page(child_pml4, virt, phys,
                                      (pte & ~PAGE_ADDR_MASK) & ~PAGE_PRESENT);
                         continue;
@@ -209,7 +212,9 @@ void vmm_free_user_mappings(PageTable *pml4)
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
                     if (!(pte & PAGE_PRESENT)) continue;
-                    if (pte & PAGE_SHARED_MAP) continue; /* owned by its SHM/BO/fb object */
+                    /* owned by its SHM/BO/fb object -- unless this mapping
+                       holds its own reference (memfd), which it drops */
+                    if ((pte & PAGE_SHARED_MAP) && !(pte & PAGE_SHARED_REF)) continue;
                     /* Refcount-aware: a leaf still COW-shared with a sibling
                        process (fork()'d, never written since) just drops
                        this owner's share here instead of freeing outright. */
