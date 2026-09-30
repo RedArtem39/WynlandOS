@@ -15,12 +15,38 @@
 #define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D       0x0105
 #define VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING   0x0106
 #define VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING   0x0107
+#define VIRTIO_GPU_CMD_GET_CAPSET_INFO           0x0108
+#define VIRTIO_GPU_CMD_GET_CAPSET                0x0109
+
+/* 3D commands (VIRTIO_GPU_F_VIRGL) */
+#define VIRTIO_GPU_CMD_CTX_CREATE                0x0200
+#define VIRTIO_GPU_CMD_CTX_DESTROY               0x0201
+#define VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE       0x0202
+#define VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE       0x0203
+#define VIRTIO_GPU_CMD_RESOURCE_CREATE_3D        0x0204
+#define VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D       0x0205
+#define VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D     0x0206
+#define VIRTIO_GPU_CMD_SUBMIT_3D                 0x0207
 #define VIRTIO_GPU_CMD_UPDATE_CURSOR             0x0300
 #define VIRTIO_GPU_CMD_MOVE_CURSOR               0x0301
 
 /* Virtio-GPU response types */
 #define VIRTIO_GPU_RESP_OK_NODATA                0x1100
 #define VIRTIO_GPU_RESP_OK_DISPLAY_INFO          0x1101
+#define VIRTIO_GPU_RESP_OK_CAPSET_INFO           0x1102
+#define VIRTIO_GPU_RESP_OK_CAPSET                0x1103
+
+/* Feature bits (word 0) */
+#define VIRTIO_GPU_F_VIRGL                       (1u << 0)
+#define VIRTIO_GPU_F_EDID                        (1u << 1)
+#define VIRTIO_GPU_F_RESOURCE_UUID               (1u << 2)
+#define VIRTIO_GPU_F_RESOURCE_BLOB               (1u << 3)
+#define VIRTIO_GPU_F_CONTEXT_INIT                (1u << 4)
+
+/* Capset ids */
+#define VIRTIO_GPU_CAPSET_VIRGL                  1
+#define VIRTIO_GPU_CAPSET_VIRGL2                 2
+#define VIRTIO_GPU_CAPSET_VENUS                  4
 #define VIRTIO_GPU_RESP_ERR_UNSPEC               0x1200
 
 /* Pixel formats */
@@ -103,6 +129,42 @@ typedef struct PACKED {
     uint32_t resource_id;
     uint32_t padding;
 } VirtioGpuResourceFlush;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t capset_index;
+    uint32_t padding;
+} VirtioGpuGetCapsetInfo;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t capset_id;
+    uint32_t capset_max_version;
+    uint32_t capset_max_size;
+    uint32_t padding;
+} VirtioGpuRespCapsetInfo;
+
+typedef struct PACKED {
+    VirtioGpuCtrlHeader hdr;
+    uint32_t capset_id;
+    uint32_t capset_version;
+} VirtioGpuGetCapset;
+
+typedef struct {
+    uint32_t capset_id;
+    uint32_t max_version;
+    uint32_t max_size;
+} VirtioGpuCapsetInfo;
+
+#define VIRTIO_GPU_MAX_CAPSETS 8
+#define VIRTIO_GPU_CAPSET_BUF  4096
+
+/* 3D state, valid after virtio_gpu_init() */
+extern bool g_virgl;        /* host accepted VIRTIO_GPU_F_VIRGL */
+extern bool g_context_init; /* host accepted VIRTIO_GPU_F_CONTEXT_INIT */
+uint32_t virtio_gpu_capset_count(void);
+const VirtioGpuCapsetInfo *virtio_gpu_capset(uint32_t i);
+int virtio_gpu_get_capset(uint32_t id, uint32_t version, void *out, uint32_t len);
 
 /* API functions */
 bool virtio_gpu_init(void);

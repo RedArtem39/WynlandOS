@@ -175,6 +175,10 @@ static uint64_t pci_get_bar_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_
     }
 }
 
+/* struct virtio_gpu_config: events_read, events_clear, num_scanouts,
+   num_capsets (all le32). NULL if the device didn't expose it. */
+static volatile uint8_t *mmio_devcfg = NULL;
+
 static volatile uint8_t *virtio_gpu_pci_find(void)
 {
     for (uint16_t bus = 0; bus < 256; bus++) {
@@ -207,6 +211,7 @@ static volatile uint8_t *virtio_gpu_pci_find(void)
                 uint32_t status_reg = pci_read_config((uint8_t)bus, slot, func, 0x04);
                 uint64_t common_phys = 0;
                 uint64_t notify_phys = 0;
+                uint64_t devcfg_phys = 0;
 
                 if (status_reg & (1 << 20)) { // Capabilities List flag in Status Register
                     uint32_t cap_ptr = pci_read_config((uint8_t)bus, slot, func, 0x34) & 0xFF;
@@ -236,6 +241,8 @@ static volatile uint8_t *virtio_gpu_pci_find(void)
                             } else if (cfg_type == 2) { // VIRTIO_PCI_CAP_NOTIFY_CFG
                                 notify_phys = bar_phys + offset;
                                 notify_off_multiplier = pci_read_config((uint8_t)bus, slot, func, cap_ptr + 16);
+                            } else if (cfg_type == 4) { // VIRTIO_PCI_CAP_DEVICE_CFG
+                                devcfg_phys = bar_phys + offset;
                             }
                         }
 
@@ -267,6 +274,10 @@ static volatile uint8_t *virtio_gpu_pci_find(void)
                 vmm_map_mmio(notify_phys & ~4095ULL, 4096);
 
                 mmio_notify = (volatile uint8_t *)(uintptr_t)notify_phys;
+                if (devcfg_phys) {
+                    vmm_map_mmio(devcfg_phys & ~4095ULL, 4096);
+                    mmio_devcfg = (volatile uint8_t *)(uintptr_t)devcfg_phys;
+                }
 
                 log_str("VIRTIO-GPU: MMIO mapped and Bus mastering enabled\r\n");
                 return (volatile uint8_t *)(uintptr_t)common_phys;
@@ -762,6 +773,79 @@ static void cursor_submit(void)
  * Public Driver Interface
  * ============================================================ */
 
+/* ============================================================
+ * 3D capability sets (virgl / venus / ...)
+ * ============================================================ */
+
+bool g_virgl = false;
+bool g_context_init = false;
+
+static VirtioGpuCapsetInfo g_capsets[VIRTIO_GPU_MAX_CAPSETS];
+static uint32_t g_num_capsets = 0;
+
+static void virtio_gpu_query_capsets(void)
+{
+    uint32_t n = mmio_devcfg ? *(volatile uint32_t *)(mmio_devcfg + 12) : 0;
+    log_dec("VIRTIO-GPU: host capsets = ", n);
+    if (n > VIRTIO_GPU_MAX_CAPSETS) n = VIRTIO_GPU_MAX_CAPSETS;
+
+    static VirtioGpuGetCapsetInfo cmd __attribute__((aligned(64)));
+    static VirtioGpuRespCapsetInfo resp __attribute__((aligned(64)));
+    for (uint32_t i = 0; i < n; i++) {
+        memset(&cmd, 0, sizeof(cmd));
+        memset(&resp, 0, sizeof(resp));
+        cmd.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+        cmd.capset_index = i;
+        if (!virtio_gpu_send_cmd(&cmd, sizeof(cmd), &resp, sizeof(resp)) ||
+            resp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO) {
+            log_hex("VIRTIO-GPU: GET_CAPSET_INFO failed, resp = ", resp.hdr.type);
+            continue;
+        }
+        g_capsets[g_num_capsets].capset_id = resp.capset_id;
+        g_capsets[g_num_capsets].max_version = resp.capset_max_version;
+        g_capsets[g_num_capsets].max_size = resp.capset_max_size;
+        g_num_capsets++;
+        log_dec("VIRTIO-GPU:   capset id = ", resp.capset_id);
+        log_dec("VIRTIO-GPU:     max_version = ", resp.capset_max_version);
+        log_dec("VIRTIO-GPU:     max_size = ", resp.capset_max_size);
+    }
+}
+
+uint32_t virtio_gpu_capset_count(void) { return g_num_capsets; }
+
+const VirtioGpuCapsetInfo *virtio_gpu_capset(uint32_t i)
+{
+    return i < g_num_capsets ? &g_capsets[i] : NULL;
+}
+
+/* Fetch capset `id`/`version` into `out` (at most `len` bytes). Returns the
+   number of bytes copied, or -1. Kernel context; waits synchronously. */
+int virtio_gpu_get_capset(uint32_t id, uint32_t version, void *out, uint32_t len)
+{
+    uint32_t max = 0;
+    for (uint32_t i = 0; i < g_num_capsets; i++)
+        if (g_capsets[i].capset_id == id) max = g_capsets[i].max_size;
+    if (!max || max > VIRTIO_GPU_CAPSET_BUF - sizeof(VirtioGpuCtrlResponse)) return -1;
+
+    /* One physically contiguous page-aligned buffer: the response is a
+       header plus up to a few KB of caps, well within it. */
+    static uint8_t buf[VIRTIO_GPU_CAPSET_BUF] __attribute__((aligned(4096)));
+    static VirtioGpuGetCapset cmd __attribute__((aligned(64)));
+    memset(&cmd, 0, sizeof(cmd));
+    memset(buf, 0, sizeof(buf));
+    cmd.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    cmd.capset_id = id;
+    cmd.capset_version = version;
+
+    uint32_t resp_len = sizeof(VirtioGpuCtrlResponse) + max;
+    if (!virtio_gpu_send_cmd(&cmd, sizeof(cmd), buf, resp_len)) return -1;
+    if (((VirtioGpuCtrlResponse *)buf)->type != VIRTIO_GPU_RESP_OK_CAPSET) return -1;
+
+    uint32_t n = max < len ? max : len;
+    memcpy(out, buf + sizeof(VirtioGpuCtrlResponse), n);
+    return (int)n;
+}
+
 bool virtio_gpu_init(void)
 {
     log_str("VIRTIO-GPU: Initializing VirtIO-GPU driver...\r\n");
@@ -794,12 +878,28 @@ bool virtio_gpu_init(void)
     mmio_write32(VIRTIO_MODERN_DEV_FEATURE_SEL, 1);
     uint32_t features1 = mmio_read32(VIRTIO_MODERN_DEV_FEATURE);
 
-    /* Write accepted features back */
+    /* Accept ONLY what this driver implements. Echoing the device's whole
+       offer back used to also accept e.g. VIRTIO_RING_F_EVENT_IDX (bit 29),
+       which changes notification rules the virtqueue code doesn't follow.
+       VIRGL (3D commands) and CONTEXT_INIT (typed contexts) are taken
+       whenever offered -- plain 2D keeps working either way. */
+    uint32_t accept0 = features0 & (VIRTIO_GPU_F_VIRGL | VIRTIO_GPU_F_CONTEXT_INIT);
+    if (!(features1 & 0x01)) {
+        log_str("VIRTIO-GPU: ERROR - device lacks VIRTIO_F_VERSION_1\r\n");
+        mmio_write8(VIRTIO_MODERN_STATUS, VIRTIO_STATUS_FAILED);
+        return false;
+    }
     mmio_write32(VIRTIO_MODERN_DRV_FEATURE_SEL, 0);
-    mmio_write32(VIRTIO_MODERN_DRV_FEATURE, features0);
+    mmio_write32(VIRTIO_MODERN_DRV_FEATURE, accept0);
 
     mmio_write32(VIRTIO_MODERN_DRV_FEATURE_SEL, 1);
-    mmio_write32(VIRTIO_MODERN_DRV_FEATURE, features1 | 0x01); /* Accept VIRTIO_F_VERSION_1 */
+    mmio_write32(VIRTIO_MODERN_DRV_FEATURE, 0x01); /* VIRTIO_F_VERSION_1 */
+
+    g_virgl = (accept0 & VIRTIO_GPU_F_VIRGL) != 0;
+    g_context_init = (accept0 & VIRTIO_GPU_F_CONTEXT_INIT) != 0;
+    log_hex("VIRTIO-GPU: device features[0] = ", features0);
+    log_str(g_virgl ? "VIRTIO-GPU: 3D (virgl) available\r\n"
+                    : "VIRTIO-GPU: 2D only (host offers no virgl)\r\n");
 
     /* Set FEATURES_OK status */
     mmio_write8(VIRTIO_MODERN_STATUS, 
@@ -980,6 +1080,8 @@ bool virtio_gpu_init(void)
             return false;
         }
     }
+
+    if (g_virgl) virtio_gpu_query_capsets();
 
     /* Show the arrow wherever the PS/2 driver already thinks the pointer is. */
     initialized = true;
