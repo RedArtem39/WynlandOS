@@ -244,6 +244,15 @@ uint32_t virtio_gpu_capset_count(void);
 const VirtioGpuCapsetInfo *virtio_gpu_capset(uint32_t i);
 int virtio_gpu_get_capset(uint32_t id, uint32_t version, void *out, uint32_t len);
 
+/* Real PCI identity of the virtio-gpu device (for the sysfs files libdrm
+   reads: vendor/device/revision/uevent). false if no device was found. */
+typedef struct {
+    uint8_t  bus, slot, func, revision;
+    uint16_t vendor, device, subvendor, subdevice;
+    uint32_t class_code; /* base<<16 | sub<<8 | prog-if */
+} VgpuPciInfo;
+bool virtio_gpu_pci_info(VgpuPciInfo *out);
+
 /* API functions */
 bool virtio_gpu_init(void);
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);

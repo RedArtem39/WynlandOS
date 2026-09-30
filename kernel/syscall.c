@@ -2024,7 +2024,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 extern Thread *thread_create(void (*entry)(void*), void *arg);
                 Thread *t = thread_create(clone_child_entry, ca);
-                t->tls_base = a5;
+                /* CLONE_SETTLS (0x80000): tls = a5, user half only (see
+                   arch_prctl). Without the flag the child keeps ours. */
+                if (a1 & 0x80000) t->tls_base = (a5 < 0x0000800000000000ULL) ? a5 : 0;
+                else              t->tls_base = sched_current()->tls_base;
                 /* This new thread shares the CALLER's process (thread_create()
                    -> thread_create_ex(..., NULL) defaults Thread.proc to
                    current_thread->proc, kernel/sched.c) -- keep a real live
@@ -2240,6 +2243,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
                 /* Like Linux's exec: the clear-tid word lived in the old image */
                 sched_current()->clear_tid = NULL;
+                /* ...and the new image starts from a clean FPU/SSE state */
+                {
+                    uint32_t mxcsr = 0x1F80;
+                    __asm__ volatile("fninit; ldmxcsr %0" :: "m"(mxcsr));
+                }
 
                 bool execve_ok = elf_load(kernel_path, &entry_point, &stack_top, pml4,
                                           have_argv_e ? kargv_e : NULL, have_envp_e ? kenvp_e : NULL, exec_proc);
@@ -2289,6 +2297,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 158: // SYS_arch_prctl (Linux standard)
             {
                 if (a1 == 0x1002) { // ARCH_SET_FS
+                    /* User addresses only (canonical lower half): anything
+                       else would #GP in the kernel's own wrmsr below and on
+                       every later context switch -- a one-syscall kernel
+                       crash on real hardware. Linux answers -EPERM. */
+                    if (a2 >= 0x0000800000000000ULL) return (uint64_t)-1; /* -EPERM */
                     uint32_t msr = 0xC0000100; // IA32_FS_BASE
                     uint32_t low = a2 & 0xFFFFFFFF;
                     uint32_t high = a2 >> 32;

@@ -542,6 +542,24 @@ static bool ctrlq_wait_spin(CtrlTicket t, uint32_t ms)
     }
 }
 
+bool virtio_gpu_pci_info(VgpuPciInfo *out)
+{
+    if (!mmio_base) return false;
+    uint32_t id  = pci_read_config(gpu_pci_bus, gpu_pci_slot, gpu_pci_func, 0x00);
+    uint32_t cls = pci_read_config(gpu_pci_bus, gpu_pci_slot, gpu_pci_func, 0x08);
+    uint32_t sub = pci_read_config(gpu_pci_bus, gpu_pci_slot, gpu_pci_func, 0x2C);
+    out->bus = gpu_pci_bus;
+    out->slot = gpu_pci_slot;
+    out->func = gpu_pci_func;
+    out->vendor = id & 0xFFFF;
+    out->device = id >> 16;
+    out->revision = cls & 0xFF;
+    out->class_code = cls >> 8;
+    out->subvendor = sub & 0xFFFF;
+    out->subdevice = sub >> 16;
+    return true;
+}
+
 /* ---- API for the DRM render node (drivers/video/virtgpu_drm.c) ---- */
 
 bool vgpu_submit(const void *cmd, uint32_t cmd_len, const void *data, uint32_t data_len,
@@ -923,8 +941,14 @@ int virtio_gpu_get_capset(uint32_t id, uint32_t version, void *out, uint32_t len
     cmd.capset_version = version;
 
     uint32_t resp_len = sizeof(VirtioGpuCtrlResponse) + max;
-    if (!virtio_gpu_send_cmd(&cmd, sizeof(cmd), buf, resp_len)) return -1;
-    if (((VirtioGpuCtrlResponse *)buf)->type != VIRTIO_GPU_RESP_OK_CAPSET) return -1;
+    if (!virtio_gpu_send_cmd(&cmd, sizeof(cmd), buf, resp_len)) {
+        log_str("VIRTIO-GPU: GET_CAPSET not answered\r\n");
+        return -1;
+    }
+    if (((VirtioGpuCtrlResponse *)buf)->type != VIRTIO_GPU_RESP_OK_CAPSET) {
+        log_hex("VIRTIO-GPU: GET_CAPSET resp = ", ((VirtioGpuCtrlResponse *)buf)->type);
+        return -1;
+    }
 
     uint32_t n = max < len ? max : len;
     memcpy(out, buf + sizeof(VirtioGpuCtrlResponse), n);

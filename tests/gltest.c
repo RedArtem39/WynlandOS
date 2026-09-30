@@ -45,17 +45,8 @@ static GLuint shader(GLenum type, const char *src)
     return s;
 }
 
-int main(int argc, char **argv)
+int main(void)
 {
-    /* The kernel starts us without an environment: re-exec once with the
-       dynamic loader's own tracing on. */
-    if (argc > 0 && !getenv("GLTEST_REEXEC")) {
-        char *envp[] = { "GLTEST_REEXEC=1", "LD_LIBRARY_PATH=/lib64", "LIBGL_DEBUG=verbose", "EGL_LOG_LEVEL=debug", "MESA_DEBUG=1", NULL };
-        execve(argv[0], argv, envp);
-    }
-
-    /* No sysfs/PCI probing needed: name the Gallium driver outright. */
-    setenv("MESA_LOADER_DRIVER_OVERRIDE", "virtio_gpu", 1);
     setenv("EGL_LOG_LEVEL", "warning", 0);
     fprintf(stderr, "[gltest] start\n");
 

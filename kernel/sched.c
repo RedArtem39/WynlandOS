@@ -41,6 +41,11 @@ void sched_init(void) {
 
     // Create the main thread structure representing the current running kernel main
     current_thread = (Thread *)kmalloc(sizeof(Thread));
+    /* Zero everything first: fields nobody sets explicitly (tls_base,
+       clear_tid, ...) were heap garbage. tls_base goes straight into
+       IA32_FS_BASE on every switch -- a non-canonical value is a #GP on
+       real hardware / KVM (TCG never checked, so it went unnoticed). */
+    memset(current_thread, 0, sizeof(Thread));
     current_thread->id = 0;
     current_thread->rsp = 0; // Will be set on context switch
     current_thread->stack_orig = NULL; // Main stack is not dynamically allocated by us
@@ -66,6 +71,7 @@ void sched_init(void) {
     {
         disable_interrupts();
         Thread *t = (Thread *)kmalloc(sizeof(Thread));
+        memset(t, 0, sizeof(Thread));
         t->id = next_thread_id++;
         t->state = THREAD_STATE_READY;
         t->tls_base = 0;
@@ -134,6 +140,11 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     disable_interrupts();
 
     Thread *t = (Thread *)kmalloc(sizeof(Thread));
+    memset(t, 0, sizeof(Thread));
+    /* The creator's live x87/SSE registers are its user state (the kernel
+       never touches them): the new thread starts from a copy, like
+       fork()/clone() on Linux. */
+    __asm__ volatile("fxsave (%0)" :: "r"(thread_fx_area(t)) : "memory");
     t->id = next_thread_id++;
     t->state = THREAD_STATE_READY;
     t->tls_base = tls_base;
@@ -342,6 +353,9 @@ void sched_schedule(void) {
     {
         uint32_t msr = 0xC0000100; // IA32_FS_BASE
         uint64_t val = next_thread->tls_base;
+        /* Last line of defence: a non-canonical FS base would #GP right
+           here, in the scheduler, with interrupts off. */
+        if ((uint64_t)((int64_t)(val << 16) >> 16) != val) val = 0;
         uint32_t low = val & 0xFFFFFFFF;
         uint32_t high = val >> 32;
         __asm__ volatile("wrmsr" :: "c"(msr), "a"(low), "d"(high));
@@ -370,6 +384,15 @@ void sched_schedule(void) {
         __asm__ volatile("mov %0, %%cr3" :: "r"(new_cr3) : "memory");
     }
 
+    /* Per-thread x87/SSE state. Without this every process shared one
+       register file: a preemption in the middle of glibc's SSE memcpy/
+       strcmp handed the next process's values to the first -- random
+       corruption (ld.so version checks failing, bad string compares).
+       Safe to restore before the stack switch: kernel code is -mno-sse. */
+    if (prev_thread != next_thread) {
+        __asm__ volatile("fxsave (%0)"  :: "r"(thread_fx_area(prev_thread)) : "memory");
+        __asm__ volatile("fxrstor (%0)" :: "r"(thread_fx_area(next_thread)) : "memory");
+    }
     context_switch(&prev_thread->rsp, next_thread->rsp);
 }
 

@@ -56,7 +56,18 @@ typedef struct Thread {
     uint64_t sig_pending;     /* bitmask, bit N = signal N pending */
     uint64_t sig_mask;        /* blocked-set (9 KILL / 19 STOP unblockable) */
     void *sig_frame;          /* kernel-side frame copy for SYS_rt_sigreturn */
+    /* x87/SSE register file (FXSAVE image, 512 bytes, needs 16-byte
+       alignment -- use thread_fx_area()). The kernel itself is built with
+       -mno-sse, so these registers only ever hold user state; the
+       scheduler saves/restores them on every switch. Last field on purpose:
+       nothing before it moves. */
+    uint8_t fx_raw[512 + 16];
 } Thread;
+
+static inline uint8_t *thread_fx_area(Thread *t)
+{
+    return (uint8_t *)(((uintptr_t)t->fx_raw + 15) & ~(uintptr_t)15);
+}
 
 void sched_init(void);
 Thread *thread_create(void (*entry)(void*), void *arg);

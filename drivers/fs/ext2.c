@@ -32,6 +32,7 @@
  * packing mistake fail the build instead of silently misreading disk.
  */
 
+#include <wynland/virtio_gpu.h>
 #include <wynland/virtgpu_drm.h>
 #include <wynland/vfs.h>
 #include <wynland/ahci.h>
@@ -1544,6 +1545,55 @@ void vfs_close(VfsFile *file) {
  * VFS API -- read
  * ============================================================ */
 
+
+/* ---- sysfs attributes of the DRM device, from the real PCI function ---- */
+
+static uint32_t put_str(char *o, uint32_t n, uint32_t cap, const char *t)
+{
+    while (*t && n + 1 < cap) o[n++] = *t++;
+    return n;
+}
+
+static uint32_t put_hex(char *o, uint32_t n, uint32_t cap, uint32_t v, int digits, bool upper)
+{
+    const char *d = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    for (int i = digits - 1; i >= 0 && n + 1 < cap; i--) o[n++] = d[(v >> (i * 4)) & 0xF];
+    return n;
+}
+
+static uint32_t sysfs_drm_attr(uint32_t kind, char *o, uint32_t cap)
+{
+    VgpuPciInfo pi;
+    if (!virtio_gpu_pci_info(&pi)) {
+        memset(&pi, 0, sizeof(pi));
+        pi.vendor = 0x1AF4; pi.device = 0x1050; pi.slot = 2;
+        pi.subvendor = 0x1AF4; pi.subdevice = 0x1100; pi.class_code = 0x038000;
+    }
+    uint32_t n = 0;
+    if (kind == 0xFFFFFFF4) {        /* vendor (and subsystem_vendor) */
+        n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.vendor, 4, false);
+    } else if (kind == 0xFFFFFFF5) { /* device (and subsystem_device) */
+        n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.device, 4, false);
+    } else if (kind == 0xFFFFFFFA) { /* revision */
+        n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.revision, 2, false);
+    } else {                         /* uevent of the PCI device */
+        n = put_str(o, n, cap, "DRIVER=virtio-pci\nPCI_CLASS=");
+        n = put_hex(o, n, cap, pi.class_code, 5, true);
+        n = put_str(o, n, cap, "\nPCI_ID=");
+        n = put_hex(o, n, cap, pi.vendor, 4, true);   n = put_str(o, n, cap, ":");
+        n = put_hex(o, n, cap, pi.device, 4, true);
+        n = put_str(o, n, cap, "\nPCI_SUBSYS_ID=");
+        n = put_hex(o, n, cap, pi.subvendor, 4, true); n = put_str(o, n, cap, ":");
+        n = put_hex(o, n, cap, pi.subdevice, 4, true);
+        n = put_str(o, n, cap, "\nPCI_SLOT_NAME=0000:");
+        n = put_hex(o, n, cap, pi.bus, 2, false);  n = put_str(o, n, cap, ":");
+        n = put_hex(o, n, cap, pi.slot, 2, false); n = put_str(o, n, cap, ".");
+        n = put_hex(o, n, cap, pi.func, 1, false);
+    }
+    n = put_str(o, n, cap, "\n");
+    return n;
+}
+
 int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
@@ -1609,42 +1659,17 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
             }
             return (int)read_bytes;
         }
-        if (file->node.first_cluster == 0xFFFFFFF4) { /* VENDOR */
-            const char *val = "0x8086\n"; uint32_t len = 7;
-            if (file->offset >= len) return 0;
-            if (size > len - file->offset) size = len - file->offset;
-            memcpy(buf, val + file->offset, size);
-            file->offset += size;
-            return (int)size;
-        }
-        if (file->node.first_cluster == 0xFFFFFFF5) { /* DEVICE */
-            const char *val = "0x1111\n"; uint32_t len = 7;
-            if (file->offset >= len) return 0;
-            if (size > len - file->offset) size = len - file->offset;
-            memcpy(buf, val + file->offset, size);
-            file->offset += size;
-            return (int)size;
-        }
-        if (file->node.first_cluster == 0xFFFFFFFA) { /* REVISION */
-            const char *val = "0x00\n"; uint32_t len = 5;
-            if (file->offset >= len) return 0;
-            if (size > len - file->offset) size = len - file->offset;
-            memcpy(buf, val + file->offset, size);
-            file->offset += size;
-            return (int)size;
-        }
-        if (file->node.first_cluster == 0xFFFFFFF6) { /* UEVENT_CARD */
-            const char *val = "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\nDRIVER=virtio_gpu\n";
-            uint32_t len = 69;
-            if (file->offset >= len) return 0;
-            if (size > len - file->offset) size = len - file->offset;
-            memcpy(buf, val + file->offset, size);
-            file->offset += size;
-            return (int)size;
-        }
-        if (file->node.first_cluster == 0xFFFFFFF7) { /* UEVENT_RENDER */
-            const char *val = "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_render_minor\nDRIVER=virtio_gpu\n";
-            uint32_t len = 83;
+        /* PCI sysfs attributes of the DRM device (/sys/dev/char/226:N/device/
+           vendor, device, revision, uevent) -- what libdrm's drmGetDevice2()
+           parses. Generated from the real virtio-gpu PCI function; the old
+           fixed strings claimed an Intel 8086:1111 and had no
+           PCI_SLOT_NAME, so libdrm rejected every DRM node (-ENODEV) and
+           Mesa's EGL gave up on the render device. */
+        if (file->node.first_cluster == 0xFFFFFFF4 || file->node.first_cluster == 0xFFFFFFF5 ||
+            file->node.first_cluster == 0xFFFFFFFA || file->node.first_cluster == 0xFFFFFFF6 ||
+            file->node.first_cluster == 0xFFFFFFF7) {
+            char val[256];
+            uint32_t len = sysfs_drm_attr(file->node.first_cluster, val, sizeof(val));
             if (file->offset >= len) return 0;
             if (size > len - file->offset) size = len - file->offset;
             memcpy(buf, val + file->offset, size);

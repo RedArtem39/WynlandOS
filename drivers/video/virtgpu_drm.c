@@ -45,7 +45,7 @@ extern void *pmm_alloc_contiguous(uint32_t count);
 
 /* 1 = log every ioctl (nr, result) and host-side failures to serial */
 #ifndef DRM_DEBUG
-#define DRM_DEBUG 1
+#define DRM_DEBUG 0
 #endif
 
 static void dbg_num(const char *pre, int64_t v)
@@ -411,6 +411,10 @@ static int64_t ioctl_get_caps(uint64_t argp)
 {
     struct virtgpu_get_caps_u gc;
     if (copy_from_user(&gc, (void *)argp, sizeof(gc))) return -EFAULT;
+    dbg_num("DRM: GET_CAPS id=", gc.cap_set_id);
+    dbg_num("DRM:   ver=", gc.cap_set_ver);
+    dbg_num("DRM:   size=", gc.size);
+    dbg_num("DRM:   known capsets=", virtio_gpu_capset_count());
     uint32_t max_ver = 0, found = 0;
     for (uint32_t i = 0; i < virtio_gpu_capset_count(); i++) {
         const VirtioGpuCapsetInfo *ci = virtio_gpu_capset(i);
@@ -419,6 +423,7 @@ static int64_t ioctl_get_caps(uint64_t argp)
     if (!found || gc.cap_set_ver > max_ver) return -EINVAL;
     static uint8_t buf[VIRTIO_GPU_CAPSET_BUF];
     int n = virtio_gpu_get_capset(gc.cap_set_id, gc.cap_set_ver, buf, sizeof(buf));
+    dbg_num("DRM:   host capset bytes=", n);
     if (n < 0) return -EINVAL;
     uint32_t k = (uint32_t)n < gc.size ? (uint32_t)n : gc.size;
     if (copy_to_user((void *)gc.addr, buf, k)) return -EFAULT;

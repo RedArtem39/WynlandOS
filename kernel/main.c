@@ -2671,7 +2671,6 @@ void kernel_main(BootInfo *boot_info)
        offers 3D, so 2D-only boots stay quiet. Prints [gltest] lines. */
     {
         extern bool g_virgl;
-        if (g_virgl) process_spawn("/dlsymtest.elf", NULL, 1000);
         if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
     }
 
