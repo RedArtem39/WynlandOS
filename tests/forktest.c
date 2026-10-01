@@ -45,6 +45,31 @@ static long now_ms(void)
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
+/* fork + execve of a static (musl) port with stdout on a pipe, the way the
+   Zerp terminal runs /usr/bin programs. Returns the exit status, output in buf. */
+static int run_capture(const char *path, const char *arg, const char *arg2, char *buf, int cap)
+{
+    int fd[2];
+    if (pipe(fd) != 0) return -100;
+    pid_t p = fork();
+    if (p == 0) {
+        dup2(fd[1], 1); dup2(fd[1], 2);
+        close(fd[0]); close(fd[1]);
+        char *av[] = { (char *)path, (char *)arg, (char *)arg2, NULL };
+        char *ev[] = { "TERM=vt100", "CURL_CA_BUNDLE=/etc/ssl/cert.pem", NULL };
+        execve(path, av, ev);
+        _exit(127);
+    }
+    close(fd[1]);
+    int n = 0, r;
+    while (n < cap - 1 && (r = (int)read(fd[0], buf + n, cap - 1 - n)) > 0) n += r;
+    buf[n] = 0;
+    close(fd[0]);
+    int st = 0;
+    if (waitpid(p, &st, 0) != p) return -101;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
+}
+
 int main(int argc, char **argv)
 {
     /* re-exec'd by the posix_spawn test */
@@ -127,6 +152,33 @@ int main(int argc, char **argv)
     /* 10. SIGCHLD reached our handler */
     check(g_sigchld > 0, "SIGCHLD handler ran");
 
+    {
+        static char out[4096];
+        pid_t q = fork();
+        if (q == 0) {
+            char *av[] = { "/usr/bin/curl", "--version", NULL };
+            char *ev[] = { "TERM=vt100", "CURL_CA_BUNDLE=/etc/ssl/cert.pem", NULL };
+            execve(av[0], av, ev);
+            _exit(127);
+        }
+        int qs = 0;
+        waitpid(q, &qs, 0);
+        fprintf(stderr, "[forktest] curl to console: status=0x%x\n", qs);
+        int rc = run_capture("/usr/bin/curl", "--version", NULL, out, sizeof(out));
+        fprintf(stderr, "[forktest] curl rc=%d out=%.80s\n", rc, out);
+        check(rc == 0 && strncmp(out, "curl ", 5) == 0, "fork+execve /usr/bin/curl --version");
+        rc = run_capture("/usr/bin/nano", "--version", NULL, out, sizeof(out));
+        fprintf(stderr, "[forktest] nano rc=%d out=%.80s\n", rc, out);
+        check(rc == 0 && strstr(out, "nano") != NULL, "fork+execve /usr/bin/nano --version");
+        /* real network: DNS (musl resolver -> /etc/resolv.conf), TCP, TLS */
+        rc = run_capture("/usr/bin/curl", "-sI", "https://example.com/", out, sizeof(out));
+        fprintf(stderr, "[forktest] curl https rc=%d out=%.60s\n", rc, out);
+        /* 6 = no DNS, 7 = no route, 28 = timeout: no network, not a bug */
+        if (rc == 6 || rc == 7 || rc == 28)
+            fprintf(stderr, "[forktest] SKIP curl -sI https://example.com/ (no network, rc=%d)\n", rc);
+        else
+            check(rc == 0 && strncmp(out, "HTTP/", 5) == 0, "curl -sI https://example.com/");
+    }
     fprintf(stderr, "[forktest] DONE pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

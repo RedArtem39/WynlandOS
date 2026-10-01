@@ -8,6 +8,7 @@
  */
 
 #include <wynland/tcp.h>
+#include <wynland/unix_socket.h>
 #include <wynland/net.h>
 #include <wynland/types.h>
 
@@ -242,8 +243,9 @@ TcpConnection *tcp_connect(uint32_t remote_ip, uint16_t remote_port)
     /* SYN consumes one sequence number */
     conn->snd_nxt = conn->snd_iss + 1;
 
-    /* Busy-poll for SYN-ACK */
-    for (i = 0; i < TCP_CONNECT_TIMEOUT; i++) {
+    /* Busy-poll for SYN-ACK (an internet round trip: tens of ms) */
+    uint64_t syn_deadline = net_deadline_ms(TCP_CONNECT_TIMEOUT_MS);
+    for (i = 0; !net_past(syn_deadline); i++) {
         net_poll();
 
         if (conn->reset_received) {
@@ -499,7 +501,8 @@ void tcp_close(TcpConnection *conn)
 
     /* If we were in CLOSE_WAIT, wait for ACK of our FIN (LAST_ACK -> CLOSED) */
     if (was_close_wait) {
-        for (i = 0; i < TCP_CLOSE_TIMEOUT; i++) {
+        uint64_t la_deadline = net_deadline_ms(TCP_CLOSE_TIMEOUT_MS);
+        for (i = 0; !net_past(la_deadline); i++) {
             net_poll();
             if (conn->state == TCP_STATE_CLOSED || conn->reset_received) {
                 break;
@@ -510,7 +513,8 @@ void tcp_close(TcpConnection *conn)
     }
 
     /* ---- Wait for ACK of our FIN (FIN_WAIT_1 → FIN_WAIT_2) ---- */
-    for (i = 0; i < TCP_CLOSE_TIMEOUT; i++) {
+    uint64_t fw1_deadline = net_deadline_ms(TCP_CLOSE_TIMEOUT_MS);
+    for (i = 0; !net_past(fw1_deadline); i++) {
         net_poll();
 
         if (conn->reset_received) {
@@ -546,7 +550,8 @@ void tcp_close(TcpConnection *conn)
     }
 
     /* ---- Wait for remote FIN (FIN_WAIT_2 → TIME_WAIT) ---- */
-    for (i = 0; i < TCP_CLOSE_TIMEOUT; i++) {
+    uint64_t fw2_deadline = net_deadline_ms(TCP_CLOSE_TIMEOUT_MS);
+    for (i = 0; !net_past(fw2_deadline); i++) {
         net_poll();
 
         if (conn->reset_received) {
@@ -654,7 +659,7 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
         serial_write_string("[TCP] RST received\n");
         conn->reset_received = true;
         conn->state = TCP_STATE_CLOSED;
-        waitqueue_wake_all(&conn->rx_wq);
+        waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
         return;
     }
 
@@ -723,14 +728,14 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
 
             /* ACK the FIN */
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-            waitqueue_wake_all(&conn->rx_wq);
+            waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
             return;
         }
 
         /* If we had data but no FIN, ACK it */
         if (payload_len > 0) {
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-            waitqueue_wake_all(&conn->rx_wq);
+            waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
             return;
         }
         break;
@@ -827,5 +832,5 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
        bad-ACK path, FIN_WAIT_1/2, CLOSE_WAIT, LAST_ACK, TIME_WAIT/default)
        -- the two ESTABLISHED paths that `return` early wake explicitly
        above instead of falling through to here. */
-    waitqueue_wake_all(&conn->rx_wq);
+    waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
 }

@@ -263,6 +263,12 @@ typedef struct {
        just a NULL head. */
     WaitQueue read_wq;  /* readers block here while count == 0 */
     WaitQueue write_wq; /* writers block here while count == PIPE_BUF_SIZE */
+    /* Open fds on each end (pipe() only; eventfd leaves is_pipe 0). With no
+       writer left, an empty pipe reads as EOF; with no reader, a write is
+       EPIPE + SIGPIPE. kfile_get()/kfile_close() keep the counts. */
+    bool     is_pipe;
+    uint32_t readers;
+    uint32_t writers;
 } KPipe;
 
 static KPipe *g_pipes[MAX_PIPES];
@@ -294,6 +300,26 @@ static ShmSegment g_shm_segments[MAX_SHM_SEGMENTS];
    (busy-loop) for a strictly worse one (unkillable hang). */
 #define PIPE_WAIT_RETRY_TICKS 200
 
+/* A signal that will be delivered (unblocked, or SIGKILL) is pending on
+   the current thread: a sleep must end with -EINTR. */
+static bool sleep_interrupted(void) {
+    Thread *t = sched_current();
+    return t && (t->sig_pending & (~t->sig_mask | (1ULL << 9)));
+}
+
+/* -EINTR for an interrupted sleep; the remaining time goes to the user's
+   rem timespec when one was given. */
+static uint64_t sleep_eintr(uint64_t rem_uaddr, uint64_t end_ms) {
+    extern uint64_t timer_get_ms(void);
+    if (rem_uaddr) {
+        uint64_t now = timer_get_ms();
+        uint64_t left = end_ms > now ? end_ms - now : 0;
+        struct { int64_t tv_sec, tv_nsec; } r = { (int64_t)(left / 1000), (int64_t)(left % 1000) * 1000000 };
+        copy_to_user((void *)rem_uaddr, &r, sizeof(r));
+    }
+    return (uint64_t)-4; /* -EINTR */
+}
+
 static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
     const uint8_t *src = (const uint8_t *)buf;
     /* POSIX PIPE_BUF atomicity: a write of <= PIPE_BUF_SIZE bytes waits
@@ -302,6 +328,7 @@ static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
        every reader that parses them. Larger writes may still be split. */
     uint32_t need = size <= PIPE_BUF_SIZE ? size : 1;
     while (PIPE_BUF_SIZE - pipe->count < need) {
+        if (pipe->is_pipe && pipe->readers == 0) return 0; /* caller: EPIPE */
         waitqueue_wait(&pipe->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
     }
     uint32_t written = 0;
@@ -321,6 +348,7 @@ static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
 static uint32_t pipe_read(KPipe *pipe, void *buf, uint32_t size) {
     uint8_t *dst = (uint8_t *)buf;
     while (pipe->count == 0) {
+        if (pipe->is_pipe && pipe->writers == 0) return 0; /* EOF */
         waitqueue_wait(&pipe->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
     }
     uint32_t read_bytes = 0;
@@ -629,6 +657,13 @@ extern uint64_t timer_get_ms(void);
    stack address is never PAGE_USER). Takes fd_table explicitly since it's
    a local in the calling syscall_dispatcher() invocation (per-process,
    see the top of that function), not a global this can reach on its own. */
+/* A recv() on this TCP connection would not block: data buffered, or the
+   peer closed/reset (recv then returns 0/-1 at once). */
+static bool tcp_conn_readable(TcpConnection *conn) {
+    return conn->rx_len > 0 || conn->fin_received || conn->reset_received ||
+           conn->state == TCP_STATE_CLOSED;
+}
+
 static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ms) {
     /* Deadline and sleeps both on the 1 kHz clock: a timeout expires
        neither early nor up to a 100 Hz tick late. */
@@ -669,7 +704,10 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                 int p_idx = file->current_cluster;
                 if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
                     KPipe *p = g_pipes[p_idx];
-                    if (p->count > 0) {
+                    if (p->count == 0 && p->is_pipe && p->writers == 0) {
+                        if (fds) fds[i].revents |= 0x0010 | (fds[i].events & 0x0001); // POLLHUP (+POLLIN: read gives EOF)
+                        ready++;
+                    } else if (p->count > 0) {
                         if (fds && (fds[i].events & 0x0001)) { // POLLIN
                             fds[i].revents |= 0x0001;
                             ready++;
@@ -680,7 +718,11 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                 }
             }
             else if (file->node.first_cluster == 0xFFFFFFFB) { // Pipe Write
-                if (fds && (fds[i].events & 0x0004)) { // POLLOUT
+                uint32_t pw = file->current_cluster;
+                if (pw < MAX_PIPES && g_pipes[pw] && g_pipes[pw]->is_pipe && g_pipes[pw]->readers == 0) {
+                    if (fds) fds[i].revents |= 0x0008; // POLLERR
+                    ready++;
+                } else if (fds && (fds[i].events & 0x0004)) { // POLLOUT
                     fds[i].revents |= 0x0004;
                     ready++;
                 }
@@ -721,6 +763,29 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                     ready++;
                 } else {
                     single_wq = wq;
+                }
+            }
+            else if (file->node.first_cluster == SOCK_FD_TCP) {
+                /* Real readiness: "always readable" made a non-blocking
+                   client (curl: poll(socket, eventfd) then read) fall into
+                   a blocking recv once the server went quiet -- forever. */
+                TcpConnection *conn = (file->current_cluster == TCP_FD_NOT_CONNECTED) ? NULL
+                                    : tcp_get_connection((int)file->current_cluster);
+                short ev = fds ? fds[i].events : 0;
+                short rev = 0;
+                if (!conn) {
+                    if (file->current_cluster != TCP_FD_NOT_CONNECTED) rev |= 0x0010; /* POLLHUP */
+                    else rev |= ev & 0x0004;                                          /* unconnected: writable (connect) */
+                } else {
+                    if (tcp_conn_readable(conn)) rev |= ev & 0x0001;
+                    if (conn->fin_received || conn->reset_received || conn->state == TCP_STATE_CLOSED) rev |= 0x0010;
+                    if (conn->state == TCP_STATE_ESTABLISHED) rev |= ev & 0x0004;
+                }
+                if (rev) {
+                    if (fds) fds[i].revents |= rev;
+                    ready++;
+                } else if (conn) {
+                    single_wq = &conn->rx_wq;
                 }
             }
             else {
@@ -778,6 +843,11 @@ void kfile_get(VfsFile *f) {
     else if (fc == MEMFD_FD) memfd_ref((int)f->current_cluster);
     else if (fc == TIMERFD_FD) timerfd_ref((int)f->current_cluster);
     else if (fc == DRM_PRIME_FD) drm_prime_get(f->current_cluster);
+    else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
+             g_pipes[f->current_cluster]) {
+        KPipe *kp = g_pipes[f->current_cluster];
+        if (fc == 0xFFFFFFFA) kp->readers++; else kp->writers++;
+    }
     else if (fc == 0xFFFFFFFD) { /* SHM segment: keep close()'s decrement balanced */
         int seg_idx = (int)f->current_cluster;
         if (seg_idx >= 0 && seg_idx < MAX_SHM_SEGMENTS) g_shm_segments[seg_idx].refcount++;
@@ -824,6 +894,23 @@ void kfile_close(VfsFile *f) {
     } else if (fc == DRM_PRIME_FD) {
         drm_prime_put(f->current_cluster); /* never sleeps: BO freed later */
         kfree(f);
+    } else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
+               g_pipes[f->current_cluster] && g_pipes[f->current_cluster]->is_pipe) {
+        uint32_t idx = f->current_cluster;
+        KPipe *kp = g_pipes[idx];
+        if (fc == 0xFFFFFFFA) { if (kp->readers) kp->readers--; }
+        else                  { if (kp->writers) kp->writers--; }
+        kfree(f);
+        if (kp->readers == 0 && kp->writers == 0) {
+            g_pipes[idx] = NULL;
+            kfree(kp);
+        } else {
+            /* last writer gone: blocked readers see EOF; last reader gone:
+               blocked writers see EPIPE; poll() re-evaluates */
+            waitqueue_wake_all(&kp->read_wq);
+            waitqueue_wake_all(&kp->write_wq);
+            waitqueue_wake_all(&g_poll_any_wq);
+        }
     } else if (fc == 0xFFFFFFFA || fc == 0xFFFFFFFB || fc == 0xFFFFFFFC ||
                fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) {
         /* Pipes/eventfd/PTYs: only the small per-fd VfsFile wrapper is
@@ -1152,10 +1239,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        Poll-driven loops (the Zerp compositor drains every
                        client's pipe each frame) depend on this -- without
                        it one quiet client parked the whole compositor. */
-                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && g_pipes[pipe_idx]->count == 0) {
+                    KPipe *kp = g_pipes[pipe_idx];
+                    if (kp->count == 0 && kp->is_pipe && kp->writers == 0) return 0; /* EOF */
+                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && kp->count == 0) {
                         return (uint64_t)-11; /* -EAGAIN */
                     }
-                    return pipe_read(g_pipes[pipe_idx], (void *)a2, (uint32_t)a3);
+                    return pipe_read(kp, (void *)a2, (uint32_t)a3);
                 }
                 return (uint64_t)-1;
             }
@@ -1163,6 +1252,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (fd_table[a1]->current_cluster == TCP_FD_NOT_CONNECTED) return (uint64_t)-107; // ENOTCONN
                 TcpConnection *conn = tcp_get_connection((int)fd_table[a1]->current_cluster);
                 if (!conn) return (uint64_t)-104; // ECONNRESET
+                if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && !tcp_conn_readable(conn))
+                    return (uint64_t)-11; /* -EAGAIN: it used to block regardless */
                 int n = tcp_recv(conn, (void *)a2, (uint32_t)a3);
                 if (n < 0) return (uint64_t)-1;
                 return (uint64_t)n;
@@ -1246,12 +1337,22 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        IF=0 (SFMASK) and pipe_write() only sleeps when it
                        can't proceed, which these checks rule out. */
                     if (a3 == 0) return 0;
+                    KPipe *kp = g_pipes[pipe_idx];
+                    if (kp->is_pipe && kp->readers == 0) {
+                        signal_raise_current(13 /* SIGPIPE */);
+                        return (uint64_t)-32; /* -EPIPE */
+                    }
                     uint32_t len = a3 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)a3;
                     uint32_t want = len <= PIPE_BUF_SIZE ? len : 1;
-                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && PIPE_BUF_SIZE - g_pipes[pipe_idx]->count < want) {
+                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && PIPE_BUF_SIZE - kp->count < want) {
                         return (uint64_t)-11; /* -EAGAIN */
                     }
-                    return pipe_write(g_pipes[pipe_idx], (const void *)a2, len);
+                    uint32_t w = pipe_write(kp, (const void *)a2, len);
+                    if (w == 0 && kp->is_pipe && kp->readers == 0) {
+                        signal_raise_current(13 /* SIGPIPE */);
+                        return (uint64_t)-32; /* -EPIPE */
+                    }
+                    return w;
                 }
                 return (uint64_t)-1;
             }
@@ -1768,6 +1869,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 KPipe *p = (KPipe *)kmalloc(sizeof(KPipe));
                 if (!p) return (uint64_t)-12; /* -ENOMEM */
                 memset(p, 0, sizeof(KPipe));
+                p->is_pipe = true;
+                p->readers = 1;
+                p->writers = 1;
 
                 // Register pipe
                 int p_idx = -1;
@@ -2229,7 +2333,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 PageTable *child_pml4 = share_mm ? parent->pml4 : vmm_new_process_pml4();
                 if (!child_pml4) return (uint64_t)-12; /* -ENOMEM */
 
-                if (!share_mm && !vmm_cow_clone_user_pages(parent->pml4, child_pml4)) {
+                /* Eager copy, not copy-on-write: with COW, fork() tests corrupted
+                   the parent's stack about every other boot ("stack smashing
+                   detected" in glibc right after fork returned), with the eager
+                   copy never. The COW defect is not found yet; until it is, fork
+                   pays a full copy (cheap here: the processes that fork -- the
+                   terminal, tests -- are small; Mesa clients never fork). */
+                if (!share_mm && !vmm_clone_user_pages(parent->pml4, child_pml4)) {
                     /* Unwinds whatever pages THIS call managed to
                        COW-share before hitting OOM (each was refcounted
                        on both sides -- freeing here drops the child's
@@ -2305,6 +2415,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 Thread *child_thread = thread_create_ex_tls(fork_child_entry, regs_copy, child, sched_current()->tls_base);
                 child->main_thread = child_thread;
                 child->thread_count = 1;
+
 
                 return child->pid; /* parent's own return value: the child's real pid */
             }
@@ -3196,6 +3307,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 61: // SYS_wait4(pid, int *wstatus, options, struct rusage *)
             {
+
                 int options = (int)a3;
                 if (options & ~(1 | 2 | 8 | 0x20000000 | 0x40000000 | (int)0x80000000)) return (uint64_t)-LNX_EINVAL;
                 if (a2 && !user_prepare_write(a2, sizeof(int))) return (uint64_t)-14;
@@ -3426,7 +3538,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     str_compare(path, "/sys/devices/pci0000:00/0000:00:02.0/revision") == 0) {
                     VfsFile *sfile = kmalloc(sizeof(VfsFile));
                     memset(sfile, 0, sizeof(VfsFile));
-                    sfile->node.first_cluster = 0xFFFFFFFA; // REVISION
+                    sfile->node.first_cluster = 0xFFFFFFEF; // REVISION (0xFFFFFFFA is a pipe read end)
                     sfile->node.size = 5;
                     fd_table[fd] = sfile;
                     return fd;
@@ -3882,6 +3994,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     sfile->node.first_cluster = 0xFFFFFFF8;
                 }
                 fd_table[fd] = sfile;
+                /* SOCK_NONBLOCK / SOCK_CLOEXEC in the type: they used to be
+                   masked off and dropped, so curl's non-blocking socket
+                   blocked in recvfrom() forever once the server went quiet. */
+                fd_oflags[fd] = LINUX_O_RDWR | (((uint32_t)a2 & 04000) ? LINUX_O_NONBLOCK : 0);
+                fd_flags[fd] = ((uint32_t)a2 & 02000000) ? FD_CLOEXEC : 0;
                 return fd;
             }
 
@@ -4030,6 +4147,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if (file->current_cluster == TCP_FD_NOT_CONNECTED) return -107; // ENOTCONN
                     TcpConnection *conn = tcp_get_connection((int)file->current_cluster);
                     if (!conn) return -104; // ECONNRESET
+                    if (((fd_oflags[a1] & LINUX_O_NONBLOCK) || (a4 & 0x40 /* MSG_DONTWAIT */)) &&
+                        !tcp_conn_readable(conn))
+                        return (uint64_t)-11; /* -EAGAIN */
                     int n = tcp_recv(conn, (void *)a2, (uint32_t)a3);
                     if (n < 0) return (uint64_t)-1;
                     return (uint64_t)n;
@@ -4433,10 +4553,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     uint64_t ms = sec * 1000 +
                                   ((uint64_t)req->tv_nsec + 999999) / 1000000;
                     uint64_t end_ms = timer_get_ms() + ms;
-                    sched_sleep_ms(ms);
-                    /* Defensive: if the sleeper is ever woken early (e.g. a
-                       future signal-interrupt path), sleep out the rest. */
+                    /* Woken early by a signal (SIGKILL from exit_group/kill
+                       included): -EINTR + the time left in *rem, so it is
+                       acted on now instead of after the whole sleep. */
                     while (ms > 0 && timer_get_ms() < end_ms) {
+                        if (sleep_interrupted()) return sleep_eintr(a2, end_ms);
                         sched_sleep_ms(end_ms - timer_get_ms());
                     }
                 }
@@ -4466,7 +4587,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 } else {
                     end = now + req_ms;
                 }
-                while (timer_get_ms() < end) sched_sleep_ms(end - timer_get_ms());
+                while (timer_get_ms() < end) {
+                    if (sleep_interrupted())
+                        return sleep_eintr((a2 & 1) ? 0 : a4, end); /* no rem with TIMER_ABSTIME */
+                    sched_sleep_ms(end - timer_get_ms());
+                }
                 return 0;
             }
 

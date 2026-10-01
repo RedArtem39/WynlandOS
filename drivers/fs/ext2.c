@@ -1668,7 +1668,7 @@ static uint32_t sysfs_drm_attr(uint32_t kind, char *o, uint32_t cap)
         n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.vendor, 4, false);
     } else if (kind == 0xFFFFFFF5) { /* device (and subsystem_device) */
         n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.device, 4, false);
-    } else if (kind == 0xFFFFFFFA) { /* revision */
+    } else if (kind == 0xFFFFFFEF) { /* revision */
         n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.revision, 2, false);
     } else {                         /* uevent of the PCI device */
         n = put_str(o, n, cap, "DRIVER=virtio-pci\nPCI_CLASS=");
@@ -1760,7 +1760,7 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
            PCI_SLOT_NAME, so libdrm rejected every DRM node (-ENODEV) and
            Mesa's EGL gave up on the render device. */
         if (file->node.first_cluster == 0xFFFFFFF4 || file->node.first_cluster == 0xFFFFFFF5 ||
-            file->node.first_cluster == 0xFFFFFFFA || file->node.first_cluster == 0xFFFFFFF6 ||
+            file->node.first_cluster == 0xFFFFFFEF || file->node.first_cluster == 0xFFFFFFF6 ||
             file->node.first_cluster == 0xFFFFFFF7) {
             char val[256];
             uint32_t len = sysfs_drm_attr(file->node.first_cluster, val, sizeof(val));

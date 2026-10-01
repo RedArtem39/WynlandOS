@@ -95,6 +95,7 @@ void sched_init(void) {
         t->wake_result = 0;
 
         t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
+        t->stack_orig[0] = KSTACK_GUARD;
         uint64_t *stack_top = t->stack_orig + (THREAD_STACK_SIZE / 8);
         stack_top = (uint64_t *)((uintptr_t)stack_top & ~0xF);
         *(--stack_top) = (uint64_t)thread_trampoline; // Return address
@@ -174,6 +175,7 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
 
     // Allocate stack
     t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
+    t->stack_orig[0] = KSTACK_GUARD;
     uint64_t *stack_top = t->stack_orig + (THREAD_STACK_SIZE / 8);
     stack_top = (uint64_t *)((uintptr_t)stack_top & ~0xF);
 
@@ -378,6 +380,13 @@ void sched_schedule(void) {
         uint32_t low = val & 0xFFFFFFFF;
         uint32_t high = val >> 32;
         __asm__ volatile("wrmsr" :: "c"(msr), "a"(low), "d"(high));
+    }
+
+    /* the thread being switched away from ran off the bottom of its stack */
+    if (prev_thread && prev_thread->stack_orig &&
+        prev_thread->stack_orig[0] != KSTACK_GUARD) {
+        serial_write_string("SCHED: KERNEL STACK OVERFLOW\r\n");
+        prev_thread->stack_orig[0] = KSTACK_GUARD; /* report once */
     }
 
     // Update TSS interrupt stack pointer for the new thread

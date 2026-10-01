@@ -217,9 +217,15 @@ void exception_handler(InterruptRegisters *regs)
        of falling through to the fatal path below. Every other fault
        (not-present, a genuine read-only violation, a guard page, kernel
        mode) is unaffected and keeps today's behavior exactly. */
-    if (regs->int_no == 14 && (regs->cs & 0x03) == 3 && (regs->err_code & 0x3) == 0x3) {
-        uint64_t cr2;
-        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+    /* Kernel-mode writes count too (CR0.WP is on): a syscall storing into a
+       user buffer that is still COW-shared after fork() gets its private
+       copy here, exactly like the user's own write would. Only for the
+       user half of the address space. */
+    uint64_t pf_cr2 = 0;
+    if (regs->int_no == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(pf_cr2));
+    if (regs->int_no == 14 && (regs->err_code & 0x3) == 0x3 &&
+        ((regs->cs & 0x03) == 3 || pf_cr2 < 0x0000800000000000ULL)) {
+        uint64_t cr2 = pf_cr2;
         PageTable *pml4 = vmm_get_current_pml4();
         uint64_t flags = vmm_get_page_flags(pml4, cr2);
 

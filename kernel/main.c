@@ -2444,6 +2444,16 @@ void kernel_main(BootInfo *boot_info)
         __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
         cr0 &= ~(1ULL << 2); // Clear EM (bit 2) - emulation disabled
         cr0 |= (1ULL << 1);  // Set MP (bit 1) - monitor co-processor
+        /* WP (bit 16): ring-0 writes honour read-only PTEs too. Without it
+           a kernel store into a fork()ed process's COW page (any user
+           pointer written without user_prepare_write()) went straight into
+           the frame still shared with the parent -- glibc in the parent
+           then died of "stack smashing detected". The page-fault handler
+           resolves such kernel-mode COW faults (kernel/idt.c). The
+           firmware's value was inherited until now. */
+        serial_write_string((cr0 & (1ULL << 16)) ? "CR0: WP was already set\r\n"
+                                                 : "CR0: WP was clear, setting it\r\n");
+        cr0 |= (1ULL << 16);
         __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
 
         __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));

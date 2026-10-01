@@ -168,6 +168,8 @@ Fo /usr/bin/nano                  build/ports/nano
 Fo /usr/bin/cmake                 build/ports/cmake
 Fo /usr/bin/pkgconf               build/ports/pkgconf
 Fo /etc/ssl/cert.pem              build/ports/cert.pem
+F  /etc/resolv.conf             rootfs/etc/resolv.conf
+F  /etc/hosts                   rootfs/etc/hosts
 
 # ---- CMake modules/templates (needed by tools/cmake-wynlandos
 #    binary to locate its CMAKE_ROOT at /usr/share/cmake-3.28) ----

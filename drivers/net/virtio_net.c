@@ -469,14 +469,20 @@ bool virtio_net_send(const void *data, uint32_t len)
     outw(io_base + VIRTIO_PCI_QUEUE_NOTIFY, TX_QUEUE);
 
     /* Poll the used ring for completion with timeout */
-    for (uint32_t i = 0; i < TX_POLL_TIMEOUT; i++) {
-        if (txq.used->idx != txq.last_used) {
+    /* volatile: the device writes used->idx behind the compiler's back --
+       a plain read could be hoisted out of this loop, and a TX the host
+       completes asynchronously (not inside the notify exit) then "timed
+       out" and the packet counted as lost. Bounded in time, not loop
+       iterations (fast under KVM). */
+    uint64_t tx_deadline = net_deadline_ms(200);
+    for (uint32_t i = 0; !net_past(tx_deadline); i++) {
+        if (*(volatile uint16_t *)&txq.used->idx != txq.last_used) {
             txq.last_used++;
             /* Return the descriptor to the free list */
             vq_free_desc(&txq, desc_idx);
             return true;
         }
-        __asm__ volatile("pause");
+        __asm__ volatile("pause" ::: "memory");
     }
 
     /* Timeout - return descriptor anyway to avoid leak */
@@ -495,7 +501,7 @@ int virtio_net_receive(void *buf, uint32_t max_len)
         return 0;
 
     /* Check if the device has placed anything in the used ring */
-    if (rxq.used->idx == rxq.last_used)
+    if (*(volatile uint16_t *)&rxq.used->idx == rxq.last_used)
         return 0;  /* No new packets */
 
     /* Get the used element */

@@ -42,6 +42,11 @@
 #define TCP_CONNECT_TIMEOUT    5000000   /* Poll iterations for connect */
 #define TCP_RECV_TIMEOUT       5000000   /* Poll iterations for recv */
 #define TCP_CLOSE_TIMEOUT      2000000   /* Poll iterations for close */
+/* Wall-clock limits (net_deadline_ms). Both run with interrupts off, so
+   they stall the whole system while they wait: keep them short. A close
+   only waits for the peer's FIN/ACK as a courtesy. */
+#define TCP_CONNECT_TIMEOUT_MS 5000
+#define TCP_CLOSE_TIMEOUT_MS   300
 #define TCP_RETRANSMIT_MAX     5
 #define TCP_EPHEMERAL_BASE     49152     /* Ephemeral port range start */
 

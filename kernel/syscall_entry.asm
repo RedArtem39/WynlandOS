@@ -70,8 +70,10 @@ syscall_entry:
     mov rbx, rax              ; stash syscall return value
     mov rdi, rsp              ; SyscallRegs*
     mov rsi, rax              ; syscall result
-    call signal_deliver_check
-    mov rax, rbx              ; syscall result back in RAX either way
+    sub rsp, 8                ; ABI alignment (the dispatcher call has its
+    call signal_deliver_check ; 7th-argument push for the same purpose)
+    add rsp, 8
+    mov rax, rbx             ; syscall result back in RAX either way
 
     ; 3c. The user's x87/SSE state back (possibly replaced by rt_sigreturn or
     ; reset by execve). RDI is restored from the stack below.

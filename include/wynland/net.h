@@ -181,6 +181,14 @@ void virtio_net_get_mac(uint8_t *mac);
 bool net_init(void);
 void net_poll(void);
 
+/* Wall-clock timeouts for the busy-poll loops (TSC based: those loops run
+   with interrupts off, inside syscalls, where the PIT tick doesn't move).
+   They used to count loop iterations, which under KVM ran out in a few
+   milliseconds -- before any DNS reply or SYN-ACK from the internet could
+   arrive. */
+uint64_t net_deadline_ms(uint32_t ms);
+bool     net_past(uint64_t deadline);
+
 /* Configuration */
 uint32_t net_get_ip(void);
 uint32_t net_get_gateway(void);

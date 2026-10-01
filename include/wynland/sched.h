@@ -7,7 +7,16 @@
 #include <wynland/boot_info.h>
 
 
-#define THREAD_STACK_SIZE 16384 // 16 KB stack
+/* Kernel stack per thread. syscall_dispatcher's frame alone is ~7 KB and
+   dup2()/sendto() re-enter it, plus the network send path (~2 KB frames)
+   and nested IRQ frames: 16 KB overflowed into the neighbouring heap block
+   -- often another thread's kernel stack with its saved user registers,
+   which came back as glibc "stack smashing detected" in that process. */
+#define THREAD_STACK_SIZE 65536 // 64 KB stack
+/* Written at the lowest word of every kernel stack, checked at each
+   context switch: an overflow is reported instead of silently corrupting
+   the heap. */
+#define KSTACK_GUARD 0x57AC6A4D57AC6A4DULL
 
 /* Passed as wake_deadline to sched_block(): never time out on its own. */
 #define SCHED_NO_DEADLINE 0ULL

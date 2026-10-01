@@ -92,8 +92,47 @@ uint16_t ip_checksum(const void *data, uint32_t len)
  * Initialization / poll
  * ============================================================ */
 
+static uint64_t net_tsc_per_ms;
+
+static inline uint64_t net_rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* TSC ticks per ms, measured against the 1 kHz PIT over ~20 ms. Needs
+   interrupts on (boot-time net_init()); otherwise, or if the clock does not
+   move, assume a 3 GHz TSC -- only the length of a timeout depends on it. */
+static void net_calibrate_tsc(void)
+{
+    extern uint64_t timer_get_ms(void);
+    uint64_t rf;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rf));
+    net_tsc_per_ms = 3000000;
+    if (!(rf & 0x200)) return;
+    uint64_t m0 = timer_get_ms(), guard = 0;
+    while (timer_get_ms() == m0 && ++guard < 500000000ull) { }
+    uint64_t t0 = net_rdtsc(), m1 = timer_get_ms();
+    while (timer_get_ms() < m1 + 20 && ++guard < 2000000000ull) { }
+    uint64_t dt = net_rdtsc() - t0, dm = timer_get_ms() - m1;
+    if (dm >= 20 && dt / dm >= 100000) net_tsc_per_ms = dt / dm;
+}
+
+uint64_t net_deadline_ms(uint32_t ms)
+{
+    if (!net_tsc_per_ms) net_calibrate_tsc();
+    return net_rdtsc() + net_tsc_per_ms * ms;
+}
+
+bool net_past(uint64_t deadline)
+{
+    return (int64_t)(net_rdtsc() - deadline) >= 0;
+}
+
 bool net_init(void)
 {
+    net_calibrate_tsc();
     virtio_net_init();
     virtio_net_get_mac(our_mac);
 
@@ -523,7 +562,8 @@ bool net_arp_resolve(uint32_t ip, uint8_t *out_mac)
                      arp_pkt, sizeof(ArpHeader));
 
     /* Poll for reply */
-    for (i = 0; i < 500000; i++) {
+    uint64_t arp_deadline = net_deadline_ms(1000);
+    for (i = 0; !net_past(arp_deadline); i++) {
         net_poll();
 
         /* Check if the target appeared in the cache */
@@ -713,7 +753,8 @@ bool net_dhcp_request(void)
     virtio_net_send(frame, frame_len);
 
     /* Poll for DHCPOFFER */
-    for (i = 0; i < 3000000; i++) {
+    uint64_t offer_deadline = net_deadline_ms(3000);
+    for (i = 0; !net_past(offer_deadline); i++) {
         net_poll();
         if (dhcp_offer_received)
             break;
@@ -798,7 +839,8 @@ bool net_dhcp_request(void)
     virtio_net_send(frame, frame_len);
 
     /* Poll for DHCPACK */
-    for (i = 0; i < 3000000; i++) {
+    uint64_t ack_deadline = net_deadline_ms(3000);
+    for (i = 0; !net_past(ack_deadline); i++) {
         net_poll();
         if (dhcp_ack_received)
             break;
@@ -837,10 +879,12 @@ int net_ping(uint32_t dst_ip)
     if (!net_send_ipv4(dst_ip, IP_PROTO_ICMP, icmp_pkt, sizeof(IcmpHeader)))
         return -1;
 
-    for (i = 0; i < 2000000; i++) {
+    uint64_t ping_start = net_deadline_ms(0);
+    uint64_t ping_deadline = net_deadline_ms(2000);
+    for (i = 0; !net_past(ping_deadline); i++) {
         net_poll();
-        if (ping_reply_received)
-            return (int)i;
+        if (ping_reply_received)  /* round trip in ms */
+            return (int)((net_deadline_ms(0) - ping_start) / (net_tsc_per_ms ? net_tsc_per_ms : 1));
     }
 
     return -1;
@@ -994,7 +1038,8 @@ bool net_dns_resolve(const char *hostname, uint32_t *out_ip)
         return false;
 
     /* Poll for response */
-    for (i = 0; i < 2000000; i++) {
+    uint64_t dns_deadline = net_deadline_ms(3000);
+    for (i = 0; !net_past(dns_deadline); i++) {
         net_poll();
         if (dns_reply_received) {
             *out_ip = dns_resolved_ip;

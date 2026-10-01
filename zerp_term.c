@@ -28,7 +28,7 @@
 
 #define ROW_H (ZERP_FONT_HEIGHT + 2)
 #define MAX_LINES 200
-#define MAX_LINE_LEN 96
+#define MAX_LINE_LEN 256
 #define BG_COLOR   0xFF0A0A14
 #define TEXT_COLOR 0xFFCCCCCC
 #define ECHO_COLOR 0xFF66FF99
@@ -98,11 +98,40 @@ static void add_multiline(const char *text) {
             buf[bi] = '\0';
             add_line(buf, TEXT_COLOR);
             bi = 0;
-        } else if (bi < MAX_LINE_LEN - 1) {
+        } else {
+            if (bi == MAX_LINE_LEN - 1) { buf[bi] = '\0'; add_line(buf, TEXT_COLOR); bi = 0; }
             buf[bi++] = text[i];
         }
     }
     if (bi > 0) { buf[bi] = '\0'; add_line(buf, TEXT_COLOR); }
+}
+
+/* Output of a program run from /usr/bin (curl, cmake, ...) kept as plain
+   lines in the history, the way a normal terminal scrolls -- the VT100
+   screen it is also drawn on goes away when the program exits. Escape
+   sequences are dropped, '\r' and '\b' handled crudely. */
+static char g_out_line[MAX_LINE_LEN];
+static int  g_out_len = 0;
+static int  g_out_esc = 0;   /* 0 none, 1 after ESC, 2 inside CSI */
+static int  g_pty_capture = 0;
+
+static void out_flush(void) {
+    g_out_line[g_out_len] = '\0';
+    add_line(g_out_line, TEXT_COLOR);
+    g_out_len = 0;
+}
+
+static void out_feed(uint8_t b) {
+    if (g_out_esc == 1) { g_out_esc = (b == '[') ? 2 : 0; return; }
+    if (g_out_esc == 2) { if (b >= 0x40 && b <= 0x7E) g_out_esc = 0; return; }
+    if (b == 27) { g_out_esc = 1; return; }
+    if (b == '\n') { out_flush(); return; }
+    if (b == '\r') return;
+    if (b == '\b') { if (g_out_len > 0) g_out_len--; return; }
+    if (b == '\t') b = ' ';
+    if (b < 32) return;
+    if (g_out_len == MAX_LINE_LEN - 1) out_flush();
+    g_out_line[g_out_len++] = (char)b;
 }
 
 static ZerpClient *g_zc; /* set once in zerp_main, used by png rendering helper */
@@ -143,12 +172,18 @@ static void redraw(ZerpClient *zc) {
         return;
     }
 
-    uint32_t visible = rows - 1; /* last row reserved for input/password */
     /* Long lines wrap at the tile width (they used to run off the right
        edge). Walk back from the newest line, counting wrapped rows, to find
        where the screen starts; then draw forward. */
     int cols = (int)((zc->tile_w > 4 ? zc->tile_w - 4 : 0) / ZERP_FONT_WIDTH);
     if (cols < 1) cols = 1;
+    /* the prompt line wraps too: it takes as many bottom rows as it needs
+       (+1 when the cursor sits right past a full row) */
+    int in_len = (g_mode == MODE_PASSWORD) ? 10 + g_password_len : 2 + g_input_len;
+    int in_rows = in_len / cols + 1;
+    if (in_rows > (int)rows - 1) in_rows = (int)rows - 1;
+    if (in_rows < 1) in_rows = 1;
+    uint32_t visible = rows - (uint32_t)in_rows; /* bottom rows: input/password */
     int oldest = g_line_count > MAX_LINES ? g_line_count - MAX_LINES : 0;
     int first = g_line_count, skip = 0, used = 0;
     while (first > oldest) {
@@ -173,20 +208,28 @@ static void redraw(ZerpClient *zc) {
         }
     }
 
-    if (g_mode == MODE_PASSWORD) {
-        char line[MAX_LINE_LEN] = "Password: ";
-        int p = 10;
-        for (int i = 0; i < g_password_len && p < MAX_LINE_LEN - 1; i++) line[p++] = '*';
+    {
+        char line[MAX_LINE_LEN + 16];
+        int p;
+        if (g_mode == MODE_PASSWORD) {
+            const char *pr = "Password: ";
+            for (p = 0; pr[p]; p++) line[p] = pr[p];
+            for (int i = 0; i < g_password_len && p < MAX_LINE_LEN + 14; i++) line[p++] = '*';
+        } else {
+            line[0] = '>'; line[1] = ' '; p = 2;
+            for (int i = 0; i < g_input_len && p < MAX_LINE_LEN + 14; i++) line[p++] = g_input[i];
+        }
         line[p] = '\0';
-        zerp_draw_string_bg(zc, 2, visible * ROW_H, line, PROMPT_COLOR, BG_COLOR);
-    } else {
-        char line[MAX_LINE_LEN + 4] = "> ";
-        int p = 2;
-        /* input longer than the row: show its tail, where the cursor is */
-        int from = g_input_len + 2 > cols ? g_input_len + 2 - cols : 0;
-        for (int i = from; i < g_input_len && p < MAX_LINE_LEN - 1; i++) line[p++] = g_input[i];
-        line[p] = '\0';
-        zerp_draw_string_bg(zc, 2, visible * ROW_H, line, PROMPT_COLOR, BG_COLOR);
+        /* keep the tail when it is taller than the screen allows */
+        int total_rows = p / cols + 1;
+        int r0 = total_rows > in_rows ? total_rows - in_rows : 0;
+        for (int r = 0; r < in_rows; r++) {
+            char piece[MAX_LINE_LEN + 16];
+            int k = 0;
+            for (int c = (r0 + r) * cols; c < p && k < cols && k < (int)sizeof(piece) - 1; c++) piece[k++] = line[c];
+            piece[k] = '\0';
+            zerp_draw_string_bg(zc, 2, (visible + (uint32_t)r) * ROW_H, piece, PROMPT_COLOR, BG_COLOR);
+        }
     }
 
     zerp_send_damage(zc, 0, 0, zc->tile_w, zc->tile_h);
@@ -414,9 +457,14 @@ static void cmd_pty_exec(const char *app, const char *args) {
         zdup2(slave, 2);
         zclose(master);
         zclose(slave);
-        const char *envp2[2];
+        /* the static curl port looks for its CA bundle under /usr/etc/ssl
+           and never finds it there; point it at the system one */
+        const char *envp2[5];
         envp2[0] = "TERM=vt100";
-        envp2[1] = 0;
+        envp2[1] = "CURL_CA_BUNDLE=/etc/ssl/cert.pem";
+        envp2[2] = "SSL_CERT_FILE=/etc/ssl/cert.pem";
+        envp2[3] = "HOME=/";
+        envp2[4] = 0;
         zexecve(path, argv2, envp2);
         zexit(127);
     }
@@ -425,6 +473,9 @@ static void cmd_pty_exec(const char *app, const char *args) {
     g_pty_master = master;
     g_pty_child = pid;
     g_ctrl_held = 0;
+    g_pty_capture = 1;
+    g_out_len = 0;
+    g_out_esc = 0;
     vt_reset((int)ws.ws_row, (int)ws.ws_col);
     g_mode = MODE_PTY;
 }
@@ -562,18 +613,29 @@ int zerp_main(int argc, char **argv) {
             /* Non-blocking drain of the child's screen output into the
                VT100 interpreter, every frame. */
             uint8_t buf[512];
+            /* exit check BEFORE the drain: output written just before the
+               child died is still read below, not lost with the screen */
+            int gone = zprocess_alive(g_pty_child) == 0;
             long n = zread(g_pty_master, buf, sizeof(buf));
             while (n > 0) {
-                for (long i = 0; i < n; i++) vt_feed_byte(buf[i]);
+                for (long i = 0; i < n; i++) {
+                    vt_feed_byte(buf[i]);
+                    if (g_pty_capture) out_feed(buf[i]);
+                }
                 dirty = 1;
                 n = zread(g_pty_master, buf, sizeof(buf));
             }
-            if (zprocess_alive(g_pty_child) == 0) {
+            if (gone) {
                 zclose(g_pty_master);
                 g_pty_master = -1;
                 g_pty_child = -1;
                 g_mode = MODE_NORMAL;
-                add_line("(nano exited)", TEXT_COLOR);
+                if (g_pty_capture) {
+                    if (g_out_len > 0) out_flush();
+                    g_pty_capture = 0;
+                } else {
+                    add_line("(nano exited)", TEXT_COLOR);
+                }
                 dirty = 1;
             }
         }

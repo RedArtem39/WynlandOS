@@ -177,6 +177,19 @@ void *pmm_alloc_page(void)
                     free_pages--;
                     refcount[idx] = 1;
                     result = (void *)(idx * PAGE_SIZE);
+                    {
+                        extern uint64_t heap_end_addr;
+                        static int alias_logged;
+                        if (idx * PAGE_SIZE >= 0x10000000ULL && idx * PAGE_SIZE < heap_end_addr && !alias_logged) {
+                            extern void serial_write_string(const char *);
+                            /* Known gap: the kernel heap's virtual window (HEAP_START..) sits on top of
+                               the RAM identity map, so a frame with this physical
+                               address is not reachable through its identity address.
+                               Not hit yet (under 256 MB in use); say so if it is. */
+                            serial_write_string("PMM: WARNING frame aliased by the kernel heap window handed out\r\n");
+                            alias_logged = 1;
+                        }
+                    }
                     goto cleanup;
                 }
             }
@@ -271,6 +284,10 @@ void pmm_page_incref(void *addr)
 
     uint64_t idx = (uint64_t)addr / PAGE_SIZE;
     if (idx < total_pages && bitmap_test(idx)) {
+        if (refcount[idx] == 255) {
+            extern void serial_write_string(const char *);
+            serial_write_string("PMM: refcount overflow\r\n");
+        }
         refcount[idx]++;
     }
 

@@ -97,6 +97,21 @@ bool vmm_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
                     uint64_t virt = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
                     if (i4 & 0x100) virt |= 0xFFFF000000000000ULL; /* canonical sign-extend, defensive -- this OS's own user addresses never actually reach the upper half today */
 
+                    if (pte & PAGE_SHARED_MAP) {
+                        /* MAP_SHARED / device memory stays shared, exactly
+                           as in vmm_cow_clone_user_pages(): same frame,
+                           same flags, one more reference if the mapping
+                           holds its own (memfd). */
+                        if (pte & PAGE_SHARED_REF) pmm_page_incref((void *)(uintptr_t)phys);
+                        vmm_map_page(child_pml4, virt, phys, (pte & ~PAGE_ADDR_MASK) & ~PAGE_PRESENT);
+                        continue;
+                    }
+
+                    /* Keep NX (bit 63; `flags` holds only the low 12 bits),
+                       and a private copy has no reason to stay COW. */
+                    flags |= pte & PAGE_NX;
+                    if (flags & PAGE_COW) flags = (flags & ~PAGE_COW) | PAGE_WRITE;
+
                     void *new_phys = pmm_alloc_page();
                     if (!new_phys) {
                         serial_write_string("vmm_clone_user_pages: out of physical memory\r\n");

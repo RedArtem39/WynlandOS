@@ -82,7 +82,14 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
             } while (it != sched_get_thread_list() && ++guard < 256);
         }
         t->state = THREAD_STATE_TERMINATED;
-        serial_write_string("[signal] fatal, terminating process\r\n");
+        {
+            char m[] = "[signal] fatal sig=00, terminating process, rip=0x0000000000000000\r\n";
+            m[19] = (char)('0' + sig / 10);
+            m[20] = (char)('0' + sig % 10);
+            for (int k = 0; k < 16; k++)
+                m[50 + k] = "0123456789abcdef"[(regs->rip >> (60 - 4 * k)) & 0xF];
+            serial_write_string(m);
+        }
         sched_schedule();
         while (1) __asm__ volatile("cli; hlt");
     }
