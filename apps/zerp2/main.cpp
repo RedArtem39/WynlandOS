@@ -25,6 +25,10 @@
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlContext>
 #include <QtQuick/QQuickWindow>
+#include <QtGui/QScreen>
+#include <QtQml/qqml.h>
+
+#include "zerp2.h"
 
 #include <cstdio>
 #include <fcntl.h>
@@ -59,7 +63,7 @@ static const char kUpper[59] = {
 class InputPump : public QObject
 {
 public:
-    explicit InputPump(QQuickWindow *w) : m_win(w)
+    InputPump(QQuickWindow *w, ZServer *srv) : m_win(w), m_srv(srv)
     {
         m_kbd = ::open("/dev/input/kbd", O_RDONLY);
         connect(&m_timer, &QTimer::timeout, this, &InputPump::poll);
@@ -105,6 +109,36 @@ private:
         }
     }
 
+    // WM bindings (mod = Alt or Super; Super is usually eaten by the host)
+    bool binding(bool e0, int code)
+    {
+        if (e0) {
+            switch (code) {
+            case 0x4B: m_srv->focusDirection(-1, 0); return true;
+            case 0x4D: m_srv->focusDirection(1, 0); return true;
+            case 0x48: m_srv->focusDirection(0, -1); return true;
+            case 0x50: m_srv->focusDirection(0, 1); return true;
+            }
+            return false;
+        }
+        if (code >= 0x02 && code <= 0x0A) {          // 1..9
+            if (m_shift) m_srv->moveFocusedTo(code - 1);
+            else m_srv->setWorkspace(code - 1);
+            return true;
+        }
+        switch (code) {
+        case 0x1C: m_srv->spawn(QStringLiteral("/zerp_term.elf")); return true;   // Enter
+        case 0x10: m_srv->closeFocused(); return true;                            // Q
+        case 0x20: m_srv->spawn(QStringLiteral("/zerp_rofi.elf")); return true;   // D
+        case 0x21: m_srv->toggleFullscreen(); return true;                        // F
+        case 0x24: m_srv->focusDirection(-1, 0); return true;                     // H J K L
+        case 0x26: m_srv->focusDirection(1, 0); return true;
+        case 0x25: m_srv->focusDirection(0, -1); return true;
+        case 0x23: m_srv->focusDirection(0, 1); return true;
+        }
+        return false;
+    }
+
     void key(unsigned char sc)
     {
         if (sc == 0xE0) { m_e0 = true; return; }
@@ -112,6 +146,20 @@ private:
         const int code = sc & 0x7F;
         const bool e0 = m_e0;
         m_e0 = false;
+
+        // modifier tracking for the bindings
+        if (!e0 && code == 0x38) m_alt = !release;
+        if (e0 && code == 0x38) m_altR = !release;
+        if (e0 && (code == 0x5B || code == 0x5C)) m_super = !release;
+        if (!e0 && (code == 0x2A || code == 0x36)) m_shift = !release;
+        const int kid = code + (e0 ? 128 : 0);
+        if (release && m_swallow[kid]) { m_swallow[kid] = false; return; }
+        if (!release && (m_alt || m_altR || m_super) && binding(e0, code)) {
+            m_swallow[kid] = true;   // its release must not reach the client either
+            return;
+        }
+        // everything else: raw scancodes to the focused client
+        if (ZClient *c = m_srv->focused()) { c->sendKey(e0, sc); return; }
 
         int qk = 0;
         QString text;
@@ -157,6 +205,9 @@ private:
     }
 
     QQuickWindow *m_win;
+    ZServer *m_srv;
+    bool m_alt = false, m_altR = false, m_super = false, m_shift = false;
+    bool m_swallow[256] = {};
     QTimer m_timer;
     int m_kbd = -1;
     QPointF m_pos;
@@ -185,7 +236,12 @@ int main(int argc, char **argv)
     if (!qEnvironmentVariableIsSet("XDG_RUNTIME_DIR")) qputenv("XDG_RUNTIME_DIR", "/tmp");
 
     QGuiApplication app(argc, argv);
+    qmlRegisterType<ZSurface>("Zerp", 1, 0, "ZSurface");
+    qmlRegisterUncreatableType<ZClient>("Zerp", 1, 0, "ZClient", QStringLiteral("made by the server"));
+    const QSize scr = app.primaryScreen() ? app.primaryScreen()->size() : QSize(1920, 1080);
+    ZServer server(uint32_t(scr.width()) * uint32_t(scr.height()) * 4u);
     QQmlApplicationEngine engine;
+    engine.rootContext()->setContextProperty(QStringLiteral("zerp"), &server);
     engine.addImportPath(QStringLiteral("/usr/lib/x86_64-linux-gnu/qt6/qml"));
     QObject::connect(&engine, &QQmlApplicationEngine::warnings, [](const QList<QQmlError> &ws) {
         for (const QQmlError &w : ws) fprintf(stderr, "[zerp2] %s\n", qPrintable(w.toString()));
@@ -199,7 +255,8 @@ int main(int argc, char **argv)
     }
     auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!win) { fprintf(stderr, "[zerp2] FAIL: root is not a Window\n"); return 1; }
-    InputPump pump(win);
+    InputPump pump(win, &server);
+    server.spawn(QStringLiteral("/zerp_term.elf"));   // a terminal to start with
     QObject::connect(win, &QQuickWindow::frameSwapped, win, [] {
         static int frames = 0;
         if (++frames == 1 || frames % 600 == 0) fprintf(stderr, "[zerp2] frame %d\n", frames);
@@ -207,8 +264,11 @@ int main(int argc, char **argv)
     fprintf(stderr, "[zerp2] shell up\n");
 
     if (bootCfg().contains("snapshot")) {
-        QTimer::singleShot(20000, win, [win] {
-            QImage img = win->grabWindow().scaledToWidth(1280, Qt::SmoothTransformation);
+        // something to tile in the picture
+        QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/zerp_files.elf")); });
+        QTimer::singleShot(6000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/qmldemo")); });
+        QTimer::singleShot(60000, win, [win] {
+            QImage img = win->grabWindow().scaledToWidth(960, Qt::SmoothTransformation);
             QBuffer buf; buf.open(QIODevice::WriteOnly);
             img.save(&buf, "PNG");
             const QByteArray b64 = buf.data().toBase64();

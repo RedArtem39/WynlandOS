@@ -13,6 +13,7 @@
 #include <QtCore/QtPlugin>
 #include <QtGui/QGuiApplication>
 #include <QtQml/QQmlApplicationEngine>
+#include <QtQuick/QQuickWindow>
 #include <cstdio>
 
 #include "../../qt_qpa/qwynlandfb_zerpargs.h"
@@ -49,5 +50,11 @@ int main(int argc, char **argv)
         return 1;
     }
     fprintf(stderr, "[qmldemo] loaded %s\n", qPrintable(file));
+    if (auto *w = qobject_cast<QQuickWindow *>(engine.rootObjects().first())) {
+        QObject::connect(w, &QQuickWindow::afterRendering, w, [w] {
+            static int n;
+            if (n++ == 0) fprintf(stderr, "[qmldemo] first frame %dx%d\n", w->width(), w->height());
+        }, Qt::DirectConnection);
+    }
     return app.exec();
 }

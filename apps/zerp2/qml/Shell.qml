@@ -1,35 +1,107 @@
-// Zerp 2.0 shell: wallpaper, macOS-style top bar, windows.
-// Windows are QML stand-ins for now; real Zerp clients become the same
-// AppWindow items (their pixels as textures) in the next step.
+// Zerp 2.0: a tiling WM. Wallpaper, a bar on top, a dock at the bottom,
+// and Zerp clients tiled dwindle-style per workspace in between.
+// Keys (mod = Alt or Super): Enter terminal, Q close, D launcher,
+// F fullscreen, 1..9 workspace, Shift+1..9 move window, arrows/HJKL focus.
 import QtQuick
 import QtQuick.Window
-import QtQuick.Effects
+import Zerp
 
 Window {
     id: shell
     visible: true
     visibility: Window.FullScreen
-    color: "#101218"
+    color: "#0b0d12"
     title: "Zerp"
 
-    property int nextZ: 10
-    property string focusedTitle: "Zerp"
+    // ---- look
+    readonly property int gapOut: 14
+    readonly property int gapIn: 10
+    readonly property int border: 2
+    readonly property int radius: 12
+    readonly property int barHeight: 34
+    readonly property int dockReserve: 84
 
-    function raise(w) { w.z = ++nextZ; focusedTitle = w.title }
+    // usable area for tiles
+    readonly property rect area: Qt.rect(gapOut, barHeight + gapOut,
+                                         width - 2 * gapOut,
+                                         height - barHeight - dockReserve - 2 * gapOut)
 
-    // ---- wallpaper (also the blur source for the top bar)
+    // id -> target rect, recomputed whenever clients/workspace change
+    property var rects: ({})
+
+    function relayout() {
+        var out = {};
+        var list = zerp.clients;
+        for (var ws = 1; ws <= 9; ws++) {
+            var tiled = [];
+            for (var i = 0; i < list.length; i++) {
+                var c = list[i];
+                if (c.workspace !== ws) continue;
+                if (c.fullscreen) out[c.id] = Qt.rect(0, 0, width, height);
+                else tiled.push(c);
+            }
+            // dwindle: each new window splits the previous one's space,
+            // alternating along the longer side
+            var r = Qt.rect(area.x, area.y, area.width, area.height);
+            for (var k = 0; k < tiled.length; k++) {
+                if (k === tiled.length - 1) { out[tiled[k].id] = r; break; }
+                var a, b;
+                if (r.width >= r.height) {
+                    var w1 = Math.floor((r.width - gapIn) / 2);
+                    a = Qt.rect(r.x, r.y, w1, r.height);
+                    b = Qt.rect(r.x + w1 + gapIn, r.y, r.width - w1 - gapIn, r.height);
+                } else {
+                    var h1 = Math.floor((r.height - gapIn) / 2);
+                    a = Qt.rect(r.x, r.y, r.width, h1);
+                    b = Qt.rect(r.x, r.y + h1 + gapIn, r.width, r.height - h1 - gapIn);
+                }
+                out[tiled[k].id] = a;
+                r = b;
+            }
+        }
+        rects = out;
+    }
+
+    Connections {
+        target: zerp
+        function onClientsChanged() { shell.relayout() }
+        function onWorkspaceChanged() { shell.relayout() }
+        function onFocusDirectionRequested(dx, dy) { shell.focusTowards(dx, dy) }
+    }
+    onWidthChanged: relayout()
+    onHeightChanged: relayout()
+
+    // nearest tile in a direction from the focused one
+    function focusTowards(dx, dy) {
+        var f = zerp.focusedClient;
+        if (!f || !rects[f.id]) return;
+        var fr = rects[f.id];
+        var fx = fr.x + fr.width / 2, fy = fr.y + fr.height / 2;
+        var best = null, bestD = 1e9;
+        var list = zerp.clients;
+        for (var i = 0; i < list.length; i++) {
+            var c = list[i];
+            if (c === f || c.workspace !== zerp.workspace || !rects[c.id]) continue;
+            var r = rects[c.id];
+            var vx = r.x + r.width / 2 - fx, vy = r.y + r.height / 2 - fy;
+            if (dx !== 0 && Math.sign(vx) !== dx) continue;
+            if (dy !== 0 && Math.sign(vy) !== dy) continue;
+            var d = Math.abs(vx) + Math.abs(vy) + (dx !== 0 ? 2 * Math.abs(vy) : 2 * Math.abs(vx));
+            if (d < bestD) { bestD = d; best = c; }
+        }
+        if (best) zerp.focus(best);
+    }
+
+    // ---- wallpaper (blur source for the bar and the dock)
     Item {
         id: desktop
         anchors.fill: parent
-
         Rectangle {
             anchors.fill: parent
             visible: wallpaperUrl === ""
             gradient: Gradient {
-                orientation: Gradient.Vertical
-                GradientStop { position: 0.0; color: "#3a2f6b" }
-                GradientStop { position: 0.55; color: "#1f4f7a" }
-                GradientStop { position: 1.0; color: "#0e2a3d" }
+                GradientStop { position: 0.0; color: "#1b1f3a" }
+                GradientStop { position: 1.0; color: "#0b1a2a" }
             }
         }
         Image {
@@ -38,63 +110,40 @@ Window {
             fillMode: Image.PreserveAspectCrop
             visible: wallpaperUrl !== ""
             asynchronous: true
+            sourceSize.width: shell.width
         }
     }
 
-    // ---- windows
+    // ---- tiles
     Item {
-        id: windows
-        anchors { fill: parent; topMargin: bar.height }
-
-        AppWindow {
-            title: "About WynlandOS"
-            x: 120; y: 70; width: 520; height: 340
-            onActivated: shell.raise(this)
-            Column {
-                anchors.centerIn: parent
-                spacing: 10
-                Rectangle {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    width: 84; height: 84; radius: 22
-                    gradient: Gradient {
-                        GradientStop { position: 0; color: "#7aa2f7" }
-                        GradientStop { position: 1; color: "#bb9af7" }
-                    }
-                    Text { anchors.centerIn: parent; text: "W"; color: "white"; font.pixelSize: 44; font.bold: true }
-                }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "WynlandOS"; color: "#f0f0f5"; font.pixelSize: 26; font.bold: true }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Zerp 2.0 · Qt Quick on the GPU"; color: "#a9b1d6"; font.pixelSize: 14 }
-                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "virgl · KMS · " + Screen.width + "×" + Screen.height; color: "#7f88a8"; font.pixelSize: 12 }
-            }
-        }
-
-        AppWindow {
-            title: "Notes"
-            x: 700; y: 160; width: 460; height: 380
-            onActivated: shell.raise(this)
-            Rectangle {
-                anchors { fill: parent; margins: 14 }
-                radius: 8
-                color: "#161922"
-                border.color: input.activeFocus ? "#7aa2f7" : "#2a2f3d"
-                TextEdit {
-                    id: input
-                    anchors { fill: parent; margins: 10 }
-                    color: "#e6e6ee"
-                    font.pixelSize: 15
-                    wrapMode: TextEdit.Wrap
-                    text: "Click here and type.\nDrag windows by the title bar."
-                    selectByMouse: true
-                }
+        id: tiles
+        anchors.fill: parent
+        Repeater {
+            model: zerp.clients
+            delegate: Tile {
+                required property var modelData
+                client: modelData
+                target: shell.rects[modelData.id] !== undefined ? shell.rects[modelData.id] : Qt.rect(0, 0, 0, 0)
+                wsOffset: (modelData.workspace - zerp.workspace) * shell.width
+                borderWidth: shell.border
+                cornerRadius: modelData.fullscreen ? 0 : shell.radius
+                z: modelData.fullscreen ? 50 : (modelData.focused ? 2 : 1)
             }
         }
     }
 
-    // ---- top bar
-    TopBar {
-        id: bar
+    Bar {
         anchors { left: parent.left; right: parent.right; top: parent.top }
+        height: shell.barHeight
         blurSource: desktop
-        appName: shell.focusedTitle
+        z: 40
     }
+
+    Dock {
+        anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 10 }
+        blurSource: desktop
+        z: 40
+    }
+
+    Component.onCompleted: relayout()
 }

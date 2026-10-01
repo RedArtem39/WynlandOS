@@ -4,6 +4,7 @@
 #include "qwynlandfb_zerpargs.h"
 #include "../zerp_protocol.h"
 #include <unistd.h>
+#include <cstdio>
 #include <QtGui/QPainter>
 
 #include <qpa/qplatformbackingstore.h>
@@ -47,7 +48,7 @@ public:
         QRect dirty = region.boundingRect();
         ZerpMsg msg = { ZERP_MSG_DAMAGE, (quint32)dirty.x(), (quint32)dirty.y(),
                          (quint32)dirty.width(), (quint32)dirty.height() };
-        write(m_c2sFd, &msg, sizeof(msg));
+        if (write(m_c2sFd, &msg, sizeof(msg)) < 0) { /* Zerp gone: nothing to tell */ }
     }
 
     void resize(const QSize &size, const QRegion &staticContents) override {
