@@ -75,6 +75,12 @@ syscall_entry:
     add rsp, 8
     mov rax, rbx             ; syscall result back in RAX either way
 
+    ; Interrupts off for the way out, whatever the handler left: below,
+    ; `pop rsp` switches to the USER stack while still in ring 0, and an
+    ; IRQ taken there pushes its frame onto that stack (no stack switch at
+    ; CPL 0) -- corrupting live user data. sysret reloads RFLAGS from R11.
+    cli
+
     ; 3c. The user's x87/SSE state back (possibly replaced by rt_sigreturn or
     ; reset by execve). RDI is restored from the stack below.
     mov rdi, [rel current_fx_user]

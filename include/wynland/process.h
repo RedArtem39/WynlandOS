@@ -103,6 +103,9 @@ typedef struct Process {
     bool       vfork_shared;
     volatile bool vfork_released;
     WaitQueue  vfork_wq;
+    /* path of the running image (process_spawn/execve, inherited by fork):
+       what readlink("/proc/self/exe") returns */
+    char       exe_path[128];
     struct Process *next;
 } Process;
 

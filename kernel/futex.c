@@ -21,26 +21,31 @@
 #include <wynland/irq.h>
 #include <wynland/rtc.h>
 #include <wynland/process.h>
+#include <wynland/usercopy.h>
 
 extern void serial_write_string(const char *str);
 
 #define FUTEX_OP_MASK        (128u | 256u) /* PRIVATE_FLAG | CLOCK_REALTIME */
 #define FUTEX_WAIT           0u
 #define FUTEX_WAKE           1u
+#define FUTEX_REQUEUE        3u
 #define FUTEX_CMP_REQUEUE    4u
+#define FUTEX_WAKE_OP        5u
 #define FUTEX_WAIT_BITSET    9u
 #define FUTEX_WAKE_BITSET   10u
 
 #define MAX_FUTEX_QUEUES 64
 
-typedef struct WaitQueue {
+/* (named FutexQueue, not WaitQueue: process.h brings in the scheduler's
+   WaitQueue -- this file only compiled while the stale object was reused) */
+typedef struct FutexQueue {
     uint64_t key_pml4;
     uint64_t key_uaddr;
     Thread  *head;      /* intrusive FIFO via Thread.wq_next */
     bool     in_use;
-} WaitQueue;
+} FutexQueue;
 
-static WaitQueue g_queues[MAX_FUTEX_QUEUES];
+static FutexQueue g_queues[MAX_FUTEX_QUEUES];
 
 void futex_init(void) {
     for (int i = 0; i < MAX_FUTEX_QUEUES; i++) {
@@ -53,7 +58,7 @@ void futex_init(void) {
    (a deadline pass can mark an entry READY without being able to unlink it
    -- the scheduler treats our queues as opaque). Returns the next live
    entry after `prev` semantics get messy; instead each helper re-walks. */
-static void queue_prune(WaitQueue *q) {
+static void queue_prune(FutexQueue *q) {
     Thread **pp = &q->head;
     while (*pp) {
         if ((*pp)->state != THREAD_STATE_BLOCKED || (*pp)->wq != (void *)q) {
@@ -64,10 +69,10 @@ static void queue_prune(WaitQueue *q) {
     }
 }
 
-static WaitQueue *queue_lookup(uint64_t key_pml4, uint64_t key_uaddr, bool create) {
-    WaitQueue *free_slot = NULL;
+static FutexQueue *queue_lookup(uint64_t key_pml4, uint64_t key_uaddr, bool create) {
+    FutexQueue *free_slot = NULL;
     for (int i = 0; i < MAX_FUTEX_QUEUES; i++) {
-        WaitQueue *q = &g_queues[i];
+        FutexQueue *q = &g_queues[i];
         if (q->in_use && q->key_pml4 == key_pml4 && q->key_uaddr == key_uaddr) {
             return q;
         }
@@ -81,11 +86,11 @@ static WaitQueue *queue_lookup(uint64_t key_pml4, uint64_t key_uaddr, bool creat
     return free_slot;
 }
 
-static void queue_release_if_empty(WaitQueue *q) {
+static void queue_release_if_empty(FutexQueue *q) {
     if (q->head == NULL) q->in_use = false;
 }
 
-static void queue_push(WaitQueue *q, Thread *t) {
+static void queue_push(FutexQueue *q, Thread *t) {
     t->wq_next = NULL;
     if (!q->head) {
         q->head = t;
@@ -101,7 +106,7 @@ static void queue_push(WaitQueue *q, Thread *t) {
    since wakers may have left the link in place when they found the thread
    already unblocked via deadline. Self-service keeps every path correct
    without the scheduler knowing queue internals. */
-static void self_unlink(WaitQueue *q, Thread *t) {
+static void self_unlink(FutexQueue *q, Thread *t) {
     Thread **pp = &q->head;
     while (*pp) {
         if (*pp == t) {
@@ -166,6 +171,15 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         uint64_t deadline = SCHED_NO_DEADLINE;
         if (op == FUTEX_WAIT_BITSET && timeout_arg != 0) {
             deadline = abs_deadline_from_timespec(timeout_arg, realtime);
+        } else if (op == FUTEX_WAIT && timeout_arg != 0) {
+            /* plain FUTEX_WAIT: a RELATIVE timespec. It used to be ignored,
+               so every timed wait (QWaitCondition::wait(ms), QMutex::
+               tryLock(ms), ...) could block forever. */
+            struct { int64_t sec; int64_t nsec; } ts;
+            memcpy(&ts, (const void *)timeout_arg, sizeof(ts));
+            if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000LL) return -22; /* -EINVAL */
+            uint64_t ms = (uint64_t)ts.sec * 1000 + (uint64_t)(ts.nsec + 999999) / 1000000;
+            deadline = timer_get_ticks() + ms / 10 + 1; /* ticks are 10 ms */
         }
 
         /* The canonical futex contract: verify the caller's expected value
@@ -179,7 +193,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             return -11; /* -EAGAIN: value changed before we could sleep */
         }
 
-        WaitQueue *q = queue_lookup(key, uaddr, true);
+        FutexQueue *q = queue_lookup(key, uaddr, true);
         if (!q) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return -12; /* -ENOMEM: queue table exhausted */
@@ -203,7 +217,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
            wakes yet, documented v1 simplification. */
         uint64_t rflags;
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-        WaitQueue *q = queue_lookup(key, uaddr, false);
+        FutexQueue *q = queue_lookup(key, uaddr, false);
         uint32_t woken = 0;
         if (q) {
             queue_prune(q);
@@ -220,6 +234,66 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         return (int64_t)woken;
     }
 
+    case FUTEX_WAKE_OP: {
+        /* Atomically: old = *uaddr2; *uaddr2 = old OP oparg; wake up to
+           val waiters on uaddr, and if (old CMP cmparg) up to val2 more on
+           uaddr2. Qt's QSemaphore is built on it -- -ENOSYS left Qt's
+           worker threads (the QML type loader) waiting forever. */
+        uint32_t val2 = (uint32_t)timeout_arg;
+        uint32_t opc = (val3 >> 28) & 0xF, cmp = (val3 >> 24) & 0xF;
+        int32_t oparg = (int32_t)((val3 >> 12) & 0xFFF), cmparg = (int32_t)(val3 & 0xFFF);
+        if (oparg & 0x800) oparg |= (int32_t)0xFFFFF000;   /* sign-extend 12 bits */
+        if (cmparg & 0x800) cmparg |= (int32_t)0xFFFFF000;
+        if (opc & 8) { opc &= 7; oparg = (int32_t)(1u << (oparg & 31)); } /* FUTEX_OP_OPARG_SHIFT */
+        if ((uaddr2 & 3) || !user_prepare_write(uaddr2, 4)) return -14; /* -EFAULT */
+
+        uint64_t rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+        volatile int32_t *a2p = (volatile int32_t *)uaddr2;
+        int32_t old = *a2p, nv;
+        switch (opc) {
+        case 0: nv = oparg; break;           /* SET */
+        case 1: nv = old + oparg; break;     /* ADD */
+        case 2: nv = old | oparg; break;     /* OR */
+        case 3: nv = old & ~oparg; break;    /* ANDN */
+        case 4: nv = old ^ oparg; break;     /* XOR */
+        default:
+            if (rflags & 0x200) __asm__ volatile("sti");
+            return -38;
+        }
+        *a2p = nv;
+        bool cond;
+        switch (cmp) {
+        case 0: cond = old == cmparg; break;
+        case 1: cond = old != cmparg; break;
+        case 2: cond = old <  cmparg; break;
+        case 3: cond = old <= cmparg; break;
+        case 4: cond = old >  cmparg; break;
+        case 5: cond = old >= cmparg; break;
+        default: cond = false; break;
+        }
+        uint32_t woken = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass == 1 && !cond) break;
+            FutexQueue *q = queue_lookup(key, pass ? uaddr2 : uaddr, false);
+            uint32_t limit = pass ? val2 : val, n = 0;
+            if (!q) continue;
+            queue_prune(q);
+            while (q->head && n < limit) {
+                Thread *t = q->head;
+                q->head = t->wq_next;
+                t->wq_next = NULL;
+                sched_unblock(t, 0);
+                n++;
+            }
+            woken += n;
+            queue_release_if_empty(q);
+        }
+        if (rflags & 0x200) __asm__ volatile("sti");
+        return (int64_t)woken;
+    }
+
+    case FUTEX_REQUEUE:
     case FUTEX_CMP_REQUEUE: {
         volatile uint32_t *addr = (volatile uint32_t *)uaddr;
         uint32_t nr_requeue = (uint32_t)timeout_arg; /* arg4 = val2 */
@@ -228,12 +302,13 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         uint64_t rflags;
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
-        if (*addr != val3) {
+        /* plain REQUEUE has no expected-value check */
+        if (op == FUTEX_CMP_REQUEUE && *addr != val3) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return -11; /* -EAGAIN */
         }
 
-        WaitQueue *q = queue_lookup(key, uaddr, false);
+        FutexQueue *q = queue_lookup(key, uaddr, false);
         if (!q) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return 0;
@@ -251,7 +326,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
 
         uint32_t moved = 0;
         if (nr_requeue > 0) {
-            WaitQueue *q2 = queue_lookup(key, uaddr2_key_addr, true);
+            FutexQueue *q2 = queue_lookup(key, uaddr2_key_addr, true);
             if (q2) {
                 /* splice up to nr_requeue remaining waiters over */
                 Thread **src = &q->head;
@@ -286,7 +361,7 @@ void futex_wake_user(uint64_t uaddr, uint32_t n) {
     uint64_t key = current_key_pml4();
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-    WaitQueue *q = queue_lookup(key, uaddr, false);
+    FutexQueue *q = queue_lookup(key, uaddr, false);
     uint32_t woken = 0;
     if (q) {
         queue_prune(q);

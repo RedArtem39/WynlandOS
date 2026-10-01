@@ -2657,17 +2657,11 @@ void kernel_main(BootInfo *boot_info)
     /* Draw initial prompt */
     console_print_string(boot_info, prompt, 0x00886EFF, term_bg_color);
 
-    /* Auto-start Hyprland at boot -- now in its own isolated process
-       (process_spawn(), kernel/process.c) instead of loading into the
-       shared kernel address space. */
-    console_print_string(boot_info, "Auto-launching Hyprland...\n", 0x0000FF00, term_bg_color);
-    /* uid=1000: the actual demotion point -- the kernel (uid 0) hands off
-       to a normal-user session here, like a real init spawning a login
-       shell. See Phase 5's Process.uid / process_spawn() plan notes. */
-
-    if (!process_spawn("/hyprland.wyn", NULL, 1000)) {
-        console_print_string(boot_info, "Failed to load /hyprland.wyn\n", 0x00FF0000, term_bg_color);
-    }
+    /* Hyprland (/hyprland.wyn) is no longer started at boot: the port is
+       abandoned (it crashed in its dynamic loader before drawing); Zerp
+       is the desktop, Zerp 2.0 goes Qt Quick. uid=1000 below is the
+       demotion point -- the kernel (uid 0) hands off to a normal-user
+       session, like an init spawning a login shell. */
 
     /* Zerp v0 -- additive alongside hyprland.wyn for now (Phase 4
        verification), not yet the default launch. hyprland.wyn crashes

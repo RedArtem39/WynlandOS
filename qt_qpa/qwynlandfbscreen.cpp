@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <qpa/qwindowsysteminterface.h>
+#include <QtGui/QGuiApplication>
+#include <QtGui/QWindow>
 
 /* Deliberately NOT #include <sys/mman.h> -- this OS's own include/sys/mman.h
    (used by this same build for the freestanding Zerp/test binaries, and
@@ -10,8 +12,14 @@
    mmap() as an inline stub that always returns MAP_FAILED. Real musl's
    mmap() is a normal exported libc symbol; declare it directly to bypass
    the stub header entirely. */
+#ifdef __GLIBC__
+/* glibc build (Ubuntu's Qt, tools/stage_qt6.sh): no stub header in the
+   way, the real one has the noexcept declarations */
+#include <sys/mman.h>
+#else
 extern "C" void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 extern "C" int munmap(void *addr, size_t length);
+#endif
 #define WYN_PROT_READ  1
 #define WYN_PROT_WRITE 2
 #define WYN_MAP_SHARED 0x01
@@ -89,6 +97,16 @@ void QWynlandFbScreen::applyTileRect(quint32 x, quint32 y, quint32 w, quint32 h)
     m_screenImage = QImage((uchar *)m_shm, (int)w, (int)h, (int)w * 4, m_format);
 
     QWindowSystemInterface::handleScreenGeometryChange(screen(), m_geometry, m_geometry);
+
+    /* Tiled: the top-level window IS the tile. A window created before
+       Zerp's first retile (e.g. a QML Window sized from Screen.width)
+       otherwise kept the old size and was cut off. This runs on the input
+       thread -- hand it to the GUI thread. */
+    const QRect g = m_geometry;
+    QMetaObject::invokeMethod(qApp, [g] {
+        for (QWindow *w : QGuiApplication::topLevelWindows())
+            w->setGeometry(g);
+    }, Qt::QueuedConnection);
 }
 
 QT_END_NAMESPACE

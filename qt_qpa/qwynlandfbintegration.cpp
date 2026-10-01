@@ -63,7 +63,8 @@ private:
 
 QWynlandFbIntegration::QWynlandFbIntegration(const QStringList &paramList)
     : m_screen(nullptr), m_inputReader(nullptr), m_parameters(paramList),
-      m_fontDb(new QGenericUnixFontDatabase), m_c2sFd(-1)
+      m_fontDb(new QGenericUnixFontDatabase), m_c2sFd(-1),
+      m_native(new QPlatformNativeInterface)
 {
 }
 
@@ -76,6 +77,7 @@ QWynlandFbIntegration::~QWynlandFbIntegration()
     }
     delete m_screen;
     delete m_fontDb;
+    delete m_native;
 }
 
 bool QWynlandFbIntegration::hasCapability(QPlatformIntegration::Capability cap) const

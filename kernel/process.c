@@ -220,6 +220,11 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
         return NULL;
     }
 
+    {
+        int k = 0;
+        while (path[k] && k < (int)sizeof(p->exe_path) - 1) { p->exe_path[k] = path[k]; k++; }
+        p->exe_path[k] = 0;
+    }
     typedef struct { void *entry; void *stack; } ExecArg;
     extern void user_exec_wrapper(void *arg);
     ExecArg *earg = (ExecArg *)kmalloc(sizeof(ExecArg));

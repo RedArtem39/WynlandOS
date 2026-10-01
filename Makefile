@@ -87,9 +87,11 @@ CFLAGS_KERNEL  = $(COMMON_FLAGS)          \
                  -nostdlib                \
                  -nostdinc                \
                  -std=c11                 \
-                 -O2
+                 -O2                      \
+                 -MMD -MP
 
 CXXFLAGS_KERNEL = $(COMMON_FLAGS)         \
+                  -MMD -MP                \
                   -mcmodel=large          \
                   -fno-pie                \
                   -fno-pic                \
@@ -387,8 +389,23 @@ $(BUILD)/renderD128:
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
 PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
-$(EXT2_PART_IMG): $(EXT2_MANIFEST) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf
-	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST)
+# Qt 6 / Qt Quick (tools/stage_qt6.sh): Ubuntu's prebuilt Qt, QML modules and the
+# qmldemo app. WITH_QT6=0 builds the image without it.
+WITH_QT6 ?= 1
+ifeq ($(WITH_QT6),1)
+QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+	@bash tools/stage_qt6.sh
+else
+QT6_MANIFEST =
+endif
+EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
+$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST)
+	@mkdir -p $(BUILD)
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) > $@
+
+$(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf
+	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 
 # ESP partition image: FAT32, firmware-loadable content only.
@@ -517,3 +534,7 @@ check-tools:
 	@which python3 > /dev/null 2>&1     || (echo "ERROR: python3 not found." && exit 1)
 	@test -f $(OVMF_FW)                 || (echo "ERROR: OVMF firmware not found at $(OVMF_FW). Run ./setup.sh" && exit 1)
 	@echo "All tools found."
+
+# Header dependencies (-MMD -MP): a struct change in a header used to leave
+# every object that was not edited compiled against the old layout.
+-include $(shell find $(BUILD) -name "*.d" 2>/dev/null)

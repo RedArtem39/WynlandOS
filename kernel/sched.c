@@ -151,6 +151,8 @@ Thread *thread_create_ex(void (*entry)(void*), void *arg, struct Process *proc) 
 }
 
 Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *proc, uint64_t tls_base) {
+    uint64_t saved_rflags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(saved_rflags));
     disable_interrupts();
 
     Thread *t = (Thread *)kmalloc(sizeof(Thread));
@@ -194,8 +196,15 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     t->next = current_thread->next;
     current_thread->next = t;
 
-    // Enable interrupts
-    __asm__ volatile("sti");
+    /* Back to the CALLER's interrupt state -- never an unconditional sti.
+       Syscalls run with IF=0 (SFMASK), and fork()/clone() call this from
+       inside one: the old sti let the timer preempt the rest of the
+       syscall. A clone()d thread then started before clone() had set its
+       TLS (FS base 0, crash on fs:0x28), and the syscall exit path ran
+       with interrupts on -- an IRQ between its `pop rsp` and `sysret`
+       pushed its frame onto the USER stack, the parent's "stack smashing
+       detected" right after fork(). */
+    if (saved_rflags & 0x200) __asm__ volatile("sti");
 
     return t;
 }

@@ -664,6 +664,60 @@ static bool tcp_conn_readable(TcpConnection *conn) {
            conn->state == TCP_STATE_CLOSED;
 }
 
+
+/* /proc/self/maps, generated from the process's VMA list into a memfd
+   (read with the ordinary memfd read path). glibc's pthread_getattr_np()
+   finds the main thread's stack in it -- Qt's QML engine sizes its JS
+   stack limit from that and refused to run any JS without it. */
+static int proc_maps_memfd(Process *pr) {
+    int mi = memfd_new("maps");
+    if (mi < 0) return mi;
+    char line[96];
+    uint64_t off = 0;
+    for (VMA *v = pr->vma_list; v; v = v->next) {
+        if (v->flags & VMA_GUARD) continue;
+        int k = 0;
+        for (int sh = 44; sh >= 0; sh -= 4) line[k++] = "0123456789abcdef"[(v->start >> sh) & 0xF];
+        line[k++] = '-';
+        for (int sh = 44; sh >= 0; sh -= 4) line[k++] = "0123456789abcdef"[(v->end >> sh) & 0xF];
+        line[k++] = ' ';
+        line[k++] = (v->prot & VMA_PROT_READ) ? 'r' : '-';
+        line[k++] = (v->prot & VMA_PROT_WRITE) ? 'w' : '-';
+        line[k++] = (v->prot & VMA_PROT_EXEC) ? 'x' : '-';
+        line[k++] = 'p';
+        const char *rest = " 00000000 00:00 0";
+        while (*rest) line[k++] = *rest++;
+        if (v->start == 0x600000000000ULL) { /* elf.c's main thread stack */
+            const char *st = "                          [stack]";
+            while (*st) line[k++] = *st++;
+        }
+        line[k++] = '\n';
+        memfd_pwrite(mi, off, line, (uint64_t)k);
+        off += (uint64_t)k;
+    }
+    return mi;
+}
+
+/* readlink() for paths no mock above claimed: /proc/self/exe is the running
+   image; any other existing path is not a symlink (ext2 here has none) --
+   -EINVAL, as on Linux. It used to be -ENOENT for everything, so glibc's
+   realpath() decided every path was missing (Qt then found no QML
+   modules, no plugins). */
+static uint64_t readlink_fallback(const char *path, uint64_t ubuf, uint64_t bufsiz) {
+    if (str_compare(path, "/proc/self/exe") == 0) {
+        Process *pr = sched_current()->proc;
+        uint64_t len = 0;
+        while (pr->exe_path[len]) len++;
+        if (!len) return (uint64_t)-2;
+        if (len > bufsiz) len = bufsiz;
+        if (copy_to_user((void *)ubuf, pr->exe_path, len) != 0) return (uint64_t)-14;
+        return len;
+    }
+    VfsStat vst;
+    if (vfs_stat(path, &vst)) return (uint64_t)-22; /* -EINVAL: not a symlink */
+    return (uint64_t)-2;                             /* -ENOENT */
+}
+
 static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ms) {
     /* Deadline and sleeps both on the 1 kHz clock: a timeout expires
        neither early nor up to a 100 Hz tick late. */
@@ -2333,13 +2387,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 PageTable *child_pml4 = share_mm ? parent->pml4 : vmm_new_process_pml4();
                 if (!child_pml4) return (uint64_t)-12; /* -ENOMEM */
 
-                /* Eager copy, not copy-on-write: with COW, fork() tests corrupted
-                   the parent's stack about every other boot ("stack smashing
-                   detected" in glibc right after fork returned), with the eager
-                   copy never. The COW defect is not found yet; until it is, fork
-                   pays a full copy (cheap here: the processes that fork -- the
-                   terminal, tests -- are small; Mesa clients never fork). */
-                if (!share_mm && !vmm_clone_user_pages(parent->pml4, child_pml4)) {
+                if (!share_mm && !vmm_cow_clone_user_pages(parent->pml4, child_pml4)) {
                     /* Unwinds whatever pages THIS call managed to
                        COW-share before hitting OOM (each was refcounted
                        on both sides -- freeing here drops the child's
@@ -2361,6 +2409,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 child->ppid = parent->pid;
                 child->pgid = parent->pgid;
                 child->sid = parent->sid;
+                memcpy(child->exe_path, parent->exe_path, sizeof(child->exe_path));
                 child->vfork_shared = share_mm;
                 child->vfork_released = !share_mm;
                 /* signal dispositions are inherited across fork() */
@@ -2567,6 +2616,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 regs->rip = entry_point;
                 regs->rsp = stack_top;
                 
+                str_copy(exec_proc->exe_path, kernel_path);
                 serial_write_string("SYS_execve: Successfully loaded ELF. Entry = ");
                 char buf[32];
                 uint_to_hex(entry_point, buf);
@@ -3506,6 +3556,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 int fd = get_free_fd(fd_table);
                 if (fd == -1) return (uint64_t)-24; /* -EMFILE */
+
+                if (str_compare(path, "/proc/self/maps") == 0) {
+                    int mi = proc_maps_memfd(proc);
+                    if (mi < 0) return (uint64_t)-12;
+                    VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+                    if (!f) { memfd_unref(mi); return (uint64_t)-12; }
+                    memset(f, 0, sizeof(VfsFile));
+                    str_copy(f->node.name, "maps");
+                    f->node.first_cluster = MEMFD_FD;
+                    f->current_cluster = (uint32_t)mi;
+                    fd_table[fd] = f;
+                    fd_flags[fd]  = (linux_flags & 02000000) ? FD_CLOEXEC : 0;
+                    fd_oflags[fd] = LINUX_O_RDONLY;
+                    return (uint64_t)fd;
+                }
                 
                 if (str_compare(path, "/sys/dev/char/226:0/device/vendor") == 0 ||
                     str_compare(path, "/sys/dev/char/226:128/device/vendor") == 0 ||
@@ -3592,6 +3657,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (strncpy_from_user(path, (const void *)a2, sizeof(path)) < 0 ||
                     !user_prepare_write(a3, sizeof(*user_stat))) {
                     return (uint64_t)-14; /* -EFAULT */
+                }
+                /* fstatat(fd, "", st, AT_EMPTY_PATH) is fstat(fd) -- glibc's
+                   fstat() and Qt's file size lookup use exactly this; it
+                   used to look up a file named "" (-ENOENT), so Qt could not
+                   size, and so not map, its plugins. */
+                if (path[0] == 0) {
+                    if (!(a4 & 0x1000 /* AT_EMPTY_PATH */)) return (uint64_t)-2;
+                    return syscall_dispatcher(5, a1, a3, 0, 0, 0, regs);
                 }
 
                 VfsStat vst;
@@ -4595,6 +4668,40 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return 0;
             }
 
+        case 332: // SYS_statx(dirfd, path, flags, mask, struct statx *)
+            {
+                /* Qt (and newer glibc) try statx first; -ENOSYS cost every
+                   stat a second syscall. Filled from the same data stat()
+                   gives. */
+                if (!a5 || !user_prepare_write(a5, 256)) return (uint64_t)-14;
+                uint64_t r = syscall_dispatcher(262, a1, a2, a5, a3, 0, regs);
+                if ((int64_t)r < 0) return r;
+                struct linux_stat st;
+                if (copy_from_user(&st, (const void *)a5, sizeof(st)) != 0) return (uint64_t)-14;
+                struct {
+                    uint32_t mask, blksize; uint64_t attributes;
+                    uint32_t nlink, uid, gid; uint16_t mode, pad1;
+                    uint64_t ino, size, blocks, attributes_mask;
+                    struct { int64_t sec; uint32_t nsec; int32_t pad; } atime, btime, ctime, mtime;
+                    uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+                    uint64_t spare[14];
+                } sx;
+                _Static_assert(sizeof(sx) == 256, "struct statx layout");
+                memset(&sx, 0, sizeof(sx));
+                sx.mask = 0x7FF;                       /* STATX_BASIC_STATS */
+                sx.blksize = (uint32_t)st.st_blksize;
+                sx.nlink = (uint32_t)st.st_nlink;
+                sx.uid = st.st_uid; sx.gid = st.st_gid;
+                sx.mode = (uint16_t)st.st_mode;
+                sx.ino = st.st_ino; sx.size = (uint64_t)st.st_size; sx.blocks = (uint64_t)st.st_blocks;
+                sx.atime.sec = (int64_t)st.st_atime_sec; sx.mtime.sec = (int64_t)st.st_mtime_sec;
+                sx.ctime.sec = (int64_t)st.st_ctime_sec;
+                sx.rdev_major = (uint32_t)(st.st_rdev >> 8) & 0xFFF; sx.rdev_minor = (uint32_t)st.st_rdev & 0xFF;
+                sx.dev_major = (uint32_t)(st.st_dev >> 8) & 0xFFF; sx.dev_minor = (uint32_t)st.st_dev & 0xFF;
+                if (copy_to_user((void *)a5, &sx, sizeof(sx)) != 0) return (uint64_t)-14;
+                return 0;
+            }
+
         case 334: // SYS_rseq — restartable sequences (stub)
             return (uint64_t)-38; /* -ENOSYS */
             
@@ -4643,7 +4750,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     }
                     return len;
                 }
-                return (uint64_t)-2; // ENOENT
+                return readlink_fallback(path, a2, a3);
             }
 
         case 267: // SYS_readlinkat
@@ -4692,7 +4799,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     }
                     return len;
                 }
-                return (uint64_t)-2; // ENOENT
+                return readlink_fallback(path, a3, a4);
             }
 
         default:

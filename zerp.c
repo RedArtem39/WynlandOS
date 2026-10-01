@@ -626,6 +626,14 @@ int zerp_main(int argc, char **argv) {
     g_shm_bytes = g_screen_w * g_screen_h * 4;
     spawn_client("/zerp_files.elf", g_shm_bytes);
     spawn_client("/zerp_term.elf", g_shm_bytes);
+    /* Qt Quick demo (Zerp 2.0 groundwork), when the image has Qt 6 */
+    {
+        long qfd = zopen("/usr/bin/qmldemo", 0);
+        if (qfd >= 0) {
+            zclose(qfd);
+            spawn_client("/usr/bin/qmldemo", g_shm_bytes);
+        }
+    }
 
     retile();
     repaint_layout();

@@ -507,8 +507,12 @@ static void run_command(const char *line) {
            Qt6 rofi-clone -- no global-hotkey infrastructure in Zerp yet. */
         zerp_send_spawn(g_zc, "/zerp_rofi.elf");
         add_line("launching rofi...", TEXT_COLOR);
+    } else if (str_eq(cmd, "qml")) {
+        /* Qt Quick demo as a new Zerp client (apps/qml/) */
+        zerp_send_spawn(g_zc, "/usr/bin/qmldemo");
+        add_line("launching the QML demo...", TEXT_COLOR);
     } else if (str_eq(cmd, "help")) {
-        add_line("built-ins: ls cd pwd cat whoami write nano ary rofi clear help", TEXT_COLOR);
+        add_line("built-ins: ls cd pwd cat whoami write nano ary rofi qml clear help", TEXT_COLOR);
         add_line("/usr/bin: curl cmake nano pkgconf (run directly, e.g. 'curl --version')", TEXT_COLOR);
     } else {
         /* not a built-in: try /usr/bin/<cmd> on a PTY (curl, cmake, ...) */

@@ -98,8 +98,6 @@ Fo /lib/fonts/DejaVuSans.ttf     build/lib/fonts/DejaVuSans.ttf
 F  /app.was             app.wasm
 F  /hello.wyn           hello.wyn
 F  /hyprland.conf       hyprland.conf
-Fo /nixos_hyprland.conf external/nixos-configuration/config/sessions/hyprland/hyprland.conf
-Fo /nixos_settings.conf external/nixos-configuration/config/sessions/hyprland/config/settings.conf
 F  /wynui.wyn           wynui.wyn
 F  /node.wyn            node.wyn
 F  /script.js           script.js
