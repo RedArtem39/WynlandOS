@@ -897,6 +897,7 @@ void kfile_get(VfsFile *f) {
     else if (fc == MEMFD_FD) memfd_ref((int)f->current_cluster);
     else if (fc == TIMERFD_FD) timerfd_ref((int)f->current_cluster);
     else if (fc == DRM_PRIME_FD) drm_prime_get(f->current_cluster);
+    else if (IS_DRM_DEV(fc)) drm_client_ref(f->current_cluster);
     else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
              g_pipes[f->current_cluster]) {
         KPipe *kp = g_pipes[f->current_cluster];

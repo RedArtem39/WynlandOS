@@ -35,6 +35,9 @@ PKGS="qt6-base-dev qt6-base-private-dev qt6-base-dev-tools qt6-declarative-dev
 # fonts.conf has no substitution rules, every font match came back empty
 # and Qt crashed in QFontconfigDatabase::setupFontEngine
 PKGS="$PKGS fontconfig-config fonts-dejavu-core"
+# eglfs links the input stacks even with input disabled (Zerp 2.0 feeds
+# input itself); they only have to load
+PKGS="$PKGS libmtdev1t64 libinput10 libts0t64 libevdev2 libwacom9 libgudev-1.0-0"
 
 # 1. fetch + unpack (cached; only packages not downloaded yet are fetched)
 mkdir -p "$CACHE/debs" "$ROOT"
@@ -70,6 +73,10 @@ g++ $CXXFLAGS -o "$OUT/qmldemo.elf" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/qmldemo.elf"
 
+# Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
+g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG -I"$INC" $(for m in QtCore QtGui QtQml QtQuick; do printf -- '-I%s/%s ' "$INC" "$m"; done)     -o "$OUT/zerp2.elf" apps/zerp2/main.cpp     -L"$LIB" -Wl,-rpath-link,"$LIB" -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
+echo "  QT6        built build/zerp2.elf"
+
 # 3. manifest: QML modules + ldd closure of the app and every QML plugin
 QMLSRC=$LIB/qt6/qml
 QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
@@ -97,12 +104,25 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
         done
     done
     echo "F /usr/bin/qmldemo build/qmldemo.elf"
+    echo "F /usr/bin/zerp2 build/zerp2.elf"
+    echo "D /usr/share/zerp2"
+    echo "D /usr/share/zerp2/qml"
+    echo "F /usr/share/zerp2/kms.json apps/zerp2/kms.json"
+    for q in apps/zerp2/qml/*.qml; do echo "F /usr/share/zerp2/qml/$(basename "$q") $q"; done
+    # eglfs + its KMS/GBM backend (Zerp 2.0 draws through them)
+    PL=$LIB/qt6/plugins
+    echo "D /usr/lib/x86_64-linux-gnu/qt6/plugins"
+    echo "D /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms"
+    echo "D /usr/lib/x86_64-linux-gnu/qt6/plugins/egldeviceintegrations"
+    echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqeglfs.so $PL/platforms/libqeglfs.so"
+    echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so $PL/egldeviceintegrations/libqeglfs-kms-integration.so"
     echo "F /usr/bin/qt.conf rootfs/usr/bin/qt.conf"
 } > "$MAN"
 
 # libraries: everything the app and the QML plugins load, by soname into
 # /lib64 -- skipping what the base manifest already ships there
-{ echo "$OUT/qmldemo.elf"; find "$QMLSRC" -name "*.so"; } | while read f; do
+{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; find "$QMLSRC" -name "*.so";
+  echo "$LIB/qt6/plugins/platforms/libqeglfs.so"; echo "$LIB/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so"; } | while read f; do
     ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
 done | sort -u | while read soname path; do
     if grep -qE "^F +/lib64/$soname( |$)" ext2_manifest.txt; then continue; fi

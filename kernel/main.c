@@ -344,6 +344,13 @@ static bool str_starts_with(const char *str, const char *prefix)
     return true;
 }
 
+static bool str_contains(const char *str, const char *needle)
+{
+    for (; *str; str++)
+        if (str_starts_with(str, needle)) return true;
+    return false;
+}
+
 
 /*
  * str_append - Append src to the end of dst
@@ -2669,15 +2676,34 @@ void kernel_main(BootInfo *boot_info)
        anything, so it doesn't race with Zerp's /dev/fb0 writes in
        practice. */
     console_print_string(boot_info, "Auto-launching Zerp...\n", 0x0000FF00, term_bg_color);
-    process_spawn("/zerp.elf", NULL, 1000);
-
-    /* virgl end-to-end check (tests/gltest.c): only when the host actually
-       offers 3D, so 2D-only boots stay quiet. Prints [gltest] lines. */
+    /* /etc/wynland/boot.cfg (written by `make`, see ZERP/AUTOTEST there):
+       zerp=2 -> Zerp 2.0 (Qt Quick on the GPU) when virgl is up and it is
+       installed, else the classic Zerp; autotest=1 -> the test programs
+       below. Missing file: classic Zerp, no tests. */
     {
         extern bool g_virgl;
-        if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
-        process_spawn("/forktest.elf", NULL, 1000);
-        if (g_virgl) process_spawn("/kmstest.elf", NULL, 1000);
+        char cfg[256] = {0};
+        VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
+        if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
+        bool want_zerp2 = str_contains(cfg, "zerp=2");
+        bool autotest   = str_contains(cfg, "autotest=1");
+        VfsFile *z2 = want_zerp2 && g_virgl && !autotest ? vfs_open("/usr/bin/zerp2") : NULL;
+        if (z2) {
+            vfs_close(z2);
+            console_print_string(boot_info, "Starting Zerp 2.0...\n", 0x0000FF00, term_bg_color);
+            process_spawn("/usr/bin/zerp2", NULL, 1000);
+        } else {
+            process_spawn("/zerp.elf", NULL, 1000);
+        }
+
+        /* end-to-end checks: virgl rendering (gltest), process lifecycle +
+           networking (forktest), KMS page flips (kmstest). kmstest takes
+           the display over, so tests boot with the classic Zerp. */
+        if (autotest) {
+            if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
+            process_spawn("/forktest.elf", NULL, 1000);
+            if (g_virgl) process_spawn("/kmstest.elf", NULL, 1000);
+        }
     }
 
     static bool was_gui_active = false;

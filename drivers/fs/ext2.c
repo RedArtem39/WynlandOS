@@ -1546,10 +1546,14 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     }
     /* DRM nodes (drivers/video/virtgpu_drm.c): ioctl/mmap-only devices */
     if (str_compare(path, "/dev/dri/renderD128") == 0) {
-        return alloc_device_file("renderD128", 0, false, DRM_DEV_RENDER, flags);
+        VfsFile *f = alloc_device_file("renderD128", 0, false, DRM_DEV_RENDER, flags);
+        if (f) f->current_cluster = drm_open_client();
+        return f;
     }
     if (str_compare(path, "/dev/dri/card0") == 0) {
-        return alloc_device_file("card0", 0, false, DRM_DEV_CARD, flags);
+        VfsFile *f = alloc_device_file("card0", 0, false, DRM_DEV_CARD, flags);
+        if (f) f->current_cluster = drm_open_client();
+        return f;
     }
     if (str_compare(path, "/dev/tty") == 0 || path_ends_with(path, "/dev/tty") || path_ends_with(path, "dev/tty")) {
         return alloc_device_file("tty", 0, false, DEV_TTY, flags);

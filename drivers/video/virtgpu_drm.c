@@ -262,6 +262,7 @@ typedef struct {
 
 typedef struct {
     bool     used;
+    uint32_t refs;      /* fds referring to this client (dup/fork share it) */
     uint64_t pid;       /* opener */
     uint32_t ctx_id;    /* 0 until the first 3D call */
     bool     orphaned;  /* opener exited; free from the next ioctl */
@@ -411,6 +412,7 @@ static DrmClient *client_get(uint32_t *slot)
             if (!g_clients[i].used) {
                 memset(&g_clients[i], 0, sizeof(g_clients[i]));
                 g_clients[i].used = true;
+                g_clients[i].refs = 1;
                 g_clients[i].pid = sched_current()->proc->pid;
                 *slot = i + 1;
                 return &g_clients[i];
@@ -1174,9 +1176,29 @@ static int64_t ioctl_addfb2(uint32_t slot, uint64_t argp)
 {
     struct drm_mode_fb_cmd2_u f;
     if (copy_from_user(&f, (void *)argp, sizeof(f))) return -EFAULT;
-    if (f.offsets[0] != 0) return -EINVAL;
-    int64_t r = fb_create(slot, f.handles[0], f.width, f.height, f.pitches[0], f.pixel_format, &f.fb_id);
-    if (r) return r;
+    int64_t r = (f.offsets[0] != 0) ? -EINVAL
+              : fb_create(slot, f.handles[0], f.width, f.height, f.pitches[0], f.pixel_format, &f.fb_id);
+    if (r) {
+        /* always logged (a few times): a refused framebuffer is a black
+           screen for whoever asked, and the reason is otherwise invisible */
+        static int logged;
+        if (logged++ < 4) {
+            extern void uint_to_hex(uint64_t val, char *buf);
+            char b[32];
+            DrmBo *bo = bo_lookup(slot, f.handles[0]);
+            serial_write_string("DRM: ADDFB2 refused, err=-"); uint_to_hex((uint64_t)-r, b); serial_write_string(b);
+            serial_write_string(" handle="); uint_to_hex(f.handles[0], b); serial_write_string(b);
+            serial_write_string(" fmt="); uint_to_hex(f.pixel_format, b); serial_write_string(b);
+            serial_write_string(" "); uint_to_hex(f.width, b); serial_write_string(b);
+            serial_write_string("x"); uint_to_hex(f.height, b); serial_write_string(b);
+            serial_write_string(" pitch="); uint_to_hex(f.pitches[0], b); serial_write_string(b);
+            serial_write_string(" off="); uint_to_hex(f.offsets[0], b); serial_write_string(b);
+            serial_write_string(" flags="); uint_to_hex(f.flags, b); serial_write_string(b);
+            serial_write_string(" bo_size="); uint_to_hex(bo ? bo->size : 0, b); serial_write_string(b);
+            serial_write_string("\r\n");
+        }
+        return r;
+    }
     if (copy_to_user((void *)argp, &f, sizeof(f))) return -EFAULT;
     return 0;
 }
@@ -1433,11 +1455,33 @@ static void client_free(uint32_t slot)
     memset(c, 0, sizeof(*c));
 }
 
+/* A client per open() of a DRM node, made right there: it used to be made
+   lazily by the first ioctl, so a dup() taken before that (Mesa dups the
+   fd it is given to gbm_create_device() at once) became a second client,
+   and buffers allocated through one fd were unknown to the other (Qt's
+   KMS backend: "Failed to create KMS FB"). */
+uint32_t drm_open_client(void)
+{
+    uint32_t slot = 0;
+    return client_get(&slot) ? slot : 0;
+}
+
+/* one more fd refers to the client (dup, fork, SCM_RIGHTS) */
+void drm_client_ref(uint32_t slot)
+{
+    if (slot == 0 || slot > DRM_MAX_CLIENTS || !g_clients[slot - 1].used) return;
+    g_clients[slot - 1].refs++;
+}
+
 void drm_release(uint32_t slot, uint64_t pid, bool can_sleep)
 {
+    (void)pid;
     if (slot == 0 || slot > DRM_MAX_CLIENTS) return;
     DrmClient *c = &g_clients[slot - 1];
-    if (!c->used || c->pid != pid) return;
+    if (!c->used) return;
+    /* only the last fd's close ends the client (it used to be the opener
+       pid's first close, even with copies still open) */
+    if (c->refs > 1) { c->refs--; return; }
     if (can_sleep) client_free(slot);
     else c->orphaned = true; /* process teardown: can't wait for the host there */
 }

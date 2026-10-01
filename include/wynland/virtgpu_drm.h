@@ -28,6 +28,8 @@ int drm_mmap_lookup(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys
    can_sleep=false (process teardown) defers the release to the next
    DRM ioctl. */
 void drm_release(uint32_t slot, uint64_t pid, bool can_sleep);
+uint32_t drm_open_client(void);       /* open() of a DRM node: the fd's client */
+void drm_client_ref(uint32_t slot);   /* a copied fd shares the client */
 
 /* dma-buf fds: reference counting (dup/fork/SCM_RIGHTS take one, close
    drops one) and mmap. */

@@ -394,15 +394,29 @@ PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf 
 WITH_QT6 ?= 1
 ifeq ($(WITH_QT6),1)
 QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
-$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/zerp2/*.cpp apps/zerp2/*.json apps/zerp2/qml/*.qml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
 	@bash tools/stage_qt6.sh
 else
 QT6_MANIFEST =
 endif
+# Boot choices, read by the kernel from /etc/wynland/boot.cfg:
+#   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
+#   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
+#   SNAPSHOT=1  Zerp 2.0 writes a screenshot to the serial log (debugging)
+ZERP     ?= 2
+AUTOTEST ?= 0
+SNAPSHOT ?= 0
+BOOT_CFG = $(BUILD)/boot.cfg
+$(BOOT_CFG): FORCE
+	@mkdir -p $(BUILD)
+	@printf 'zerp=$(ZERP)\nautotest=$(AUTOTEST)\n%s' "$(if $(filter 1,$(SNAPSHOT)),snapshot=1\n,)" | sed 's/\\n/\n/g' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST)
+$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) > $@
+	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
 $(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
