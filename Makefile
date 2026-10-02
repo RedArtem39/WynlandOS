@@ -152,9 +152,11 @@ QUICKJS_SRC    = $(QUICKJS_DIR)/quickjs.c \
                  $(QUICKJS_DIR)/libregexp.c \
                  $(QUICKJS_DIR)/libunicode.c \
                  $(QUICKJS_DIR)/cutils.c \
-                 $(QUICKJS_DIR)/compat.c \
-                 $(QUICKJS_DIR)/quickjs_binding.c
-QUICKJS_OBJ    = $(patsubst $(QUICKJS_DIR)/%.c, $(BUILD_GUI)/quickjs_%.o, $(QUICKJS_SRC))
+                 $(QJS_COMPAT)/compat.c \
+                 $(QJS_COMPAT)/quickjs_binding.c
+# our libc shim + kernel binding for QuickJS (pkg/quickjs is upstream's submodule)
+QJS_COMPAT     = pkg/quickjs-compat
+QUICKJS_OBJ    = $(patsubst $(QJS_COMPAT)/%.c, $(BUILD_GUI)/quickjs_%.o, $(patsubst $(QUICKJS_DIR)/%.c, $(BUILD_GUI)/quickjs_%.o, $(QUICKJS_SRC)))
 
 # All kernel-side objects
 KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ) $(GUI_CPP_OBJ) $(QUICKJS_OBJ)
@@ -270,10 +272,17 @@ $(BUILD_GUI)/%.o: $(SRC_GUI)/%.cpp
 	@echo "  CXX(GUI)   $<"
 	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
 
+QJS_CFLAGS = -I$(QJS_COMPAT)/include -I$(QJS_COMPAT) -Ipkg/quickjs -include $(QJS_COMPAT)/compat.h
+
+$(BUILD_GUI)/quickjs_%.o: $(QJS_COMPAT)/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC(QJS)    $<"
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) $(QJS_CFLAGS) -DCONFIG_VERSION=\"2024-01-13\" -DCONFIG_BIGNUM=0 -Wno-unused-parameter -Wno-unused-variable -Wno-implicit-fallthrough -Wno-return-type -Wno-sign-compare -Wno-unused-function -Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-format -Wno-int-conversion -c $< -o $@
+
 $(BUILD_GUI)/quickjs_%.o: $(QUICKJS_DIR)/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC(QJS)    $<"
-	@$(CC_KERNEL) $(CFLAGS_KERNEL) -Ipkg/quickjs/compat/include -Ipkg/quickjs -include pkg/quickjs/compat.h -DCONFIG_VERSION=\"2024-01-13\" -DCONFIG_BIGNUM=0 -Wno-unused-parameter -Wno-unused-variable -Wno-implicit-fallthrough -Wno-return-type -Wno-sign-compare -Wno-unused-function -Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-format -Wno-int-conversion -c $< -o $@
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) $(QJS_CFLAGS) -DCONFIG_VERSION=\"2024-01-13\" -DCONFIG_BIGNUM=0 -Wno-unused-parameter -Wno-unused-variable -Wno-implicit-fallthrough -Wno-return-type -Wno-sign-compare -Wno-unused-function -Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-format -Wno-int-conversion -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_ALL_OBJ)
 	@echo "  LD(KERN)   $@"
