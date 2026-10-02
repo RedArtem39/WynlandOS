@@ -55,12 +55,21 @@ static int  g_line_count = 0; /* total ever added; ring-indexed mod MAX_LINES */
 
 static char g_input[MAX_LINE_LEN];
 static int  g_input_len = 0;
-static char g_path[256] = "/";
+static char g_path[256] = "/home/user";
 
 typedef enum { MODE_NORMAL, MODE_PASSWORD, MODE_PTY } Mode;
 static Mode g_mode = MODE_NORMAL;
 static char g_password_buf[MAX_LINE_LEN];
 static int  g_password_len = 0;
+
+/* `ary`: what the password being typed is for */
+typedef enum { PW_SU, PW_RUN, PW_OLD, PW_NEW1, PW_NEW2 } PwFor;
+static PwFor g_pw_for;
+static char g_pw_run[MAX_LINE_LEN];   /* `ary <command>` waiting for the password */
+static char g_pw_old[MAX_LINE_LEN];
+static char g_pw_new[MAX_LINE_LEN];
+static int  g_root_session;           /* inside `ary su` */
+#define USER_UID 1000
 
 /* Phase 18g: real interactive-child (nano) session state. master/child
    are only meaningful while g_mode == MODE_PTY. */
@@ -212,11 +221,20 @@ static void redraw(ZerpClient *zc) {
         char line[MAX_LINE_LEN + 16];
         int p;
         if (g_mode == MODE_PASSWORD) {
-            const char *pr = "Password: ";
+            const char *pr = g_pw_for == PW_NEW1 ? "New root password: "
+                           : g_pw_for == PW_NEW2 ? "Repeat new password: "
+                           : g_pw_for == PW_OLD  ? "Current root password: "
+                           : "[ary] root password: ";
             for (p = 0; pr[p]; p++) line[p] = pr[p];
             for (int i = 0; i < g_password_len && p < MAX_LINE_LEN + 14; i++) line[p++] = '*';
         } else {
-            line[0] = '>'; line[1] = ' '; p = 2;
+            /* "user /home/user $ " or "root /etc # " */
+            const int root = zgetuid() == 0;
+            const char *who = root ? "root " : "user ";
+            p = 0;
+            for (const char *q = who; *q; q++) line[p++] = *q;
+            for (const char *q = g_path; *q && p < 120; q++) line[p++] = *q;
+            line[p++] = ' '; line[p++] = root ? '#' : '$'; line[p++] = ' ';
             for (int i = 0; i < g_input_len && p < MAX_LINE_LEN + 14; i++) line[p++] = g_input[i];
         }
         line[p] = '\0';
@@ -480,6 +498,87 @@ static void cmd_pty_exec(const char *app, const char *args) {
     g_mode = MODE_PTY;
 }
 
+static void run_command(const char *line);
+
+static void ary_ask(PwFor what)
+{
+    g_pw_for = what;
+    g_password_len = 0;
+    g_mode = MODE_PASSWORD;
+}
+
+/* ary login | su | passwd | <command> */
+static void cmd_ary(const char *args)
+{
+    const int have = zary_status() == 1;
+    const int root = zgetuid() == 0;
+    if (!args || !*args) {
+        add_line("usage: ary login | ary su | ary passwd | ary <command>", TEXT_COLOR);
+        add_line(have ? "superuser: set" : "superuser: none yet -- 'ary login' creates it", TEXT_COLOR);
+        return;
+    }
+    if (str_eq(args, "login")) {
+        if (have) { add_line("ary: the superuser exists -- 'ary su' to become root, 'ary passwd' to change it", TEXT_COLOR); return; }
+        add_line("ary: creating the superuser (root). Choose its password.", TEXT_COLOR);
+        ary_ask(PW_NEW1);
+        return;
+    }
+    if (str_eq(args, "passwd")) {
+        if (!have || root) ary_ask(PW_NEW1);
+        else ary_ask(PW_OLD);
+        return;
+    }
+    if (!have) { add_line("ary: no superuser yet -- run 'ary login' first", ERR_COLOR); return; }
+    if (str_eq(args, "su")) {
+        if (root) { add_line("ary: already root ('exit' to leave)", TEXT_COLOR); return; }
+        ary_ask(PW_SU);
+        return;
+    }
+    /* ary <command>: one command as root */
+    if (root) { run_command(args); return; }
+    str_copy_n(g_pw_run, args, MAX_LINE_LEN);
+    ary_ask(PW_RUN);
+}
+
+static void ary_password_entered(const char *pw)
+{
+    switch (g_pw_for) {
+    case PW_SU:
+    case PW_RUN: {
+        long r = zelevate(pw);
+        if (r != 0) { add_line("ary: incorrect password", ERR_COLOR); return; }
+        if (g_pw_for == PW_SU) {
+            g_root_session = 1;
+            add_line("ary: root session ('exit' to leave)", TEXT_COLOR);
+        } else {
+            run_command(g_pw_run);     /* programs it starts inherit uid 0 */
+            if (!g_root_session) zsetuid(USER_UID);
+        }
+        return;
+    }
+    case PW_OLD:
+        str_copy_n(g_pw_old, pw, MAX_LINE_LEN);
+        ary_ask(PW_NEW1);
+        return;
+    case PW_NEW1:
+        if (!pw[0]) { add_line("ary: an empty password is not allowed", ERR_COLOR); return; }
+        str_copy_n(g_pw_new, pw, MAX_LINE_LEN);
+        ary_ask(PW_NEW2);
+        return;
+    case PW_NEW2: {
+        if (!str_eq(pw, g_pw_new)) { add_line("ary: the passwords differ, nothing changed", ERR_COLOR); }
+        else {
+            long r = zary_passwd(g_pw_new, g_pw_old[0] ? g_pw_old : 0);
+            add_line(r == 0 ? "ary: root password set -- 'ary su' to become root"
+                     : r == -13 ? "ary: wrong current password, nothing changed"
+                     : "ary: could not save the password", r == 0 ? TEXT_COLOR : ERR_COLOR);
+        }
+        for (int k = 0; k < MAX_LINE_LEN; k++) { g_pw_new[k] = 0; g_pw_old[k] = 0; }
+        return;
+    }
+    }
+}
+
 static void run_command(const char *line) {
     add_line(line, ECHO_COLOR); /* echo what was typed, styled differently from output */
 
@@ -499,9 +598,11 @@ static void run_command(const char *line) {
     else if (str_eq(cmd, "write")) cmd_write(args);
     else if (str_eq(cmd, "nano")) cmd_nano(args);
     else if (str_eq(cmd, "clear")) { g_line_count = 0; g_png_pending = 0; }
-    else if (str_eq(cmd, "ary")) { /* WynlandOS's sudo */
-        g_mode = MODE_PASSWORD;
-        g_password_len = 0;
+    else if (str_eq(cmd, "ary")) cmd_ary(args);
+    else if (str_eq(cmd, "exit") && g_root_session) {
+        zsetuid(USER_UID);
+        g_root_session = 0;
+        add_line("ary: left the root session", TEXT_COLOR);
     } else if (str_eq(cmd, "rofi")) {
         /* Phase 9 v0 launcher invocation path: request Zerp spawn the real
            Qt6 rofi-clone -- no global-hotkey infrastructure in Zerp yet. */
@@ -513,6 +614,7 @@ static void run_command(const char *line) {
         add_line("launching the QML demo...", TEXT_COLOR);
     } else if (str_eq(cmd, "help")) {
         add_line("built-ins: ls cd pwd cat whoami write nano ary rofi qml clear help", TEXT_COLOR);
+        add_line("ary login | ary su | ary passwd | ary <command>   (root; 'exit' leaves ary su)", TEXT_COLOR);
         add_line("/usr/bin: curl cmake nano pkgconf rc-status rc-service rc-update (e.g. 'rc-status')", TEXT_COLOR);
     } else {
         /* not a built-in: try /usr/bin/<cmd> on a PTY (curl, cmake, ...) */
@@ -566,13 +668,17 @@ static void handle_key(uint8_t scancode) {
     g_png_pending = 0; /* any keypress dismisses an image view, back to text */
 
     if (g_mode == MODE_PASSWORD) {
+        if (ch == 27) {   /* Esc: cancel */
+            g_mode = MODE_NORMAL; g_password_len = 0;
+            add_line("ary: cancelled", TEXT_COLOR);
+            return;
+        }
         if (ch == '\n' || ch == '\r') {
             g_password_buf[g_password_len] = '\0';
-            long ok = zelevate(g_password_buf);
-            add_line(ok == 0 ? "ary: elevated to root" : "ary: incorrect password",
-                     ok == 0 ? TEXT_COLOR : ERR_COLOR);
-            g_mode = MODE_NORMAL;
             g_password_len = 0;
+            g_mode = MODE_NORMAL;
+            ary_password_entered(g_password_buf);
+            for (int k = 0; k < MAX_LINE_LEN; k++) g_password_buf[k] = 0;
         } else if (ch == '\b') {
             if (g_password_len > 0) g_password_len--;
         } else if (g_password_len < MAX_LINE_LEN - 1) {
@@ -599,6 +705,8 @@ int zerp_main(int argc, char **argv) {
     g_zc = &zc;
 
     add_line("Zerp terminal -- type 'help' for commands", TEXT_COLOR);
+    if (zary_status() != 1)
+        add_line("no superuser yet -- 'ary login' creates one", TEXT_COLOR);
     redraw(&zc);
 
     for (;;) {

@@ -94,6 +94,8 @@ bool vfs_delete(const char *path);
 bool vfs_rename(const char *oldpath, const char *newpath);
 bool vfs_stat(const char *path, VfsStat *out);
 bool vfs_set_readonly(const char *path); /* clears all write bits in i_mode */
+bool vfs_chmod(const char *path, uint32_t mode); /* owner or root */
+bool vfs_may_access(const char *path, uint32_t want); /* 4 r, 2 w, 1 x; root always */
 
 /* ---- ext2 mount diagnostics (shell disk_dump etc.) ---- */
 uint32_t ext2_fs_block_size(void);

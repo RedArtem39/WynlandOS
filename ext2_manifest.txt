@@ -20,6 +20,8 @@ D /lib/fonts
 D /plugins
 D /plugins/platforms
 D /tmp
+D /home
+D /home/user
 D /etc
 D /etc/hypr
 D /lib64
@@ -67,7 +69,6 @@ F  /sbin/init              build/wynrc.elf
 F  /usr/bin/rc-status      build/rc.elf
 F  /usr/bin/rc-service     build/rc.elf
 F  /usr/bin/rc-update      build/rc.elf
-F  /etc/sudopw             rootfs/etc/sudopw
 D /etc/wynrc
 D /etc/wynrc/services
 D /etc/wynrc/runlevels
@@ -1485,3 +1486,10 @@ F /usr/share/cmake-3.28/Templates/Windows/Windows_TemporaryKey.pfx build/ports/c
 Fo /test_signals.elf build/test_signals.elf
 Fo /test_vma.elf build/test_vma.elf
 Fo /test_blockio.elf build/test_blockio.elf
+
+# permissions beyond the defaults (root, 0755 dirs/programs, 0644 files)
+P /tmp 0 41777
+P /home/user 1000 40755
+P /dev/dri/card0 0 100666
+P /dev/dri/renderD128 0 100666
+P /var/cache/fontconfig 0 41777

@@ -276,10 +276,26 @@ static void print_hex32(uint32_t v) {
 /* Creating process's uid, falling back to root for the boot-time
    calls that happen before the scheduler/process subsystem exists
    (those really are root-owned bootstrap files). */
+/* Set while the kernel itself writes on a user's behalf (/etc/shadow for
+   `ary`): those writes are root's, whoever made the call. */
+int g_vfs_root_override;
+
 static uint32_t current_uid_or_root(void) {
+    if (g_vfs_root_override) return 0;
     Thread *t = sched_current();
     if (t && t->proc) return t->proc->uid;
     return 0;
+}
+
+/* Adding or removing a name in a directory needs write permission on the
+   directory (root: always). There was no check at all: any user could
+   create or delete files anywhere. */
+static bool may_write_dir(const Ext2Inode *dir) {
+    uint32_t uid = current_uid_or_root();
+    if (uid == 0) return true;
+    bool ok = (dir->i_uid == uid) ? (dir->i_mode & 0200) != 0 : (dir->i_mode & 0002) != 0;
+    if (!ok) serial_write_string("perm: denied a directory write\r\n");
+    return ok;
 }
 
 /* ============================================================
@@ -1146,6 +1162,7 @@ bool ext2_dir_add_entry(uint32_t dir_inum, Ext2Inode *dir,
    "Directories count wrong for group #0"). */
 bool ext2_mkdir(uint32_t parent_inum, Ext2Inode *parent, const char *name) {
     if (!g_group_desc || !parent || !name) return false;
+    if (!may_write_dir(parent)) return false;
 
     uint32_t exist_inum;
     uint8_t  exist_type;
@@ -1257,6 +1274,7 @@ static void ext2_free_all_blocks(const Ext2Inode *inode) {
 
 bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
     (void)dir_inum;
+    if (!may_write_dir(dir)) return false;
     uint32_t name_len = 0;
     while (name[name_len]) name_len++;
 
@@ -1343,6 +1361,7 @@ bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
    convention, not invented. Longer targets fall back to a normal
    single data block (this OS's own paths are always short). */
 bool ext2_create_symlink(uint32_t dir_inum, Ext2Inode *dir, const char *name, const char *target) {
+    if (!may_write_dir(dir)) return false;
     uint32_t target_len = 0;
     while (target[target_len]) target_len++;
 
@@ -1918,6 +1937,7 @@ bool vfs_create(const char *path) {
     uint32_t dir_inum;
     Ext2Inode dir;
     if (!ext2_lookup_path(dirname, &dir_inum, &dir)) return false;
+    if (!may_write_dir(&dir)) return false;
 
     uint32_t existing_inum; uint8_t existing_type;
     if (ext2_dir_lookup(&dir, basename, &existing_inum, &existing_type)) return false;
@@ -1957,6 +1977,36 @@ bool vfs_create(const char *path) {
    grant write access (owner+group+other), backed by SYS_open's real
    owner-vs-other enforcement. Replaces the old FAT32 single-attribute-
    bit hack with actual permission semantics. */
+/* May the caller read (4) / write (2) / execute (1) an existing path?
+   Owner bits for the owner, "other" bits for everyone else (no groups),
+   root always. A path that doesn't exist answers true: creating it is
+   the directory's business (may_write_dir). */
+bool vfs_may_access(const char *path, uint32_t want) {
+    uint32_t uid = current_uid_or_root();
+    if (uid == 0 || !want) return true;
+    uint32_t inum;
+    Ext2Inode inode;
+    if (!ext2_lookup_path(path, &inum, &inode)) return true;
+    uint32_t have = (inode.i_uid == uid) ? ((inode.i_mode >> 6) & 7) : (inode.i_mode & 7);
+    if ((have & want) == want) return true;
+    serial_write_string("perm: denied ");
+    serial_write_string(path);
+    serial_write_string("\r\n");
+    return false;
+}
+
+/* chmod: the owner or root; only the permission bits change */
+bool vfs_chmod(const char *path, uint32_t mode) {
+    uint32_t inum;
+    Ext2Inode inode;
+    if (!ext2_lookup_path(path, &inum, &inode)) return false;
+    uint32_t uid = current_uid_or_root();
+    if (uid != 0 && inode.i_uid != uid) return false;
+    inode.i_mode = (uint16_t)((inode.i_mode & ~07777u) | (mode & 07777u));
+    inode.i_ctime = (uint32_t)rtc_get_unix_time();
+    return ext2_write_inode(inum, &inode);
+}
+
 bool vfs_set_readonly(const char *path) {
     uint32_t inum;
     Ext2Inode inode;
@@ -2158,6 +2208,7 @@ bool vfs_rename(const char *oldpath, const char *newpath) {
     if (!ext2_lookup_path(new_dir, &new_dir_inum, &new_dir_inode)) return false;
     if (!ext2_dir_lookup(&old_dir_inode, old_base, &old_inum, NULL)) return false;
     if (!ext2_read_inode(old_inum, &old_inode)) return false;
+    if (!may_write_dir(&old_dir_inode) || !may_write_dir(&new_dir_inode)) return false;
 
     /* If destination exists, remove it first (real POSIX rename semantics:
        silently replace). Its inode gets freed by unlink. */

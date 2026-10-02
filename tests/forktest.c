@@ -17,6 +17,8 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -174,6 +176,50 @@ int main(int argc, char **argv)
         rc = run_capture("/usr/bin/rc-status", NULL, NULL, out, sizeof(out));
         fprintf(stderr, "[forktest] rc-status rc=%d out=%.120s\n", rc, out);
         check(rc == 0 && strstr(out, "SERVICE") && strstr(out, "forktest"), "rc-status talks to wynrc");
+        /* permissions: a user (uid 1000) can't write /etc, can write /tmp
+           and its home, can't read /etc/shadow, can't setuid(0) */
+        if (getuid() != 0) {
+            FILE *f = fopen("/etc/forktest-perm", "w");
+            check(f == NULL, "user cannot create files in /etc");
+            if (f) { fclose(f); unlink("/etc/forktest-perm"); }
+            f = fopen("/tmp/forktest-perm", "w");
+            check(f != NULL, "user can create files in /tmp");
+            if (f) { fclose(f); check(unlink("/tmp/forktest-perm") == 0, "user can delete its file in /tmp"); }
+            f = fopen("/home/user/.forktest-perm", "w");
+            check(f != NULL, "user can create files in /home/user");
+            if (f) { fclose(f); unlink("/home/user/.forktest-perm"); }
+            check(unlink("/etc/hosts") != 0 && access("/etc/hosts", F_OK) == 0, "user cannot delete /etc files");
+            check(mkdir("/tmp/forktest-d", 0755) == 0, "mkdir in /tmp");
+            f = fopen("/tmp/forktest-d/a", "w");
+            if (f) fclose(f);
+            check(rename("/tmp/forktest-d/a", "/tmp/forktest-d/b") == 0 &&
+                  access("/tmp/forktest-d/b", F_OK) == 0, "rename");
+            check(rmdir("/tmp/forktest-d") != 0 && errno == ENOTEMPTY, "rmdir refuses a non-empty dir");
+            unlink("/tmp/forktest-d/b");
+            check(rmdir("/tmp/forktest-d") == 0, "rmdir");
+            check(setuid(0) != 0, "user cannot setuid(0)");
+            check(syscall(409, "definitely-wrong") != 0, "ary elevate rejects a wrong password");
+            check(getuid() != 0, "still a user afterwards");
+        }
+        /* `ary` end to end -- only with BOOT_EXTRA=authtest=1 and QEMU_EXTRA=-snapshot,
+           since it sets a real root password on the disk */
+        char cfg[512] = {0};
+        FILE *cf = fopen("/etc/wynland/boot.cfg", "r");
+        if (cf) { fread(cfg, 1, sizeof(cfg) - 1, cf); fclose(cf); }
+        if (strstr(cfg, "authtest=1") && getuid() != 0) {
+            check(syscall(414) == 0, "ary: no superuser on a fresh disk");
+            check(syscall(409, "x") == -1 && errno == ENOENT, "ary su without a superuser -> ENOENT");
+            check(syscall(413, "s3cret", 0) == 0, "ary login creates the superuser");
+            check(syscall(414) == 1, "ary: superuser exists now");
+            check(syscall(413, "evil", 0) != 0, "a user cannot overwrite it");
+            check(access("/etc/shadow", R_OK) != 0, "/etc/shadow unreadable for users");
+            check(syscall(409, "wrong") != 0 && getuid() != 0, "wrong password refused");
+            check(syscall(409, "s3cret") == 0 && getuid() == 0, "ary su -> root");
+            FILE *f = fopen("/etc/forktest-root", "w");
+            check(f != NULL, "root can write /etc");
+            if (f) { fclose(f); unlink("/etc/forktest-root"); }
+            check(setuid(1000) == 0 && getuid() == 1000, "exit -> back to user");
+        }
         /* real network: DNS (musl resolver -> /etc/resolv.conf), TCP, TLS */
         rc = run_capture("/usr/bin/curl", "-sI", "https://example.com/", out, sizeof(out));
         fprintf(stderr, "[forktest] curl https rc=%d out=%.60s\n", rc, out);

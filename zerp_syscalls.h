@@ -116,6 +116,10 @@ static void zexit(int code) { zsys3(SYS_exit, code, 0, 0); }
 static long zfcntl(int fd, int cmd, long arg) { return zsys3(SYS_fcntl, fd, cmd, arg); }
 static long zgetuid(void) { return zsys3(SYS_getuid, 0, 0, 0); }
 static long zelevate(const char *password) { return zsys3(SYS_wynland_elevate, (long)password, 0, 0); }
+/* root password (kernel/auth.c): set/change, whether one exists; setuid */
+static long zary_passwd(const char *npw, const char *opw) { return zsys3(413, (long)npw, (long)opw, 0); }
+static long zary_status(void) { return zsys3(414, 0, 0, 0); }
+static long zsetuid(long uid) { return zsys3(105, uid, 0, 0); }
 static long zgetdents64(int fd, void *dirp, long count) { return zsys3(SYS_getdents64, fd, (long)dirp, count); }
 static long zspawn_argv(const char *path, const char **argv) { return zsys3(SYS_spawn_argv, (long)path, (long)argv, 0); }
 static long zshm_create(long size) { return zsys3(SYS_shm_create, size, 0, 0); }

@@ -2607,16 +2607,7 @@ void kernel_main(BootInfo *boot_info)
        vfs_lookup_path() call for the identical path failed). */
     boot_mark("dev dirs");
     vfs_mkdir("/etc"); /* no-op if it already exists, matching the /dev calls above */
-    VfsStat pw_st;
-    if (!vfs_stat("/etc/sudopw", &pw_st) && vfs_create("/etc/sudopw")) {
-        VfsFile *pwfile = vfs_open_flags("/etc/sudopw", VFS_O_WRITE);
-        if (pwfile) {
-            const char *pw_content = "wynland\n";
-            vfs_write(pwfile, pw_content, 8);
-            vfs_close(pwfile);
-        }
-        vfs_set_readonly("/etc/sudopw");
-    }
+    /* (the root password lives in /etc/shadow now, set by `ary login`) */
 
     boot_mark("sudopw");
     /* ---- Initialize Network Stack ---- */

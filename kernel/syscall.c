@@ -1,6 +1,7 @@
 #include <wynland/types.h>
 #include <wynland/sched.h>
 #include <wynland/vfs.h>
+#include <wynland/auth.h>
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
@@ -1539,6 +1540,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 int fd = get_free_fd(fd_table);
                 if (fd == -1) return (uint64_t)-2;
+                /* before opening: O_TRUNC acts inside vfs_open_flags */
+                if (!vfs_may_access(path_kbuf, ((vfs_flags & 0x01) ? 4u : 0u) |
+                                               ((vfs_flags & 0x1A) ? 2u : 0u)))
+                    return (uint64_t)-13; /* -EACCES */
                 VfsFile *file = vfs_open_flags(path_kbuf, vfs_flags);
                 if (!file) return (uint64_t)-2;
 
@@ -1996,6 +2001,53 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 serial_write_string("\r\n");
 
                 return 0; // Success
+            }
+
+        case 87:  // SYS_unlink(path)
+        case 84:  // SYS_rmdir(path)
+        case 263: // SYS_unlinkat(dirfd, path, flags) -- AT_REMOVEDIR 0x200
+            {
+                /* There were none of these: rm, file managers and every
+                   temp-file cleanup got -ENOSYS. Paths are absolute (cwd is /). */
+                uint64_t up = (num == 263) ? a2 : a1;
+                bool want_dir = (num == 84) || (num == 263 && (a3 & 0x200));
+                char path[MAX_PATH];
+                if (!up || strncpy_from_user(path, (const void *)up, sizeof(path)) < 0) return (uint64_t)-14;
+                VfsStat ust;
+                if (!vfs_stat(path, &ust)) return (uint64_t)-2;          /* -ENOENT */
+                if (ust.is_dir && !want_dir) return (uint64_t)-21;      /* -EISDIR */
+                if (!ust.is_dir && want_dir) return (uint64_t)-20;      /* -ENOTDIR */
+                if (vfs_delete(path)) return 0;
+                return ust.is_dir ? (uint64_t)-39 : (uint64_t)-13;       /* -ENOTEMPTY / -EACCES */
+            }
+
+        case 82:  // SYS_rename(old, new)
+        case 264: // SYS_renameat(olddirfd, old, newdirfd, new)
+        case 316: // SYS_renameat2(..., flags)
+            {
+                uint64_t uo = (num == 82) ? a1 : a2;
+                uint64_t un = (num == 82) ? a2 : a4;
+                char op[MAX_PATH], np[MAX_PATH];
+                if (!uo || !un || strncpy_from_user(op, (const void *)uo, sizeof(op)) < 0 ||
+                    strncpy_from_user(np, (const void *)un, sizeof(np)) < 0) return (uint64_t)-14;
+                VfsStat rst;
+                if (!vfs_stat(op, &rst)) return (uint64_t)-2;
+                if (str_compare(op, np) == 0) return 0;
+                if (vfs_stat(np, &rst)) {
+                    /* POSIX: the target is replaced */
+                    if (num == 316 && (a5 & 1)) return (uint64_t)-17;   /* RENAME_NOREPLACE */
+                    if (!vfs_delete(np)) return (uint64_t)-13;
+                }
+                return vfs_rename(op, np) ? 0 : (uint64_t)-13;
+            }
+
+        case 258: // SYS_mkdirat(dirfd, path, mode)
+            {
+                char path[MAX_PATH];
+                if (!a2 || strncpy_from_user(path, (const void *)a2, sizeof(path)) < 0) return (uint64_t)-14;
+                VfsStat mst;
+                if (vfs_stat(path, &mst)) return (uint64_t)-17;          /* -EEXIST */
+                return vfs_mkdir(path) ? 0 : (uint64_t)-13;
             }
 
         case 83: // SYS_mkdir
@@ -2821,17 +2873,57 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    // runs via SYS_spawn_argv (408, PROC_UID_INHERIT)
                    // correctly inherits uid 0.
             {
-                if (!a1) return (uint64_t)-1;
-                static const char root_password[] = "wynland";
-                char given[32];
+                /* Checked against the salted hash in /etc/shadow
+                   (kernel/auth.c); it was a constant in this file.
+                   -ENOENT: no root password yet (`ary login` sets one). */
+                if (!a1) return (uint64_t)-14;
+                char given[128];
                 if (strncpy_from_user(given, (const void *)a1, sizeof(given)) < 0) {
                     return (uint64_t)-14; /* -EFAULT */
                 }
-                if (str_compare(given, root_password) == 0) {
+                if (!auth_root_password_set()) return (uint64_t)-2;
+                if (auth_check_root(given)) {
                     sched_current()->proc->uid = 0;
                     return 0;
                 }
-                return (uint64_t)-1;
+                return (uint64_t)-13; /* -EACCES */
+            }
+
+        case 413: // SYS_ary_passwd(new_password, old_password): set the root
+                  // password. Allowed when none is set yet (first boot,
+                  // `ary login`), for root, or with the current password.
+            {
+                char npw[128], opw[128] = {0};
+                if (!a1 || strncpy_from_user(npw, (const void *)a1, sizeof(npw)) < 0) return (uint64_t)-14;
+                if (a2 && strncpy_from_user(opw, (const void *)a2, sizeof(opw)) < 0) return (uint64_t)-14;
+                if (!npw[0]) return (uint64_t)-22; /* -EINVAL: empty */
+                bool allowed = !auth_root_password_set() || sched_current()->proc->uid == 0 ||
+                               (a2 && auth_check_root(opw));
+                if (!allowed) return (uint64_t)-13; /* -EACCES */
+                return auth_set_root(npw) ? 0 : (uint64_t)-5; /* -EIO */
+            }
+
+        case 414: // SYS_ary_status: 1 when a root password is set, else 0
+            return auth_root_password_set() ? 1 : 0;
+
+        case 105: // SYS_setuid(uid): root may become anyone; others only themselves
+            {
+                Process *pr = sched_current()->proc;
+                if (pr->uid != 0 && (uint32_t)a1 != pr->uid) return (uint64_t)-1; /* -EPERM */
+                pr->uid = (uint32_t)a1;
+                return 0;
+            }
+
+        case 90:  // SYS_chmod(path, mode)
+        case 268: // SYS_fchmodat(dirfd, path, mode, flags) -- absolute paths
+            {
+                uint64_t up = (num == 90) ? a1 : a2;
+                uint32_t mode = (uint32_t)((num == 90) ? a2 : a3);
+                char cpath[MAX_PATH];
+                if (!up || strncpy_from_user(cpath, (const void *)up, sizeof(cpath)) < 0) return (uint64_t)-14;
+                VfsStat cst;
+                if (!vfs_stat(cpath, &cst)) return (uint64_t)-2;  /* -ENOENT */
+                return vfs_chmod(cpath, mode) ? 0 : (uint64_t)-1; /* -EPERM */
             }
 
         case 410: // SYS_pty_create(int fds[2]) -- Phase 18. Allocates a
@@ -3237,18 +3329,19 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return total_read;
             }
 
-        case 21: // SYS_access (Linux standard) — check file accessibility
+        case 21:  // SYS_access (Linux standard) — check file accessibility
+        case 269: // SYS_faccessat(dirfd, path, mode)
+        case 439: // SYS_faccessat2(dirfd, path, mode, flags)
             {
+                if (num != 21) { a1 = a2; a2 = a3; }   /* absolute paths: dirfd unused */
                 if (!a1) return (uint64_t)-14; /* -EFAULT */
                 char path[MAX_PATH];
                 if (strncpy_from_user(path, (const void *)a1, sizeof(path)) < 0) {
                     return (uint64_t)-14; /* -EFAULT */
                 }
                 VfsStat vst;
-                if (vfs_stat(path, &vst)) {
-                    return 0; /* File exists and is accessible */
-                }
-                return (uint64_t)-2; /* -ENOENT */
+                if (!vfs_stat(path, &vst)) return (uint64_t)-2; /* -ENOENT */
+                return vfs_may_access(path, (uint32_t)a2 & 7) ? 0 : (uint64_t)-13; /* -EACCES */
             }
 
         case 72: // SYS_fcntl (Linux standard) — file descriptor control
@@ -3644,6 +3737,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return fd;
                 }
                 
+                {
+                    uint32_t want = 0;
+                    if (vfs_flags & 0x01) want |= 4;
+                    if (vfs_flags & (0x02 | 0x10 | 0x08)) want |= 2;
+                    if (!vfs_may_access(path, want)) return (uint64_t)-13; /* -EACCES */
+                }
                 VfsFile *file = vfs_open_flags(path, vfs_flags);
                 if (!file) return (uint64_t)-2; /* -ENOENT */
                 fd_table[fd] = file;

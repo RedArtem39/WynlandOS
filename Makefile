@@ -415,6 +415,7 @@ endif
 #   SNAPSHOT=1  Zerp 2.0 writes a screenshot to the serial log (debugging)
 ZERP     ?= 2
 AUTOTEST ?= 0
+QEMU_EXTRA ?=
 SNAPSHOT ?= 0
 BOOT_CFG = $(BUILD)/boot.cfg
 $(BOOT_CFG): FORCE
@@ -513,6 +514,7 @@ run-gl: all
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-gpu-gl-pci                         \
 		-display $(QEMU_DISPLAY)                          \
+		$(QEMU_EXTRA)                                     \
 		-device virtio-net-pci,netdev=net0                \
 		-netdev user,id=net0                              \
 		-serial stdio                                     \

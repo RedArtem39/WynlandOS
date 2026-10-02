@@ -52,6 +52,7 @@ def main() -> None:
     required: list[tuple[str, str]] = []
     optional: list[tuple[str, str]] = []
 
+    perms: list[tuple[str, int, int]] = []
     with open(manifest_path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.split("#", 1)[0].strip()
@@ -61,6 +62,10 @@ def main() -> None:
             kind = parts[0]
             if kind == "D" and len(parts) == 2:
                 dirs.append(parts[1])
+            elif kind == "P" and len(parts) == 3:
+                # P <path> <uid> <octal mode incl. type>, e.g. P /tmp 0 41777
+                uid, mode = parts[2].split()
+                perms.append((parts[1], int(uid), int(mode, 8)))
             elif kind in ("F", "Fo") and len(parts) == 3:
                 (required if kind == "F" else optional).append((parts[1], parts[2]))
             else:
@@ -93,6 +98,25 @@ def main() -> None:
 
     add_writes(required, True)
     add_writes(optional, False)
+
+    # Ownership and modes: everything root's, directories 0755, programs
+    # (ELF) 0755, other files 0644 -- sources on a Windows drive all read
+    # as 0777, which made every file in the image world-writable. "P"
+    # lines then set the exceptions (/tmp, the user's home).
+    def is_elf(src: str) -> bool:
+        try:
+            with open(src, "rb") as h:
+                return h.read(4) == b"\x7fELF"
+        except OSError:
+            return False
+    for d in dirs:
+        cmds += [f"sif {d} uid 0", f"sif {d} gid 0", f"sif {d} mode 040755"]
+    for dest, src in required + optional:
+        if os.path.exists(src):
+            mode = "0100755" if is_elf(src) else "0100644"
+            cmds += [f"sif {dest} uid 0", f"sif {dest} gid 0", f"sif {dest} mode {mode}"]
+    for path, uid, mode in perms:
+        cmds += [f"sif {path} uid {uid}", f"sif {path} gid {uid}", f"sif {path} mode 0{mode:o}"]
 
     script_path = out_img + ".debugfs.cmds"
     with open(script_path, "w", encoding="utf-8") as f:
