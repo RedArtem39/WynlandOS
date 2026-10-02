@@ -49,6 +49,17 @@ int main(void)
     check(ioctl(fd, SNDCTL_DSP_SETFMT, &fmt) == 0 && fmt == AFMT_S16_LE, "SETFMT S16_LE");
     check(ioctl(fd, SNDCTL_DSP_CHANNELS, &ch) == 0 && ch == 2, "CHANNELS 2");
     check(ioctl(fd, SNDCTL_DSP_SPEED, &rate) == 0 && rate == 48000, "SPEED 48000");
+    /* after a RESET a short write is all still queued (the lead-in
+       silence was subtracted from it) */
+    {
+        static short shortbuf[1024 * 2];   /* 4 KB of silence */
+        int q = 0;
+        ioctl(fd, SNDCTL_DSP_RESET, 0);
+        write(fd, shortbuf, sizeof shortbuf);
+        ioctl(fd, SNDCTL_DSP_GETODELAY, &q);
+        check(q >= (int)sizeof shortbuf, "GETODELAY counts a fresh write");
+        ioctl(fd, SNDCTL_DSP_SYNC, 0);
+    }
     int space[4] = {0};
     check(ioctl(fd, SNDCTL_DSP_GETOSPACE, space) == 0 && space[3] > 0, "GETOSPACE");
 

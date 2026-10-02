@@ -6,6 +6,7 @@
 
 static void queue_push(WaitQueue *q, Thread *t) {
     t->wq_next = NULL;
+    t->wq_head = &q->head;
     if (!q->head) {
         q->head = t;
         return;
@@ -25,6 +26,7 @@ static void self_unlink(WaitQueue *q, Thread *t) {
         if (*pp == t) {
             *pp = t->wq_next;
             t->wq_next = NULL;
+            t->wq_head = NULL;
             return;
         }
         pp = &(*pp)->wq_next;

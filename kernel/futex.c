@@ -62,7 +62,10 @@ static void queue_prune(FutexQueue *q) {
     Thread **pp = &q->head;
     while (*pp) {
         if ((*pp)->state != THREAD_STATE_BLOCKED || (*pp)->wq != (void *)q) {
-            *pp = (*pp)->wq_next; /* stale: already resumed some other way */
+            Thread *stale = *pp;
+            *pp = stale->wq_next; /* stale: already resumed some other way */
+            stale->wq_next = NULL;
+            stale->wq_head = NULL;
         } else {
             pp = &(*pp)->wq_next;
         }
@@ -92,6 +95,7 @@ static void queue_release_if_empty(FutexQueue *q) {
 
 static void queue_push(FutexQueue *q, Thread *t) {
     t->wq_next = NULL;
+    t->wq_head = &q->head;
     if (!q->head) {
         q->head = t;
         return;
@@ -112,6 +116,7 @@ static void self_unlink(FutexQueue *q, Thread *t) {
         if (*pp == t) {
             *pp = t->wq_next;
             t->wq_next = NULL;
+            t->wq_head = NULL;
             break;
         }
         pp = &(*pp)->wq_next;
@@ -225,6 +230,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                 Thread *t = q->head;
                 q->head = t->wq_next;
                 t->wq_next = NULL;
+                t->wq_head = NULL;
                 sched_unblock(t, 0);
                 woken++;
             }
@@ -283,6 +289,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                 Thread *t = q->head;
                 q->head = t->wq_next;
                 t->wq_next = NULL;
+                t->wq_head = NULL;
                 sched_unblock(t, 0);
                 n++;
             }
@@ -320,6 +327,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             Thread *t = q->head;
             q->head = t->wq_next;
             t->wq_next = NULL;
+            t->wq_head = NULL;
             sched_unblock(t, 0);
             woken++;
         }
@@ -369,6 +377,7 @@ void futex_wake_user(uint64_t uaddr, uint32_t n) {
             Thread *t = q->head;
             q->head = t->wq_next;
             t->wq_next = NULL;
+            t->wq_head = NULL;
             sched_unblock(t, 0);
             woken++;
         }

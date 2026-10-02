@@ -300,6 +300,44 @@ int main(int argc, char **argv)
                       "O_TRUNC keeps the mode");
                 unlink(sh);
             }
+            /* review regressions */
+            {
+                /* a failed execve() leaves the lazy memory of the image usable */
+                char *lazy = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                pid_t c = fork();
+                if (c == 0) {
+                    char *na[] = { "/nonexistent", NULL };
+                    execve("/nonexistent", na, environ);
+                    lazy[12345] = 7;                       /* untouched until now */
+                    _exit(lazy[12345] == 7 ? 0 : 1);
+                }
+                int st = 0;
+                waitpid(c, &st, 0);
+                check(WIFEXITED(st) && WEXITSTATUS(st) == 0, "failed execve keeps lazy memory usable");
+                munmap(lazy, 1 << 20);
+
+                /* a mapped file outlives its name */
+                const char *mf = "/tmp/forktest-mapped";
+                int fd = open(mf, O_RDWR | O_CREAT | O_TRUNC, 0644);
+                static unsigned char page[4096];
+                for (int k = 0; k < 64; k++) {             /* 256 KB, page k filled with k */
+                    memset(page, k, sizeof page);
+                    if (write(fd, page, sizeof page) != (ssize_t)sizeof page) break;
+                }
+                unsigned char *m = mmap(NULL, 64 * 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+                close(fd);
+                unlink(mf);
+                /* and a new file that may take the freed inode */
+                int fd2 = open("/tmp/forktest-other", O_RDWR | O_CREAT | O_TRUNC, 0644);
+                memset(page, 0xEE, sizeof page);
+                for (int k = 0; k < 64; k++) if (write(fd2, page, sizeof page) < 0) break;
+                close(fd2);
+                int intact = m != MAP_FAILED;
+                for (int k = 0; intact && k < 64; k++) intact = m[k * 4096 + 100] == k;
+                check(intact, "unlinked mapped file still reads its own data");
+                if (m != MAP_FAILED) munmap(m, 64 * 4096);
+                unlink("/tmp/forktest-other");
+            }
             /* normal anonymous mappings still work */
             char *a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             check(a != MAP_FAILED, "anonymous mmap still works");

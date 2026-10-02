@@ -1021,7 +1021,7 @@ static void draw_input_line(BootInfo *info, const char *prompt, const char *inpu
 
 void sys_reboot(void)
 {
-    extern void ext2_flush(void);
+    extern bool ext2_flush(void);
     ext2_flush();   /* write-back cache: nothing may be left behind */
     /* 1. Pulse CPU reset via keyboard controller (port 0x64) */
     uint8_t temp = 0x02;
@@ -1036,7 +1036,7 @@ void sys_reboot(void)
 
 void sys_poweroff(void)
 {
-    extern void ext2_flush(void);
+    extern bool ext2_flush(void);
     ext2_flush();
     /* QEMU q35 ACPI shutdown */
     outw(0x604, 0x2000);

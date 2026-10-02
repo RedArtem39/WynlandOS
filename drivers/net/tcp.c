@@ -837,7 +837,9 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
                 conn->snd_una = ack;
                 conn->ack_of_fin = true;
                 conn->state  = TCP_STATE_CLOSED;
-                conn->in_use = false;
+                /* the slot is freed by tcp_close(), which is waiting for
+                   this: freeing it here let another connection take the
+                   slot while the closer still held it */
                 serial_write_string("[TCP] LAST_ACK → CLOSED\n");
             }
         }

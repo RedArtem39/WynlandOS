@@ -12,19 +12,30 @@ extern void *memcpy(void *dest, const void *src, size_t n);
 _Static_assert(sizeof(VfsFile) <= sizeof(((VmaFile *)0)->vf), "VmaFile.vf too small for a VfsFile");
 
 static void file_ref(VmaFile *f) { if (f) f->refs++; }
+extern bool ext2_pin_inode(uint32_t inum);
+extern void ext2_unpin_inode(uint32_t inum);
+
 static void file_unref(VmaFile *f)
 {
-    if (f && f->refs && --f->refs == 0) kfree(f);
+    if (f && f->refs && --f->refs == 0) {
+        ext2_unpin_inode(((VfsFile *)f->vf)->node.first_cluster);
+        kfree(f);
+    }
 }
 
+/* NULL when the inode cannot be pinned (pin table full): the caller then
+   reads the file eagerly instead */
 VmaFile *vma_file_new(const void *f)
 {
+    if (!ext2_pin_inode(((const VfsFile *)f)->node.first_cluster)) return NULL;
     VmaFile *vf = (VmaFile *)kmalloc(sizeof(VmaFile));
-    if (!vf) return NULL;
+    if (!vf) { ext2_unpin_inode(((const VfsFile *)f)->node.first_cluster); return NULL; }
     memcpy(vf->vf, f, sizeof(VfsFile));
     vf->refs = 0;
     return vf;
 }
+
+void vma_file_put(VmaFile *f) { file_unref(f); }
 
 void vma_free(VMA *v)
 {

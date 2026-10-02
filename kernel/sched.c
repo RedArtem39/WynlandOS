@@ -66,6 +66,7 @@ void sched_init(void) {
     thread_list = current_thread;
     current_thread->wq = NULL;
     current_thread->wq_next = NULL;
+    current_thread->wq_head = NULL;
     current_thread->wake_deadline = SCHED_NO_DEADLINE;
     current_thread->wake_result = 0;
 
@@ -91,6 +92,7 @@ void sched_init(void) {
         t->proc = NULL;
         t->wq = NULL;
         t->wq_next = NULL;
+        t->wq_head = NULL;
         t->wake_deadline = SCHED_NO_DEADLINE;
         t->wake_result = 0;
 
@@ -273,6 +275,17 @@ void sched_schedule(void) {
                 }
                 Thread *to_free = curr;
                 curr = curr->next;
+                /* killed while blocked (signal_kill_process(), a fatal
+                   signal): it never ran its own unlink, so its wait queue
+                   would keep pointing at the freed Thread */
+                if (to_free->wq_head) {
+                    Thread **pp = to_free->wq_head;
+                    while (*pp) {
+                        if (*pp == to_free) { *pp = to_free->wq_next; break; }
+                        pp = &(*pp)->wq_next;
+                    }
+                    to_free->wq_head = NULL;
+                }
 
                 /* Real address-space teardown, deferred to exactly here:
                    thread_exit() (above) can't do it itself -- it's still

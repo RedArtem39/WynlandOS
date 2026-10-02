@@ -48,6 +48,10 @@ typedef struct Thread {
                                  continues INSIDE sched_block()'s frame and its
                                  return value carries the wake result. */
     struct Thread *wq_next;   /* intrusive FIFO link within that queue */
+    struct Thread **wq_head;  /* head of the list this thread is linked on
+                                 (WaitQueue or FutexQueue), NULL if none:
+                                 lets the scheduler unlink a thread that was
+                                 killed while blocked before freeing it */
     uint64_t wake_deadline;   /* absolute timer ticks after which the scheduler
                                  unblocks with -ETIMEDOUT; SCHED_NO_DEADLINE */
     uint64_t wake_deadline_ms; /* same, on the 1 kHz timer_get_ms() clock

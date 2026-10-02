@@ -2001,14 +2001,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     !fd_table[fd]->node.is_dir &&
                     fd_table[fd]->node.first_cluster < 0xFFFFFF00u) {
                     VmaFile *vf = vma_file_new(fd_table[fd]);
-                    if (!vf) return (uint64_t)-12;
-                    uint32_t fprot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
-                    if (!vma_insert_file(sched_current()->proc, virt_addr, virt_addr + size_aligned,
-                                         fprot, VMA_LAZY | VMA_FILE, vf, offset, len)) {
-                        kfree(vf);
-                        return (uint64_t)-12;
+                    if (vf) {   /* else: read it all below, as before */
+                        uint32_t fprot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
+                        if (!vma_insert_file(sched_current()->proc, virt_addr, virt_addr + size_aligned,
+                                             fprot, VMA_LAZY | VMA_FILE, vf, offset, len)) {
+                            vf->refs = 1;   /* drop it the regular way (unpins) */
+                            extern void vma_file_put(VmaFile *f);
+                            vma_file_put(vf);
+                            return (uint64_t)-12;
+                        }
+                        return virt_addr;
                     }
-                    return virt_addr;
                 }
 
                 /* Physical pages one by one. This took one physically
@@ -2749,23 +2752,6 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    space: don't touch a single page of it. It gets a fresh
                    one of its own below, after the target check. */
                 bool exec_vfork = exec_proc->vfork_shared;
-                vma_free_list(exec_proc);
-
-                /* Same reasoning as the VMA list above: the old image's heap
-                   pages describe nothing the new image wants, and unlike the
-                   VMA nodes (plain kernel bookkeeping) these are real
-                   physical frames -- reset the metadata AND actually give
-                   the frames back, or every execve() would leak the exiting
-                   image's entire heap forever. */
-                for (uint64_t a = exec_proc->brk_start; !exec_vfork && a < exec_proc->brk_current; a += PAGE_SIZE) {
-                    uint64_t phys = vmm_get_phys(pml4, a);
-                    if (phys) {
-                        vmm_unmap_page(pml4, a);
-                        pmm_free_page((void *)(uintptr_t)phys);
-                    }
-                }
-                exec_proc->brk_current = exec_proc->brk_start;
-                memset(exec_proc->mmap_next, 0, sizeof(exec_proc->mmap_next));   /* new address space */
 
                 /* Check the target BEFORE the point of no return below: a
                    missing or non-ELF file must still fail with an error the
@@ -2783,6 +2769,27 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         return (uint64_t)-2; /* -ENOENT / -ENOEXEC */
                     }
                 }
+
+                /* The old image's bookkeeping goes only now, past the target
+                   check: freed before it, a failing execve() returned into an
+                   image whose untouched lazy pages could no longer fault in. */
+                vma_free_list(exec_proc);
+
+                /* Same reasoning as the VMA list above: the old image's heap
+                   pages describe nothing the new image wants, and unlike the
+                   VMA nodes (plain kernel bookkeeping) these are real
+                   physical frames -- reset the metadata AND actually give
+                   the frames back, or every execve() would leak the exiting
+                   image's entire heap forever. */
+                for (uint64_t a = exec_proc->brk_start; !exec_vfork && a < exec_proc->brk_current; a += PAGE_SIZE) {
+                    uint64_t phys = vmm_get_phys(pml4, a);
+                    if (phys) {
+                        vmm_unmap_page(pml4, a);
+                        pmm_free_page((void *)(uintptr_t)phys);
+                    }
+                }
+                exec_proc->brk_current = exec_proc->brk_start;
+                memset(exec_proc->mmap_next, 0, sizeof(exec_proc->mmap_next));   /* new address space */
 
                 /* Point of no return: drop the WHOLE old user address space
                    (segments, libraries, stack, mmaps), not just its VMAs and
@@ -4417,6 +4424,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 int idx = tcp_connect_slot(addr.sin_addr, ntohs(addr.sin_port));
                 if (idx < 0) return -110; // ETIMEDOUT (covers both handshake timeout and RST)
 
+                /* the handshake sleeps: another thread may have closed (and
+                   freed) this fd meanwhile -- don't write through a stale
+                   pointer */
+                if (fd_table[fd] != file) {
+                    tcp_close(tcp_get_connection(idx));
+                    return -9; // EBADF
+                }
                 file->current_cluster = (uint32_t)idx;
                 return 0;
             }
@@ -4893,9 +4907,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             {
                 /* the write-back cache, all of it, on the disk now (one
                    filesystem: fsync of one file flushes everything) */
-                extern void ext2_flush(void);
-                ext2_flush();
-                return 0;
+                extern bool ext2_flush(void);
+                return ext2_flush() ? 0 : (uint64_t)-5;   /* -EIO: not all of it reached the disk */
             }
 
         case 28: // SYS_madvise (stub - returning 0 is always safe)

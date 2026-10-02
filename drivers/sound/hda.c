@@ -84,7 +84,9 @@ static uint64_t *g_bdl;
    the timer tick) */
 static uint32_t g_wpos;                      /* next byte the writer fills */
 static uint32_t g_last_lpib;
-static uint32_t g_pending;                   /* written, not played yet */
+static uint32_t g_pending;                   /* queued ahead of the hardware: PCM plus the
+                                                lead-in silence before it */
+static bool     g_idle = true;               /* nothing queued: the next write starts fresh */
 static uint32_t g_rate = 48000, g_channels = 2;
 static bool     g_running;
 
@@ -244,6 +246,7 @@ static void stream_start(void)
     for (uint32_t i = 0; i < RING_BYTES / 8; i++) ((uint64_t *)g_ring)[i] = 0;
     g_wpos = WRITE_LEAD;
     g_pending = 0;
+    g_idle = true;
     g_last_lpib = 0;
     w8(g_sd + SD_CTL0, 0x02);                              /* RUN */
     g_running = true;
@@ -436,8 +439,8 @@ static void account(void)
         for (uint32_t i = 0; i < played; i++) { g_ring[p] = 0; p = (p + 1) % RING_BYTES; }
         g_last_lpib = pos;
         if (played >= g_pending) {
-            g_pending = 0;
-            g_wpos = (pos + WRITE_LEAD) % RING_BYTES & ~3u;  /* underrun: restart just ahead */
+            g_pending = 0;                 /* all played (or an underrun) */
+            g_idle = true;
         } else {
             g_pending -= played;
         }
@@ -466,6 +469,13 @@ int64_t hda_dsp_write(const void *buf, uint32_t len)
     uint64_t deadline = timer_get_ms() + 2000;
     while (done < len) {
         account();
+        if (g_idle) {
+            /* start just ahead of the hardware; the silence before the
+               data counts as queued (GETODELAY, SYNC) */
+            g_wpos = ((lpib() + WRITE_LEAD) % RING_BYTES) & ~3u;
+            g_pending = WRITE_LEAD;
+            g_idle = false;
+        }
         uint32_t space = g_pending >= MAX_QUEUED ? 0 : MAX_QUEUED - g_pending;
         if (space == 0) {
             if (timer_get_ms() > deadline) break;           /* hardware stuck: give up */
@@ -473,10 +483,14 @@ int64_t hda_dsp_write(const void *buf, uint32_t len)
             continue;
         }
         uint32_t n = len - done < space ? len - done : space;
-        for (uint32_t i = 0; i < n; i++) {
-            g_ring[g_wpos] = src[done + i];
-            g_wpos = (g_wpos + 1) % RING_BYTES;
-        }
+        /* copy_from_user each time: the buffer was checked before we
+           slept, and another thread may have unmapped it since -- a plain
+           read here faulted in the kernel */
+        uint32_t first = RING_BYTES - g_wpos < n ? RING_BYTES - g_wpos : n;
+        if (copy_from_user(g_ring + g_wpos, src + done, first) != 0 ||
+            (n > first && copy_from_user(g_ring, src + done + first, n - first) != 0))
+            return done ? (int64_t)done : -14;              /* -EFAULT */
+        g_wpos = (g_wpos + n) % RING_BYTES;
         g_pending += n;
         done += n;
         deadline = timer_get_ms() + 2000;

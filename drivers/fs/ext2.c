@@ -387,7 +387,12 @@ static bool ext2_read_block(uint32_t block, void *buf) {
                         g_sectors_per_block, buf);
     if (ok) {
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-        bcache_put(block, buf, false);
+        /* a caller with interrupts on can be preempted during the disk
+           read, and a writer may cache a newer, dirty version meanwhile:
+           that one wins (it used to be overwritten by the stale read) */
+        const uint8_t *newer = bcache_dirty(block);
+        if (newer) memcpy(buf, newer, g_block_size);
+        else bcache_put(block, buf, false);
         g_bcache_misses++;
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     }
@@ -403,7 +408,17 @@ static bool ext2_write_block(uint32_t block, const void *buf) {
     /* could not cache it: straight to the disk */
     bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
                          g_sectors_per_block, buf);
-    if (!ok) bcache_slot(block)->valid = false;   /* unknown on disk now */
+    if (!ok) {
+        /* unknown on disk now -- but only if the slot holds this block: it
+           may still hold another block's dirty data that must not be lost */
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        BCacheSlot *e = bcache_slot(block);
+        if (e->valid && e->block == block) {
+            if (e->dirty) { e->dirty = false; g_dirty_blocks--; }
+            e->valid = false;
+        }
+        if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    }
     return ok;
 }
 
@@ -417,18 +432,23 @@ static bool ext2_write_sb(void) {
    flusher thread with interrupts on (each block is copied out under cli
    and written while the cache can change again: a block written meanwhile
    stays dirty, its generation tells), or from sync() in a syscall. */
-void ext2_flush(void) {
+bool ext2_flush(void) {
     uint8_t *tmp = (uint8_t *)kmalloc(g_block_size);
-    if (!tmp) return;
+    if (!tmp) return false;
+    bool all_ok = true;
     for (uint32_t i = 0; i < BCACHE_SLOTS && g_dirty_blocks; i++) {
         uint64_t rflags;
+        /* no thread switch from the snapshot to the end of its write: a
+           writer that ran in between could rewrite and fsync the block,
+           and this older snapshot would then land on the disk last */
+        g_sched_no_preempt++;
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
         BCacheSlot *e = &g_bcache[i];
         bool todo = e->valid && e->dirty && e->data;
         uint32_t block = e->block, gen = e->gen;
         if (todo) memcpy(tmp, e->data, g_block_size);
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
-        if (!todo) continue;
+        if (!todo) { g_sched_no_preempt--; continue; }
 
         bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
                              g_sectors_per_block, tmp);
@@ -438,27 +458,35 @@ void ext2_flush(void) {
             e->dirty = false;
             g_dirty_blocks--;
         }
+        if (!ok) all_ok = false;
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+        g_sched_no_preempt--;
     }
     kfree(tmp);
     if (g_sb_dirty) {
-        g_sb_dirty = false;
         static Ext2Superblock sb_copy;
         uint64_t rflags;
+        g_sched_no_preempt++;   /* same reason as the blocks above */
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        g_sb_dirty = false;
         memcpy(&sb_copy, &g_sb, sizeof(sb_copy));
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
-        if (!ahci_write(mbr_root_partition_lba() + 2, 2, &sb_copy)) g_sb_dirty = true;
+        if (!ahci_write(mbr_root_partition_lba() + 2, 2, &sb_copy)) { g_sb_dirty = true; all_ok = false; }
+        g_sched_no_preempt--;
     }
+    return all_ok && !g_dirty_blocks && !g_sb_dirty;
 }
 
 bool ext2_has_dirty(void) { return g_dirty_blocks || g_sb_dirty; }
 
 /* the flusher kernel thread */
+static void ext2_reap_orphans(void);
+
 void ext2_flusher_thread(void *arg) {
     (void)arg;
     for (;;) {
         sched_sleep_ms(1000);
+        ext2_reap_orphans();
         if (ext2_has_dirty()) ext2_flush();
     }
 }
@@ -1398,6 +1426,55 @@ static void ext2_free_all_blocks(const Ext2Inode *inode) {
     }
 }
 
+/* Inodes held by lazy file mappings (kernel/vma.c VmaFile). Unlinking
+   such a file removes its name only; the inode and its blocks stay until
+   the last mapping goes, then the flusher thread frees them (the last
+   unpin can happen in the scheduler's reaper, no place for disk I/O).
+   Without this, a mapped file's inode was freed at unlink and could be
+   reused: untouched pages of the old mapping then read another file. */
+#define PIN_SLOTS 512
+static struct { uint32_t inum; uint32_t refs; bool orphan; } g_pins[PIN_SLOTS];
+
+static int pin_find(uint32_t inum) {
+    for (int i = 0; i < PIN_SLOTS; i++)
+        if (g_pins[i].inum == inum && (g_pins[i].refs || g_pins[i].orphan)) return i;
+    return -1;
+}
+
+bool ext2_pin_inode(uint32_t inum) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    int i = pin_find(inum);
+    if (i < 0)
+        for (int k = 0; k < PIN_SLOTS; k++)
+            if (!g_pins[k].refs && !g_pins[k].orphan) { i = k; g_pins[k].inum = inum; break; }
+    if (i >= 0) g_pins[i].refs++;
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return i >= 0;
+}
+
+void ext2_unpin_inode(uint32_t inum) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    int i = pin_find(inum);
+    if (i >= 0 && g_pins[i].refs) g_pins[i].refs--;   /* orphan + 0 refs: the flusher frees it */
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+static void ext2_destroy_inode(uint32_t inum, Ext2Inode *inode);
+
+/* flusher thread: free orphaned inodes nothing maps any more */
+static void ext2_reap_orphans(void) {
+    for (int i = 0; i < PIN_SLOTS; i++) {
+        if (!g_pins[i].orphan || g_pins[i].refs) continue;
+        uint32_t inum = g_pins[i].inum;
+        g_pins[i].orphan = false;
+        g_pins[i].inum = 0;
+        Ext2Inode inode;
+        if (ext2_read_inode(inum, &inode)) ext2_destroy_inode(inum, &inode);
+    }
+}
+
 bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
     (void)dir_inum;
     if (!may_write_dir(dir)) return false;
@@ -1457,28 +1534,39 @@ bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
            It kept its inode with one link left -- fsck found it orphaned,
            its ".." still counting against the parent. */
         if ((target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) target.i_links_count = 0;
-        if (target.i_links_count == 0) {
-            ext2_free_all_blocks(&target);
-            /* Real bug found via independent e2fsck cross-check (see
-               Phase 20 plan writeup): freeing the bitmap bit alone
-               left the on-disk inode struct still looking like a
-               real, populated file (nonzero i_links_count, real block
-               pointers) -- e2fsck correctly flagged this as an
-               "unattached inode" plus bitmap inconsistencies, since it
-               trusts the inode table's own content over the bitmap.
-               A real ext2 delete zeroes the inode and stamps i_dtime;
-               do the same before releasing the bitmap bit. */
-            Ext2Inode empty;
-            memset(&empty, 0, sizeof(empty));
-            empty.i_dtime = (uint32_t)rtc_get_unix_time();
-            ext2_write_inode(found_inode, &empty);
-            ext2_free_inode(found_inode);
+        int pin = target.i_links_count == 0 ? pin_find(found_inode) : -1;
+        if (pin >= 0 && g_pins[pin].refs) {
+            /* still mapped: nameless until the last mapping goes */
+            g_pins[pin].orphan = true;
+            ext2_write_inode(found_inode, &target);
+        } else if (target.i_links_count == 0) {
+            ext2_destroy_inode(found_inode, &target);
         } else {
             ext2_write_inode(found_inode, &target);
         }
     }
 
     return true;
+}
+
+/* Free an inode with no links left: its blocks, then the inode itself. */
+static void ext2_destroy_inode(uint32_t found_inode, Ext2Inode *inode) {
+    Ext2Inode target = *inode;
+    ext2_free_all_blocks(&target);
+    /* Real bug found via independent e2fsck cross-check (see
+       Phase 20 plan writeup): freeing the bitmap bit alone
+       left the on-disk inode struct still looking like a
+       real, populated file (nonzero i_links_count, real block
+       pointers) -- e2fsck correctly flagged this as an
+       "unattached inode" plus bitmap inconsistencies, since it
+       trusts the inode table's own content over the bitmap.
+       A real ext2 delete zeroes the inode and stamps i_dtime;
+       do the same before releasing the bitmap bit. */
+    Ext2Inode empty;
+    memset(&empty, 0, sizeof(empty));
+    empty.i_dtime = (uint32_t)rtc_get_unix_time();
+    ext2_write_inode(found_inode, &empty);
+    ext2_free_inode(found_inode);
 }
 
 /* ---------------- fast symlinks ---------------- */
