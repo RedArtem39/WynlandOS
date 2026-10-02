@@ -7,6 +7,7 @@
  *             tcp_handle_packet, and internal helpers.
  */
 
+#include <wynland/random.h>
 #include <wynland/tcp.h>
 #include <wynland/unix_socket.h>
 #include <wynland/net.h>
@@ -37,8 +38,34 @@ extern uint32_t net_get_ip(void);
  * ============================================================ */
 
 static TcpConnection connections[TCP_MAX_CONNECTIONS];
-static uint16_t      ephemeral_port_counter;
-static uint32_t      iss_counter;   /* Simple ISS generator */
+
+/* Sequence-number comparisons modulo 2^32: plain < and >= broke when the
+   numbers wrapped. */
+#define SEQ_LT(a, b)  ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)
+#define SEQ_LEQ(a, b) ((int32_t)((uint32_t)(a) - (uint32_t)(b)) <= 0)
+#define SEQ_GT(a, b)  SEQ_LT(b, a)
+#define SEQ_GEQ(a, b) SEQ_LEQ(b, a)
+
+/* free receive space, as advertised (no window scaling: at most 65535) */
+static uint16_t rx_window(const TcpConnection *c)
+{
+    uint32_t room = TCP_RX_BUF_SIZE - c->rx_len;
+    return (uint16_t)(room > 65535 ? 65535 : room);
+}
+
+/* A random free local port. The old counter was predictable and, being
+   added to 49152 in a uint16_t, wrapped to ports 0, 1, 2... */
+static uint16_t pick_local_port(void)
+{
+    for (int tries = 0; tries < 128; tries++) {
+        uint16_t p = (uint16_t)(TCP_EPHEMERAL_BASE + random_u32() % (65536 - TCP_EPHEMERAL_BASE));
+        bool used = false;
+        for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS; i++)
+            if (connections[i].in_use && connections[i].local_port == p) used = true;
+        if (!used) return p;
+    }
+    return 0;
+}
 
 /* ============================================================
  * Forward declarations of internal helpers
@@ -147,7 +174,8 @@ static bool tcp_send_segment(TcpConnection *conn, uint8_t flags,
     tcp->ack_num    = htonl(conn->rcv_nxt);
     tcp->data_offset = (uint8_t)((sizeof(TcpHeader) / 4) << 4);  /* 0x50 */
     tcp->flags      = flags;
-    tcp->window     = htons(conn->rcv_wnd);
+    tcp->window     = htons(rx_window(conn));
+    conn->wnd_small = rx_window(conn) < TCP_MSS;
     tcp->checksum   = 0;
     tcp->urgent_ptr = 0;
 
@@ -171,8 +199,6 @@ static bool tcp_send_segment(TcpConnection *conn, uint8_t flags,
 void tcp_init(void)
 {
     memset(connections, 0, sizeof(connections));
-    ephemeral_port_counter = 0;
-    iss_counter = 1000;
 
     serial_write_string("[TCP] TCP subsystem initialised\n");
 }
@@ -208,13 +234,15 @@ TcpConnection *tcp_connect(uint32_t remote_ip, uint16_t remote_port)
     memset(conn, 0, sizeof(TcpConnection));
     conn->in_use      = true;
     conn->local_ip    = net_get_ip();
-    conn->local_port  = TCP_EPHEMERAL_BASE + ephemeral_port_counter++;
+    conn->local_port  = pick_local_port();
+    if (!conn->local_port) { conn->in_use = false; return NULL; }
     conn->remote_ip   = remote_ip;
     conn->remote_port = remote_port;
 
     /* Sequence numbers */
-    conn->snd_iss = iss_counter;
-    iss_counter  += 64000;  /* Advance ISS for next connection */
+    /* random ISS (RFC 6528): a counter let anyone guess the numbers and
+       inject into or reset the connection */
+    conn->snd_iss = random_u32();
     conn->snd_nxt = conn->snd_iss;
     conn->snd_una = conn->snd_iss;
 
@@ -333,7 +361,7 @@ int tcp_send(TcpConnection *conn, const void *data, uint32_t len)
                         return -1;
                     }
 
-                    if (conn->snd_una >= expected_ack) {
+                    if (SEQ_GEQ(conn->snd_una, expected_ack)) {
                         acked = true;
                         break;
                     }
@@ -398,6 +426,8 @@ int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len)
         }
 
         conn->data_available = (conn->rx_len > 0);
+        if (conn->wnd_small && rx_window(conn) >= 2 * TCP_MSS)
+            tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);   /* window update */
         return (int)copy_len;
     }
 
@@ -450,6 +480,8 @@ int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len)
     }
 
     conn->data_available = (conn->rx_len > 0);
+    if (conn->wnd_small && rx_window(conn) >= 2 * TCP_MSS)
+        tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);   /* window update */
     return (int)copy_len;
 }
 
@@ -604,6 +636,42 @@ TcpConnection *tcp_get_connection(int idx)
     return &connections[idx];
 }
 
+/* A new cumulative ACK: inside (snd_una, snd_nxt] only. */
+static void take_ack(TcpConnection *c, uint32_t ack)
+{
+    if (SEQ_GT(ack, c->snd_una) && SEQ_LEQ(ack, c->snd_nxt)) c->snd_una = ack;
+}
+
+/* Receive in order only: bytes we already have are trimmed, a segment
+   past a gap is dropped (the ACK we send back tells the peer where we
+   are, so it resends), and only what fits in the buffer is taken --
+   rcv_nxt moves by exactly what was stored. The FIN counts once every
+   byte before it is in. Every segment used to be appended whatever its
+   sequence number (duplicates and reordering corrupted the stream) and
+   data past a full buffer was ACKed and lost. Returns whether the
+   segment needs an ACK. */
+static bool take_data(TcpConnection *c, uint32_t seq, const uint8_t *p, uint32_t len, bool fin)
+{
+    if (len == 0 && !fin) return false;
+    if (SEQ_GT(seq, c->rcv_nxt)) return true;           /* gap: dup ACK */
+    uint32_t skip = c->rcv_nxt - seq;                    /* already have these */
+    if (skip > len) return true;                         /* all old (a resent FIN too) */
+    uint32_t fresh = len - skip;
+    uint32_t room = TCP_RX_BUF_SIZE - c->rx_len;
+    uint32_t take = fresh < room ? fresh : room;
+    if (take) {
+        memcpy(c->rx_buf + c->rx_len, p + skip, take);
+        c->rx_len += take;
+        c->rcv_nxt += take;
+        c->data_available = true;
+    }
+    if (fin && take == fresh && !c->fin_received) {
+        c->rcv_nxt += 1;                                 /* FIN takes one number */
+        c->fin_received = true;
+    }
+    return true;
+}
+
 /* ============================================================
  * tcp_handle_packet — Incoming TCP segment handler
  *
@@ -656,6 +724,20 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
 
     /* ---- Handle RST at any state ---- */
     if (flags & TCP_FLAG_RST) {
+        /* RFC 5961: only an RST at exactly the next expected sequence
+           number resets (in SYN_SENT: one acknowledging our SYN); one
+           elsewhere in the window gets a challenge ACK, the rest are
+           dropped. Any RST with the right 4-tuple used to kill the
+           connection. */
+        bool exact = conn->state == TCP_STATE_SYN_SENT
+                   ? ((flags & TCP_FLAG_ACK) && ack == conn->snd_nxt)
+                   : seq == conn->rcv_nxt;
+        if (!exact) {
+            if (conn->state != TCP_STATE_SYN_SENT &&
+                SEQ_GEQ(seq, conn->rcv_nxt) && SEQ_LT(seq, conn->rcv_nxt + rx_window(conn)))
+                tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
+            return;
+        }
         serial_write_string("[TCP] RST received\n");
         conn->reset_received = true;
         conn->state = TCP_STATE_CLOSED;
@@ -697,46 +779,15 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
         /* Update send window */
         conn->snd_wnd = ntohs(tcp->window);
 
-        /* Update send unacknowledged pointer if ACK flag is set */
-        if (flags & TCP_FLAG_ACK) {
-            if (ack >= conn->snd_una && ack <= conn->snd_nxt) {
-                conn->snd_una = ack;
+        if (flags & TCP_FLAG_ACK) take_ack(conn, ack);
+        {
+            bool had_fin = conn->fin_received;
+            bool need_ack = take_data(conn, seq, payload, payload_len, (flags & TCP_FLAG_FIN) != 0);
+            if (conn->fin_received && !had_fin) {
+                serial_write_string("[TCP] FIN received (ESTABLISHED)\n");
+                conn->state = TCP_STATE_CLOSE_WAIT;
             }
-        }
-
-        /* Handle incoming data */
-        if (payload_len > 0) {
-            /* Copy to receive buffer if space available */
-            if (conn->rx_len + payload_len <= TCP_RX_BUF_SIZE) {
-                memcpy(conn->rx_buf + conn->rx_len, payload, payload_len);
-                conn->rx_len += payload_len;
-            } else {
-                serial_write_string("[TCP] RX buffer overflow, dropping\n");
-            }
-
-            /* Advance rcv_nxt */
-            conn->rcv_nxt = seq + payload_len;
-            conn->data_available = true;
-        }
-
-        /* Handle FIN */
-        if (flags & TCP_FLAG_FIN) {
-            serial_write_string("[TCP] FIN received (ESTABLISHED)\n");
-            conn->rcv_nxt = seq + payload_len + 1;  /* FIN consumes one seq */
-            conn->fin_received = true;
-            conn->state = TCP_STATE_CLOSE_WAIT;
-
-            /* ACK the FIN */
-            tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-            waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
-            return;
-        }
-
-        /* If we had data but no FIN, ACK it */
-        if (payload_len > 0) {
-            tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-            waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
-            return;
+            if (need_ack) tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
         }
         break;
 
@@ -746,64 +797,31 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
     case TCP_STATE_FIN_WAIT_1:
         /* ACK of our FIN */
         if (flags & TCP_FLAG_ACK) {
-            if (ack >= conn->snd_una && ack <= conn->snd_nxt) {
-                conn->snd_una = ack;
-                if (ack >= conn->snd_nxt) {
-                    conn->ack_of_fin = true;
-                }
-            }
+            take_ack(conn, ack);
+            if (SEQ_GEQ(conn->snd_una, conn->snd_nxt)) conn->ack_of_fin = true;
         }
-
-        /* Remote also sending FIN (simultaneous close) */
-        if (flags & TCP_FLAG_FIN) {
-            conn->rcv_nxt = seq + 1;
-            conn->fin_received = true;
-
-            /* ACK the remote FIN */
+        /* data still in flight from the peer, and its FIN (simultaneous
+           close); data here used to be dropped */
+        if (take_data(conn, seq, payload, payload_len, (flags & TCP_FLAG_FIN) != 0))
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-        }
         break;
 
     /* --------------------------------------------------------
      * FIN_WAIT_2: our FIN was ACKed, waiting for remote FIN
      * -------------------------------------------------------- */
     case TCP_STATE_FIN_WAIT_2:
-        if (flags & TCP_FLAG_ACK) {
-            if (ack >= conn->snd_una && ack <= conn->snd_nxt) {
-                conn->snd_una = ack;
-            }
-        }
-
-        if (flags & TCP_FLAG_FIN) {
-            conn->rcv_nxt = seq + 1;  /* FIN consumes one seq */
-            conn->fin_received = true;
-
-            /* Final ACK is sent by tcp_close() after detecting fin_received */
-        }
-
-        /* Also absorb any data that arrives before FIN */
-        if (payload_len > 0) {
-            if (conn->rx_len + payload_len <= TCP_RX_BUF_SIZE) {
-                memcpy(conn->rx_buf + conn->rx_len, payload, payload_len);
-                conn->rx_len += payload_len;
-            }
-            conn->rcv_nxt = seq + payload_len;
-            if (flags & TCP_FLAG_FIN)
-                conn->rcv_nxt += 1;
+        if (flags & TCP_FLAG_ACK) take_ack(conn, ack);
+        /* remaining data, then the peer's FIN (tcp_close() also sends a
+           final ACK once it sees fin_received) */
+        if (take_data(conn, seq, payload, payload_len, (flags & TCP_FLAG_FIN) != 0))
             tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-            conn->data_available = true;
-        }
         break;
 
     /* --------------------------------------------------------
      * CLOSE_WAIT: remote closed, we may still be sending
      * -------------------------------------------------------- */
     case TCP_STATE_CLOSE_WAIT:
-        if (flags & TCP_FLAG_ACK) {
-            if (ack >= conn->snd_una && ack <= conn->snd_nxt) {
-                conn->snd_una = ack;
-            }
-        }
+        if (flags & TCP_FLAG_ACK) take_ack(conn, ack);
         break;
 
     /* --------------------------------------------------------
@@ -811,7 +829,7 @@ void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
      * -------------------------------------------------------- */
     case TCP_STATE_LAST_ACK:
         if (flags & TCP_FLAG_ACK) {
-            if (ack >= conn->snd_nxt) {
+            if (SEQ_GEQ(ack, conn->snd_nxt)) {
                 conn->snd_una = ack;
                 conn->ack_of_fin = true;
                 conn->state  = TCP_STATE_CLOSED;

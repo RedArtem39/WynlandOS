@@ -86,6 +86,10 @@ typedef struct Process {
        back to brk_start for the new image. */
     uint64_t brk_start;
     uint64_t brk_current;
+    /* next free address of each mmap() slot (MMAP_SLOT_*, kernel/syscall.c);
+       0 = slot unused yet. Per process: they were global, so every mmap of
+       every process ever pushed them up until one slot ran into the next. */
+    uint64_t mmap_next[6];
     /* ---- process lifecycle: exit status, wait4/waitid, vfork ---- */
     int        exit_code;    /* exit()/exit_group() argument, kept until death */
     int        wait_status;  /* Linux wait status once exited: code<<8, or the

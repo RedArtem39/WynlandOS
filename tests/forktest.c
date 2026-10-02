@@ -215,6 +215,18 @@ int main(int argc, char **argv)
                 fprintf(stderr, "[forktest] AF_UNIX queue held %d empty datagrams\n", n);
                 close(sv[0]); close(sv[1]);
             }
+            /* randomness: getrandom() and /dev/urandom were TSC words / zeros */
+            {
+                unsigned char r1[32] = {0}, r2[32] = {0}, u[32] = {0};
+                syscall(SYS_getrandom, r1, sizeof r1, 0);
+                syscall(SYS_getrandom, r2, sizeof r2, 0);
+                int fd = open("/dev/urandom", O_RDONLY);
+                if (fd >= 0) { read(fd, u, sizeof u); close(fd); }
+                int zeros = 0;
+                for (int i = 0; i < 32; i++) zeros += (u[i] == 0);
+                check(memcmp(r1, r2, sizeof r1) != 0, "getrandom gives different bytes each call");
+                check(zeros < 8, "/dev/urandom is not zeros");
+            }
             /* normal anonymous mappings still work */
             char *a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             check(a != MAP_FAILED, "anonymous mmap still works");

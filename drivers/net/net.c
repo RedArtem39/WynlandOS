@@ -8,6 +8,7 @@
  *             and all configuration getters.
  */
 
+#include <wynland/random.h>
 #include <wynland/net.h>
 #include <wynland/virtio.h>
 #include <wynland/types.h>
@@ -30,6 +31,7 @@ static uint8_t  our_mac[ETH_ALEN];
 static uint32_t our_ip;
 static uint32_t our_netmask;
 static uint32_t our_gateway;
+static uint32_t arp_pending_ip;   /* the address net_arp_resolve() asked about */
 static uint32_t our_dns;
 
 static ArpEntry arp_cache[ARP_CACHE_SIZE];
@@ -40,6 +42,12 @@ static volatile bool dhcp_offer_received;
 static volatile bool dhcp_ack_received;
 static volatile bool dns_reply_received;
 static uint32_t dns_resolved_ip;
+/* the query in flight: random id and source port, as RFC 5452 asks -- a
+   fixed id (0xABCD) from a fixed port (12345) let anyone on the network
+   answer first with any address */
+static volatile bool dns_waiting;
+static uint16_t dns_query_id;
+static uint16_t dns_query_port;
 
 static uint16_t ip_id_counter;
 
@@ -250,6 +258,22 @@ static void handle_arp(const uint8_t *data, uint32_t len)
         virtio_net_send(frame, sizeof(frame));
 
     } else if (ntohs(arp->opcode) == ARP_OP_REPLY) {
+        /* Only replies meant for us, from our own subnet, and new entries
+           only for an address we asked about: every unsolicited reply used
+           to be cached, so anyone on the LAN could claim the gateway's
+           address and see (or change) all our traffic. */
+        if (ntohs(arp->hw_type) != 1 || ntohs(arp->proto_type) != ETH_TYPE_IPV4 ||
+            arp->hw_len != ETH_ALEN || arp->proto_len != 4)
+            return;
+        if (arp->target_ip != our_ip) return;
+        if (our_netmask && (arp->sender_ip & our_netmask) != (our_ip & our_netmask)) return;
+        bool asked = arp_pending_ip && arp->sender_ip == arp_pending_ip;
+        bool known = false;
+        for (i = 0; i < ARP_CACHE_SIZE; i++)
+            if (arp_cache[i].valid && arp_cache[i].ip == arp->sender_ip) known = true;
+        if (!asked && !known) return;
+        if (known && !asked) return;   /* no silent changes to a cached address */
+        if (asked) arp_pending_ip = 0;
         /* Update ARP cache */
         /* First check if entry already exists */
         for (i = 0; i < ARP_CACHE_SIZE; i++) {
@@ -317,9 +341,22 @@ static void handle_ipv4(const uint8_t *data, uint32_t len,
         payload_len = ip_total_len - ihl;
     }
 
+    /* No reassembly here: a fragment (more-fragments bit or an offset)
+       used to be handed on as if it were the whole TCP/UDP segment. */
+    if (ntohs(ip_hdr->flags_frag) & 0x3FFF)
+        return;
+
+    /* Addressed to us. Broadcasts are fine for UDP (DHCP, before we even
+       have an address); everything else must name our address. */
+    bool to_us = our_ip && ip_hdr->dst_ip == our_ip;
+    bool bcast = ip_hdr->dst_ip == 0xFFFFFFFFu ||
+                 (our_netmask && ip_hdr->dst_ip == ((our_ip & our_netmask) | ~our_netmask));
+    if (!to_us && !(ip_hdr->protocol == IP_PROTO_UDP && (bcast || !our_ip)))
+        return;
+
     switch (ip_hdr->protocol) {
     case IP_PROTO_ICMP:
-        handle_icmp(payload, payload_len, ip_hdr);
+        handle_icmp(payload, payload_len, ip_hdr);   /* to_us only: no broadcast echo */
         break;
     case IP_PROTO_TCP:
         tcp_handle_packet(ip_hdr->src_ip, ip_hdr->dst_ip, payload, payload_len);
@@ -419,7 +456,8 @@ static void handle_udp(const uint8_t *data, uint32_t len,
 
     if (dst_port == DHCP_CLIENT_PORT) {
         handle_dhcp(udp_payload, udp_payload_len);
-    } else if (src_port == 53 && dst_port == 12345) {
+    } else if (dns_waiting && src_port == 53 && dst_port == dns_query_port &&
+               ip_hdr->src_ip == our_dns) {
         /* The OS's own dedicated Ring-0 DNS client (net_dns_resolve())
            always queries from this fixed local port -- kept as its own
            narrow check (not just "src_port == 53") so a real userspace
@@ -563,6 +601,7 @@ bool net_arp_resolve(uint32_t ip, uint8_t *out_mac)
     arp->sender_ip  = our_ip;
     memset(arp->target_mac, 0, ETH_ALEN);
     arp->target_ip  = target_ip;
+    arp_pending_ip  = target_ip;
 
     net_send_raw_eth(broadcast_mac, our_mac, ETH_TYPE_ARP,
                      arp_pkt, sizeof(ArpHeader));
@@ -912,6 +951,9 @@ static void handle_dns_response(const uint8_t *data, uint32_t len)
         return;
 
     dns = (const DnsHeader *)data;
+    /* our query's answer: same id, QR set, RCODE 0 */
+    if (ntohs(dns->id) != dns_query_id) return;
+    if (!(ntohs(dns->flags) & 0x8000) || (ntohs(dns->flags) & 0x000F)) return;
     ancount = ntohs(dns->ancount);
     qdcount = ntohs(dns->qdcount);
 
@@ -993,7 +1035,9 @@ bool net_dns_resolve(const char *hostname, uint32_t *out_ip)
     memset(dns_pkt, 0, sizeof(dns_pkt));
 
     dns = (DnsHeader *)dns_pkt;
-    dns->id      = htons(0xABCD);
+    dns_query_id   = (uint16_t)random_u32();
+    dns_query_port = (uint16_t)(20000 + random_u32() % 20000);
+    dns->id      = htons(dns_query_id);
     dns->flags   = htons(0x0100);  /* Standard query, recursion desired */
     dns->qdcount = htons(1);
     dns->ancount = 0;
@@ -1038,20 +1082,25 @@ bool net_dns_resolve(const char *hostname, uint32_t *out_ip)
 
     dns_reply_received = false;
     dns_resolved_ip    = 0;
+    dns_waiting        = true;
 
     /* Send DNS query as UDP to our DNS server, port 53 */
-    if (!net_send_udp(our_dns, 12345, 53, dns_pkt, offset))
+    if (!net_send_udp(our_dns, dns_query_port, 53, dns_pkt, offset)) {
+        dns_waiting = false;
         return false;
+    }
 
     /* Poll for response */
     uint64_t dns_deadline = net_deadline_ms(3000);
     for (i = 0; !net_past(dns_deadline); i++) {
         net_poll();
         if (dns_reply_received) {
+            dns_waiting = false;
             *out_ip = dns_resolved_ip;
             return true;
         }
     }
+    dns_waiting = false;
 
     serial_write_string("[DNS] Resolution timeout\n");
     return false;

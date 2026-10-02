@@ -35,9 +35,12 @@
 #define TCP_STATE_LAST_ACK     10
 
 /* Limits */
-#define TCP_MAX_CONNECTIONS    8
-#define TCP_RX_BUF_SIZE        16384
-#define TCP_WINDOW_SIZE        8192
+/* A browser keeps dozens of connections open, and an 8 KB window made
+   every download crawl: more slots, and a 64 KB buffer whose free space
+   is the window we advertise. */
+#define TCP_MAX_CONNECTIONS    32
+#define TCP_RX_BUF_SIZE        65536
+#define TCP_WINDOW_SIZE        65535
 #define TCP_MSS                1460  /* Max Segment Size (ETH_MTU - IP_HDR - TCP_HDR) */
 #define TCP_CONNECT_TIMEOUT    5000000   /* Poll iterations for connect */
 #define TCP_RECV_TIMEOUT       5000000   /* Poll iterations for recv */
@@ -95,6 +98,7 @@ typedef struct {
     /* Receive buffer */
     uint8_t  rx_buf[TCP_RX_BUF_SIZE];
     uint32_t rx_len;         /* Bytes available in rx_buf */
+    bool     wnd_small;      /* advertised less than an MSS: tell the peer when it opens */
 
     /* Synchronisation flags (volatile for busy-wait loops) */
     volatile bool syn_ack_received;

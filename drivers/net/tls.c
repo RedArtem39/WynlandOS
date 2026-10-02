@@ -1,5 +1,5 @@
 /*
- * WynlandOS - TLS 1.3 Client Wrapper (Host Tunneling)
+ * WynlandOS - kernel TLS stub (no TLS here: see tls_connect())
  * ============================================================
  */
 #include <wynland/tls.h>
@@ -9,35 +9,17 @@
 
 extern void serial_write_string(const char *str);
 
+/* There is no TLS in the kernel. This used to open plain TCP to the
+   gateway's port 8080 (in QEMU's user network: the host itself), mark
+   the "handshake" done and send everything in clear text -- callers
+   believed they had an encrypted channel. Refusing is the honest answer;
+   HTTPS on WynlandOS is curl/LibreSSL in user space. */
 TlsSocket *tls_connect(const char *hostname, uint16_t port)
 {
     (void)hostname;
     (void)port;
-    
-    uint32_t gateway_ip = net_get_gateway();
-    if (gateway_ip == 0) {
-        serial_write_string("TLS: Error - Network gateway not resolved yet.\r\n");
-        return NULL;
-    }
-    
-    /* Connect to the host proxy on port 8080 */
-    TcpConnection *conn = tcp_connect(gateway_ip, 8080);
-    if (!conn) {
-        serial_write_string("TLS: Error - Failed to connect to host transparent proxy on port 8080.\r\n");
-        return NULL;
-    }
-    
-    TlsSocket *sock = (TlsSocket *)kmalloc(sizeof(TlsSocket));
-    if (!sock) {
-        tcp_close(conn);
-        return NULL;
-    }
-    
-    sock->conn = (void *)conn;
-    sock->handshake_done = true;
-    
-    serial_write_string("TLS: Secure transparent tunnel established via host proxy.\r\n");
-    return sock;
+    serial_write_string("TLS: not available in the kernel (use curl / LibreSSL in user space)\r\n");
+    return NULL;
 }
 
 int tls_send(TlsSocket *sock, const void *data, uint32_t len)

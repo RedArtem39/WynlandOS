@@ -1772,8 +1772,9 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
             return 0;
         }
         if (file->node.first_cluster == DEV_URANDOM) {
-            /* v1: deterministic zeros; SYS_getrandom is the real entropy path */
-            for (uint32_t i = 0; i < size; i++) ((uint8_t *)buf)[i] = 0;
+            /* the kernel CSPRNG, as getrandom() (this returned zeros) */
+            extern void random_bytes(void *buf, uint64_t len);
+            random_bytes(buf, size);
             return (int)size;
         }
         if (file->node.first_cluster == DEV_FB0) {

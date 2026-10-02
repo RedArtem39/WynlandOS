@@ -2,6 +2,7 @@
 #include <wynland/sched.h>
 #include <wynland/vfs.h>
 #include <wynland/auth.h>
+#include <wynland/random.h>
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
@@ -515,6 +516,27 @@ static bool range_has_kernel_pages(PageTable *pml4, uint64_t addr, uint64_t end)
          a = vmm_next_mapped(pml4, a + PAGE_SIZE, end))
         if (!(vmm_get_pte(pml4, a) & PAGE_USER)) return true;
     return false;
+}
+
+/* mmap() address slots, one PML4-sized region (1 TB here) per kind of
+   mapping; addresses come from a per-process bump pointer. 0 when the
+   slot is exhausted -- the caller fails with -ENOMEM instead of running
+   into the next slot. */
+enum { MMAP_SLOT_FB, MMAP_SLOT_SHM, MMAP_SLOT_ANON, MMAP_SLOT_MEMFD, MMAP_SLOT_DRM, MMAP_SLOT_DMABUF };
+static const uint64_t mmap_slot_base[6] = {
+    0x610000000000ULL, 0x620000000000ULL, 0x630000000000ULL,
+    0x640000000000ULL, 0x650000000000ULL, 0x660000000000ULL,
+};
+#define MMAP_SLOT_SIZE 0x010000000000ULL
+
+static uint64_t mmap_bump(int slot, uint64_t size)
+{
+    Process *p = sched_current()->proc;
+    uint64_t base = mmap_slot_base[slot];
+    uint64_t cur = p->mmap_next[slot] ? p->mmap_next[slot] : base;
+    if (size > MMAP_SLOT_SIZE || cur - base > MMAP_SLOT_SIZE - size) return 0;
+    p->mmap_next[slot] = cur + size;
+    return cur;
 }
 
 static int get_free_fd(VfsFile **fd_table) {
@@ -1756,9 +1778,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                     uint64_t virt_addr = addr;
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                        static uint64_t mmap_fb_ptr = 0x610000000000;
-                        virt_addr = mmap_fb_ptr;
-                        mmap_fb_ptr += size_aligned;
+                        virt_addr = mmap_bump(MMAP_SLOT_FB, size_aligned);
+                        if (!virt_addr) return (uint64_t)-12;
                     }
                     PageTable *pml4 = vmm_get_current_pml4();
                     /* Cache type depends on what fb_phys actually is:
@@ -1789,9 +1810,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         return (uint64_t)-22; /* -EINVAL */
                     uint64_t virt_addr = addr & ~(uint64_t)(PAGE_SIZE - 1);
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                        static uint64_t mmap_dmabuf_ptr = 0x660000000000; // own slot (0x65 DRM)
-                        virt_addr = mmap_dmabuf_ptr;
-                        mmap_dmabuf_ptr += size_aligned;
+                        virt_addr = mmap_bump(MMAP_SLOT_DMABUF, size_aligned);
+                        if (!virt_addr) return (uint64_t)-12;
                     }
                     /* PAGE_SHARED_REF: the mapping holds its own reference
                        on every frame (dropped by munmap/teardown), so
@@ -1815,9 +1835,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         return (uint64_t)-22; /* -EINVAL */
                     uint64_t virt_addr = addr & ~(uint64_t)(PAGE_SIZE - 1);
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                        static uint64_t mmap_drm_ptr = 0x650000000000; // own slot (0x63 anon, 0x64 memfd)
-                        virt_addr = mmap_drm_ptr;
-                        mmap_drm_ptr += size_aligned;
+                        virt_addr = mmap_bump(MMAP_SLOT_DRM, size_aligned);
+                        if (!virt_addr) return (uint64_t)-12;
                     }
                     /* PAGE_SHARED_REF: the mapping holds its own reference
                        on every frame (dropped by munmap/teardown), so
@@ -1848,9 +1867,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                     uint64_t virt_addr = addr;
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                        static uint64_t mmap_shm_ptr = 0x620000000000; // dedicated slot, disjoint from the stack (0x600...) and /dev/fb0 (0x610...) ranges
-                        virt_addr = mmap_shm_ptr;
-                        mmap_shm_ptr += (uint64_t)shm_pages * PAGE_SIZE;
+                        virt_addr = mmap_bump(MMAP_SLOT_SHM, (uint64_t)shm_pages * PAGE_SIZE);
+                        if (!virt_addr) return (uint64_t)-12;
                     }
                     PageTable *pml4 = vmm_get_current_pml4();
                     for (uint32_t i = 0; i < shm_pages; i++) {
@@ -1885,9 +1903,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     Process *mproc = sched_current()->proc;
                     uint64_t virt_addr = addr & ~(PAGE_SIZE - 1);
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
-                        static uint64_t mmap_memfd_ptr = 0x640000000000; // own slot, same "0x6X0..." convention
-                        virt_addr = mmap_memfd_ptr;
-                        mmap_memfd_ptr += size_aligned;
+                        virt_addr = mmap_bump(MMAP_SLOT_MEMFD, size_aligned);
+                        if (!virt_addr) return (uint64_t)-12;
                     } else {
                         for (uint64_t off = 0; off < size_aligned; off += PAGE_SIZE)
                             user_unmap_page(pml4, virt_addr + off);
@@ -1918,9 +1935,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        it. Matches the project's per-purpose "0x6X0..."
                        slot convention (stack=0x60.., /dev/fb0=0x61..,
                        SHM=0x62..). */
-                    static uint64_t mmap_alloc_ptr = 0x630000000000;
-                    virt_addr = mmap_alloc_ptr;
-                    mmap_alloc_ptr += size_aligned;
+                    virt_addr = mmap_bump(MMAP_SLOT_ANON, size_aligned);
+                    if (!virt_addr) return (uint64_t)-12; /* -ENOMEM */
                 } else {
                     virt_addr &= ~(PAGE_SIZE - 1); // align down to page boundary
                     /* MAP_FIXED: real semantics replace whatever was mapped
@@ -2580,6 +2596,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    default of "no heap yet". */
                 child->brk_start = parent->brk_start;
                 child->brk_current = parent->brk_current;
+                memcpy(child->mmap_next, parent->mmap_next, sizeof(child->mmap_next));
 
                 /* The VMA list is process-local bookkeeping, not part of the
                    page tables vmm_cow_clone_user_pages() just shared -- copy
@@ -2695,6 +2712,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     }
                 }
                 exec_proc->brk_current = exec_proc->brk_start;
+                memset(exec_proc->mmap_next, 0, sizeof(exec_proc->mmap_next));   /* new address space */
 
                 /* Check the target BEFORE the point of no return below: a
                    missing or non-ELF file must still fail with an error the
@@ -4800,14 +4818,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 uint8_t *buf = (uint8_t *)a1;
                 uint64_t len = a2;
                 if (len != 0 && !user_prepare_write(a1, len)) return (uint64_t)-14; /* -EFAULT */
-                uint64_t val = 0;
-                for (uint64_t i = 0; i < len; i++) {
-                    if ((i % 8) == 0) {
-                        uint32_t lo, hi;
-                        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-                        val = ((uint64_t)hi << 32) | lo;
-                    }
-                    buf[i] = (uint8_t)(val >> ((i % 8) * 8));
+                /* kernel CSPRNG (kernel/random.c) -- these used to be raw
+                   TSC readings, i.e. predictable TLS keys */
+                for (uint64_t done = 0; done < len; ) {
+                    uint64_t n = len - done < 256 ? len - done : 256;
+                    random_bytes(buf + done, n);
+                    done += n;
                 }
                 return len;
             }

@@ -9,11 +9,30 @@
 extern void serial_write_string(const char *str);
 extern void uint_to_hex(uint64_t val, char *buf);
 
+/* Blocks tile the heap in address order: next/prev are also the
+   physical neighbours, so freeing merges with them directly. kfree() used
+   to walk the whole list with interrupts off on every call, and could not
+   tell a double free from a first one. */
 typedef struct HeapHeader {
     size_t size;             /* Size of the data block in bytes */
+    struct HeapHeader *next; /* following block (higher address) */
+    struct HeapHeader *prev; /* preceding block (lower address) */
+    uint32_t magic;          /* HEAP_MAGIC_USED / HEAP_MAGIC_FREE */
     bool is_free;            /* Is this block free? */
-    struct HeapHeader *next; /* Next block in the list */
 } HeapHeader;
+
+#define HEAP_MAGIC_USED 0x4B4D5553u   /* "KMUS" */
+#define HEAP_MAGIC_FREE 0x4B4D4652u   /* "KMFR" */
+
+/* b absorbs the free block right after it */
+static void merge_next(HeapHeader *b)
+{
+    HeapHeader *n = b->next;
+    b->size += sizeof(HeapHeader) + n->size;
+    b->next = n->next;
+    if (b->next) b->next->prev = b;
+    n->magic = 0;
+}
 
 static HeapHeader *heap_first = NULL;
 uint64_t heap_end_addr = HEAP_START;
@@ -45,7 +64,9 @@ void heap_init(void)
     heap_first = (HeapHeader *)HEAP_START;
     heap_first->size = (HEAP_INITIAL_PAGES * PAGE_SIZE) - sizeof(HeapHeader);
     heap_first->is_free = true;
+    heap_first->magic = HEAP_MAGIC_FREE;
     heap_first->next = NULL;
+    heap_first->prev = NULL;
 
     heap_end_addr = HEAP_START + (HEAP_INITIAL_PAGES * PAGE_SIZE);
 
@@ -85,6 +106,7 @@ static bool heap_grow(size_t size_needed)
     HeapHeader *new_block = (HeapHeader *)heap_end_addr;
     new_block->size = (pages_needed * PAGE_SIZE) - sizeof(HeapHeader);
     new_block->is_free = true;
+    new_block->magic = HEAP_MAGIC_FREE;
     new_block->next = NULL;
 
     /* Append to the end of the block list */
@@ -93,11 +115,12 @@ static bool heap_grow(size_t size_needed)
         curr = curr->next;
     }
     curr->next = new_block;
+    new_block->prev = curr;
 
     heap_end_addr = new_end;
 
-    /* Coalesce immediately to merge the new block if the previous one was free */
-    kfree(NULL); /* Passing NULL triggers coalescing only */
+    /* merge with the last block if that one is free */
+    if (curr->is_free) merge_next(curr);
 
     return true;
 }
@@ -157,13 +180,17 @@ void *kmalloc(size_t size)
         HeapHeader *next_block = (HeapHeader *)((uintptr_t)curr + sizeof(HeapHeader) + aligned_size);
         next_block->size = curr->size - aligned_size - sizeof(HeapHeader);
         next_block->is_free = true;
+        next_block->magic = HEAP_MAGIC_FREE;
         next_block->next = curr->next;
+        next_block->prev = curr;
+        if (next_block->next) next_block->next->prev = next_block;
 
         curr->size = aligned_size;
         curr->next = next_block;
     }
 
     curr->is_free = false;
+    curr->magic = HEAP_MAGIC_USED;
     result = (void *)((uintptr_t)curr + sizeof(HeapHeader));
 
 cleanup:
@@ -180,17 +207,22 @@ void kfree(void *ptr)
 
     if (ptr != NULL) {
         HeapHeader *block = (HeapHeader *)((uintptr_t)ptr - sizeof(HeapHeader));
-        block->is_free = true;
-    }
-
-    /* Coalesce contiguous free blocks */
-    HeapHeader *curr = heap_first;
-    while (curr != NULL && curr->next != NULL) {
-        if (curr->is_free && curr->next->is_free) {
-            curr->size += sizeof(HeapHeader) + curr->next->size;
-            curr->next = curr->next->next;
+        uint64_t a = (uint64_t)(uintptr_t)block;
+        bool in_heap = a >= HEAP_START && a < heap_end_addr && !((uintptr_t)ptr & 15);
+        if (!in_heap || block->magic != HEAP_MAGIC_USED || block->is_free) {
+            /* a double free, or a pointer kmalloc() never returned:
+               ignore it rather than corrupt the heap, and say so */
+            char buf[32];
+            serial_write_string(in_heap && block->magic == HEAP_MAGIC_FREE ? "Heap: double kfree " : "Heap: bad kfree ");
+            uint_to_hex((uint64_t)(uintptr_t)ptr, buf);
+            serial_write_string(buf);
+            serial_write_string("\r\n");
         } else {
-            curr = curr->next;
+            block->is_free = true;
+            block->magic = HEAP_MAGIC_FREE;
+            /* merge with the neighbours only: O(1) */
+            if (block->next && block->next->is_free) merge_next(block);
+            if (block->prev && block->prev->is_free) merge_next(block->prev);
         }
     }
 

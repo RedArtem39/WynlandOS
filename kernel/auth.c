@@ -9,6 +9,7 @@
  */
 #include <wynland/auth.h>
 #include <wynland/sha256.h>
+#include <wynland/random.h>
 #include <wynland/rtc.h>
 #include <wynland/types.h>
 #include <wynland/vfs.h>
@@ -96,10 +97,7 @@ bool auth_check_root(const char *pw)
 bool auth_set_root(const char *pw)
 {
     uint8_t salt[8], hash[32];
-    uint64_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    uint64_t seed = (hi << 32 | lo) ^ (rtc_get_unix_time() * 0x9E3779B97F4A7C15ULL);
-    for (int i = 0; i < 8; i++) { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; salt[i] = (uint8_t)seed; }
+    random_bytes(salt, sizeof(salt));
     derive(salt, pw, hash);
 
     char line[5 + 16 + 1 + 64 + 2];

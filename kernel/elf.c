@@ -546,15 +546,9 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     uint64_t random_addr = stack_top - 16;
     uint8_t *random_ptr = (uint8_t *)random_addr;
     {
-        uint64_t rv = 0;
-        for (int i = 0; i < 16; i++) {
-            if ((i % 8) == 0) {
-                uint32_t lo, hi;
-                __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-                rv = ((uint64_t)hi << 32) | lo;
-            }
-            random_ptr[i] = (uint8_t)(rv >> ((i % 8) * 8));
-        }
+        /* glibc's stack guard and pointer guard come from these bytes */
+        extern void random_bytes(void *buf, uint64_t len);
+        random_bytes(random_ptr, 16);
     }
 
     /* Program name string */
