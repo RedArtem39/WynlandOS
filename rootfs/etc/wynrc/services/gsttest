@@ -1,0 +1,5 @@
+description=GStreamer check (registry, Vorbis, H.264/AAC through osssink)
+type=oneshot
+exec=/gsttest.elf
+when=autotest=1
+after=display sndtest

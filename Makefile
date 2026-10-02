@@ -382,6 +382,11 @@ $(BUILD)/jittest.elf: tests/jittest.c
 	@echo "  CC(HOST)   $< (glibc, JIT memory policy)"
 	@gcc -O2 -o $@ $<
 
+$(BUILD)/gsttest.elf: tests/gsttest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, GStreamer check)"
+	@gcc -O2 -o $@ $<
+
 $(BUILD)/sndtest.elf: tests/sndtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, sound check)"
@@ -436,6 +441,16 @@ $(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wil
 else
 QT6_MANIFEST =
 endif
+# GStreamer (Ubuntu's, glibc): tools, a set of plugins, test media and
+# the gsttest check. WITH_GST=0 builds the image without it.
+WITH_GST ?= 1
+ifeq ($(WITH_GST),1)
+GST_MANIFEST = $(BUILD)/gst_manifest.txt
+$(GST_MANIFEST): tools/stage_gst.sh $(EXT2_MANIFEST) $(QT6_MANIFEST) $(BUILD)/gsttest.elf rootfs/etc/wynrc/services/gsttest
+	@bash tools/stage_gst.sh
+else
+GST_MANIFEST =
+endif
 # Boot choices, read by the kernel from /etc/wynland/boot.cfg:
 #   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
 #   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
@@ -466,9 +481,9 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
 $(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf

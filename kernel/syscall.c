@@ -191,6 +191,15 @@ struct linux_stat {
 #define F_GETFD   1
 #define F_SETFD   2
 #define F_GETFL   3
+
+/* What open()/openat() record for a new fd: the access mode, O_APPEND and
+   O_NONBLOCK (F_GETFL reports them; glibc's fdopen() checks the access
+   mode against its "w"/"r") and O_CLOEXEC. */
+static void fd_set_open_flags(uint32_t *fd_flags, uint32_t *fd_oflags, int fd, int linux_flags)
+{
+    fd_oflags[fd] = (uint32_t)linux_flags & (3u | 02000u /* O_APPEND */ | 04000u /* O_NONBLOCK */);
+    fd_flags[fd]  = (linux_flags & 02000000) ? FD_CLOEXEC : 0;
+}
 #define F_SETFL   4
 
 /* Linux O_flags for fcntl */
@@ -1664,6 +1673,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 }
 
                 fd_table[fd] = file;
+                fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
                 return fd;
             }
 
@@ -1689,7 +1699,26 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 kfile_close(f);
             }
             return 0;
-            
+
+        case 436: // SYS_close_range(first, last, flags): glib closes a child's fds with it
+            {
+                if (a1 > a2) return (uint64_t)-22;                      /* -EINVAL */
+                if (a3 & ~(uint64_t)(2 | 4)) return (uint64_t)-22;      /* only UNSHARE (no-op), CLOEXEC */
+                uint64_t last = a2 < MAX_OPEN_FILES - 1 ? a2 : MAX_OPEN_FILES - 1;
+                for (uint64_t fd = a1; fd <= last && fd < MAX_OPEN_FILES; fd++) {
+                    if (!fd_table[fd]) continue;
+                    if (a3 & 4) { fd_flags[fd] |= FD_CLOEXEC; continue; }  /* CLOSE_RANGE_CLOEXEC */
+                    if (IS_DRM_DEV(fd_table[fd]->node.first_cluster))
+                        drm_release(fd_table[fd]->current_cluster, proc->pid, true);
+                    fd_oflags[fd] = 0;
+                    fd_flags[fd] = 0;
+                    VfsFile *f = fd_table[fd];
+                    fd_table[fd] = NULL;
+                    kfile_close(f);
+                }
+                return 0;
+            }
+
         case 32: // SYS_dup(oldfd)
             {
                 int oldfd = (int)a1;
@@ -1736,7 +1765,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 8: // SYS_lseek (Linux standard)
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
-                return (uint64_t)-1;
+                return (uint64_t)-9; /* -EBADF */
             }
             if (fd_table[a1]->node.first_cluster == USOCK_FD ||
                 fd_table[a1]->node.first_cluster == TIMERFD_FD) return (uint64_t)-29; /* -ESPIPE */
@@ -1749,8 +1778,26 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 fd_table[a1]->offset = (uint32_t)pos;
                 return (uint64_t)pos;
             }
-            return vfs_seek(fd_table[a1], (int32_t)a2, (int)a3);
-            
+            {
+                /* the new offset is the result (vfs_seek says only ok or
+                   not): programs check lseek(fd, off, SEEK_SET) == off */
+                VfsFile *f = fd_table[a1];
+                int64_t size = (int64_t)f->node.size, cur = (int64_t)f->offset, off = (int64_t)a2, pos;
+                switch (a3) {
+                    case 0: pos = off; break;                       /* SEEK_SET */
+                    case 1: pos = cur + off; break;                 /* SEEK_CUR */
+                    case 2: pos = size + off; break;                /* SEEK_END */
+                    case 3: if (off < 0 || off >= size) return (uint64_t)-6;  /* SEEK_DATA: -ENXIO past the end */
+                            pos = off; break;                       /* no holes: data is everywhere */
+                    case 4: if (off < 0 || off >= size) return (uint64_t)-6;  /* SEEK_HOLE */
+                            pos = size; break;
+                    default: return (uint64_t)-22;                  /* -EINVAL */
+                }
+                if (pos < 0 || pos > 0xFFFFFFFFLL) return (uint64_t)-22;
+                f->offset = (uint32_t)pos;
+                return (uint64_t)pos;
+            }
+
         case 9: // SYS_mmap (Linux standard)
             if (a2 == 0) return 0;
             {
@@ -3936,6 +3983,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 VfsFile *file = vfs_open_flags(path, vfs_flags);
                 if (!file) return (uint64_t)-2; /* -ENOENT */
                 fd_table[fd] = file;
+                fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
                 return fd;
             }
 

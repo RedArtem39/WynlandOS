@@ -5,4 +5,5 @@ gltest
 forktest
 sndtest
 jittest
+gsttest
 kmstest
