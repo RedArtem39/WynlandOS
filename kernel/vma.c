@@ -4,6 +4,8 @@
 #include <wynland/vma.h>
 #include <wynland/process.h>
 #include <wynland/heap.h>
+#include <wynland/pmm.h>
+#include <wynland/vmm.h>
 
 VMA *vma_insert(Process *proc, uint64_t start, uint64_t end, uint32_t prot, uint32_t flags)
 {
@@ -24,6 +26,30 @@ VMA *vma_find(Process *proc, uint64_t addr)
         if (addr >= v->start && addr < v->end) return v;
     }
     return NULL;
+}
+
+bool vma_fault_in(Process *proc, uint64_t addr, uint32_t access)
+{
+    if (!proc || !proc->pml4) return false;
+    VMA *v = vma_find(proc, addr);
+    if (!v || !(v->flags & VMA_LAZY) || (v->flags & VMA_GUARD)) return false;
+    if ((v->prot & access) != access) return false;   /* PROT_NONE, or no write/exec */
+
+    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    if (vmm_get_page_flags(proc->pml4, page) & PAGE_PRESENT) return false;   /* not ours to fix */
+
+    void *frame = pmm_alloc_page();
+    if (!frame) return false;   /* out of memory: the access faults for real */
+    /* RAM is identity-mapped in the kernel's half: zero it there, before
+       the process can see it */
+    uint64_t *z = (uint64_t *)(uintptr_t)frame;
+    for (uint32_t i = 0; i < PAGE_SIZE / 8; i++) z[i] = 0;
+
+    uint64_t f = PAGE_USER;
+    if (v->prot & VMA_PROT_WRITE) f |= PAGE_WRITE;
+    if (!(v->prot & VMA_PROT_EXEC)) f |= PAGE_NX;
+    vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, f);
+    return true;
 }
 
 /* Ensure a VMA boundary exists exactly at `addr`, splitting whichever VMA

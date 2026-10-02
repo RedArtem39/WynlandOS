@@ -1956,6 +1956,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 PageTable *pml4 = vmm_get_current_pml4();
 
+                /* Anonymous memory is demand-zero: only the range is recorded
+                   here, each page gets a frame on first touch (vma_fault_in(),
+                   from the page fault handler and the user-copy checks).
+                   Allocating and zeroing everything up front made glibc's
+                   64 MB per-thread malloc arenas and every 8 MB thread stack
+                   cost real RAM, and WebKit's multi-GB reservations
+                   impossible. MAP_POPULATE (0x8000) still populates now. */
+                if ((flags & 0x20) && !(flags & 0x8000)) {
+                    uint32_t lazy_prot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
+                    if (!vma_insert(sched_current()->proc, virt_addr, virt_addr + size_aligned,
+                                    lazy_prot, VMA_ANON | VMA_LAZY))
+                        return (uint64_t)-12; /* -ENOMEM */
+                    return virt_addr;
+                }
+
                 /* Physical pages one by one. This took one physically
                    contiguous run per mapping: every 8 MB thread stack of
                    every Qt app needed 2048 adjacent free frames, and once

@@ -35,6 +35,24 @@ static int default_ignored(int sig) {
     return sig == 13 /* PIPE */ || sig == 17 /* CHLD */ || sig == 23 /* URG */;
 }
 
+/* Kill a whole process with `sig` (its wait status says so): every one
+   of its threads is marked TERMINATED, the current one included if it
+   belongs to it -- the caller schedules away afterwards. */
+void signal_kill_process(Process *p, int sig) {
+    if (!p) return;
+    process_mark_exited(p, sig & 0x7F);
+    extern Thread *sched_get_thread_list(void);
+    Thread *it = sched_get_thread_list();
+    if (it) {
+        int guard = 0;
+        do {
+            if (it->proc == p && it->state != THREAD_STATE_TERMINATED)
+                it->state = THREAD_STATE_TERMINATED;
+            it = it->next;
+        } while (it != sched_get_thread_list() && ++guard < 4096);
+    }
+}
+
 void signal_init(void) {
     /* state lives in Process/Thread structs; nothing global to set up */
 }
@@ -70,21 +88,7 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
            are not reaped here yet (Phase 23's wait4/reaping lands that);
            non-current victims' clear-tid words are not written either,
            since their address spaces are not loaded in this context. */
-        /* killed by `sig`: that is its wait status */
-        process_mark_exited(t->proc, sig & 0x7F);
-        extern Thread *sched_get_thread_list(void);
-        Thread *it = sched_get_thread_list();
-        if (it) {
-            int guard = 0;
-            do {
-                if (it->proc == t->proc && it != t &&
-                    it->state != THREAD_STATE_TERMINATED) {
-                    it->state = THREAD_STATE_TERMINATED;
-                }
-                it = it->next;
-            } while (it != sched_get_thread_list() && ++guard < 256);
-        }
-        t->state = THREAD_STATE_TERMINATED;
+        signal_kill_process(t->proc, sig);
         {
             char m[] = "[signal] fatal sig=00, terminating process, rip=0x0000000000000000\r\n";
             m[19] = (char)('0' + sig / 10);

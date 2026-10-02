@@ -17,6 +17,7 @@
 #define VMA_ANON  0x1  /* anonymous (no backing file) */
 #define VMA_GUARD 0x2  /* deliberately unmapped hole (e.g. below a stack) --
                            touching it is always fatal, never lazily faulted in */
+#define VMA_LAZY  0x4  /* demand-zero: a page gets a frame on first touch */
 
 struct Process; /* include/wynland/process.h -- forward-declared to avoid a
                     header cycle (Process embeds a VMA* list head) */
@@ -38,6 +39,12 @@ VMA *vma_insert(struct Process *proc, uint64_t start, uint64_t end, uint32_t pro
 
 /* The VMA covering address `addr`, or NULL if none does. */
 VMA *vma_find(struct Process *proc, uint64_t addr);
+
+/* Demand paging: give the not-yet-present page holding `addr` a zeroed
+   frame if it lies in a VMA_LAZY region that allows `access` (VMA_PROT_*).
+   True when the page is now mapped -- the faulting access can be retried.
+   Called by the page fault handler and by the user-copy checks. */
+bool vma_fault_in(struct Process *proc, uint64_t addr, uint32_t access);
 
 /* Update the prot field of every VMA overlapping [start,end), splitting
    VMAs at the boundary where the requested range only partially covers

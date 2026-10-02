@@ -507,7 +507,12 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
        (CMake, git, curl, etc.) would hit the same wall sooner or later. */
     uint64_t stack_base = 0x600000000000ULL;
     uint64_t stack_size = 8 * 1024 * 1024;
-    for (uint64_t offset = 0; offset < stack_size; offset += PAGE_SIZE) {
+    /* Demand-zero below the top: only the top 128 KB (argv, envp, auxv
+       are written there right below, possibly not from this process's own
+       context) get frames now; the rest arrives on first touch. All 8 MB
+       used to be allocated and zeroed for every process. */
+    uint64_t stack_eager = proc ? 128 * 1024 : stack_size;
+    for (uint64_t offset = stack_size - stack_eager; offset < stack_size; offset += PAGE_SIZE) {
         uint64_t addr = stack_base + offset;
         void *phys = find_mapped_page(pml4, addr);
         if (!phys) {
@@ -523,7 +528,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     }
 
     if (proc) {
-        vma_insert(proc, stack_base, stack_base + stack_size, VMA_PROT_READ | VMA_PROT_WRITE, VMA_ANON);
+        vma_insert(proc, stack_base, stack_base + stack_size, VMA_PROT_READ | VMA_PROT_WRITE, VMA_ANON | VMA_LAZY);
         /* Guard page: one page immediately below the stack, deliberately
            left unmapped (bookkeeping only -- no vmm_map_page call for it,
            ever). A stack overflow faults here with no PAGE_COW bit and no

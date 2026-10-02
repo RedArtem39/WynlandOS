@@ -32,6 +32,11 @@
 
 void signal_init(void);
 
+/* Kill a whole process with sig: all its threads TERMINATED, wait status
+   = killed by sig. The caller schedules away afterwards. */
+struct Process;
+void signal_kill_process(struct Process *p, int sig);
+
 /* Called from the syscall-return tail. Returns 1 when it patched the
    saved-context block (*regs, a SyscallRegs* in disguise) for immediate
    handler entry -- caller must then load live RAX from offset 0 of the

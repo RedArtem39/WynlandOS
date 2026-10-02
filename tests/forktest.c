@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -226,6 +227,41 @@ int main(int argc, char **argv)
                 for (int i = 0; i < 32; i++) zeros += (u[i] == 0);
                 check(memcmp(r1, r2, sizeof r1) != 0, "getrandom gives different bytes each call");
                 check(zeros < 8, "/dev/urandom is not zeros");
+            }
+            /* demand paging: reservations cost nothing until touched */
+            {
+                struct sysinfo si0, si1;
+                void *res = mmap(NULL, 16UL << 30, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+                check(res != MAP_FAILED, "16 GB PROT_NONE reservation");
+                sysinfo(&si0);
+                char *big = mmap(NULL, 1UL << 30, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                check(big != MAP_FAILED, "1 GB anonymous mapping");
+                if (big != MAP_FAILED) {
+                    big[0] = 1; big[(1UL << 30) - 1] = 2;   /* two pages touched */
+                    sysinfo(&si1);
+                    long used = (long)(si0.freeram - si1.freeram);
+                    fprintf(stderr, "[forktest] 1 GB mapping, 2 pages touched: %ld KB used\n", used / 1024);
+                    check(used < 4L * 1024 * 1024, "untouched pages cost no RAM");
+                    check(big[12345] == 0 && big[1UL << 29] == 0, "fresh pages read as zero");
+                    /* the kernel writing into a never-touched page (read() from a pipe) */
+                    int pp[2];
+                    if (pipe(pp) == 0) {
+                        write(pp[1], "lazy", 4);
+                        check(read(pp[0], big + (300UL << 20), 4) == 4 && memcmp(big + (300UL << 20), "lazy", 4) == 0,
+                              "read() into an untouched page");
+                        close(pp[0]); close(pp[1]);
+                    }
+                    munmap(big, 1UL << 30);
+                }
+                if (res != MAP_FAILED) {
+                    /* touching PROT_NONE must still kill: in a child */
+                    pid_t c = fork();
+                    if (c == 0) { *(volatile char *)res = 1; _exit(0); }
+                    int st = 0;
+                    waitpid(c, &st, 0);
+                    check(WIFSIGNALED(st) || (WIFEXITED(st) && WEXITSTATUS(st) != 0), "PROT_NONE page still faults");
+                    munmap(res, 16UL << 30);
+                }
             }
             /* normal anonymous mappings still work */
             char *a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

@@ -12,6 +12,9 @@
 #include <wynland/usercopy.h>
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
+#include <wynland/sched.h>
+#include <wynland/process.h>
+#include <wynland/vma.h>
 
 extern void *memcpy(void *dest, const void *src, size_t n);
 
@@ -37,6 +40,14 @@ bool user_range_valid(PageTable *pml4, uint64_t addr, uint64_t len, uint32_t req
 
     for (uint64_t page = start_page; ; page += PAGE_SIZE) {
         uint64_t flags = vmm_get_page_flags(pml4, page);
+        /* a lazy page nobody touched yet: give it its frame now (a read()
+           into a fresh malloc'ed buffer must not fail with EFAULT) */
+        if (!(flags & PAGE_PRESENT) && pml4 == vmm_get_current_pml4()) {
+            Thread *t = sched_current();
+            uint32_t acc = (required_access & UACCESS_WRITE) ? VMA_PROT_WRITE : VMA_PROT_READ;
+            if (t && t->proc && vma_fault_in(t->proc, page, acc))
+                flags = vmm_get_page_flags(pml4, page);
+        }
         if (!(flags & PAGE_PRESENT) || !(flags & PAGE_USER)) return false;
         if ((required_access & UACCESS_WRITE) && !(flags & PAGE_WRITE) && !(flags & PAGE_COW)) {
             return false; /* read-only page (e.g. mprotect(PROT_READ), .text) */

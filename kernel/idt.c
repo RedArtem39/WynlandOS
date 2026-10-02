@@ -6,6 +6,10 @@
 #include <wynland/boot_info.h>
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
+#include <wynland/sched.h>
+#include <wynland/process.h>
+#include <wynland/vma.h>
+#include <wynland/signal.h>
 
 extern void *memcpy(void *dest, const void *src, size_t n);
 
@@ -223,6 +227,20 @@ void exception_handler(InterruptRegisters *regs)
        user half of the address space. */
     uint64_t pf_cr2 = 0;
     if (regs->int_no == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(pf_cr2));
+
+    /* Demand paging: a not-present fault (err bit 0 clear) in a lazy
+       anonymous region gets its zeroed frame now, and the instruction
+       runs again. From user mode, or from the kernel touching the user
+       half on a process's behalf. Instruction fetch (bit 4) needs EXEC,
+       write (bit 1) needs WRITE. */
+    if (regs->int_no == 14 && !(regs->err_code & 0x1) &&
+        ((regs->cs & 0x03) == 3 || pf_cr2 < 0x0000800000000000ULL)) {
+        Thread *ft = sched_current();
+        uint32_t access = VMA_PROT_READ;
+        if (regs->err_code & 0x2) access = VMA_PROT_WRITE;
+        if (regs->err_code & 0x10) access = VMA_PROT_EXEC;
+        if (ft && ft->proc && vma_fault_in(ft->proc, pf_cr2, access)) return;
+    }
     if (regs->int_no == 14 && (regs->err_code & 0x3) == 0x3 &&
         ((regs->cs & 0x03) == 3 || pf_cr2 < 0x0000800000000000ULL)) {
         uint64_t cr2 = pf_cr2;
@@ -323,6 +341,23 @@ void exception_handler(InterruptRegisters *regs)
             console_print_string(g_boot_info, ". Thread terminated.\n", 0x00FFFFFF, 0x000F0F1A);
         }
 
+        /* The whole process dies of the matching signal, as on Linux:
+           only this thread used to end, with a normal exit status, while
+           the process's other threads ran on. (A user SIGSEGV handler is
+           not run here yet.) */
+        {
+            int sig = 11;                                        /* SIGSEGV */
+            if (regs->int_no == 0 || regs->int_no == 16 || regs->int_no == 19) sig = 8;  /* SIGFPE */
+            else if (regs->int_no == 6) sig = 4;                 /* SIGILL */
+            else if (regs->int_no == 3 || regs->int_no == 1) sig = 5;  /* SIGTRAP */
+            else if (regs->int_no == 17) sig = 7;                /* SIGBUS */
+            Thread *ct = sched_current();
+            if (ct && ct->proc) {
+                signal_kill_process(ct->proc, sig);
+                sched_schedule();
+                while (1) __asm__ volatile("cli; hlt");
+            }
+        }
         extern void thread_exit(void);
         thread_exit();
         return;
