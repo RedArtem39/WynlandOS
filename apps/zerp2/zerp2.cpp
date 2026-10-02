@@ -4,6 +4,7 @@
 #include <QtCore/QFileInfo>
 #include <QtGui/QImage>
 #include <QtGui/QScreen>
+#include <QtGui/QWheelEvent>
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
 #include <QtQuick/QSGTexture>
@@ -33,7 +34,7 @@ ZClient::ZClient(int id, const QString &path, QObject *parent)
     const QString base = QFileInfo(path).completeBaseName();
     m_appId = base;
     if (base == QLatin1String("zerp_term")) m_title = QStringLiteral("Terminal");
-    else if (base == QLatin1String("zerp_files")) m_title = QStringLiteral("Files");
+    else if (base == QLatin1String("zerp_files") || base == QLatin1String("files")) m_title = QStringLiteral("Files");
     else if (base == QLatin1String("zerp_rofi")) m_title = QStringLiteral("Launcher");
     else if (base == QLatin1String("qmldemo")) m_title = QStringLiteral("Qt Quick demo");
     else m_title = base;
@@ -488,3 +489,17 @@ void ZSurface::mousePressEvent(QMouseEvent *e)
 void ZSurface::mouseReleaseEvent(QMouseEvent *e) { forward(e->position(), e->buttons(), false); e->accept(); }
 void ZSurface::mouseMoveEvent(QMouseEvent *e) { forward(e->position(), e->buttons(), true); e->accept(); }
 void ZSurface::hoverMoveEvent(QHoverEvent *e) { forward(e->position(), Qt::NoButton, true); e->accept(); }
+
+void ZSurface::wheelEvent(QWheelEvent *e)
+{
+    if (!m_client || width() <= 0 || height() <= 0) return;
+    const int steps = -e->angleDelta().y() / 120;   // + = down, as the PS/2 wheel
+    if (!steps) return;
+    const int x = int(e->position().x() * m_client->bufWidth() / width());
+    const int y = int(e->position().y() * m_client->bufHeight() / height());
+    uint32_t mask = 0;
+    if (e->buttons() & Qt::LeftButton) mask |= 1;
+    mask |= uint32_t(uint8_t(int8_t(qBound(-127, steps, 127)))) << 8;
+    m_client->sendMouse(x, y, mask, false);
+    e->accept();
+}

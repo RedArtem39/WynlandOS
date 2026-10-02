@@ -95,6 +95,12 @@ private:
         if (e.buttons & 1) now |= Qt::LeftButton;
         if (e.buttons & 2) now |= Qt::RightButton;
         if (e.buttons & 4) now |= Qt::MiddleButton;
+        if (const int wheel = (int8_t)((e.buttons >> 8) & 0xFF)) {   // + = down
+            QWheelEvent we(p, p, QPoint(), QPoint(0, -wheel * 120), m_buttons, m_mods,
+                           Qt::NoScrollPhase, false);
+            QCoreApplication::sendEvent(m_win, &we);
+            return;
+        }
         if (p != m_pos || now == m_buttons) {
             m_pos = p;
             QMouseEvent mv(QEvent::MouseMove, p, p, Qt::NoButton, m_buttons, m_mods);
@@ -267,8 +273,10 @@ int main(int argc, char **argv)
 
     if (bootCfg().contains("snapshot")) {
         // something to tile in the picture
-        QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/zerp_files.elf")); });
+        QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/files")); });
         if (!bootCfg().contains("noqml")) QTimer::singleShot(6000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/qmldemo")); });
+        // "snapfiles": the file manager full screen in the picture
+        if (bootCfg().contains("snapfiles")) QTimer::singleShot(5500, &server, [&server] { server.toggleFullscreen(); });
 
         // measured load: frames per second while the pointer sweeps the dock
         // (magnification) and while workspaces switch (tiles slide)

@@ -35,6 +35,42 @@ static const char SCANCODE_TO_ASCII[59] = {
     '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
 };
 
+static const char SCANCODE_TO_ASCII_SHIFT[59] = {
+    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
+    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
+    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' '
+};
+
+/* keys past the 59-entry table: F1-F10 (0x3B-0x44), F11/F12, and the
+   0xE0-prefixed navigation block */
+static int extendedKey(bool e0, uint8_t code)
+{
+    if (e0) {
+        switch (code) {
+        case 0x48: return Qt::Key_Up;
+        case 0x50: return Qt::Key_Down;
+        case 0x4B: return Qt::Key_Left;
+        case 0x4D: return Qt::Key_Right;
+        case 0x47: return Qt::Key_Home;
+        case 0x4F: return Qt::Key_End;
+        case 0x49: return Qt::Key_PageUp;
+        case 0x51: return Qt::Key_PageDown;
+        case 0x52: return Qt::Key_Insert;
+        case 0x53: return Qt::Key_Delete;
+        case 0x1C: return Qt::Key_Enter;
+        case 0x1D: return Qt::Key_Control;
+        case 0x38: return Qt::Key_Alt;
+        case 0x5D: return Qt::Key_Menu;
+        }
+        return 0;
+    }
+    if (code >= 0x3B && code <= 0x44) return Qt::Key_F1 + (code - 0x3B);
+    if (code == 0x57) return Qt::Key_F11;
+    if (code == 0x58) return Qt::Key_F12;
+    return 0;
+}
+
 QWynlandFbInputReader::QWynlandFbInputReader()
     : m_s2cFd(-1), m_running(false), m_screen(nullptr), m_modifiers(Qt::NoModifier)
 {
@@ -59,6 +95,7 @@ void QWynlandFbInputReader::run()
 {
     m_running = true;
     Qt::MouseButtons buttons = Qt::NoButton;
+    bool e0 = false;
 
     while (m_running) {
         ZerpMsg msg;
@@ -79,6 +116,13 @@ void QWynlandFbInputReader::run()
             if (msg.w & 1) newButtons |= Qt::LeftButton;
             if (msg.w & 2) newButtons |= Qt::RightButton;
             if (msg.w & 4) newButtons |= Qt::MiddleButton;
+            /* bits 8-15: wheel steps, positive = scroll down (zerp2) */
+            const int wheel = (int8_t)((msg.w >> 8) & 0xFF);
+            if (wheel) {
+                QWindowSystemInterface::handleWheelEvent(nullptr, pos, pos, QPoint(),
+                                                         QPoint(0, -wheel * 120), m_modifiers);
+                break;
+            }
 
             Qt::MouseButton changedButton = Qt::NoButton;
             QEvent::Type type = QEvent::MouseMove;
@@ -98,11 +142,14 @@ void QWynlandFbInputReader::run()
 
         case ZERP_MSG_INPUT_KEY: {
             uint8_t scancode = (uint8_t)msg.x;
+            if (scancode == 0xE0) { e0 = true; break; }
             bool release = (scancode & 0x80) != 0;
             uint8_t code = scancode & 0x7F;
-            if (code >= 59) break;
+            const bool ext = e0;
+            e0 = false;
 
-            int qtKey = SCANCODE_TO_QTKEY[code];
+            int qtKey = ext ? 0 : (code < 59 ? SCANCODE_TO_QTKEY[code] : 0);
+            if (!qtKey) qtKey = extendedKey(ext, code);
             if (qtKey == 0) break;
 
             if (qtKey == Qt::Key_Shift) {
@@ -113,7 +160,10 @@ void QWynlandFbInputReader::run()
                 m_modifiers.setFlag(Qt::AltModifier, !release);
             }
 
-            char ch = SCANCODE_TO_ASCII[code];
+            char ch = 0;
+            if (!ext && code < 59 && !(m_modifiers & (Qt::ControlModifier | Qt::AltModifier)))
+                ch = (m_modifiers & Qt::ShiftModifier) ? SCANCODE_TO_ASCII_SHIFT[code] : SCANCODE_TO_ASCII[code];
+            if (ch == '\n') ch = '\r';
             QString text = (ch != 0) ? QString(QChar((uchar)ch)) : QString();
 
             QWindowSystemInterface::handleKeyEvent(

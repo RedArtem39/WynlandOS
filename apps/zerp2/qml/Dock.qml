@@ -17,7 +17,7 @@ Item {
 
     readonly property var apps: [
         { name: "Terminal", path: "/zerp_term.elf", appId: "zerp_term", kind: "term" },
-        { name: "Files", path: "/zerp_files.elf", appId: "zerp_files", kind: "files" },
+        { name: "Files", path: "/usr/bin/files", appId: "files", kind: "files" },
         { name: "Launcher", path: "/zerp_rofi.elf", appId: "zerp_rofi", kind: "launcher" },
         { name: "Qt Quick", path: "/usr/bin/qmldemo", appId: "qmldemo", kind: "qt" }
     ]

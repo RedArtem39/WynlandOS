@@ -45,6 +45,7 @@ typedef struct {
     bool readonly;          /* true iff no write bit at all in the ext2 mode */
     uint16_t mode;          /* ext2 i_mode & 07777 -- real permission bits */
     uint32_t uid;           /* ext2 i_uid -- real ownership */
+    uint32_t mtime;         /* ext2 i_mtime (unix seconds) */
 } VfsNode;
 
 typedef struct {
@@ -69,6 +70,9 @@ typedef struct {
     uint16_t write_time;
     uint16_t write_date;
     uint8_t  attr;          /* low byte of the ext2 mode */
+    uint16_t mode;          /* ext2 i_mode & 07777 */
+    uint32_t uid;           /* ext2 i_uid */
+    uint32_t mtime, atime, ctime; /* unix seconds */
 } VfsStat;
 
 /* ---- Core VFS API ---- */

@@ -73,6 +73,15 @@ g++ $CXXFLAGS -o "$OUT/qmldemo.elf" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/qmldemo.elf"
 
+# Files (apps/files): the file manager, same plumbing as qmldemo
+"$ROOT/usr/lib/qt6/libexec/moc" $MOCINC -o "$B/moc_fs.cpp" apps/files/fs.h
+g++ $CXXFLAGS -Iapps/files -o "$OUT/files.elf" \
+    apps/files/main.cpp "$B/moc_fs.cpp" qt_qpa/qwynlandfbmain.cpp qt_qpa/qwynlandfb_zerpargs.cpp \
+    qt_qpa/qwynlandfbintegration.cpp qt_qpa/qwynlandfbscreen.cpp qt_qpa/qwynlandfbinput.cpp \
+    "$B/moc_qwynlandfbinput.cpp" \
+    -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
+echo "  QT6        built build/files.elf"
+
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
 Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
@@ -96,6 +105,9 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     echo "D /usr/share/zerp"
     echo "D /usr/share/zerp/qml"
     echo "F /usr/share/zerp/qml/demo.qml apps/qml/demo.qml"
+    echo "D /usr/share/zerp/qml/files"
+    for q in apps/files/qml/*.qml; do echo "F /usr/share/zerp/qml/files/$(basename "$q") $q"; done
+    echo "F /usr/bin/files build/files.elf"
     # fontconfig configuration and fonts, from the packages (symlinks in
     # conf.d are stored as copies of their targets)
     echo "D /var"
@@ -125,7 +137,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
 
 # libraries: everything the app and the QML plugins load, by soname into
 # /lib64 -- skipping what the base manifest already ships there
-{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; find "$QMLSRC" -name "*.so";
+{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; echo "$OUT/files.elf"; find "$QMLSRC" -name "*.so";
   echo "$LIB/qt6/plugins/platforms/libqeglfs.so"; echo "$LIB/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so"; } | while read f; do
     ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
 done | sort -u | while read soname path; do

@@ -1548,6 +1548,7 @@ static void fill_node_from_inode(VfsNode *node, uint32_t inum,
     node->readonly = (inode->i_mode & 0222) == 0;
     node->mode = inode->i_mode & 07777;
     node->uid = inode->i_uid;
+    node->mtime = inode->i_mtime;
 }
 
 /* ============================================================
@@ -2132,6 +2133,11 @@ bool vfs_stat(const char *path, VfsStat *out) {
     out->write_time = 0;
     out->write_date = 0;
     out->attr = (uint8_t)(inode.i_mode & 0xFF); /* low mode byte for callers that peek */
+    out->mode = (uint16_t)(inode.i_mode & 07777);
+    out->uid = inode.i_uid;
+    out->mtime = inode.i_mtime;
+    out->atime = inode.i_atime;
+    out->ctime = inode.i_ctime;
 
     return true;
 }

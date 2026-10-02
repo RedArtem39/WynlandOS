@@ -33,6 +33,8 @@ static BootInfo *g_boot_info = NULL;
 static int32_t mouse_x = 0;
 static int32_t mouse_y = 0;
 static uint8_t mouse_buttons = 0;
+static bool mouse_has_wheel = false;   /* IntelliMouse: 4-byte packets */
+static int8_t mouse_wheel = 0;         /* this packet's wheel delta */
 
 
 static uint32_t saved_background[CURSOR_W * CURSOR_H];
@@ -227,6 +229,17 @@ void mouse_init(BootInfo *info)
     mouse_write_mouse(0xF6);
     mouse_read(); /* Read ACK */
 
+    /* 3b. IntelliMouse knock (sample rate 200, 100, 80): a wheel mouse
+       then reports ID 3 and sends a 4th byte, the wheel delta. */
+    static const uint8_t knock[3] = { 200, 100, 80 };
+    for (int i = 0; i < 3; i++) {
+        mouse_write_mouse(0xF3); mouse_read();
+        mouse_write_mouse(knock[i]); mouse_read();
+    }
+    mouse_write_mouse(0xF2); mouse_read();   /* get ID: ACK, then the ID */
+    mouse_has_wheel = mouse_read() == 3;
+    serial_write_string(mouse_has_wheel ? "Mouse: wheel (IntelliMouse)\r\n" : "Mouse: no wheel\r\n");
+
     /* 4. Enable data reporting */
     mouse_write_mouse(0xF4);
     mouse_read(); /* Read ACK */
@@ -271,7 +284,9 @@ static bool mouse_ev_enabled = false;
 static void mouse_event_push(void)
 {
     if (!mouse_ev_enabled) return;
-    MouseEvent ev = { mouse_x, mouse_y, mouse_buttons };
+    /* buttons: bits 0-2 the buttons, bits 8-15 this packet's wheel delta
+       (int8, positive = towards the user... i.e. scroll down) */
+    MouseEvent ev = { mouse_x, mouse_y, (uint32_t)mouse_buttons | ((uint32_t)(uint8_t)mouse_wheel << 8) };
     if (mouse_ev_count == MOUSE_EVENT_RING) {
         /* Full (reader stalled): drop the oldest event whose successor has
            the same buttons -- only a position is lost, never a press or
@@ -290,7 +305,7 @@ static void mouse_event_push(void)
             mouse_ev_count--;
         } else {
             MouseEvent *last = &mouse_events[(mouse_ev_head + mouse_ev_count - 1) % MOUSE_EVENT_RING];
-            if (last->buttons == ev.buttons) { *last = ev; return; }
+            if (last->buttons == ev.buttons && !(ev.buttons & 0xFF00)) { *last = ev; return; }
             mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
             mouse_ev_count--;
         }
@@ -337,7 +352,7 @@ int mouse_read_queue(uint8_t *buf, int size)
 }
 
 static uint8_t mouse_cycle = 0;
-static uint8_t mouse_packet[3];
+static uint8_t mouse_packet[4];
 
 void mouse_handle_interrupt(uint8_t data)
 {
@@ -355,8 +370,12 @@ void mouse_handle_interrupt(uint8_t data)
             mouse_cycle = 2;
             break;
         case 2:
-            mouse_packet[2] = data;
+        case 3:
+            mouse_packet[mouse_cycle] = data;
+            if (mouse_has_wheel && mouse_cycle == 2) { mouse_cycle = 3; break; }
             mouse_cycle = 0;
+            /* low nibble of the 4th byte, sign-extended */
+            mouse_wheel = mouse_has_wheel ? (int8_t)((int8_t)(mouse_packet[3] << 4) >> 4) : 0;
 
             uint8_t buttons = mouse_packet[0];
             int32_t rel_x = (int32_t)mouse_packet[1];
@@ -377,7 +396,7 @@ void mouse_handle_interrupt(uint8_t data)
             if (new_y < 0) new_y = 0;
             if (new_y >= (int32_t)g_boot_info->fb_height) new_y = g_boot_info->fb_height - 1;
 
-            if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons)) {
+            if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons) || mouse_wheel) {
                 extern bool wm_is_gui_active(void);
                 bool gui = wm_is_gui_active();
 

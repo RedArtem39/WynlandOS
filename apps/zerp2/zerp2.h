@@ -181,6 +181,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent *e) override;
     void mouseMoveEvent(QMouseEvent *e) override;
     void hoverMoveEvent(QHoverEvent *e) override;
+    void wheelEvent(QWheelEvent *e) override;
 
 private:
     void forward(const QPointF &p, Qt::MouseButtons b, bool motion);

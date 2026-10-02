@@ -22,6 +22,10 @@ D /plugins/platforms
 D /tmp
 D /home
 D /home/user
+D /home/user/Documents
+D /home/user/Downloads
+D /home/user/Pictures
+D /home/user/Projects
 D /etc
 D /etc/hypr
 D /lib64
@@ -1487,9 +1491,19 @@ Fo /test_signals.elf build/test_signals.elf
 Fo /test_vma.elf build/test_vma.elf
 Fo /test_blockio.elf build/test_blockio.elf
 
+# the home skeleton
+F  /home/user/README.txt           rootfs/home/user/README.txt
+F  /home/user/Pictures/wallpaper.png build/wall.png
+
 # permissions beyond the defaults (root, 0755 dirs/programs, 0644 files)
 P /tmp 0 41777
 P /home/user 1000 40755
 P /dev/dri/card0 0 100666
 P /dev/dri/renderD128 0 100666
 P /var/cache/fontconfig 0 41777
+P /home/user/Documents 1000 40755
+P /home/user/Downloads 1000 40755
+P /home/user/Pictures 1000 40755
+P /home/user/Projects 1000 40755
+P /home/user/README.txt 1000 100644
+P /home/user/Pictures/wallpaper.png 1000 100644

@@ -404,7 +404,7 @@ PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf 
 WITH_QT6 ?= 1
 ifeq ($(WITH_QT6),1)
 QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
-$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml) $(wildcard apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
 	@bash tools/stage_qt6.sh
 else
 QT6_MANIFEST =

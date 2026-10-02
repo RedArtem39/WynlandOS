@@ -197,6 +197,11 @@ int main(int argc, char **argv)
             check(rmdir("/tmp/forktest-d") != 0 && errno == ENOTEMPTY, "rmdir refuses a non-empty dir");
             unlink("/tmp/forktest-d/b");
             check(rmdir("/tmp/forktest-d") == 0, "rmdir");
+            struct stat hs, es;
+            check(stat("/home/user", &hs) == 0 && hs.st_uid == 1000 && (hs.st_mode & 0777) == 0755 &&
+                  hs.st_mtime > 1600000000, "stat: real owner, mode and mtime");
+            check(stat("/etc/hosts", &es) == 0 && es.st_uid == 0 && (es.st_mode & 0777) == 0644, "stat: /etc/hosts root 0644");
+            check(stat("/tmp", &es) == 0 && (es.st_mode & 07777) == 01777, "stat: /tmp is 1777");
             check(setuid(0) != 0, "user cannot setuid(0)");
             check(syscall(409, "definitely-wrong") != 0, "ary elevate rejects a wrong password");
             check(getuid() != 0, "still a user afterwards");

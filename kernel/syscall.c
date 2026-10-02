@@ -545,6 +545,14 @@ static int copy_argv_array_from_user(const char *const *uarray, char **kbufs, co
     return count;
 }
 
+/* owner and times of a path's inode */
+static void stat_fill_owner(struct linux_stat *st, const VfsStat *vst) {
+    st->st_uid = vst->uid;
+    st->st_atime_sec = vst->atime;
+    st->st_mtime_sec = vst->mtime;
+    st->st_ctime_sec = vst->ctime;
+}
+
 /* Helper: fill a linux_stat structure from a VFS file descriptor */
 static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
     memset(st, 0, sizeof(*st));
@@ -555,12 +563,19 @@ static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
     st->st_gid     = 0;
     st->st_blksize = 4096;
 
+    /* real files: the inode's own owner, permission bits and time
+       (device sentinels below override) */
+    const uint32_t perm = file->node.first_cluster < 0xFFFFFF00u && file->node.mode ? file->node.mode : 0;
     if (file->node.is_dir) {
-        st->st_mode = S_IFDIR | 0755;
+        st->st_mode = S_IFDIR | (perm ? perm : 0755);
         st->st_size = 0;
     } else {
-        st->st_mode = S_IFREG | 0644;
+        st->st_mode = S_IFREG | (perm ? perm : 0644);
         st->st_size = (int64_t)file->node.size;
+    }
+    if (perm) {
+        st->st_uid = file->node.uid;
+        st->st_mtime_sec = st->st_ctime_sec = st->st_atime_sec = file->node.mtime;
     }
     st->st_blocks = (st->st_size + 511) / 512;
 
@@ -2134,10 +2149,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 user_stat->st_ino     = (uint64_t)vst.first_cluster;
                 user_stat->st_nlink   = 1;
                 user_stat->st_blksize = 4096;
+                stat_fill_owner(user_stat, &vst);
                 if (vst.is_dir) {
-                    user_stat->st_mode = S_IFDIR | 0755;
+                    user_stat->st_mode = S_IFDIR | (vst.mode ? vst.mode : 0755);
                 } else {
-                    user_stat->st_mode = S_IFREG | 0644;
+                    user_stat->st_mode = S_IFREG | (vst.mode ? vst.mode : 0644);
                     user_stat->st_size = (int64_t)vst.size;
                 }
                 user_stat->st_blocks = (user_stat->st_size + 511) / 512;
@@ -3790,10 +3806,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 user_stat->st_ino     = (uint64_t)vst.first_cluster;
                 user_stat->st_nlink   = 1;
                 user_stat->st_blksize = 4096;
+                stat_fill_owner(user_stat, &vst);
                 if (vst.is_dir) {
-                    user_stat->st_mode = S_IFDIR | 0755;
+                    user_stat->st_mode = S_IFDIR | (vst.mode ? vst.mode : 0755);
                 } else {
-                    user_stat->st_mode = S_IFREG | 0644;
+                    user_stat->st_mode = S_IFREG | (vst.mode ? vst.mode : 0644);
                     user_stat->st_size = (int64_t)vst.size;
                     
                     if (str_compare(path, "/dev/dri/renderD128") == 0 || 
