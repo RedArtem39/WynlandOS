@@ -513,7 +513,7 @@ static void run_command(const char *line) {
         add_line("launching the QML demo...", TEXT_COLOR);
     } else if (str_eq(cmd, "help")) {
         add_line("built-ins: ls cd pwd cat whoami write nano ary rofi qml clear help", TEXT_COLOR);
-        add_line("/usr/bin: curl cmake nano pkgconf (run directly, e.g. 'curl --version')", TEXT_COLOR);
+        add_line("/usr/bin: curl cmake nano pkgconf rc-status rc-service rc-update (e.g. 'rc-status')", TEXT_COLOR);
     } else {
         /* not a built-in: try /usr/bin/<cmd> on a PTY (curl, cmake, ...) */
         cmd_pty_exec(cmd, args);

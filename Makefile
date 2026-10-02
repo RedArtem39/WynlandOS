@@ -365,6 +365,16 @@ $(BUILD)/forktest.elf: tests/forktest.c
 	@echo "  CC(HOST)   $< (glibc, process lifecycle test)"
 	@gcc -O2 -pthread -o $@ $<
 
+# wynrc: the init (/sbin/init) and rc-status/rc-service/rc-update
+$(BUILD)/wynrc.elf: apps/wynrc/wynrc.c apps/wynrc/wynrc.h
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, init)"
+	@gcc -O2 -Wall -Wl,-rpath,/lib64 -o $@ $<
+$(BUILD)/rc.elf: apps/wynrc/rc.c apps/wynrc/wynrc.h
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, rc tools)"
+	@gcc -O2 -Wall -Wl,-rpath,/lib64 -o $@ $<
+
 $(BUILD)/dlsymtest.elf: tests/dlsymtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, dlsym diagnostic)"
@@ -418,7 +428,7 @@ $(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(BOOT_CFG)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
-$(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf
+$(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

@@ -344,6 +344,59 @@ static bool str_starts_with(const char *str, const char *prefix)
     return true;
 }
 
+/* "[boot +N ms] what": where the boot time goes (ms since the PIT
+   started; the firmware and loader before that are not counted). */
+void serial_write_string(const char *str);   /* defined further down */
+
+static void boot_mark(const char *what)
+{
+    extern uint64_t timer_get_ms(void);
+    char b[24];
+    uint_to_str(timer_get_ms(), b);
+    serial_write_string("[boot +");
+    serial_write_string(b);
+    serial_write_string(" ms] ");
+    serial_write_string(what);
+    serial_write_string("\r\n");
+}
+
+/* DHCP, /etc/resolv.conf and timezone detection, off the boot path: they
+   wait on the network (an internet round trip for the geo-IP lookup, a
+   few seconds of timeouts with no network at all) and used to hold the
+   desktop back until they were done. The zone from the last boot is
+   already in effect (tz_load_cached()). */
+static void boot_network(void *arg)
+{
+    (void)arg;
+    if (net_dhcp_request()) {
+        /* vfs_create() only makes the directory entry -- call it
+           unconditionally and always rewrite: the lease may differ.
+           Interrupts off: this thread must not interleave an ext2 update
+           with a syscall's (those run with interrupts off). */
+        uint64_t rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        vfs_create("/etc/resolv.conf");
+        VfsFile *rf = vfs_open_flags("/etc/resolv.conf", VFS_O_WRITE | VFS_O_TRUNC);
+        if (rf) {
+            char ip_str[20];
+            net_ip_to_str(net_get_dns(), ip_str);
+            char line[64];
+            uint32_t pos = 0;
+            for (const char *q = "nameserver "; *q; q++) line[pos++] = *q;
+            for (const char *q = ip_str; *q; q++) line[pos++] = *q;
+            line[pos++] = '\n';
+            vfs_write(rf, line, pos);
+            vfs_close(rf);
+        }
+        if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+        boot_mark("network up (DHCP)");
+        tz_auto_detect();
+        boot_mark("timezone detected");
+    } else {
+        boot_mark("no network");
+    }
+}
+
 static bool str_contains(const char *str, const char *needle)
 {
     for (; *str; str++)
@@ -2497,6 +2550,7 @@ void kernel_main(BootInfo *boot_info)
 
     /* ---- Initialize IRQs ---- */
     irq_init();
+    boot_mark("interrupts on");
 
     /* ---- Real wall-clock time: read the CMOS RTC now that the PIT (used
        to track elapsed time since this read) is running. Fixes the
@@ -2515,19 +2569,28 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize VirtIO-GPU ---- */
     extern bool virtio_gpu_init(void);
     virtio_gpu_init();
+    boot_mark("virtio-gpu up");
 
     /* ---- Initialize Serial Port (COM1) ---- */
     serial_init();
+    boot_mark("serial up");
     serial_write_string("\r\nWynlandOS Kernel Starting...\r\n");
 
     /* ---- Initialize Filesystem ---- */
     vfs_init();
-    vfs_mkdir("/apps");
-    vfs_mkdir("/docs");
-    vfs_mkdir("/dev");
-    vfs_mkdir("/dev/dri");
-    vfs_create("/dev/dri/card0");
-    vfs_create("/dev/dri/renderD128");
+    boot_mark("vfs (ext2) mounted");
+    /* The image ships these (ext2_manifest.txt); create only what is
+       missing. Creating -- even a no-op on an existing name -- walked the
+       ext2 bitmaps and cost ~1.5 s each, 9 s of every boot. */
+    {
+        static const char *const dirs[] = { "/apps", "/docs", "/dev", "/dev/dri" };
+        static const char *const files[] = { "/dev/dri/card0", "/dev/dri/renderD128" };
+        VfsStat st;
+        for (unsigned i = 0; i < sizeof dirs / sizeof dirs[0]; i++)
+            if (!vfs_stat(dirs[i], &st)) vfs_mkdir(dirs[i]);
+        for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++)
+            if (!vfs_stat(files[i], &st)) vfs_create(files[i]);
+    }
 
     /* Phase 5: the one concrete protected resource demonstrating the new
        real permission boundary -- created writable, populated, THEN
@@ -2542,8 +2605,10 @@ void kernel_main(BootInfo *boot_info)
        a directory entry that a same-name lookup could never find again
        (caught live: vfs_create() reported success, the very next
        vfs_lookup_path() call for the identical path failed). */
+    boot_mark("dev dirs");
     vfs_mkdir("/etc"); /* no-op if it already exists, matching the /dev calls above */
-    if (vfs_create("/etc/sudopw")) {
+    VfsStat pw_st;
+    if (!vfs_stat("/etc/sudopw", &pw_st) && vfs_create("/etc/sudopw")) {
         VfsFile *pwfile = vfs_open_flags("/etc/sudopw", VFS_O_WRITE);
         if (pwfile) {
             const char *pw_content = "wynland\n";
@@ -2553,8 +2618,10 @@ void kernel_main(BootInfo *boot_info)
         vfs_set_readonly("/etc/sudopw");
     }
 
+    boot_mark("sudopw");
     /* ---- Initialize Network Stack ---- */
     net_init();
+    boot_mark("net_init done");
     tcp_init();
     udp_socket_init();
 
@@ -2567,36 +2634,26 @@ void kernel_main(BootInfo *boot_info)
        QEMU launched with no NIC), net_dhcp_request() just returns false
        and nothing else regresses -- apps simply have no DNS, same as
        before this phase existed. */
-    if (net_dhcp_request()) {
-        /* vfs_create() only makes the directory entry -- call it
-           unconditionally (ignoring its return value, which is false
-           if the file already exists from a prior boot) and always
-           follow up with an open-for-write, so the nameserver line
-           gets refreshed every boot rather than only the very first
-           time this file is ever created. */
-        vfs_create("/etc/resolv.conf");
-        {
-            VfsFile *rf = vfs_open_flags("/etc/resolv.conf", VFS_O_WRITE | VFS_O_TRUNC);
-            if (rf) {
-                char ip_str[20];
-                net_ip_to_str(net_get_dns(), ip_str);
-                char line[64];
-                uint32_t pos = 0;
-                const char *prefix = "nameserver ";
-                for (const char *p = prefix; *p; p++) line[pos++] = *p;
-                for (const char *p = ip_str; *p; p++) line[pos++] = *p;
-                line[pos++] = '\n';
-                vfs_write(rf, line, pos);
-                vfs_close(rf);
-            }
+    boot_mark("filesystem + network stack ready");
+    tz_load_cached();
+    {
+        /* facts for userspace (wynrc service conditions): what this boot
+           found, next to the user's own choices in boot.cfg */
+        extern bool g_virgl;
+        const char *line = g_virgl ? "virgl=1\n" : "virgl=0\n";
+        char cur[16] = {0};
+        VfsFile *old = vfs_open("/etc/wynland/hw");
+        if (old) { vfs_read(old, cur, 8); vfs_close(old); }
+        if (!str_starts_with(cur, line)) {
+            VfsStat hw_st;
+            if (!vfs_stat("/etc/wynland/hw", &hw_st)) vfs_create("/etc/wynland/hw");
+            VfsFile *hw = vfs_open_flags("/etc/wynland/hw", VFS_O_WRITE | VFS_O_TRUNC);
+            if (hw) { vfs_write(hw, line, 8); vfs_close(hw); }
         }
-
-        /* Best-effort timezone auto-detection (IP geolocation, no
-           hardcoded location anywhere in this source tree -- see
-           kernel/rtc.c). Only attempted if DHCP/DNS actually came up;
-           tz_auto_detect() itself leaves everything at UTC on any
-           failure rather than ever guessing wrong. */
-        tz_auto_detect();
+    }
+    {
+        extern Thread *thread_create(void (*entry)(void *), void *arg);
+        thread_create(boot_network, NULL);
     }
 
     /* ---- Draw gradient background ---- */
@@ -2618,11 +2675,13 @@ void kernel_main(BootInfo *boot_info)
         serial_write_string("\r\n");
     }
     fb_draw_gradient(boot_info);
+    boot_mark("gradient drawn");
     serial_write_string("Main: Gradient background drawn successfully.\r\n");
 
     /* ---- Draw Terminal Window ---- */
     serial_write_string("Main: Drawing terminal window...\r\n");
     draw_terminal_window(boot_info);
+    boot_mark("console window drawn");
     serial_write_string("Main: Terminal window drawn successfully.\r\n");
 
     cursor_x = 0;
@@ -2645,6 +2704,7 @@ void kernel_main(BootInfo *boot_info)
 
     /* Load persistent command history and set cursor */
     load_history();
+    boot_mark("history loaded");
     input_cursor = 0;
 
     /* Drain keyboard controller buffer from BIOS/UEFI legacy inputs with timeout */
@@ -2676,33 +2736,45 @@ void kernel_main(BootInfo *boot_info)
        anything, so it doesn't race with Zerp's /dev/fb0 writes in
        practice. */
     console_print_string(boot_info, "Auto-launching Zerp...\n", 0x0000FF00, term_bg_color);
-    /* /etc/wynland/boot.cfg (written by `make`, see ZERP/AUTOTEST there):
-       zerp=2 -> Zerp 2.0 (Qt Quick on the GPU) when virgl is up and it is
-       installed, else the classic Zerp; autotest=1 -> the test programs
-       below. Missing file: classic Zerp, no tests. */
+    boot_mark("starting userspace");
     {
-        extern bool g_virgl;
-        char cfg[256] = {0};
-        VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
-        if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
-        bool want_zerp2 = str_contains(cfg, "zerp=2");
-        bool autotest   = str_contains(cfg, "autotest=1");
-        VfsFile *z2 = want_zerp2 && g_virgl && !autotest ? vfs_open("/usr/bin/zerp2") : NULL;
-        if (z2) {
-            vfs_close(z2);
-            console_print_string(boot_info, "Starting Zerp 2.0...\n", 0x0000FF00, term_bg_color);
-            process_spawn("/usr/bin/zerp2", NULL, 1000);
+        VfsFile *initf = vfs_open("/sbin/init");
+        if (initf) {
+            /* wynrc (apps/wynrc): services, their dependencies and the
+               runlevels live in /etc/wynrc; it decides what starts. */
+            vfs_close(initf);
+            console_print_string(boot_info, "Starting wynrc (/sbin/init)...\n", 0x0000FF00, term_bg_color);
+            process_spawn("/sbin/init", NULL, 1000);
         } else {
-            process_spawn("/zerp.elf", NULL, 1000);
+    /* /etc/wynland/boot.cfg (written by `make`, see ZERP/AUTOTEST there):
+           zerp=2 -> Zerp 2.0 (Qt Quick on the GPU) when virgl is up and it is
+           installed, else the classic Zerp; autotest=1 -> the test programs
+           below. Missing file: classic Zerp, no tests. */
+        {
+            extern bool g_virgl;
+            char cfg[256] = {0};
+            VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
+            if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
+            bool want_zerp2 = str_contains(cfg, "zerp=2");
+            bool autotest   = str_contains(cfg, "autotest=1");
+            VfsFile *z2 = want_zerp2 && g_virgl && !autotest ? vfs_open("/usr/bin/zerp2") : NULL;
+            if (z2) {
+                vfs_close(z2);
+                console_print_string(boot_info, "Starting Zerp 2.0...\n", 0x0000FF00, term_bg_color);
+                process_spawn("/usr/bin/zerp2", NULL, 1000);
+            } else {
+                process_spawn("/zerp.elf", NULL, 1000);
+            }
+    
+            /* end-to-end checks: virgl rendering (gltest), process lifecycle +
+               networking (forktest), KMS page flips (kmstest). kmstest takes
+               the display over, so tests boot with the classic Zerp. */
+            if (autotest) {
+                if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
+                process_spawn("/forktest.elf", NULL, 1000);
+                if (g_virgl) process_spawn("/kmstest.elf", NULL, 1000);
+            }
         }
-
-        /* end-to-end checks: virgl rendering (gltest), process lifecycle +
-           networking (forktest), KMS page flips (kmstest). kmstest takes
-           the display over, so tests boot with the classic Zerp. */
-        if (autotest) {
-            if (g_virgl) process_spawn("/gltest.elf", NULL, 1000);
-            process_spawn("/forktest.elf", NULL, 1000);
-            if (g_virgl) process_spawn("/kmstest.elf", NULL, 1000);
         }
     }
 

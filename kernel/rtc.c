@@ -159,6 +159,31 @@ uint64_t rtc_get_unix_time_ms(void) {
 
 /* ---------------- timezone auto-detection ---------------- */
 
+/* Last boot's zone (/etc/timezone, written by tz_auto_detect()) as the
+   starting TZ, so processes started before the network is up -- the
+   desktop -- get local time at once instead of UTC. Format "UTC-3",
+   "UTC+5:30", "UTC0" (POSIX: the sign is inverted). */
+void tz_load_cached(void) {
+    VfsFile *f = vfs_open("/etc/timezone");
+    if (!f) return;
+    char buf[24] = {0};
+    int n = vfs_read(f, buf, sizeof(buf) - 1);
+    vfs_close(f);
+    if (n < 4 || buf[0] != 'U' || buf[1] != 'T' || buf[2] != 'C') return;
+    int i = 3, sign = 1, h = 0, m = 0;
+    if (buf[i] == '-') { sign = -1; i++; } else if (buf[i] == '+') i++;
+    while (buf[i] >= '0' && buf[i] <= '9') h = h * 10 + (buf[i++] - '0');
+    if (buf[i] == ':') { i++; while (buf[i] >= '0' && buf[i] <= '9') m = m * 10 + (buf[i++] - '0'); }
+    char *p = g_tz_envp_line;
+    *p++ = 'T'; *p++ = 'Z'; *p++ = '=';
+    for (int k = 0; k < i && k < 20; k++) *p++ = buf[k];
+    *p = '\0';
+    g_tz_offset_seconds = -sign * (h * 3600 + m * 60);
+    serial_write_string("RTC/TZ: cached zone ");
+    serial_write_string(g_tz_envp_line);
+    serial_write_string("\r\n");
+}
+
 void tz_auto_detect(void) {
     char resp_buf[512];
     HttpResponse resp;
@@ -255,6 +280,10 @@ void tz_auto_detect(void) {
        for this OS's purposes -- refreshed every boot, same reasoning as
        /etc/resolv.conf's own "always overwrite, don't gate on first
        creation" pattern. */
+    /* runs on the boot network thread (interrupts on): the ext2 update
+       must not interleave with a syscall's -- interrupts off around it */
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
     vfs_create("/etc/timezone");
     VfsFile *tf = vfs_open_flags("/etc/timezone", VFS_O_WRITE | VFS_O_TRUNC);
     if (tf) {
@@ -265,4 +294,5 @@ void tz_auto_detect(void) {
         vfs_write(tf, line, (uint32_t)ln);
         vfs_close(tf);
     }
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
 }

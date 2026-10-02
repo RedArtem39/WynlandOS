@@ -70,7 +70,7 @@ g++ $CXXFLAGS -o "$OUT/qmldemo.elf" \
     apps/qml/qmldemo.cpp qt_qpa/qwynlandfbmain.cpp qt_qpa/qwynlandfb_zerpargs.cpp \
     qt_qpa/qwynlandfbintegration.cpp qt_qpa/qwynlandfbscreen.cpp qt_qpa/qwynlandfbinput.cpp \
     "$B/moc_qwynlandfbinput.cpp" \
-    -L"$LIB" -Wl,-rpath-link,"$LIB" -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
+    -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/qmldemo.elf"
 
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
@@ -78,7 +78,7 @@ Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick; d
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
     apps/zerp2/main.cpp apps/zerp2/zerp2.cpp "$B/moc_zerp2.cpp" \
-    -L"$LIB" -Wl,-rpath-link,"$LIB" -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
+    -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/zerp2.elf"
 
 # 3. manifest: QML modules + ldd closure of the app and every QML plugin

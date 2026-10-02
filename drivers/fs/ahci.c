@@ -15,7 +15,10 @@ extern void serial_write_string(const char *str);
 static volatile HbaMem *hba_mem = NULL;
 int sata_port_num = -1;
 
+static uint8_t *bounce(void);
+
 void ahci_init(void) {
+    (void)bounce();
     serial_write_string("AHCI: Scanning PCI for SATA controller...\r\n");
     PciDevice dev;
     if (!pci_find_device(0x01, 0x06, &dev)) {
@@ -116,8 +119,80 @@ void ahci_init(void) {
 }
 
 /* ahci_read - read sectors from SATA disk via AHCI DMA */
+/* After a Task File Error the port stays in an error state: every later
+   command fails too. Stop the command engine, clear the error bits and
+   start it again (AHCI 1.3, 6.2.2.1), and say what failed. */
+static void ahci_recover(volatile HbaPort *port, const char *op, uint32_t lba, uint32_t count, uint64_t phys)
+{
+    extern void uint_to_hex(uint64_t val, char *buf);
+    char b[32];
+    serial_write_string("AHCI "); serial_write_string(op);
+    serial_write_string(" error: lba="); uint_to_hex(lba, b); serial_write_string(b);
+    serial_write_string(" count="); uint_to_hex(count, b); serial_write_string(b);
+    serial_write_string(" phys="); uint_to_hex(phys, b); serial_write_string(b);
+    serial_write_string(" tfd="); uint_to_hex(port->tfd, b); serial_write_string(b);
+    serial_write_string(" serr="); uint_to_hex(port->serr, b); serial_write_string(b);
+    serial_write_string("\r\n");
+    port->cmd &= ~0x0001u;                      /* ST off */
+    for (int i = 0; i < 1000000 && (port->cmd & 0x8000u); i++) { } /* CR clears */
+    port->serr = 0xFFFFFFFF;
+    port->is = 0xFFFFFFFF;
+    port->cmd |= 0x0001u;                       /* ST on */
+}
+
+/* DMA goes to ONE physical range (a single PRDT entry, from the
+   buffer's first byte). A kernel heap buffer is only virtually
+   contiguous: one crossing a page boundary had the device write its
+   second part into whatever frame follows the first -- someone else's
+   memory, and the caller got garbage (block numbers far past the disk,
+   loader crashes). Such buffers go through a physically contiguous
+   bounce buffer instead. */
+#define AHCI_BOUNCE_PAGES 128                     /* 512 KB: >= any one request */
+static uint8_t *g_bounce;
+
+static bool dma_contiguous(const void *buf, uint32_t len)
+{
+    PageTable *pml4 = vmm_get_current_pml4();
+    uint64_t va = (uint64_t)(uintptr_t)buf;
+    uint64_t p0 = pml4 ? vmm_get_phys(pml4, va) : va;
+    if (!p0) return false;
+    for (uint64_t off = PAGE_SIZE - (va & (PAGE_SIZE - 1)); off < len; off += PAGE_SIZE)
+        if (vmm_get_phys(pml4, va + off) != p0 + off) return false;
+    return true;
+}
+
+static uint8_t *bounce(void)
+{
+    if (!g_bounce) {
+        extern void *pmm_alloc_contiguous(uint32_t count);
+        g_bounce = (uint8_t *)pmm_alloc_contiguous(AHCI_BOUNCE_PAGES);  /* identity-mapped */
+    }
+    return g_bounce;
+}
+
 bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
-    return ahci_read_hw(lba, count, buf);
+    /* Everything uses command slot 0: a second command started while one
+       is in flight (a kernel thread preempted mid-command, then a syscall
+       reading) corrupted both -- "Task File Error", or a library read
+       back damaged. Interrupts stay off for the whole command. */
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    bool ok = true;
+    if (dma_contiguous(buf, count * 512)) {
+        ok = ahci_read_hw(lba, count, buf);
+    } else {
+        uint8_t *b = bounce();
+        uint8_t *out = (uint8_t *)buf;
+        const uint32_t per = AHCI_BOUNCE_PAGES * PAGE_SIZE / 512;
+        for (uint32_t done = 0; ok && done < count; ) {
+            uint32_t n = count - done < per ? count - done : per;
+            ok = b && ahci_read_hw(lba + done, n, b);
+            if (ok) memcpy(out + (uint64_t)done * 512, b, (uint64_t)n * 512);
+            done += n;
+        }
+    }
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return ok;
 }
 
 /* Hardware-level read */
@@ -187,7 +262,7 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
             break;
         }
         if (port->is & (1 << 30)) { // Task File Error
-            serial_write_string("AHCI Read Error: Task File Error!\r\n");
+            ahci_recover(port, "read", lba, count, phys_buf);
             return false;
         }
         if (--timeout == 0) {
@@ -208,14 +283,37 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
     }
     
     if (port->is & (1 << 30)) {
-        serial_write_string("AHCI Read Error: Task File Error!\r\n");
+        ahci_recover(port, "read", lba, count, phys_buf);
         return false;
     }
     
     return true;
 }
 
+static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf);
+
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
+    uint64_t rflags;   /* see ahci_read(): one command at a time, contiguous DMA */
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    bool ok = true;
+    if (dma_contiguous(buf, count * 512)) {
+        ok = ahci_write_hw(lba, count, buf);
+    } else {
+        uint8_t *b = bounce();
+        const uint8_t *in = (const uint8_t *)buf;
+        const uint32_t per = AHCI_BOUNCE_PAGES * PAGE_SIZE / 512;
+        for (uint32_t done = 0; ok && done < count; ) {
+            uint32_t n = count - done < per ? count - done : per;
+            if (b) memcpy(b, in + (uint64_t)done * 512, (uint64_t)n * 512);
+            ok = b && ahci_write_hw(lba + done, n, b);
+            done += n;
+        }
+    }
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return ok;
+}
+
+static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf) {
     if (sata_port_num == -1) return false;
     volatile HbaPort *port = &hba_mem->ports[sata_port_num];
     

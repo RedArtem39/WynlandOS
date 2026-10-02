@@ -1,0 +1,5 @@
+description=Zerp (classic, software)
+type=daemon
+exec=/zerp.elf
+provide=display
+restart=always

@@ -60,6 +60,24 @@ Fo /zerp.elf            build/zerp.elf
 Fo /gltest.elf          build/gltest.elf
 Fo /dlsymtest.elf       build/dlsymtest.elf
 Fo /forktest.elf        build/forktest.elf
+
+# wynrc: init, rc tools, services, runlevels
+D /sbin
+F  /sbin/init              build/wynrc.elf
+F  /usr/bin/rc-status      build/rc.elf
+F  /usr/bin/rc-service     build/rc.elf
+F  /usr/bin/rc-update      build/rc.elf
+F  /etc/sudopw             rootfs/etc/sudopw
+D /etc/wynrc
+D /etc/wynrc/services
+D /etc/wynrc/runlevels
+F  /etc/wynrc/services/forktest rootfs/etc/wynrc/services/forktest
+F  /etc/wynrc/services/gltest rootfs/etc/wynrc/services/gltest
+F  /etc/wynrc/services/kmstest rootfs/etc/wynrc/services/kmstest
+F  /etc/wynrc/services/zerp rootfs/etc/wynrc/services/zerp
+F  /etc/wynrc/services/zerp2 rootfs/etc/wynrc/services/zerp2
+F  /etc/wynrc/runlevels/boot rootfs/etc/wynrc/runlevels/boot
+F  /etc/wynrc/runlevels/default rootfs/etc/wynrc/runlevels/default
 Fo /kmstest.elf         build/kmstest.elf
 Fo /zerp_files.elf      build/zerp_files.elf
 Fo /zerp_term.elf       build/zerp_term.elf

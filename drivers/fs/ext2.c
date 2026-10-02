@@ -286,14 +286,63 @@ static uint32_t current_uid_or_root(void) {
  * Block-level I/O (partition-relative)
  * ============================================================ */
 
+/* Block cache: metadata (directories, inode tables, bitmaps, indirect
+   blocks) and small file reads. Every path lookup used to go to the disk
+   for every block it touched -- creating /apps, /docs, /dev and two DRM
+   nodes at boot took 9 s. Direct-mapped, write-through (a write updates
+   disk and cache together, so the cache never holds anything the disk
+   doesn't), slot memory allocated on first use. Multi-block runs of file
+   data bypass it: big libraries would only flush it. */
+#define BCACHE_SLOTS 4096                    /* x 4 KB blocks = 16 MB at most */
+#define BCACHE_ON 1
+typedef struct { uint32_t block; bool valid; uint8_t *data; } BCacheSlot;
+static BCacheSlot g_bcache[BCACHE_SLOTS];
+static uint64_t g_bcache_hits, g_bcache_misses;
+
+static BCacheSlot *bcache_slot(uint32_t block) {
+    return &g_bcache[(block * 2654435761u) % BCACHE_SLOTS];
+}
+
+static void bcache_put(uint32_t block, const void *buf) {
+    BCacheSlot *e = bcache_slot(block);
+    if (!e->data) {
+        e->data = (uint8_t *)kmalloc(g_block_size);
+        if (!e->data) return;
+    }
+    memcpy(e->data, buf, g_block_size);
+    e->block = block;
+    e->valid = true;
+}
+
 static bool ext2_read_block(uint32_t block, void *buf) {
-    return ahci_read(mbr_root_partition_lba() + block * g_sectors_per_block,
-                     g_sectors_per_block, buf);
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    BCacheSlot *e = bcache_slot(block);
+    bool hit = BCACHE_ON && e->valid && e->block == block && e->data;
+    if (hit) { memcpy(buf, e->data, g_block_size); g_bcache_hits++; }
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    if (hit) return true;
+
+    bool ok = ahci_read(mbr_root_partition_lba() + block * g_sectors_per_block,
+                        g_sectors_per_block, buf);
+    if (ok) {
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        bcache_put(block, buf);
+        g_bcache_misses++;
+        if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    }
+    return ok;
 }
 
 static bool ext2_write_block(uint32_t block, const void *buf) {
-    return ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
-                      g_sectors_per_block, buf);
+    bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
+                         g_sectors_per_block, buf);
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    if (ok) bcache_put(block, buf);
+    else bcache_slot(block)->valid = false;   /* unknown on disk now */
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return ok;
 }
 
 /* Writes the superblock copy back to disk (free counts etc.). */

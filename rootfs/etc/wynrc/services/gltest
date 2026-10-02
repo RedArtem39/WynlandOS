@@ -1,0 +1,5 @@
+description=virgl rendering check
+type=oneshot
+exec=/gltest.elf
+when=autotest=1 virgl=1
+after=display

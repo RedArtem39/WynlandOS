@@ -1,0 +1,6 @@
+# wynrc default runlevel (order matters for providers: zerp2 before zerp)
+zerp2
+zerp
+gltest
+forktest
+kmstest

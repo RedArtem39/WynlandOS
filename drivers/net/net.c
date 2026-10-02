@@ -152,14 +152,20 @@ bool net_init(void)
 void net_poll(void)
 {
     static uint8_t rx_buf[NET_PKT_BUF];
+    static volatile int in_poll;
     int received;
 
+    /* The timer IRQ polls too: with the network brought up by a kernel
+       thread running with interrupts on, an IRQ could land inside this
+       loop and run it again over the same buffer. A second caller skips. */
+    if (__sync_lock_test_and_set(&in_poll, 1)) return;
     for (;;) {
         received = virtio_net_receive(rx_buf, sizeof(rx_buf));
         if (received <= 0)
             break;
         net_process_packet(rx_buf, (uint32_t)received);
     }
+    __sync_lock_release(&in_poll);
 }
 
 /* ============================================================

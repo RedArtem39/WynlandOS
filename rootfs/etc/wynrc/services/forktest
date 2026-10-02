@@ -1,0 +1,5 @@
+description=process lifecycle + network check
+type=oneshot
+exec=/forktest.elf
+when=autotest=1
+after=display

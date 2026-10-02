@@ -27,6 +27,7 @@ uint64_t rtc_get_unix_time_ms(void);
    fails -- never guesses, per the explicit "wrong could break things"
    concern this was built for. Call after net_dhcp_request()/DNS are up. */
 void tz_auto_detect(void);
+void tz_load_cached(void);   /* last boot's /etc/timezone, before the network */
 
 /* "TZ=UTC<offset>" (POSIX sign convention: west-of-UTC is positive),
    e.g. "TZ=UTC-2" for UTC+2. Defaults to "TZ=UTC0" until/unless

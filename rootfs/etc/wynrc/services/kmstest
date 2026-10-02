@@ -1,0 +1,5 @@
+description=KMS page flip check
+type=oneshot
+exec=/kmstest.elf
+when=autotest=1 virgl=1
+after=display

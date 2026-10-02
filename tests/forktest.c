@@ -170,6 +170,10 @@ int main(int argc, char **argv)
         rc = run_capture("/usr/bin/nano", "--version", NULL, out, sizeof(out));
         fprintf(stderr, "[forktest] nano rc=%d out=%.80s\n", rc, out);
         check(rc == 0 && strstr(out, "nano") != NULL, "fork+execve /usr/bin/nano --version");
+        /* wynrc's control socket answers: rc-status lists the services */
+        rc = run_capture("/usr/bin/rc-status", NULL, NULL, out, sizeof(out));
+        fprintf(stderr, "[forktest] rc-status rc=%d out=%.120s\n", rc, out);
+        check(rc == 0 && strstr(out, "SERVICE") && strstr(out, "forktest"), "rc-status talks to wynrc");
         /* real network: DNS (musl resolver -> /etc/resolv.conf), TCP, TLS */
         rc = run_capture("/usr/bin/curl", "-sI", "https://example.com/", out, sizeof(out));
         fprintf(stderr, "[forktest] curl https rc=%d out=%.60s\n", rc, out);
