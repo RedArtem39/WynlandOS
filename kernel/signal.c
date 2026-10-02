@@ -9,6 +9,9 @@
 #include <wynland/process.h>
 #include <wynland/usercopy.h>
 
+/* first non-user address: canonical low half ends here */
+#define SIG_USER_LIMIT 0x0000800000000000ULL
+
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
 
@@ -94,6 +97,14 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
         while (1) __asm__ volatile("cli; hlt");
     }
 
+    /* never sysret to a non-user RIP (sigaction checks it too) */
+    if (act->handler >= SIG_USER_LIMIT || act->restorer >= SIG_USER_LIMIT) {
+        process_mark_exited(t->proc, 11);
+        t->state = THREAD_STATE_TERMINATED;
+        sched_schedule();
+        while (1) __asm__ volatile("cli; hlt");
+    }
+
     /* handler installed: build delivery context */
     SignalFrame *kf = (SignalFrame *)kmalloc(sizeof(SignalFrame));
     if (!kf) return 0; /* out of memory: drop the signal, keep running */
@@ -156,6 +167,12 @@ uint64_t signal_do_sigaction(int sig, uint64_t act_ptr, uint64_t oldact_ptr) {
         KSigAction o = { slot->handler, slot->flags, slot->restorer, slot->mask };
         if (copy_to_user((void *)oldact_ptr, &o, sizeof(o)) != 0) return (uint64_t)-14;
     }
+    /* handler and restorer end up in RIP via sysret: a non-canonical
+       address there faults in ring 0 with the user stack already loaded
+       (the CVE-2012-0217 shape). 0/1 are SIG_DFL/SIG_IGN. */
+    if (act_ptr && ((na.handler > 1 && na.handler >= SIG_USER_LIMIT) ||
+                    (na.restorer && na.restorer >= SIG_USER_LIMIT)))
+        return (uint64_t)-22; /* -EINVAL */
     if (act_ptr) {
         slot->handler = na.handler;
         slot->flags = na.flags;

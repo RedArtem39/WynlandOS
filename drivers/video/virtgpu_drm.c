@@ -248,6 +248,7 @@ struct virtgpu_get_caps_u { uint32_t cap_set_id; uint32_t cap_set_ver; uint64_t 
 
 #define DRM_MAX_CLIENTS  32
 #define DRM_MAX_BOS      4096
+#define DRM_BO_MAX_BYTES (256u << 20)   /* one buffer object, at most */
 #define DRM_MAX_PENDING  512
 #define DRM_MAX_CMDBUF   (1024u * 1024u) /* virgl caps its stream at 256 KB; generous */
 #define DRM_WAIT_MS      10000
@@ -579,7 +580,10 @@ static int64_t ioctl_resource_create(uint32_t slot, DrmClient *c, uint64_t argp)
     if (!client_ensure_ctx(c)) return -ENODEV;
 
     uint32_t size = rc.size ? rc.size : PAGE_SZ;
-    uint32_t pages = (size + PAGE_SZ - 1) / PAGE_SZ;
+    /* size + PAGE_SZ - 1 wrapped for sizes near 4 GB: a huge resource on
+       the host backed by a page or two of guest memory */
+    if (size > DRM_BO_MAX_BYTES) return -EINVAL;
+    uint32_t pages = (uint32_t)(((uint64_t)size + PAGE_SZ - 1) / PAGE_SZ);
 
     uint32_t h;
     for (h = 0; h < DRM_MAX_BOS && g_bos[h].used; h++) {}
@@ -752,6 +756,7 @@ static int64_t ioctl_execbuffer(uint32_t slot, DrmClient *c, uint64_t argp, uint
     }
     for (uint32_t i = 0; i < eb.num_bo_handles; i++) {
         DrmBo *bo = bo_lookup(slot, handles[i]);
+        if (!bo) continue;   /* closed by another thread while submit_owned() slept */
         bo->last = t;
         bo->has_last = true;
     }
@@ -859,7 +864,9 @@ int drm_prime_mmap_lookup(uint32_t idx, uint64_t offset, uint64_t len, uint64_t 
 {
     if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used || g_bos[idx - 1].zombie) return -EINVAL;
     DrmBo *bo = &g_bos[idx - 1];
-    if (offset & (PAGE_SZ - 1) || offset + len > bo->size) return -EINVAL;
+    /* offset + len could wrap past 2^64 and pass a plain sum check,
+       mapping physical memory below the BO */
+    if (offset & (PAGE_SZ - 1) || offset > bo->size || len > bo->size - offset) return -EINVAL;
     *phys = bo->phys + offset;
     return 0;
 }

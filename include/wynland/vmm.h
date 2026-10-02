@@ -84,6 +84,10 @@ uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt);
    it's part of a huge page. */
 uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt);
 
+/* First address in [virt, end) with a 4 KB leaf mapping, or end; skips
+   absent page-table levels whole. */
+uint64_t vmm_next_mapped(PageTable *pml4, uint64_t virt, uint64_t end);
+
 /* True if the mapping at virt has PAGE_USER set (i.e. genuinely owned by
    this process, not an aliased kernel-identity-map page it happens to
    overlap -- see vmm_new_process_pml4()). Used by the ELF loader to refuse

@@ -455,6 +455,36 @@ uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt)
     return (e & PAGE_PRESENT) ? e : 0;
 }
 
+/* First address in [virt, end) that has a 4 KB leaf mapping, or end.
+   Whole absent page-table levels are skipped in one step (512 GB, 1 GB,
+   2 MB), so walking a huge, mostly empty range costs next to nothing --
+   munmap(addr, 1 TB) used to loop page by page with interrupts off. */
+uint64_t vmm_next_mapped(PageTable *pml4, uint64_t virt, uint64_t end)
+{
+    virt &= ~(uint64_t)(PAGE_SIZE - 1);
+    while (virt < end) {
+        uint64_t step;
+        PageTableEntry e = pml4->entries[PML4_INDEX(virt)];
+        if (!(e & PAGE_PRESENT)) { step = 1ULL << 39; goto skip; }
+        PageTable *pdpt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+        e = pdpt->entries[PDPT_INDEX(virt)];
+        if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) { step = 1ULL << 30; goto skip; }
+        PageTable *pd = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+        e = pd->entries[PD_INDEX(virt)];
+        if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) { step = 1ULL << 21; goto skip; }
+        PageTable *pt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+        if (pt->entries[PT_INDEX(virt)] & PAGE_PRESENT) return virt;
+        step = PAGE_SIZE;
+    skip:
+        {
+            uint64_t next = (virt & ~(step - 1)) + step;
+            if (next <= virt) return end;   /* wrapped */
+            virt = next;
+        }
+    }
+    return end;
+}
+
 uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
 {
     uint64_t pml4_idx = PML4_INDEX(virt);

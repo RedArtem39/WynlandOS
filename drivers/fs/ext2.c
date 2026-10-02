@@ -278,11 +278,13 @@ static void print_hex32(uint32_t v) {
    (those really are root-owned bootstrap files). */
 /* Set while the kernel itself writes on a user's behalf (/etc/shadow for
    `ary`): those writes are root's, whoever made the call. */
-int g_vfs_root_override;
+void *g_vfs_root_override;   /* the thread doing it; NULL = nobody */
 
 static uint32_t current_uid_or_root(void) {
-    if (g_vfs_root_override) return 0;
     Thread *t = sched_current();
+    /* only that thread: a global flag gave root to anyone who ran while
+       the write blocked */
+    if (g_vfs_root_override && g_vfs_root_override == (void *)t) return 0;
     if (t && t->proc) return t->proc->uid;
     return 0;
 }

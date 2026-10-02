@@ -43,6 +43,11 @@ extern uint64_t timer_get_ms(void);
 #define USOCK_BACKLOG   64
 #define USOCK_NAME_MAX  108            /* sizeof(sun_path) */
 #define UMSG_MIN_CAP    512
+/* Queued messages per socket, whatever their size: rx_bytes counts only
+   payload, so a flood of empty or 1-byte messages (each a UMsg plus
+   UMSG_MIN_CAP of kernel heap) used to be unbounded and could exhaust the
+   kernel heap for the whole system. */
+#define USOCK_MAX_MSGS  1024
 
 #define EAGAIN      11
 #define ENOMEM      12
@@ -88,6 +93,7 @@ typedef struct USock {
     bool     peer_wr_shut;  /* peer did shutdown(SHUT_WR): EOF after the queue */
     UMsg    *rx_head, *rx_tail;
     uint32_t rx_bytes;
+    uint32_t rx_msgs;       /* messages queued (bounded by USOCK_MAX_MSGS) */
     struct USock *pend[USOCK_BACKLOG]; /* server ends waiting in accept() */
     int      npend;
     bool     bound;
@@ -187,6 +193,7 @@ static void usock_destroy(USock *s) {
     s->npend = 0;
     UMsg *m = s->rx_head;
     s->rx_head = s->rx_tail = NULL;
+    s->rx_msgs = 0;
     while (m) { UMsg *n = m->next; msg_free(m); m = n; }
     wake(s); /* anyone still parked here holds a ref -- can't happen, but harmless */
     kfree(s);
@@ -378,6 +385,13 @@ static void enqueue(USock *r, UMsg *m) {
     if (r->rx_tail) r->rx_tail->next = m; else r->rx_head = m;
     r->rx_tail = m;
     r->rx_bytes += m->len;
+    r->rx_msgs++;
+}
+
+/* one message left the queue: room for a writer again */
+static void dequeued(USock *s) {
+    if (s->rx_msgs) s->rx_msgs--;
+    if (s->peer) wake(s->peer);
 }
 
 static UMsg *msg_new(uint32_t cap) {
@@ -425,15 +439,18 @@ int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint3
         }
 
         uint32_t room = r->rx_bytes >= USOCK_RCVBUF ? 0 : USOCK_RCVBUF - r->rx_bytes;
+        const bool msg_room = r->rx_msgs < USOCK_MAX_MSGS;
 
         if (s->type == USOCK_STREAM) {
             uint64_t left = total - sent;
             if (left == 0 && (fds_sent || nfds == 0)) { ret = (int64_t)sent; break; }
-            if (room > 0 || (left == 0 && !fds_sent)) {
-                uint32_t chunk = (uint32_t)(left < room ? left : room);
-                bool with_fds = !fds_sent && nfds > 0;
-                UMsg *tail = r->rx_tail;
-                if (!with_fds && tail && tail->nfds == 0 && tail->cap - tail->len >= chunk && chunk > 0) {
+            uint32_t chunk = (uint32_t)(left < room ? left : room);
+            bool with_fds = !fds_sent && nfds > 0;
+            UMsg *tail = r->rx_tail;
+            bool append = !with_fds && tail && tail->nfds == 0 && tail->cap - tail->len >= chunk && chunk > 0;
+            /* a new message needs a free queue slot; without one, wait */
+            if ((room > 0 || (left == 0 && !fds_sent)) && (append || msg_room)) {
+                if (append) {
                     iov_gather(tail->data + tail->len, iov, iovcnt, sent, chunk);
                     tail->len += chunk;
                     r->rx_bytes += chunk;
@@ -458,7 +475,7 @@ int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint3
         } else {
             /* seqpacket / datagram: one atomic message */
             if (total > USOCK_RCVBUF) { ret = -EMSGSIZE; break; }
-            if (room >= total || r->rx_head == NULL) {
+            if (msg_room && (room >= total || r->rx_head == NULL)) {
                 UMsg *m = msg_new((uint32_t)total);
                 if (!m) { ret = -ENOMEM; break; }
                 iov_gather(m->data, iov, iovcnt, 0, total);
@@ -568,6 +585,7 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
                 s->rx_head = m->next;
                 if (!s->rx_head) s->rx_tail = NULL;
                 msg_free(m);
+                dequeued(s);
                 m = s->rx_head;
             } else {
                 break;
@@ -596,6 +614,7 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
             if (!s->rx_head) s->rx_tail = NULL;
             uint32_t len = m->len;
             msg_free(m);
+            dequeued(s);
             consumed(s, len);
         }
     }
@@ -661,11 +680,11 @@ uint32_t usock_poll(int idx, uint32_t events, WaitQueue **wq) {
         bool hup = (s->was_connected && !s->peer) || (s->rd_shut && s->wr_shut);
         if (hup) rev |= UPOLLHUP | UPOLLIN;
         if (s->peer_wr_shut || s->rd_shut) rev |= UPOLLRDHUP | UPOLLIN;
-        if (s->peer && !s->wr_shut && s->peer->rx_bytes < USOCK_RCVBUF) rev |= UPOLLOUT;
+        if (s->peer && !s->wr_shut && s->peer->rx_bytes < USOCK_RCVBUF && s->peer->rx_msgs < USOCK_MAX_MSGS) rev |= UPOLLOUT;
         if (s->state == US_UNCONNECTED && !s->was_connected) rev |= UPOLLOUT | UPOLLHUP;
     } else {
         USock *r = s->peer;
-        if (!r || r->rx_bytes < USOCK_RCVBUF) rev |= UPOLLOUT;
+        if (!r || (r->rx_bytes < USOCK_RCVBUF && r->rx_msgs < USOCK_MAX_MSGS)) rev |= UPOLLOUT;
     }
     return rev & (events | UPOLLERR | UPOLLHUP);
 }

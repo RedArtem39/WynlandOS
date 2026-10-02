@@ -474,9 +474,47 @@ static void user_unmap_page(PageTable *pml4, uint64_t va)
 {
     uint64_t pte = vmm_get_pte(pml4, va);
     if (!pte) return;
+    /* only the process's own pages: the kernel has mappings in the user
+       half too (the virtio-gpu queues), shared with every process */
+    if (!(pte & PAGE_USER)) return;
     vmm_unmap_page(pml4, va);
     if (!(pte & PAGE_SHARED_MAP) || (pte & PAGE_SHARED_REF))
         pmm_free_page((void *)(uintptr_t)(pte & PAGE_ADDR_MASK));
+}
+
+/* The part of the address space a process may map, unmap and protect
+   itself. PML4 slot 0 (below 512 GB) is the kernel/RAM identity map,
+   shared by pointer with every process: MAP_FIXED or munmap there used to
+   replace or free kernel pages. Above 2^47 is the canonical hole. */
+#define USER_MAP_MIN     0x0000008000000000ULL
+#define USER_MAP_MAX     0x0000800000000000ULL
+#define USER_MAP_LEN_MAX (64ULL << 30)   /* one mapping, at most */
+
+static bool user_map_range_ok(uint64_t addr, uint64_t len)
+{
+    if (addr & (PAGE_SIZE - 1)) return false;
+    if (len == 0 || len > USER_MAP_MAX) return false;
+    uint64_t end = addr + len;
+    return end > addr && addr >= USER_MAP_MIN && end <= USER_MAP_MAX;
+}
+
+/* Unmap every page in [addr, end) the process has, skipping the empty
+   parts of the page tables whole. Caller checked the range. */
+static void user_unmap_range(PageTable *pml4, uint64_t addr, uint64_t end)
+{
+    for (uint64_t a = vmm_next_mapped(pml4, addr, end); a < end;
+         a = vmm_next_mapped(pml4, a + PAGE_SIZE, end))
+        user_unmap_page(pml4, a);
+}
+
+/* Does [addr, end) contain a page that isn't the process's own? The
+   kernel keeps mappings in the user half too (the virtio-gpu queues). */
+static bool range_has_kernel_pages(PageTable *pml4, uint64_t addr, uint64_t end)
+{
+    for (uint64_t a = vmm_next_mapped(pml4, addr, end); a < end;
+         a = vmm_next_mapped(pml4, a + PAGE_SIZE, end))
+        if (!(vmm_get_pte(pml4, a) & PAGE_USER)) return true;
+    return false;
 }
 
 static int get_free_fd(VfsFile **fd_table) {
@@ -1685,8 +1723,16 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 int fd = (int)a5;
                 uint64_t offset = regs->r9;
 
+                if (len > USER_MAP_LEN_MAX) return (uint64_t)-12; /* -ENOMEM */
                 uint64_t pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
                 uint64_t size_aligned = pages * PAGE_SIZE;
+
+                /* MAP_FIXED: only where the process may map at all (not
+                   over the shared kernel identity map). Without MAP_FIXED
+                   the address is a hint the paths below ignore. */
+                if ((flags & 0x10) && (!user_map_range_ok(addr, size_aligned) ||
+                    range_has_kernel_pages(vmm_get_current_pml4(), addr, addr + size_aligned)))
+                    return (uint64_t)-22; /* -EINVAL */
 
                 /* Same W^X policy as mprotect()/the ELF loader (kernel/elf.c):
                    reject outright rather than silently granting a mapping
@@ -1700,6 +1746,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if (!g_boot_info) return 0;
                     extern uint64_t fb_active_phys_addr(void);
                     uint64_t fb_phys = fb_active_phys_addr();
+                    /* The framebuffer and not one page more: the length
+                       used to be taken as given, so mmap(fb0, 1 GB) mapped
+                       whatever physical memory follows it -- the kernel's
+                       included -- writable into the process. */
+                    uint64_t fb_bytes = (uint64_t)g_boot_info->fb_pitch * g_boot_info->fb_height;
+                    uint64_t fb_pages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+                    if (offset != 0 || pages > fb_pages) return (uint64_t)-22; /* -EINVAL */
 
                     uint64_t virt_addr = addr;
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
@@ -1740,10 +1793,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         virt_addr = mmap_dmabuf_ptr;
                         mmap_dmabuf_ptr += size_aligned;
                     }
-                    uint64_t pflags = PAGE_USER | PAGE_NX | PAGE_SHARED_MAP | ((prot & 0x2) ? PAGE_WRITE : 0);
+                    /* PAGE_SHARED_REF: the mapping holds its own reference
+                       on every frame (dropped by munmap/teardown), so
+                       closing the BO while it is still mapped can no
+                       longer hand the frames out again under the mapping */
+                    uint64_t pflags = PAGE_USER | PAGE_NX | PAGE_SHARED_MAP | PAGE_SHARED_REF | ((prot & 0x2) ? PAGE_WRITE : 0);
                     PageTable *pml4 = vmm_get_current_pml4();
-                    for (uint64_t i = 0; i < pages; i++)
+                    for (uint64_t i = 0; i < pages; i++) {
+                        user_unmap_page(pml4, virt_addr + i * PAGE_SIZE);
+                        pmm_page_incref((void *)(uintptr_t)(bo_phys + i * PAGE_SIZE));
                         vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, bo_phys + i * PAGE_SIZE, pflags);
+                    }
                     return virt_addr;
                 }
 
@@ -1759,10 +1819,17 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                         virt_addr = mmap_drm_ptr;
                         mmap_drm_ptr += size_aligned;
                     }
-                    uint64_t pflags = PAGE_USER | PAGE_NX | PAGE_SHARED_MAP | ((prot & 0x2) ? PAGE_WRITE : 0);
+                    /* PAGE_SHARED_REF: the mapping holds its own reference
+                       on every frame (dropped by munmap/teardown), so
+                       closing the BO while it is still mapped can no
+                       longer hand the frames out again under the mapping */
+                    uint64_t pflags = PAGE_USER | PAGE_NX | PAGE_SHARED_MAP | PAGE_SHARED_REF | ((prot & 0x2) ? PAGE_WRITE : 0);
                     PageTable *pml4 = vmm_get_current_pml4();
-                    for (uint64_t i = 0; i < pages; i++)
+                    for (uint64_t i = 0; i < pages; i++) {
+                        user_unmap_page(pml4, virt_addr + i * PAGE_SIZE);
+                        pmm_page_incref((void *)(uintptr_t)(bo_phys + i * PAGE_SIZE));
                         vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, bo_phys + i * PAGE_SIZE, pflags);
+                    }
                     return virt_addr;
                 }
 
@@ -1774,6 +1841,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     }
                     ShmSegment *seg = &g_shm_segments[seg_idx];
                     uint32_t shm_pages = seg->size / PAGE_SIZE;
+                    /* the whole segment gets mapped, whatever len said */
+                    if ((flags & 0x10) && (!user_map_range_ok(addr, (uint64_t)shm_pages * PAGE_SIZE) ||
+                        range_has_kernel_pages(vmm_get_current_pml4(), addr, addr + (uint64_t)shm_pages * PAGE_SIZE)))
+                        return (uint64_t)-22; /* -EINVAL */
 
                     uint64_t virt_addr = addr;
                     if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
@@ -2168,8 +2239,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 10: // SYS_mprotect (Linux standard)
             {
-                uint64_t addr = a1 & ~(PAGE_SIZE - 1);
-                uint64_t end = addr + ((a2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+                if (a2 > USER_MAP_MAX) return (uint64_t)-22; /* -EINVAL */
+                uint64_t addr = a1;
+                uint64_t len = (a2 + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+                if (len == 0) return 0;
+                if (!user_map_range_ok(addr, len)) return (uint64_t)-22;
+                uint64_t end = addr + len;
                 uint64_t prot = a3;
 
                 /* Same W^X policy as the ELF loader (kernel/elf.c): reject
@@ -2211,13 +2286,20 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 11: // SYS_munmap (Linux standard)
             {
-                uint64_t addr = a1 & ~(PAGE_SIZE - 1);
-                uint64_t end = addr + ((a2 + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+                /* Only the process's own part of the address space: this
+                   used to unmap (and free!) whatever was at any address,
+                   kernel identity-map pages shared with every process
+                   included, and munmap(x, 2^63) looped page by page with
+                   interrupts off for ever. */
+                if (a2 > USER_MAP_MAX) return (uint64_t)-22; /* -EINVAL */
+                uint64_t addr = a1;
+                uint64_t len = (a2 + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+                if (!user_map_range_ok(addr, len)) return (uint64_t)-22;
+                uint64_t end = addr + len;
 
                 Process *proc = sched_current()->proc;
                 PageTable *pml4 = vmm_get_current_pml4();
-                for (uint64_t a = addr; a < end; a += PAGE_SIZE)
-                    user_unmap_page(pml4, a); /* fb0/SHM/DRM pages belong to their object */
+                user_unmap_range(pml4, addr, end); /* fb0/SHM/DRM pages belong to their object */
                 vma_unmap_range(proc, addr, end);
                 return 0;
             }
@@ -2908,6 +2990,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     sched_current()->proc->uid = 0;
                     return 0;
                 }
+                /* like sudo: a wrong password costs a couple of seconds,
+                   so guessing it by brute force is not practical */
+                sched_sleep_ms(2000);
                 return (uint64_t)-13; /* -EACCES */
             }
 
@@ -2921,7 +3006,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (!npw[0]) return (uint64_t)-22; /* -EINVAL: empty */
                 bool allowed = !auth_root_password_set() || sched_current()->proc->uid == 0 ||
                                (a2 && auth_check_root(opw));
-                if (!allowed) return (uint64_t)-13; /* -EACCES */
+                if (!allowed) { sched_sleep_ms(2000); return (uint64_t)-13; } /* -EACCES */
                 return auth_set_root(npw) ? 0 : (uint64_t)-5; /* -EIO */
             }
 
@@ -3981,9 +4066,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             {
                 uint64_t old = a1;
                 if (old & (PAGE_SIZE - 1)) return (uint64_t)-22; /* -EINVAL */
+                if (a2 > USER_MAP_LEN_MAX || a3 > USER_MAP_LEN_MAX) return (uint64_t)-12; /* -ENOMEM */
                 uint64_t old_sz = (a2 + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
                 uint64_t new_sz = (a3 + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
                 if (new_sz == 0) return (uint64_t)-22;
+                /* the old range is copied below: it must be the process's
+                   own readable memory, not a kernel address */
+                if (!user_map_range_ok(old, old_sz ? old_sz : PAGE_SIZE) ||
+                    (old_sz && !user_check_read(old, old_sz))) return (uint64_t)-14; /* -EFAULT */
                 if (a4 & ~1ULL) return (uint64_t)-22; /* only MREMAP_MAYMOVE */
                 PageTable *pml4 = vmm_get_current_pml4();
                 /* Shared mappings would lose their sharing if copied. */

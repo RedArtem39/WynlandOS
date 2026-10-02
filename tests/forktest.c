@@ -15,6 +15,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <sys/stat.h>
@@ -176,6 +179,50 @@ int main(int argc, char **argv)
         rc = run_capture("/usr/bin/rc-status", NULL, NULL, out, sizeof(out));
         fprintf(stderr, "[forktest] rc-status rc=%d out=%.120s\n", rc, out);
         check(rc == 0 && strstr(out, "SERVICE") && strstr(out, "forktest"), "rc-status talks to wynrc");
+        /* audit regressions: each of these used to reach kernel memory */
+        {
+            /* C1: /dev/fb0 maps the framebuffer and not one page more */
+            int fb = open("/dev/fb0", O_RDWR);
+            if (fb >= 0) {
+                void *m = mmap(NULL, 1UL << 30, PROT_READ, MAP_SHARED, fb, 0);
+                check(m == MAP_FAILED, "mmap(/dev/fb0, 1 GB) refused");
+                if (m != MAP_FAILED) munmap(m, 1UL << 30);
+                close(fb);
+            }
+            /* C3: MAP_FIXED / munmap / mprotect over the kernel identity map */
+            void *k = mmap((void *)0x200000, 4096, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+            check(k == MAP_FAILED, "MAP_FIXED over kernel memory refused");
+            check(munmap((void *)0x200000, 4096) != 0, "munmap of kernel memory refused");
+            check(mprotect((void *)0x200000, 4096, PROT_READ) != 0, "mprotect of kernel memory refused");
+            long t0 = now_ms();
+            munmap((void *)0x8000000000UL, 1UL << 46);   /* huge, empty: must not hang */
+            check(now_ms() - t0 < 1000, "munmap of a huge empty range returns at once");
+            /* the kernel has pages in the user half too (virtio-gpu queues):
+               that munmap must have left them alone -- the GPU still works */
+            /* mremap copying from a kernel address */
+            void *r = (void *)syscall(SYS_mremap, (void *)0x200000UL, 4096UL, 8192UL, 1UL, 0UL);
+            check(r == MAP_FAILED, "mremap from kernel memory refused");
+            /* C5: a signal handler outside user space */
+            struct { unsigned long h, f, r, m; } sa = { 0xffff800000001000UL, 0x04000000UL, 0, 0 };
+            check(syscall(SYS_rt_sigaction, SIGUSR2, &sa, NULL, 8) != 0, "sigaction with a kernel handler refused");
+            /* H1: empty datagrams can't fill the kernel heap */
+            int sv[2];
+            if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, sv) == 0) {
+                int n = 0;
+                while (n < 100000 && send(sv[0], "", 0, 0) == 0) n++;
+                check(n < 100000 && errno == EAGAIN, "AF_UNIX queue bounded");
+                fprintf(stderr, "[forktest] AF_UNIX queue held %d empty datagrams\n", n);
+                close(sv[0]); close(sv[1]);
+            }
+            /* normal anonymous mappings still work */
+            char *a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            check(a != MAP_FAILED, "anonymous mmap still works");
+            if (a != MAP_FAILED) {
+                a[0] = 1; a[(1 << 20) - 1] = 2;
+                check(munmap(a, 1 << 20) == 0, "munmap of own mapping works");
+            }
+        }
         /* permissions: a user (uid 1000) can't write /etc, can write /tmp
            and its home, can't read /etc/shadow, can't setuid(0) */
         if (getuid() != 0) {

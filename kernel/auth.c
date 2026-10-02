@@ -12,11 +12,12 @@
 #include <wynland/rtc.h>
 #include <wynland/types.h>
 #include <wynland/vfs.h>
+#include <wynland/sched.h>
 
 #define AUTH_FILE   "/etc/shadow"
 #define AUTH_ROUNDS 20000
 
-extern int g_vfs_root_override;   /* drivers/fs/ext2.c */
+extern void *g_vfs_root_override;   /* drivers/fs/ext2.c: thread acting as root */
 
 static int hexval(char c)
 {
@@ -109,13 +110,15 @@ bool auth_set_root(const char *pw)
     line[86] = '\n';
     line[87] = 0;
 
-    g_vfs_root_override = 1;        /* the kernel writes it, as root */
+    g_vfs_root_override = (void *)sched_current();   /* this thread writes it, as root */
     VfsStat st;
     if (!vfs_stat(AUTH_FILE, &st)) vfs_create(AUTH_FILE);
-    VfsFile *f = vfs_open_flags(AUTH_FILE, VFS_O_WRITE | VFS_O_TRUNC);
-    bool ok = false;
+    /* root-only BEFORE the hash goes in: it used to be chmod'ed after the
+       write, a window in which a fresh file was world-readable */
+    bool ok = vfs_chmod(AUTH_FILE, 0600);
+    VfsFile *f = ok ? vfs_open_flags(AUTH_FILE, VFS_O_WRITE | VFS_O_TRUNC) : NULL;
+    ok = false;
     if (f) { ok = vfs_write(f, line, 87) == 87; vfs_close(f); }
-    vfs_chmod(AUTH_FILE, 0600);
-    g_vfs_root_override = 0;
+    g_vfs_root_override = NULL;
     return ok;
 }

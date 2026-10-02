@@ -39,19 +39,6 @@ static uint32_t str_len_local(const char *s)
     return len;
 }
 
-/*
- * str_copy_local — copy src into dst, returns pointer past last char written
- *
- * Does NOT append a NUL terminator; the caller is responsible for that.
- */
-static char *str_copy_local(char *dst, const char *src)
-{
-    while (*src != '\0') {
-        *dst++ = *src++;
-    }
-    return dst;
-}
-
 /* ============================================================
  * Helper: simple string-to-integer (like atoi)
  * ============================================================ */
@@ -155,36 +142,35 @@ static const char *find_substr_nocase(const char *haystack, uint32_t haystack_le
  *
  * Returns the total length of the request string.
  */
+/* append src at *p, never past end (the last byte, kept for the NUL) */
+static bool req_put(char **p, char *end, const char *src)
+{
+    while (*src) {
+        if (*p >= end) return false;
+        *(*p)++ = *src++;
+    }
+    return true;
+}
+
+/* 0 when the request doesn't fit: hostname and path come from scripts
+   (lib/wlang.c) and used to be copied with no bound into a 512-byte
+   stack buffer */
 static uint32_t build_request(char *buf, uint32_t buf_size,
                                const char *hostname, const char *path)
 {
+    if (!buf || buf_size == 0) return 0;
     char *p = buf;
     char *end = buf + buf_size - 1;   /* Reserve space for NUL */
 
-    /* GET <path> HTTP/1.0\r\n */
-    p = str_copy_local(p, "GET ");
-    p = str_copy_local(p, path);
-    p = str_copy_local(p, " HTTP/1.0\r\n");
-
-    /* Host: <hostname>\r\n */
-    p = str_copy_local(p, "Host: ");
-    p = str_copy_local(p, hostname);
-    p = str_copy_local(p, "\r\n");
-
-    /* User-Agent: WynlandOS/1.0\r\n */
-    p = str_copy_local(p, "User-Agent: WynlandOS/1.0\r\n");
-
-    /* Connection: close\r\n */
-    p = str_copy_local(p, "Connection: close\r\n");
-
-    /* End of headers */
-    p = str_copy_local(p, "\r\n");
-
+    bool ok = req_put(&p, end, "GET ") && req_put(&p, end, path) &&
+              req_put(&p, end, " HTTP/1.0\r\n") &&
+              req_put(&p, end, "Host: ") && req_put(&p, end, hostname) &&
+              req_put(&p, end, "\r\n") &&
+              req_put(&p, end, "User-Agent: WynlandOS/1.0\r\n") &&
+              req_put(&p, end, "Connection: close\r\n") &&
+              req_put(&p, end, "\r\n");
     *p = '\0';
-
-    (void)end;  /* buf_size check omitted for simplicity — requests are small */
-
-    return (uint32_t)(p - buf);
+    return ok ? (uint32_t)(p - buf) : 0;
 }
 
 /* ============================================================
@@ -301,6 +287,7 @@ int http_get_ip(uint32_t ip, uint16_t port, const char *hostname,
     /* --- Build the HTTP request --- */
     char req_buf[512];
     uint32_t req_len = build_request(req_buf, sizeof(req_buf), hostname, path);
+    if (!req_len) return -1;   /* host or path too long */
 
     serial_write_string("[HTTP] Connecting to ");
     serial_write_string(hostname);
@@ -409,6 +396,7 @@ int https_get_ip(uint32_t ip, uint16_t port, const char *hostname,
     /* --- Build the HTTP request --- */
     char req_buf[512];
     uint32_t req_len = build_request(req_buf, sizeof(req_buf), hostname, path);
+    if (!req_len) return -1;   /* host or path too long */
 
     serial_write_string("[HTTPS] Connecting to ");
     serial_write_string(hostname);
