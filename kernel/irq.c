@@ -220,6 +220,31 @@ void irq_handler(InterruptRegisters *regs)
            happens to get rescheduled back after a preemption. */
         extern void net_poll(void);
         net_poll();
+        extern void hda_tick(void);
+        hda_tick();                  /* silence what the sound card just played */
+        {   /* Latency report: timer ticks more than 100 ms apart mean the
+               kernel ran that long with interrupts off. The first tick
+               after it lands on the culprit: its syscall and process. */
+            static uint64_t last_tsc;
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            uint64_t now = ((uint64_t)hi << 32) | lo;
+            extern uint64_t net_tsc_ms(void);
+            uint64_t per = net_tsc_ms();
+            if (last_tsc && per && (now - last_tsc) / per > 100) {
+                extern volatile uint64_t g_last_syscall;
+                extern void uint_to_str(uint64_t v, char *b);
+                char b[32];
+                serial_write_string("LATENCY: ");
+                uint_to_str((now - last_tsc) / per, b); serial_write_string(b);
+                serial_write_string(" ms, syscall ");
+                uint_to_str(g_last_syscall, b); serial_write_string(b);
+                Thread *lt = sched_current();
+                if (lt && lt->proc) { serial_write_string(" in "); serial_write_string(lt->proc->exe_path); }
+                serial_write_string("\r\n");
+            }
+            last_tsc = now;
+        }
         sched_preempt_tick();
         return;
     } else if (irq == 1) {

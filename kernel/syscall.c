@@ -3,6 +3,7 @@
 #include <wynland/vfs.h>
 #include <wynland/auth.h>
 #include <wynland/random.h>
+#include <wynland/hda.h>
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
@@ -247,7 +248,10 @@ static int __attribute__((unused)) str_compare(const char *s1, const char *s2) {
 }
 
 #define MAX_PIPES 256
-#define MAX_SPAWN_ARGV 8
+/* argv/envp a program gets: these were 8 and 16, and everything past
+   them was dropped without a word */
+#define MAX_SPAWN_ARGV 64
+#define ARG_STR_MAX    4096   /* one argv/envp string */
 #define PIPE_BUF_SIZE 4096
 /* Bound on how many struct iovec entries SYS_readv/SYS_writev will copy
    into a kernel-side array in one call -- real Linux's own IOV_MAX is
@@ -591,15 +595,18 @@ uint32_t drm_prime_fd_bo(int fd)
 static int copy_argv_array_from_user(const char *const *uarray, char **kbufs, const char **kptrs, int max_entries) {
     if (!uarray) return -1;
     int count = 0;
-    for (; count < max_entries; count++) {
-        if (!user_check_read((uint64_t)(uintptr_t)(uarray + count), sizeof(char *))) break;
-        const char *ustr = uarray[count];
+    for (int i = 0; count < max_entries && i < 4096; i++) {
+        if (!user_check_read((uint64_t)(uintptr_t)(uarray + i), sizeof(char *))) break;
+        const char *ustr = uarray[i];
         if (!ustr) break;
-        char *buf = (char *)kmalloc(MAX_PATH);
+        char *buf = (char *)kmalloc(ARG_STR_MAX);
         if (!buf) break;
-        if (strncpy_from_user(buf, ustr, MAX_PATH) < 0) { kfree(buf); break; }
+        /* a string too long (or unreadable) is left out and the rest still
+           counts -- one long variable used to cut the whole list there */
+        if (strncpy_from_user(buf, ustr, ARG_STR_MAX) < 0) { kfree(buf); continue; }
         kbufs[count] = buf;
         kptrs[count] = buf;
+        count++;
     }
     kptrs[count] = NULL;
     return count;
@@ -1232,12 +1239,7 @@ void process_teardown(Process *proc) {
         kfile_close(f);
     }
 
-    for (VMA *v = proc->vma_list; v; ) {
-        VMA *next_v = v->next;
-        kfree(v);
-        v = next_v;
-    }
-    proc->vma_list = NULL;
+    vma_free_list(proc);
 
     /* Real address-space teardown: walks the actual page tables (never a
        side list -- see vmm_destroy_process_pml4()'s own comment) freeing
@@ -1254,7 +1256,9 @@ void process_teardown(Process *proc) {
 
 bool g_syscall_trace = false;
 
+volatile uint64_t g_last_syscall;   /* for the latency report in kernel/irq.c */
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
+    g_last_syscall = num;
     /* Per-process fd namespace -- shadows the identifiers every case below
        already uses, so this is the only change needed to make fd_table/
        fd_flags/fd_oflags per-process instead of one shared global table. */
@@ -1758,9 +1762,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 /* Same W^X policy as mprotect()/the ELF loader (kernel/elf.c):
                    reject outright rather than silently granting a mapping
-                   that's both writable and executable. */
-                if ((prot & 0x2) && (prot & 0x4)) {
-                    return (uint64_t)-1; /* MAP_FAILED */
+                   that's both writable and executable -- except anonymous
+                   memory of a process that opted in for a JIT (allow_wx). */
+                if ((prot & 0x2) && (prot & 0x4) &&
+                    !(sched_current()->proc->allow_wx && (flags & 0x20))) {
+                    return (uint64_t)-13; /* -EACCES (it was -1: EPERM) */
                 }
 
                 // Check if mapping the framebuffer character device /dev/fb0
@@ -1968,6 +1974,28 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     if (!vma_insert(sched_current()->proc, virt_addr, virt_addr + size_aligned,
                                     lazy_prot, VMA_ANON | VMA_LAZY))
                         return (uint64_t)-12; /* -ENOMEM */
+                    return virt_addr;
+                }
+
+                /* A regular file the same way: each page is read from the
+                   file on first touch. Reading the whole file here, with
+                   interrupts off, froze the system for up to 2.7 s every
+                   time ld.so mapped a big library (Mesa, Qt) -- audio
+                   skipped, the clock stopped -- and read megabytes nobody
+                   would touch. Device and memfd mappings keep their own
+                   paths above/below. */
+                if (!(flags & 0x20) && !(flags & 0x8000) &&
+                    fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    !fd_table[fd]->node.is_dir &&
+                    fd_table[fd]->node.first_cluster < 0xFFFFFF00u) {
+                    VmaFile *vf = vma_file_new(fd_table[fd]);
+                    if (!vf) return (uint64_t)-12;
+                    uint32_t fprot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
+                    if (!vma_insert_file(sched_current()->proc, virt_addr, virt_addr + size_aligned,
+                                         fprot, VMA_LAZY | VMA_FILE, vf, offset, len)) {
+                        kfree(vf);
+                        return (uint64_t)-12;
+                    }
                     return virt_addr;
                 }
 
@@ -2280,9 +2308,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 /* Same W^X policy as the ELF loader (kernel/elf.c): reject
                    outright rather than silently granting a page that's both
-                   writable and executable. */
+                   writable and executable -- except anonymous memory of a
+                   process that opted in for a JIT (allow_wx). */
                 if ((prot & 0x2) && (prot & 0x4)) {
-                    return (uint64_t)-13; /* -EACCES */
+                    VMA *jv = vma_find(sched_current()->proc, addr);
+                    if (!sched_current()->proc->allow_wx || !jv || !(jv->flags & VMA_ANON) ||
+                        (jv->flags & VMA_FILE) || jv->end < end)
+                        return (uint64_t)-13; /* -EACCES */
                 }
 
                 Process *proc = sched_current()->proc;
@@ -2609,6 +2641,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    future brk() calls grow/shrink from the same point the
                    parent was at, instead of process_create()'s fresh-process
                    default of "no heap yet". */
+                child->allow_wx = parent->allow_wx;
                 child->brk_start = parent->brk_start;
                 child->brk_current = parent->brk_current;
                 memcpy(child->mmap_next, parent->mmap_next, sizeof(child->mmap_next));
@@ -2618,9 +2651,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    every parent VMA into the child's own list so mprotect/
                    munmap/the page fault handler's vma_find() lookups work
                    identically in both processes after the fork. */
-                for (VMA *pv = parent->vma_list; pv; pv = pv->next) {
-                    vma_insert(child, pv->start, pv->end, pv->prot, pv->flags);
-                }
+                vma_clone_list(child, parent);
 
                 /* fork() inherits every open fd as-is -- FD_CLOEXEC only
                    matters across an exec(), which fork() alone doesn't do.
@@ -2681,7 +2712,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    copy_argv_array_from_user() validates every level -- the
                    array of user pointers, and each string it points to --
                    before elf_load() touches any of it. */
-                #define MAX_SPAWN_ENVP 16
+                #define MAX_SPAWN_ENVP 128
                 char *argv_bufs_e[MAX_SPAWN_ARGV] = {0};
                 const char *kargv_e[MAX_SPAWN_ARGV + 1];
                 int argc_e = copy_argv_array_from_user((const char *const *)a2, argv_bufs_e, kargv_e, MAX_SPAWN_ARGV);
@@ -2706,12 +2737,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                    space: don't touch a single page of it. It gets a fresh
                    one of its own below, after the target check. */
                 bool exec_vfork = exec_proc->vfork_shared;
-                for (VMA *v = exec_proc->vma_list; v; ) {
-                    VMA *next_v = v->next;
-                    kfree(v);
-                    v = next_v;
-                }
-                exec_proc->vma_list = NULL;
+                vma_free_list(exec_proc);
 
                 /* Same reasoning as the VMA list above: the old image's heap
                    pages describe nothing the new image wants, and unlike the
@@ -3273,6 +3299,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
                     IS_DRM_DEV(fd_table[fd]->node.first_cluster)) {
                     return (uint64_t)drm_ioctl(&fd_table[fd]->current_cluster, request, a3);
+                }
+                /* /dev/dsp: OSS ioctls to the HD Audio driver */
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    fd_table[fd]->node.first_cluster == DEV_DSP) {
+                    return (uint64_t)hda_dsp_ioctl(request, a3);
                 }
 
                 {

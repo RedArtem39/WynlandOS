@@ -274,6 +274,7 @@ TcpConnection *tcp_connect(uint32_t remote_ip, uint16_t remote_port)
     /* Busy-poll for SYN-ACK (an internet round trip: tens of ms) */
     uint64_t syn_deadline = net_deadline_ms(TCP_CONNECT_TIMEOUT_MS);
     for (i = 0; !net_past(syn_deadline); i++) {
+        net_wait_tick();
         net_poll();
 
         if (conn->reset_received) {
@@ -535,6 +536,7 @@ void tcp_close(TcpConnection *conn)
     if (was_close_wait) {
         uint64_t la_deadline = net_deadline_ms(TCP_CLOSE_TIMEOUT_MS);
         for (i = 0; !net_past(la_deadline); i++) {
+            net_wait_tick();
             net_poll();
             if (conn->state == TCP_STATE_CLOSED || conn->reset_received) {
                 break;
@@ -547,6 +549,7 @@ void tcp_close(TcpConnection *conn)
     /* ---- Wait for ACK of our FIN (FIN_WAIT_1 → FIN_WAIT_2) ---- */
     uint64_t fw1_deadline = net_deadline_ms(TCP_CLOSE_TIMEOUT_MS);
     for (i = 0; !net_past(fw1_deadline); i++) {
+        net_wait_tick();
         net_poll();
 
         if (conn->reset_received) {
@@ -584,6 +587,7 @@ void tcp_close(TcpConnection *conn)
     /* ---- Wait for remote FIN (FIN_WAIT_2 → TIME_WAIT) ---- */
     uint64_t fw2_deadline = net_deadline_ms(TCP_CLOSE_TIMEOUT_MS);
     for (i = 0; !net_past(fw2_deadline); i++) {
+        net_wait_tick();
         net_poll();
 
         if (conn->reset_received) {

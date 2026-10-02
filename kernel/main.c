@@ -2613,6 +2613,11 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize Network Stack ---- */
     net_init();
     boot_mark("net_init done");
+    {
+        extern void hda_init(void);
+        hda_init();
+        boot_mark("sound (HDA)");
+    }
     tcp_init();
     udp_socket_init();
 

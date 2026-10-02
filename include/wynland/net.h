@@ -188,6 +188,7 @@ void net_poll(void);
    arrive. */
 uint64_t net_deadline_ms(uint32_t ms);
 bool     net_past(uint64_t deadline);
+void     net_wait_tick(void);   /* one step of a network wait: sleeps 1 ms from a thread */
 
 /* Configuration */
 uint32_t net_get_ip(void);

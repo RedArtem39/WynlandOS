@@ -369,6 +369,16 @@ $(BUILD)/kmstest.elf: tests/kmstest.c
 	@echo "  CC(HOST)   $< (glibc, KMS + GPU presentation test)"
 	@gcc -O2 -I/usr/include/libdrm -o $@ $< -ldrm -lgbm -lEGL -lGLESv2
 
+$(BUILD)/jittest.elf: tests/jittest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, JIT memory policy)"
+	@gcc -O2 -o $@ $<
+
+$(BUILD)/sndtest.elf: tests/sndtest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, sound check)"
+	@gcc -O2 -o $@ $< -lm
+
 $(BUILD)/forktest.elf: tests/forktest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, process lifecycle test)"
@@ -425,6 +435,21 @@ endif
 ZERP     ?= 2
 AUTOTEST ?= 0
 QEMU_EXTRA ?=
+# Sound: an Intel HDA card with an output codec. AUDIO=pa plays through
+# PulseAudio (WSLg's server when there is one: the Windows speakers),
+# AUDIO=wav records into AUDIO_WAV (for checking it without ears),
+# AUDIO=none keeps the card but discards the sound.
+AUDIO ?= pa
+AUDIO_WAV ?= /tmp/wynland-audio.wav
+ifeq ($(AUDIO),pa)
+AUDIO_DEV = -audiodev pa,id=snd0$(if $(wildcard /mnt/wslg/PulseServer),$(comma)server=unix:/mnt/wslg/PulseServer,)
+else ifeq ($(AUDIO),wav)
+AUDIO_DEV = -audiodev wav,id=snd0,path=$(AUDIO_WAV),out.frequency=48000
+else
+AUDIO_DEV = -audiodev none,id=snd0
+endif
+comma := ,
+AUDIO_ARGS = $(AUDIO_DEV) -device intel-hda -device hda-output,audiodev=snd0
 SNAPSHOT ?= 0
 BOOT_CFG = $(BUILD)/boot.cfg
 $(BOOT_CFG): FORCE
@@ -438,7 +463,7 @@ $(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(BOOT_CFG)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
-$(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf
+$(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 
@@ -523,7 +548,7 @@ run-gl: all
 		-drive file=$(DISK_IMAGE),format=raw              \
 		-device virtio-gpu-gl-pci                         \
 		-display $(QEMU_DISPLAY)                          \
-		$(QEMU_EXTRA)                                     \
+		$(QEMU_EXTRA) $(AUDIO_ARGS)                       \
 		-device virtio-net-pci,netdev=net0                \
 		-netdev user,id=net0                              \
 		-serial stdio                                     \

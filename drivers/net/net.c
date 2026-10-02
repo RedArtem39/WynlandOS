@@ -8,6 +8,7 @@
  *             and all configuration getters.
  */
 
+#include <wynland/sched.h>
 #include <wynland/random.h>
 #include <wynland/net.h>
 #include <wynland/virtio.h>
@@ -101,6 +102,7 @@ uint16_t ip_checksum(const void *data, uint32_t len)
  * ============================================================ */
 
 static uint64_t net_tsc_per_ms;
+uint64_t net_tsc_ms(void) { return net_tsc_per_ms; }   /* TSC ticks per ms (0 before calibration) */
 
 static inline uint64_t net_rdtsc(void)
 {
@@ -157,10 +159,29 @@ bool net_init(void)
     return true;
 }
 
+static volatile int in_poll;   /* inside net_poll(): packet handlers run */
+
+/* One step of a bounded network wait (ARP, DHCP, ping, DNS, TCP connect
+   and close). From a thread -- a syscall, a kernel thread -- it sleeps a
+   millisecond with interrupts on: the timer tick keeps polling the NIC,
+   and sound, other threads and the clock run on. These loops used to spin
+   with interrupts off for up to 5 s, freezing the whole system (audio
+   replayed stale buffers meanwhile). Inside packet processing (an ARP
+   lookup for an ACK sent from the timer interrupt) it must not sleep and
+   just spins, as before. */
+void net_wait_tick(void)
+{
+    extern Thread *sched_current(void);
+    if (in_poll || !sched_current()) {
+        __asm__ volatile("pause");
+        return;
+    }
+    sched_sleep_ms(1);
+}
+
 void net_poll(void)
 {
     static uint8_t rx_buf[NET_PKT_BUF];
-    static volatile int in_poll;
     int received;
 
     /* The timer IRQ polls too: with the network brought up by a kernel
@@ -609,6 +630,7 @@ bool net_arp_resolve(uint32_t ip, uint8_t *out_mac)
     /* Poll for reply */
     uint64_t arp_deadline = net_deadline_ms(1000);
     for (i = 0; !net_past(arp_deadline); i++) {
+        net_wait_tick();
         net_poll();
 
         /* Check if the target appeared in the cache */
@@ -800,6 +822,7 @@ bool net_dhcp_request(void)
     /* Poll for DHCPOFFER */
     uint64_t offer_deadline = net_deadline_ms(3000);
     for (i = 0; !net_past(offer_deadline); i++) {
+        net_wait_tick();
         net_poll();
         if (dhcp_offer_received)
             break;
@@ -886,6 +909,7 @@ bool net_dhcp_request(void)
     /* Poll for DHCPACK */
     uint64_t ack_deadline = net_deadline_ms(3000);
     for (i = 0; !net_past(ack_deadline); i++) {
+        net_wait_tick();
         net_poll();
         if (dhcp_ack_received)
             break;
@@ -927,6 +951,7 @@ int net_ping(uint32_t dst_ip)
     uint64_t ping_start = net_deadline_ms(0);
     uint64_t ping_deadline = net_deadline_ms(2000);
     for (i = 0; !net_past(ping_deadline); i++) {
+        net_wait_tick();
         net_poll();
         if (ping_reply_received)  /* round trip in ms */
             return (int)((net_deadline_ms(0) - ping_start) / (net_tsc_per_ms ? net_tsc_per_ms : 1));
@@ -1035,6 +1060,7 @@ bool net_dns_resolve(const char *hostname, uint32_t *out_ip)
     memset(dns_pkt, 0, sizeof(dns_pkt));
 
     dns = (DnsHeader *)dns_pkt;
+    while (dns_waiting) net_wait_tick();   /* one query in flight at a time */
     dns_query_id   = (uint16_t)random_u32();
     dns_query_port = (uint16_t)(20000 + random_u32() % 20000);
     dns->id      = htons(dns_query_id);
@@ -1093,6 +1119,7 @@ bool net_dns_resolve(const char *hostname, uint32_t *out_ip)
     /* Poll for response */
     uint64_t dns_deadline = net_deadline_ms(3000);
     for (i = 0; !net_past(dns_deadline); i++) {
+        net_wait_tick();
         net_poll();
         if (dns_reply_received) {
             dns_waiting = false;

@@ -90,6 +90,11 @@ typedef struct Process {
        0 = slot unused yet. Per process: they were global, so every mmap of
        every process ever pushed them up until one slot ran into the next. */
     uint64_t mmap_next[6];
+    /* JIT: anonymous memory may be writable and executable at once
+       (JavaScriptCore's JIT on Linux wants RWX). Off by default -- W^X --
+       on for a program started with WYNLAND_ALLOW_JIT=1 in its
+       environment, inherited by fork(), decided again at every execve(). */
+    bool allow_wx;
     /* ---- process lifecycle: exit status, wait4/waitid, vfork ---- */
     int        exit_code;    /* exit()/exit_group() argument, kept until death */
     int        wait_status;  /* Linux wait status once exited: code<<8, or the

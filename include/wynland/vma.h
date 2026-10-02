@@ -18,6 +18,15 @@
 #define VMA_GUARD 0x2  /* deliberately unmapped hole (e.g. below a stack) --
                            touching it is always fatal, never lazily faulted in */
 #define VMA_LAZY  0x4  /* demand-zero: a page gets a frame on first touch */
+#define VMA_FILE  0x8  /* with VMA_LAZY: the page is read from `file` on first touch */
+
+/* A file behind lazy mappings: a private copy of the open file (the fd
+   may be closed right after mmap()), shared by the VMAs split from one
+   mapping and by fork() copies. */
+typedef struct VmaFile {
+    uint8_t  vf[512];        /* a VfsFile, by value (vma.c checks the size) */
+    uint32_t refs;
+} VmaFile;
 
 struct Process; /* include/wynland/process.h -- forward-declared to avoid a
                     header cycle (Process embeds a VMA* list head) */
@@ -26,7 +35,10 @@ typedef struct VMA {
     uint64_t start;  /* page-aligned, inclusive */
     uint64_t end;    /* page-aligned, exclusive */
     uint32_t prot;   /* VMA_PROT_* */
-    uint32_t flags;  /* VMA_ANON / VMA_GUARD */
+    uint32_t flags;  /* VMA_ANON / VMA_GUARD / VMA_LAZY / VMA_FILE */
+    VmaFile *file;       /* VMA_FILE: where the pages come from */
+    uint64_t file_off;   /* file offset of `start` */
+    uint64_t file_len;   /* bytes from `start` backed by the file; the rest reads as zero */
     struct VMA *next;
 } VMA;
 
@@ -36,6 +48,22 @@ typedef struct VMA {
    Does not check for overlap with existing VMAs; callers that need
    MAP_FIXED-replace semantics should vma_unmap_range() first. */
 VMA *vma_insert(struct Process *proc, uint64_t start, uint64_t end, uint32_t prot, uint32_t flags);
+
+/* A file-backed lazy region: [start,end) shows `len` bytes of `file`
+   from `off`. Takes its own reference on file. */
+VMA *vma_insert_file(struct Process *proc, uint64_t start, uint64_t end, uint32_t prot,
+                     uint32_t flags, VmaFile *file, uint64_t off, uint64_t len);
+
+/* A VmaFile holding a private copy of an open file (refs = 0 until a VMA
+   takes it). NULL on OOM. */
+VmaFile *vma_file_new(const void *vfsfile);   /* a VfsFile * */
+
+/* Copy every VMA of `from` into `to` (fork). */
+void vma_clone_list(struct Process *to, struct Process *from);
+
+/* Free one VMA (dropping its file reference) / a whole list. */
+void vma_free(VMA *v);
+void vma_free_list(struct Process *proc);
 
 /* The VMA covering address `addr`, or NULL if none does. */
 VMA *vma_find(struct Process *proc, uint64_t addr);

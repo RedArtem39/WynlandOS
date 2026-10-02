@@ -194,6 +194,7 @@ static uint32_t        g_inode_size = 128;
 #define DEV_KBD        0xFFFFFFF3
 #define DEV_NULL       0xFFFFFFFE
 #define DEV_URANDOM    0xFFFFFFF8
+#define DEV_DSP        0xFFFFFFC0   /* include/wynland/hda.h */
 
 /* ============================================================
  * Local string helpers (same conventions as every other driver)
@@ -1640,6 +1641,15 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         return alloc_device_file("null", 0, false, DEV_NULL, flags);
     }
 
+    /* /dev/dsp: the HD Audio output (drivers/sound/hda.c), OSS style */
+    if (str_compare(path, "/dev/dsp") == 0 || path_ends_with(path, "/dev/dsp")) {
+        extern bool hda_present(void);
+        extern void hda_dsp_open(void);
+        if (!hda_present()) return NULL;
+        hda_dsp_open();
+        return alloc_device_file("dsp", 0, false, DEV_DSP, flags);
+    }
+
     /* Real /dev/urandom|/dev/random semantics for this driver v1:
        reads return zeros (getrandom syscall is the real entropy source
        elsewhere); writes silently succeed. */
@@ -1766,6 +1776,7 @@ static uint32_t sysfs_drm_attr(uint32_t kind, char *o, uint32_t cap)
 int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
+    if (file->node.first_cluster == DEV_DSP) return -1;  /* playback only */
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* always EOF */
@@ -1862,6 +1873,11 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
 
 int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     if (!file || !buf) return -1;
+    if (file->node.first_cluster == DEV_DSP) {
+        extern int64_t hda_dsp_write(const void *buf, uint32_t len);
+        int64_t r = hda_dsp_write(buf, size);
+        return r < 0 ? -1 : (int)r;
+    }
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {

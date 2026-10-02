@@ -7,6 +7,7 @@
 #include <wynland/vmm.h>
 #include <wynland/heap.h>
 #include <wynland/vma.h>
+#include <wynland/process.h>
 
 #define PF_X 1
 #define PF_W 2
@@ -588,10 +589,16 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
        existing caller relies on. A real caller-supplied array (Phase 18's
        execve()) fully replaces it, mirroring argv's own NULL-means-default
        convention immediately below. */
-    #define MAX_SPAWN_ENVP 16
+    #define MAX_SPAWN_ENVP 128
+    /* argv + envp strings must fit in the eagerly mapped top of the stack
+       (see stack_eager above: this may run from another process's
+       context, where a lazy stack page could not be faulted in) */
+    #define ARG_BYTES_MAX (96 * 1024)
+    uint64_t arg_bytes = 0;
     uint64_t envp_addrs[MAX_SPAWN_ENVP];
     int envp_count = 0;
 
+    if (proc) proc->allow_wx = false;   /* decided again by every image */
     if (envp == NULL) {
         /* g_tz_envp_line (kernel/rtc.c) is a mutable global, not a string
            literal -- filled at boot by tz_auto_detect() (or left at its
@@ -617,9 +624,20 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
             envp_addrs[envp_count++] = addr;
         }
     } else {
+        /* WYNLAND_ALLOW_JIT=1: this program may have RWX anonymous memory */
+        if (proc) {
+            for (int e = 0; envp[e] != NULL; e++) {
+                const char *k = "WYNLAND_ALLOW_JIT=1";
+                int i = 0;
+                while (k[i] && envp[e][i] == k[i]) i++;
+                if (!k[i] && envp[e][i] == '\0') { proc->allow_wx = true; break; }
+            }
+        }
         for (int e = 0; envp[e] != NULL && envp_count < MAX_SPAWN_ENVP; e++) {
             uint32_t len = 0;
             while (envp[e][len] != '\0') len++;
+            if (arg_bytes + len + 1 > ARG_BYTES_MAX) break;
+            arg_bytes += len + 1;
             uint64_t addr = sp - (len + 1);
             char *ptr = (char *)addr;
             for (uint32_t i = 0; i <= len; i++) ptr[i] = envp[e][i];
@@ -639,7 +657,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
        appended after) was tried first and produced a duplicated/shifted
        argv in the child -- caught live via a spawn test where the child's
        argv[1] came back as the path string instead of the intended arg. */
-    #define MAX_SPAWN_ARGV 8
+    #define MAX_SPAWN_ARGV 64
     uint64_t argv_addrs[MAX_SPAWN_ARGV];
     int argv_count = 0;
 
@@ -657,6 +675,8 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
         for (int a = 0; argv[a] != NULL && argv_count < MAX_SPAWN_ARGV; a++) {
             uint32_t len = 0;
             while (argv[a][len] != '\0') len++;
+            if (arg_bytes + len + 1 > ARG_BYTES_MAX) break;
+            arg_bytes += len + 1;
             uint64_t addr = sp - (len + 1);
             char *ptr = (char *)addr;
             for (uint32_t i = 0; i <= len; i++) ptr[i] = argv[a][i];
