@@ -1,10 +1,14 @@
 #include "qwynlandfbscreen.h"
 #include "../zerp_protocol.h"
 #include <unistd.h>
+#include <cstdio>
 #include <sys/types.h>
 #include <qpa/qwindowsysteminterface.h>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QWindow>
+#include <QtCore/QThread>
+#include <QtGui/QColor>
+#include <qpa/qplatformwindow.h>
 
 /* Deliberately NOT #include <sys/mman.h> -- this OS's own include/sys/mman.h
    (used by this same build for the freestanding Zerp/test binaries, and
@@ -92,21 +96,38 @@ void QWynlandFbScreen::applyTileRect(quint32 x, quint32 y, quint32 w, quint32 h)
            around a stride that walks past the mapped SHM region. */
         h = m_shmCapacityPixels / w;
     }
+    /* Called on the input thread (retiles) -- the GUI thread may be
+       painting into m_screenImage right now, so the swap happens there.
+       The first tile (initialize(), GUI thread, no event loop yet) is
+       applied directly. */
+    if (!qApp || (QThread::currentThread() == qApp->thread() && m_geometry.width() <= 1)) {
+        resizeTo(QSize((int)w, (int)h));
+        return;
+    }
+    const QSize size((int)w, (int)h);
+    QMetaObject::invokeMethod(qApp, [this, size] { resizeTo(size); }, Qt::QueuedConnection);
+}
 
-    m_geometry = QRect(0, 0, (int)w, (int)h);
-    m_screenImage = QImage((uchar *)m_shm, (int)w, (int)h, (int)w * 4, m_format);
+/* GUI thread. The SHM's row stride is the tile width, so the window must
+   be the same size before it paints again: tell Qt the window was resized
+   (QPlatformWindow::setGeometry() alone sends no event -- the window kept
+   its old size and painted with the old stride, which Zerp showed as
+   smeared stripes) and have it repaint everything. */
+void QWynlandFbScreen::resizeTo(const QSize &size)
+{
+    fprintf(stderr, "[qpa] tile %dx%d (was %dx%d)\n", size.width(), size.height(), m_geometry.width(), m_geometry.height());
+    if (m_geometry.size() == size) return;
+    m_geometry = QRect(QPoint(0, 0), size);
+    m_screenImage = QImage((uchar *)m_shm, size.width(), size.height(), size.width() * 4, m_format);
+    m_screenImage.fill(QColor(0x11, 0x14, 0x1c));   /* no stale rows while it repaints */
 
     QWindowSystemInterface::handleScreenGeometryChange(screen(), m_geometry, m_geometry);
-
-    /* Tiled: the top-level window IS the tile. A window created before
-       Zerp's first retile (e.g. a QML Window sized from Screen.width)
-       otherwise kept the old size and was cut off. This runs on the input
-       thread -- hand it to the GUI thread. */
-    const QRect g = m_geometry;
-    QMetaObject::invokeMethod(qApp, [g] {
-        for (QWindow *w : QGuiApplication::topLevelWindows())
-            w->setGeometry(g);
-    }, Qt::QueuedConnection);
+    for (QWindow *w : QGuiApplication::topLevelWindows()) {
+        if (QPlatformWindow *pw = w->handle()) pw->QPlatformWindow::setGeometry(m_geometry);
+        QWindowSystemInterface::handleGeometryChange(w, m_geometry);
+        if (w->isVisible())
+            QWindowSystemInterface::handleExposeEvent(w, QRect(QPoint(0, 0), size));
+    }
 }
 
 QT_END_NAMESPACE

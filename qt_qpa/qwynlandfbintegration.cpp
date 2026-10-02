@@ -114,9 +114,35 @@ void QWynlandFbIntegration::initialize()
     }
 }
 
+/* The window always fills the tile: whatever size the app asks for (a
+   QML Window sized from Screen.width before the first retile), it gets
+   the tile, and Qt hears about it -- the base class's setGeometry() only
+   records the rectangle, so the window never learnt it had been resized. */
+class QWynlandFbWindow : public QPlatformWindow
+{
+public:
+    QWynlandFbWindow(QWindow *window, QWynlandFbScreen *screen) : QPlatformWindow(window), m_screen(screen) {}
+
+    void setGeometry(const QRect &) override {
+        const QRect tile = m_screen ? m_screen->geometry() : QRect();
+        QPlatformWindow::setGeometry(tile);
+        QWindowSystemInterface::handleGeometryChange(window(), tile);
+    }
+    void setVisible(bool visible) override {
+        QPlatformWindow::setVisible(visible);
+        if (visible) {
+            setGeometry(QRect());
+            QWindowSystemInterface::handleExposeEvent(window(), QRect(QPoint(0, 0), geometry().size()));
+        }
+    }
+
+private:
+    QWynlandFbScreen *m_screen;
+};
+
 QPlatformWindow *QWynlandFbIntegration::createPlatformWindow(QWindow *window) const
 {
-    QPlatformWindow *w = new QPlatformWindow(window);
+    QPlatformWindow *w = new QWynlandFbWindow(window, m_screen);
     w->requestActivateWindow();
     return w;
 }

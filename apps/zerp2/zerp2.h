@@ -85,6 +85,11 @@ private:
     uint32_t *m_shm = nullptr;
     uint32_t m_shmBytes = 0;
     int m_bufW = 0, m_bufH = 0;      // size the client renders at
+    // asked for, not yet drawn: the SHM rows are still the old width until
+    // the client's first full frame at the new size (or a timeout)
+    int m_pendW = 0, m_pendH = 0;
+    qint64 m_pendSince = 0;
+    void adoptPending();
     bool m_dirty = false;
     QRect m_damage;
     QByteArray m_rx;

@@ -1869,22 +1869,28 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 PageTable *pml4 = vmm_get_current_pml4();
 
-                // Allocate physical pages
-                extern void *pmm_alloc_contiguous(uint32_t count);
-                void *phys_ptr = pmm_alloc_contiguous(pages);
-                if (!phys_ptr) {
-                    serial_write_string("SYS_mmap: pmm_alloc_contiguous failed\r\n");
-                    return (uint64_t)-1; // MAP_FAILED
-                }
-                uint64_t phys_start = (uint64_t)(uintptr_t)phys_ptr;
-
-                /* Real prot: map writable now regardless of the requested
-                   PROT_WRITE (file content/zeroing below needs to write
-                   through this same mapping), then downgrade to the real
-                   requested permissions once populated -- same pattern as
-                   the ELF loader's segment loading (kernel/elf.c). */
+                /* Physical pages one by one. This took one physically
+                   contiguous run per mapping: every 8 MB thread stack of
+                   every Qt app needed 2048 adjacent free frames, and once
+                   memory fragmented, mmap failed while plenty was free
+                   (three Qt clients were enough to get one killed). Nothing
+                   needs user memory to be contiguous -- device paths walk
+                   it page by page or bounce. */
                 for (uint64_t i = 0; i < pages; i++) {
-                    vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, phys_start + i * PAGE_SIZE, PAGE_WRITE | PAGE_USER);
+                    void *pg = pmm_alloc_page();
+                    if (!pg) {
+                        serial_write_string("SYS_mmap: out of memory\r\n");
+                        for (uint64_t j = 0; j < i; j++) user_unmap_page(pml4, virt_addr + j * PAGE_SIZE);
+                        return (uint64_t)-12; /* -ENOMEM */
+                    }
+                    /* Real prot: map writable now regardless of the
+                       requested PROT_WRITE (file content/zeroing below
+                       writes through this same mapping), then downgrade
+                       once populated -- as the ELF loader does. */
+                    vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, (uint64_t)(uintptr_t)pg, PAGE_WRITE | PAGE_USER);
+                }
+
+                for (uint64_t i = 0; i < pages; i++) {
                     // Clear the page
                     memset((void *)(uintptr_t)(virt_addr + i * PAGE_SIZE), 0, PAGE_SIZE);
                 }

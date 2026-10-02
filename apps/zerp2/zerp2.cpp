@@ -2,6 +2,7 @@
 #include "zerp2.h"
 
 #include <QtCore/QFileInfo>
+#include <QtCore/QDateTime>
 #include <QtGui/QImage>
 #include <QtGui/QScreen>
 #include <QtGui/QWheelEvent>
@@ -89,14 +90,35 @@ void ZClient::configure(int x, int y, int w, int h)
     if (w < 8) w = 8;
     if (h < 8) h = 8;
     if ((uint64_t)w * (uint64_t)h * 4 > m_shmBytes) return;   // can't exceed the buffer
-    if (w == m_bufW && h == m_bufH) return;
+    if (m_pendW ? (w == m_pendW && h == m_pendH) : (w == m_bufW && h == m_bufH)) return;
     fprintf(stderr, "[zerp2] client %d configure %dx%d\n", m_id, w, h);
-    m_bufW = w;
-    m_bufH = h;
-    m_dirty = true;
-    m_damage = QRect(0, 0, w, h);
+    if (m_bufW <= 0) {           // first size: nothing on screen yet to protect
+        m_bufW = w;
+        m_bufH = h;
+        m_dirty = true;
+        m_damage = QRect(0, 0, w, h);
+        emit damaged();
+    } else if (w == m_bufW && h == m_bufH) {
+        m_pendW = m_pendH = 0;   // back to what is already drawn
+    } else {
+        // keep showing the old frame (old stride) until the client has
+        // drawn at the new size -- reading it with the new stride smeared
+        // it into stripes
+        m_pendW = w;
+        m_pendH = h;
+        m_pendSince = QDateTime::currentMSecsSinceEpoch();
+    }
     ZerpMsg m = { ZERP_MSG_TILE_RECT, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h };
     send(m);
+}
+
+void ZClient::adoptPending()
+{
+    m_bufW = m_pendW;
+    m_bufH = m_pendH;
+    m_pendW = m_pendH = 0;
+    m_dirty = true;
+    m_damage = QRect(0, 0, m_bufW, m_bufH);
     emit damaged();
 }
 
@@ -185,14 +207,20 @@ bool ZClient::pump(QVector<QString> *spawnRequests)
             if (m.type == ZERP_MSG_DAMAGE) {
                 static int logged[64];
                 if (m_id < 64 && !logged[m_id]++) fprintf(stderr, "[zerp2] client %d first damage %ux%u\n", m_id, m.w, m.h);
-                m_damage |= QRect(int(m.x), int(m.y), int(m.w), int(m.h)) & QRect(0, 0, m_bufW, m_bufH);
-                m_dirty = true; emit damaged();
+                if (m_pendW && m.x == 0 && m.y == 0 && int(m.w) == m_pendW && int(m.h) == m_pendH) {
+                    adoptPending();   // a full frame at the new size
+                } else if (!m_pendW) {
+                    m_damage |= QRect(int(m.x), int(m.y), int(m.w), int(m.h)) & QRect(0, 0, m_bufW, m_bufH);
+                    m_dirty = true; emit damaged();
+                }
             }
             else if (m.type == ZERP_MSG_CLOSE) closed = true;
         }
         off += size;
     }
     m_rx.remove(0, off);
+    // a client that never sends one full frame: switch anyway
+    if (m_pendW && QDateTime::currentMSecsSinceEpoch() - m_pendSince > 250) adoptPending();
     return !closed;
 }
 

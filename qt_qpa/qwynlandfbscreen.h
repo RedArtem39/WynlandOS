@@ -29,6 +29,7 @@ public:
        retile()) -- rebuilds the QImage wrapper over the same SHM pointer
        with the new dimensions and notifies Qt of the geometry change. */
     void applyTileRect(quint32 x, quint32 y, quint32 w, quint32 h);
+    void resizeTo(const QSize &size);   /* GUI thread */
 
 private:
     QRect m_geometry;
