@@ -1021,6 +1021,8 @@ static void draw_input_line(BootInfo *info, const char *prompt, const char *inpu
 
 void sys_reboot(void)
 {
+    extern void ext2_flush(void);
+    ext2_flush();   /* write-back cache: nothing may be left behind */
     /* 1. Pulse CPU reset via keyboard controller (port 0x64) */
     uint8_t temp = 0x02;
     while (temp & 0x02) {
@@ -1034,6 +1036,8 @@ void sys_reboot(void)
 
 void sys_poweroff(void)
 {
+    extern void ext2_flush(void);
+    ext2_flush();
     /* QEMU q35 ACPI shutdown */
     outw(0x604, 0x2000);
     /* QEMU piix4 ACPI shutdown */
@@ -2579,6 +2583,10 @@ void kernel_main(BootInfo *boot_info)
     /* ---- Initialize Filesystem ---- */
     vfs_init();
     boot_mark("vfs (ext2) mounted");
+    {   /* ext2 writes are write-back: this thread puts them on the disk */
+        extern void ext2_flusher_thread(void *arg);
+        thread_create(ext2_flusher_thread, NULL);
+    }
     /* The image ships these (ext2_manifest.txt); create only what is
        missing. Creating -- even a no-op on an existing name -- walked the
        ext2 bitmaps and cost ~1.5 s each, 9 s of every boot. */

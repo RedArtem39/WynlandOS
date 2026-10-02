@@ -446,7 +446,13 @@ void sched_yield(void) {
     }
 }
 
+/* While > 0 the timer does not switch threads (interrupts may be on):
+   for a thread that must not be interleaved with others but should not
+   hold interrupts off for long either -- a disk command it waits for. */
+volatile int g_sched_no_preempt;
+
 void sched_preempt_tick(void) {
+    if (g_sched_no_preempt) return;
     if (current_thread && current_thread->state == THREAD_STATE_RUNNING) {
         sched_yield();
     }

@@ -111,6 +111,7 @@ void sched_yield(void);
 void sched_schedule(void);
 Thread *sched_current(void);
 void sched_preempt_tick(void);
+extern volatile int g_sched_no_preempt;   /* > 0: no switching on the timer tick */
 void sched_print_tasks(BootInfo *info, uint32_t bg_color);
 Thread *sched_get_thread_list(void);
 bool sched_kill_thread(uint64_t id);

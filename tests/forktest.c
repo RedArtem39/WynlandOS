@@ -263,6 +263,43 @@ int main(int argc, char **argv)
                     munmap(res, 16UL << 30);
                 }
             }
+            /* filesystem: a file past the doubly-indirect boundary (the table
+               used to be wiped when it grew another level), O_TRUNC keeping
+               the mode, sync() */
+            {
+                const char *big = "/tmp/forktest-big";
+                int fd = open(big, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                static unsigned int chunk[16384];   /* 64 KB */
+                int ok = fd >= 0;
+                for (int k = 0; ok && k < 160; k++) {          /* 10 MB */
+                    for (int j = 0; j < 16384; j++) chunk[j] = (unsigned)(k * 16384 + j) * 2654435761u;
+                    ok = write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+                }
+                if (fd >= 0) close(fd);
+                check(ok, "write a 10 MB file");
+                check(syscall(SYS_sync) == 0, "sync()");
+                fd = open(big, O_RDONLY);
+                int good = fd >= 0;
+                for (int k = 0; good && k < 160; k++) {
+                    good = read(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+                    for (int j = 0; good && j < 16384; j++)
+                        good = chunk[j] == (unsigned)(k * 16384 + j) * 2654435761u;
+                }
+                if (fd >= 0) close(fd);
+                check(good, "10 MB file reads back intact");
+                unlink(big);
+
+                const char *sh = "/tmp/forktest-sh";
+                fd = open(sh, O_WRONLY | O_CREAT, 0644);
+                if (fd >= 0) { write(fd, "#!/bin/sh\n", 10); close(fd); }
+                chmod(sh, 0755);
+                fd = open(sh, O_WRONLY | O_TRUNC);
+                if (fd >= 0) close(fd);
+                struct stat ts;
+                check(stat(sh, &ts) == 0 && (ts.st_mode & 0777) == 0755 && ts.st_size == 0,
+                      "O_TRUNC keeps the mode");
+                unlink(sh);
+            }
             /* normal anonymous mappings still work */
             char *a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             check(a != MAP_FAILED, "anonymous mmap still works");

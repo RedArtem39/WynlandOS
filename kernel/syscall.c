@@ -543,6 +543,18 @@ static uint64_t mmap_bump(int slot, uint64_t size)
     return cur;
 }
 
+/* Per-call tracing of open/openat/mkdir/pipe/eventfd/ioctl on the serial
+   console. Off unless built with SYSCALL_TRACE=1: every line is written
+   with interrupts off, a byte at a time, and Qt opens thousands of files
+   at startup -- the trace alone stalled the system for seconds. */
+#ifndef SYSCALL_TRACE
+#define SYSCALL_TRACE 0
+#endif
+static inline void trace_str(const char *s)
+{
+    if (SYSCALL_TRACE) serial_write_string(s);
+}
+
 static int get_free_fd(VfsFile **fd_table) {
     for (int i = 3; i < MAX_OPEN_FILES; i++) {
         if (fd_table[i] == NULL) {
@@ -1604,9 +1616,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)-14; /* -EFAULT (also covers a too-long path) */
                 }
 
-                serial_write_string("Syscall: open path: ");
-                serial_write_string(path_kbuf);
-                serial_write_string("\r\n");
+                trace_str("Syscall: open path: ");
+                trace_str(path_kbuf);
+                trace_str("\r\n");
 
                 int linux_flags = (int)a2;
                 uint32_t vfs_flags = 0;
@@ -2069,7 +2081,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 22: // SYS_pipe (Linux standard)
         case 293: // SYS_pipe2 (Linux standard)
             {
-                serial_write_string("Syscall: pipe/pipe2 called\r\n");
+                trace_str("Syscall: pipe/pipe2 called\r\n");
                 int *pipefd = (int *)a1;
                 if (!pipefd || !user_prepare_write(a1, 2 * sizeof(int))) {
                     serial_write_string("  Error: pipefd is NULL or invalid\r\n");
@@ -2144,12 +2156,12 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     fd_flags[fd_write] = (p2 & 02000000) ? 1 : 0;
                 }
 
-                serial_write_string("  Success: created read_fd=");
+                trace_str("  Success: created read_fd=");
                 char fdbuf[16];
-                uint_to_str(fd_read, fdbuf); serial_write_string(fdbuf);
-                serial_write_string(", write_fd=");
-                uint_to_str(fd_write, fdbuf); serial_write_string(fdbuf);
-                serial_write_string("\r\n");
+                uint_to_str(fd_read, fdbuf); trace_str(fdbuf);
+                trace_str(", write_fd=");
+                uint_to_str(fd_write, fdbuf); trace_str(fdbuf);
+                trace_str("\r\n");
 
                 return 0; // Success
             }
@@ -2207,9 +2219,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (strncpy_from_user(path, (const void *)a1, sizeof(path)) < 0) {
                     return (uint64_t)-14; /* -EFAULT */
                 }
-                serial_write_string("Syscall: mkdir path: ");
-                serial_write_string(path);
-                serial_write_string("\r\n");
+                trace_str("Syscall: mkdir path: ");
+                trace_str(path);
+                trace_str("\r\n");
 
                 extern bool vfs_mkdir(const char *path);
                 if (vfs_mkdir(path)) {
@@ -2220,7 +2232,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
         case 290: // SYS_eventfd2 (Linux standard)
             {
-                serial_write_string("Syscall: eventfd2 called\r\n");
+                trace_str("Syscall: eventfd2 called\r\n");
                 int initval = (int)a1;
                 // Allocate pipe for eventfd
                 KPipe *p = (KPipe *)kmalloc(sizeof(KPipe));
@@ -2259,10 +2271,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 file->current_cluster = p_idx;
                 fd_table[fd] = file;
 
-                serial_write_string("  Success: created eventfd fd=");
+                trace_str("  Success: created eventfd fd=");
                 char fdbuf[16];
-                uint_to_str(fd, fdbuf); serial_write_string(fdbuf);
-                serial_write_string("\r\n");
+                uint_to_str(fd, fdbuf); trace_str(fdbuf);
+                trace_str("\r\n");
                 return fd;
             }
 
@@ -3310,11 +3322,11 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     char fd_str[32], req_str[32];
                     uint_to_hex(fd, fd_str);
                     uint_to_hex(request, req_str);
-                    serial_write_string("SYS_ioctl: fd=");
-                    serial_write_string(fd_str);
-                    serial_write_string(" request=");
-                    serial_write_string(req_str);
-                    serial_write_string("\r\n");
+                    trace_str("SYS_ioctl: fd=");
+                    trace_str(fd_str);
+                    trace_str(" request=");
+                    trace_str(req_str);
+                    trace_str("\r\n");
                 }
 
                 // Phase 18: termios / window-size ioctls for PTY master+slave fds
@@ -3806,9 +3818,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (strncpy_from_user(path, (const void *)a2, sizeof(path)) < 0) {
                     return (uint64_t)-14; /* -EFAULT */
                 }
-                serial_write_string("Syscall: openat path: ");
-                serial_write_string(path);
-                serial_write_string("\r\n");
+                trace_str("Syscall: openat path: ");
+                trace_str(path);
+                trace_str("\r\n");
 
                 int linux_flags = (int)a3;
                 uint32_t vfs_flags = 0;
@@ -4872,6 +4884,18 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     done += n;
                 }
                 return len;
+            }
+
+        case 162: // SYS_sync
+        case 74:  // SYS_fsync(fd)
+        case 75:  // SYS_fdatasync(fd)
+        case 306: // SYS_syncfs(fd)
+            {
+                /* the write-back cache, all of it, on the disk now (one
+                   filesystem: fsync of one file flushes everything) */
+                extern void ext2_flush(void);
+                ext2_flush();
+                return 0;
             }
 
         case 28: // SYS_madvise (stub - returning 0 is always safe)

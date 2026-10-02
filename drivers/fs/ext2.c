@@ -308,29 +308,70 @@ static bool may_write_dir(const Ext2Inode *dir) {
 /* Block cache: metadata (directories, inode tables, bitmaps, indirect
    blocks) and small file reads. Every path lookup used to go to the disk
    for every block it touched -- creating /apps, /docs, /dev and two DRM
-   nodes at boot took 9 s. Direct-mapped, write-through (a write updates
-   disk and cache together, so the cache never holds anything the disk
-   doesn't), slot memory allocated on first use. Multi-block runs of file
-   data bypass it: big libraries would only flush it. */
+   nodes at boot took 9 s. Direct-mapped, slot memory allocated on first
+   use. Multi-block runs of file data are read around it (big libraries
+   would only flush it) and then patched with any dirty cached block.
+
+   Write-back: a write only updates the cache and marks the block dirty;
+   the flusher thread writes dirty blocks out once a second, with
+   interrupts on between them, and sync()/fsync() do it at once. It was
+   write-through -- every block written went to the disk synchronously
+   with interrupts off, plus the bitmap, group descriptors and superblock
+   each time: a 30 KB file cost ~40 disk writes and froze the system for a
+   quarter of a second; Qt's caches stalled the desktop for seconds. A
+   block rewritten many times between flushes now reaches the disk once. */
 #define BCACHE_SLOTS 4096                    /* x 4 KB blocks = 16 MB at most */
 #define BCACHE_ON 1
-typedef struct { uint32_t block; bool valid; uint8_t *data; } BCacheSlot;
+typedef struct {
+    uint32_t block;
+    bool     valid;
+    bool     dirty;      /* newer than the disk */
+    uint32_t gen;        /* bumped by every write: the flusher's race check */
+    uint8_t *data;
+} BCacheSlot;
 static BCacheSlot g_bcache[BCACHE_SLOTS];
 static uint64_t g_bcache_hits, g_bcache_misses;
+static volatile uint32_t g_dirty_blocks;
+static volatile bool g_sb_dirty;
 
 static BCacheSlot *bcache_slot(uint32_t block) {
     return &g_bcache[(block * 2654435761u) % BCACHE_SLOTS];
 }
 
-static void bcache_put(uint32_t block, const void *buf) {
+/* Interrupts off. Write a dirty slot to the disk now (it is about to be
+   reused for another block). */
+static bool bcache_writeout(BCacheSlot *e) {
+    if (!e->valid || !e->dirty) return true;
+    bool ok = ahci_write(mbr_root_partition_lba() + e->block * g_sectors_per_block,
+                         g_sectors_per_block, e->data);
+    if (ok) { e->dirty = false; g_dirty_blocks--; }
+    return ok;
+}
+
+/* Interrupts off. Cache `buf` as `block`; dirty = it is a write. False
+   only when a write could not be cached (the caller writes it through). */
+static bool bcache_put(uint32_t block, const void *buf, bool dirty) {
     BCacheSlot *e = bcache_slot(block);
+    if (e->valid && e->dirty && e->block != block && !bcache_writeout(e)) return false;
     if (!e->data) {
         e->data = (uint8_t *)kmalloc(g_block_size);
-        if (!e->data) return;
+        if (!e->data) return false;
     }
+    if (e->valid && e->block != block) e->dirty = false;
     memcpy(e->data, buf, g_block_size);
     e->block = block;
     e->valid = true;
+    if (dirty) {
+        if (!e->dirty) { e->dirty = true; g_dirty_blocks++; }
+        e->gen++;
+    }
+    return true;
+}
+
+/* A dirty cached copy of `block`, if there is one (interrupts off). */
+static const uint8_t *bcache_dirty(uint32_t block) {
+    BCacheSlot *e = bcache_slot(block);
+    return (e->valid && e->dirty && e->block == block && e->data) ? e->data : NULL;
 }
 
 static bool ext2_read_block(uint32_t block, void *buf) {
@@ -346,7 +387,7 @@ static bool ext2_read_block(uint32_t block, void *buf) {
                         g_sectors_per_block, buf);
     if (ok) {
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-        bcache_put(block, buf);
+        bcache_put(block, buf, false);
         g_bcache_misses++;
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     }
@@ -354,19 +395,72 @@ static bool ext2_read_block(uint32_t block, void *buf) {
 }
 
 static bool ext2_write_block(uint32_t block, const void *buf) {
-    bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
-                         g_sectors_per_block, buf);
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-    if (ok) bcache_put(block, buf);
-    else bcache_slot(block)->valid = false;   /* unknown on disk now */
+    bool cached = bcache_put(block, buf, true);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    if (cached) return true;
+    /* could not cache it: straight to the disk */
+    bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
+                         g_sectors_per_block, buf);
+    if (!ok) bcache_slot(block)->valid = false;   /* unknown on disk now */
     return ok;
 }
 
-/* Writes the superblock copy back to disk (free counts etc.). */
+/* The superblock copy (free counts etc.) goes out with the next flush. */
 static bool ext2_write_sb(void) {
-    return ahci_write(mbr_root_partition_lba() + 2, 2, &g_sb);
+    g_sb_dirty = true;
+    return true;
+}
+
+/* Write every dirty block and the superblock to the disk. From the
+   flusher thread with interrupts on (each block is copied out under cli
+   and written while the cache can change again: a block written meanwhile
+   stays dirty, its generation tells), or from sync() in a syscall. */
+void ext2_flush(void) {
+    uint8_t *tmp = (uint8_t *)kmalloc(g_block_size);
+    if (!tmp) return;
+    for (uint32_t i = 0; i < BCACHE_SLOTS && g_dirty_blocks; i++) {
+        uint64_t rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        BCacheSlot *e = &g_bcache[i];
+        bool todo = e->valid && e->dirty && e->data;
+        uint32_t block = e->block, gen = e->gen;
+        if (todo) memcpy(tmp, e->data, g_block_size);
+        if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+        if (!todo) continue;
+
+        bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
+                             g_sectors_per_block, tmp);
+
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        if (ok && e->valid && e->dirty && e->block == block && e->gen == gen) {
+            e->dirty = false;
+            g_dirty_blocks--;
+        }
+        if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    }
+    kfree(tmp);
+    if (g_sb_dirty) {
+        g_sb_dirty = false;
+        static Ext2Superblock sb_copy;
+        uint64_t rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+        memcpy(&sb_copy, &g_sb, sizeof(sb_copy));
+        if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+        if (!ahci_write(mbr_root_partition_lba() + 2, 2, &sb_copy)) g_sb_dirty = true;
+    }
+}
+
+bool ext2_has_dirty(void) { return g_dirty_blocks || g_sb_dirty; }
+
+/* the flusher kernel thread */
+void ext2_flusher_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        sched_sleep_ms(1000);
+        if (ext2_has_dirty()) ext2_flush();
+    }
 }
 
 /* Writes the whole group descriptor table back to disk. It starts in
@@ -583,6 +677,32 @@ static bool ext2_bitmap_test_and_set(uint32_t bit, uint32_t bitmap_block,
     return was;
 }
 
+/* Claim the first clear bit in [first, nbits) of a bitmap block: one
+   read, a byte-wise scan, one write. -1 if none is free. The allocators
+   used to test bit by bit, each test copying the whole 4 KB bitmap into a
+   fresh heap buffer -- finding block N cost N copies, hundreds of MB per
+   allocation on a filled disk, all with interrupts off (seconds per
+   write() of a growing file). */
+static int64_t bitmap_claim_first(uint32_t bitmap_block, uint32_t first, uint32_t nbits)
+{
+    uint8_t *bm = (uint8_t *)kmalloc(g_block_size);
+    if (!bm) return -1;
+    if (!ext2_read_block(bitmap_block, bm)) { kfree(bm); return -1; }
+    if (nbits > g_block_size * 8) nbits = g_block_size * 8;
+    int64_t found = -1;
+    for (uint32_t bit = first; bit < nbits; ) {
+        if ((bit & 7) == 0 && bit + 8 <= nbits && bm[bit >> 3] == 0xFF) { bit += 8; continue; }
+        if (!((bm[bit >> 3] >> (bit & 7)) & 1)) { found = bit; break; }
+        bit++;
+    }
+    if (found >= 0) {
+        bm[found >> 3] |= (uint8_t)(1u << (found & 7));
+        if (!ext2_write_block(bitmap_block, bm)) found = -1;
+    }
+    kfree(bm);
+    return found;
+}
+
 uint32_t ext2_alloc_block(void) {
     if (!g_group_desc) return 0;
 
@@ -598,25 +718,18 @@ uint32_t ext2_alloc_block(void) {
            self-consistent for this driver alone. */
         uint32_t group_base = g * g_sb.s_blocks_per_group;
         uint32_t bits_this_group = g_sb.s_blocks_per_group;
-        for (uint32_t local = 0; local < bits_this_group; local++) {
-            uint32_t blk = group_base + local;
-            if (blk >= g_sb.s_blocks_count) break;
-            /* test-and-set returns true when the bit WAS already set
-               (block in use): skip those. false = it was free and we
-               just claimed it. */
-            if (ext2_bitmap_test_and_set(local,
-                                         g_group_desc[g].bg_block_bitmap,
-                                         g_sb.s_blocks_per_group, true)) {
-                continue;
-            }
-            if (g_group_desc[g].bg_free_blocks_count > 0)
-                g_group_desc[g].bg_free_blocks_count--;
-            if (g_sb.s_free_blocks_count > 0)
-                g_sb.s_free_blocks_count--;
-            ext2_write_gdt();
-            ext2_write_sb();
-            return blk;
-        }
+        if (group_base + bits_this_group > g_sb.s_blocks_count)
+            bits_this_group = g_sb.s_blocks_count - group_base;
+        int64_t local = bitmap_claim_first(g_group_desc[g].bg_block_bitmap, 0, bits_this_group);
+        if (local < 0) continue;
+        uint32_t blk = group_base + (uint32_t)local;
+        if (g_group_desc[g].bg_free_blocks_count > 0)
+            g_group_desc[g].bg_free_blocks_count--;
+        if (g_sb.s_free_blocks_count > 0)
+            g_sb.s_free_blocks_count--;
+        ext2_write_gdt();
+        ext2_write_sb();
+        return blk;
     }
     serial_write_string("ext2: out of disk blocks!\r\n");
     return 0;
@@ -646,25 +759,21 @@ uint32_t ext2_alloc_inode(void) {
 
     for (uint32_t g = 0; g < g_group_count; g++) {
         if (g_group_desc[g].bg_free_inodes_count == 0) continue;
-        for (uint32_t idx = 0; idx < g_sb.s_inodes_per_group; idx++) {
-            /* inode numbers are 1-based within the whole fs */
-            uint32_t inum = g * g_sb.s_inodes_per_group + idx + 1;
-            if (inum < EXT2_ROOT_INO || inum > g_sb.s_inodes_count) continue;
-            /* same inverted-returns contract as ext2_alloc_block: true =
-               was already in use (skip), false = was free, now claimed */
-            if (ext2_bitmap_test_and_set(idx,
-                                         g_group_desc[g].bg_inode_bitmap,
-                                         g_sb.s_inodes_per_group, true)) {
-                continue;
-            }
-            if (g_group_desc[g].bg_free_inodes_count > 0)
-                g_group_desc[g].bg_free_inodes_count--;
-            if (g_sb.s_free_inodes_count > 0)
-                g_sb.s_free_inodes_count--;
-            ext2_write_gdt();
-            ext2_write_sb();
-            return inum;
-        }
+        /* inode numbers are 1-based within the whole fs; never below the root */
+        uint32_t first = (g == 0) ? EXT2_ROOT_INO - 1 : 0;
+        uint32_t nbits = g_sb.s_inodes_per_group;
+        if (g * g_sb.s_inodes_per_group + nbits > g_sb.s_inodes_count)
+            nbits = g_sb.s_inodes_count - g * g_sb.s_inodes_per_group;
+        int64_t idx = bitmap_claim_first(g_group_desc[g].bg_inode_bitmap, first, nbits);
+        if (idx < 0) continue;
+        uint32_t inum = g * g_sb.s_inodes_per_group + (uint32_t)idx + 1;
+        if (g_group_desc[g].bg_free_inodes_count > 0)
+            g_group_desc[g].bg_free_inodes_count--;
+        if (g_sb.s_free_inodes_count > 0)
+            g_sb.s_free_inodes_count--;
+        ext2_write_gdt();
+        ext2_write_sb();
+        return inum;
     }
     serial_write_string("ext2: out of free inodes!\r\n");
     return 0;
@@ -713,6 +822,7 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
         if (!alloc) return 0;
         uint32_t nb = ext2_alloc_block();
         if (!nb) return 0;
+        inode->i_blocks += g_sectors_per_block;
         inode->i_block[logical] = nb;
         return nb;
     }
@@ -727,6 +837,7 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
             if (!alloc) { kfree(blkbuf); return 0; }
             uint32_t ib = ext2_alloc_block();
             if (!ib) { kfree(blkbuf); return 0; }
+            inode->i_blocks += g_sectors_per_block;
             memset(blkbuf, 0, g_block_size);
             ext2_write_block(ib, blkbuf);
             inode->i_block[12] = ib;
@@ -738,6 +849,7 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
             if (!alloc) { kfree(blkbuf); return 0; }
             phys = ext2_alloc_block();
             if (!phys) { kfree(blkbuf); return 0; }
+            inode->i_blocks += g_sectors_per_block;
             ((uint32_t *)blkbuf)[idx] = phys;
             ext2_write_block(inode->i_block[12], blkbuf);
         }
@@ -752,6 +864,7 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
             if (!alloc) { kfree(blkbuf); return 0; }
             uint32_t ib = ext2_alloc_block();
             if (!ib) { kfree(blkbuf); return 0; }
+            inode->i_blocks += g_sectors_per_block;
             memset(blkbuf, 0, g_block_size);
             ext2_write_block(ib, blkbuf);
             inode->i_block[13] = ib;
@@ -766,7 +879,11 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
             if (!alloc) { kfree(blkbuf); return 0; }
             outer_blk = ext2_alloc_block();
             if (!outer_blk) { kfree(blkbuf); return 0; }
-            memset(blkbuf, 0, g_block_size);
+            inode->i_blocks += g_sectors_per_block;
+            /* blkbuf holds the doubly-indirect table read above: add the
+               new entry to it. It was zeroed first -- every other entry of
+               the table was lost, and with it all data a file had past
+               ~4 MB as soon as it grew another 4 MB. */
             ((uint32_t *)blkbuf)[outer_idx] = outer_blk;
             ext2_write_block(inode->i_block[13], blkbuf);
             /* freshly allocated inner table must start zeroed */
@@ -780,6 +897,7 @@ uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
         if (!phys && alloc) {
             phys = ext2_alloc_block();
             if (phys) {
+                inode->i_blocks += g_sectors_per_block;
                 ((uint32_t *)blkbuf)[inner_idx] = phys;
                 ext2_write_block(outer_blk, blkbuf);
             }
@@ -912,7 +1030,14 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
                 __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
                 bool ok = ahci_read(mbr_root_partition_lba() + phys_block * g_sectors_per_block,
                                     run * g_sectors_per_block, g_run_buf);
-                if (ok) memcpy(out + bytes_read, g_run_buf, run * g_block_size);
+                if (ok) {
+                    /* the disk may be behind the cache (write-back) */
+                    for (uint32_t r = 0; r < run && g_dirty_blocks; r++) {
+                        const uint8_t *d = bcache_dirty(phys_block + r);
+                        if (d) memcpy(g_run_buf + r * g_block_size, d, g_block_size);
+                    }
+                    memcpy(out + bytes_read, g_run_buf, run * g_block_size);
+                }
                 if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
                 if (!ok) break;
                 bytes_read += run * g_block_size;
@@ -973,11 +1098,9 @@ uint32_t ext2_write_file_data(uint32_t inum, Ext2Inode *inode, uint32_t offset, 
 
     uint32_t new_end = offset + bytes_written;
     if (new_end > inode->i_size) inode->i_size = new_end;
-    /* Approximate -- real ext2 also counts indirect/double-indirect
-       pointer blocks in i_blocks, this only counts data blocks. Close
-       enough for a v1: nothing in this project inspects i_blocks for
-       correctness, only i_size. */
-    inode->i_blocks = ((inode->i_size + g_block_size - 1) / g_block_size) * g_sectors_per_block;
+    /* i_blocks is kept exact by ext2_resolve_block(): every data and
+       pointer block it allocates is counted there (this used to be a
+       data-only estimate from i_size, which fsck flagged) */
     inode->i_mtime = (uint32_t)rtc_get_unix_time();
     ext2_write_inode(inum, inode);
 
@@ -1330,6 +1453,10 @@ bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
     Ext2Inode target;
     if (ext2_read_inode(found_inode, &target)) {
         if (target.i_links_count > 0) target.i_links_count--;
+        /* an (empty) directory also loses its own "." link: it is gone.
+           It kept its inode with one link left -- fsck found it orphaned,
+           its ".." still counting against the parent. */
+        if ((target.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) target.i_links_count = 0;
         if (target.i_links_count == 0) {
             ext2_free_all_blocks(&target);
             /* Real bug found via independent e2fsck cross-check (see
@@ -1698,10 +1825,15 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
 
     if (flags & VFS_O_TRUNC) {
         ext2_free_all_blocks(&inode);
+        /* the contents go; the file's mode, owner and links stay (it was
+           reset to 0644 owned by whoever truncated it) */
+        uint16_t mode = inode.i_mode, uid = inode.i_uid, gid = inode.i_gid;
+        uint16_t links = inode.i_links_count;
         memset(&inode, 0, sizeof(inode));
-        inode.i_mode = EXT2_S_IFREG | 0644;
-        inode.i_links_count = 1;
-        inode.i_uid = (uint16_t)current_uid_or_root();
+        inode.i_mode = mode;
+        inode.i_links_count = links ? links : 1;
+        inode.i_uid = uid;
+        inode.i_gid = gid;
         inode.i_mtime = inode.i_ctime = inode.i_atime = (uint32_t)rtc_get_unix_time();
         ext2_write_inode(inum, &inode);
         file->node.size = 0;

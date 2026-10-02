@@ -2,6 +2,7 @@
  * WynlandOS - AHCI SATA Driver Implementation
  */
 
+#include <wynland/sched.h>
 #include <wynland/ahci.h>
 #include <wynland/pci.h>
 #include <wynland/vmm.h>
@@ -170,6 +171,30 @@ static uint8_t *bounce(void)
     return g_bounce;
 }
 
+/* Every caller waits for its command with interrupts on -- the clock,
+   sound and network keep going while the disk is slow (a write to an
+   image on a Windows drive can take seconds) -- but the scheduler
+   switches nothing, so no other thread can start a command or step into
+   the filesystem meanwhile. (The timer's kill-a-dead-thread path only
+   acts on interrupted user code, never on a kernel wait like this.) */
+static volatile bool g_ahci_irq_ok;
+static void ahci_wait_begin(uint64_t rflags)
+{
+    (void)rflags;
+    g_sched_no_preempt++;
+    g_ahci_irq_ok = true;
+}
+static void ahci_wait_end(uint64_t rflags)
+{
+    (void)rflags;
+    g_ahci_irq_ok = false;
+    g_sched_no_preempt--;
+}
+static inline void ahci_wait_step(void)
+{
+    if (g_ahci_irq_ok) __asm__ volatile("sti; pause; cli" ::: "memory");
+}
+
 bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
     /* Everything uses command slot 0: a second command started while one
        is in flight (a kernel thread preempted mid-command, then a syscall
@@ -177,6 +202,7 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
        back damaged. Interrupts stay off for the whole command. */
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    ahci_wait_begin(rflags);
     bool ok = true;
     if (dma_contiguous(buf, count * 512)) {
         ok = ahci_read_hw(lba, count, buf);
@@ -191,6 +217,7 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
             done += n;
         }
     }
+    ahci_wait_end(rflags);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return ok;
 }
@@ -208,6 +235,7 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
     
     int timeout = 100000000;
     while ((port->ci & (1 << slot)) || (port->tfd & (AHCI_DEV_BUSY | AHCI_DEV_DRQ))) {
+        ahci_wait_step();
         if (--timeout == 0) {
             serial_write_string("AHCI Read: Port is busy/hung!\r\n");
             return false;
@@ -258,6 +286,7 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
     
     timeout = 100000000;
     while (1) {
+        ahci_wait_step();
         if ((port->ci & (1 << slot)) == 0) {
             break;
         }
@@ -295,6 +324,7 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf);
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
     uint64_t rflags;   /* see ahci_read(): one command at a time, contiguous DMA */
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    ahci_wait_begin(rflags);
     bool ok = true;
     if (dma_contiguous(buf, count * 512)) {
         ok = ahci_write_hw(lba, count, buf);
@@ -309,6 +339,7 @@ bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
             done += n;
         }
     }
+    ahci_wait_end(rflags);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return ok;
 }
@@ -324,6 +355,7 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf) {
     
     int timeout = 100000000;
     while ((port->ci & (1 << slot)) || (port->tfd & (AHCI_DEV_BUSY | AHCI_DEV_DRQ))) {
+        ahci_wait_step();
         if (--timeout == 0) {
             serial_write_string("AHCI Write: Port is busy/hung!\r\n");
             return false;
@@ -374,6 +406,7 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf) {
     
     timeout = 100000000;
     while (1) {
+        ahci_wait_step();
         if ((port->ci & (1 << slot)) == 0) {
             break;
         }

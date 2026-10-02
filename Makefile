@@ -79,7 +79,10 @@ LDFLAGS_BOOT   = --subsystem 10           \
                  -s
 
 # Kernel: ELF64 freestanding
+# SYSCALL_TRACE=1: log open/openat/mkdir/pipe/ioctl calls on the serial console
+SYSCALL_TRACE ?= 0
 CFLAGS_KERNEL  = $(COMMON_FLAGS)          \
+                 -DSYSCALL_TRACE=$(SYSCALL_TRACE) \
                  -mcmodel=large           \
                  -fno-pie                 \
                  -fno-pic                 \
@@ -167,7 +170,12 @@ KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_
 
 BOOTLOADER_EFI = $(BUILD)/BOOTX64.EFI
 KERNEL_ELF     = $(BUILD)/kernel.elf
-DISK_IMAGE     = $(BUILD)/wynland.img
+# The 2 GB disk images live in the WSL filesystem when building under WSL:
+# on /mnt/c every write the VM makes goes through the Windows file bridge
+# (seconds per burst) and debugfs/e2fsck are slow there too.
+IMG_DIR       ?= $(if $(wildcard /mnt/wslg),$(HOME)/.cache/wynland-img,$(BUILD))
+$(shell mkdir -p $(IMG_DIR))
+DISK_IMAGE     = $(IMG_DIR)/wynland.img
 OVMF_FW        = tools/ovmf/OVMF.fd
 
 # Two-partition disk layout (real MBR): a small FAT32 ESP holding only
@@ -177,8 +185,8 @@ OVMF_FW        = tools/ovmf/OVMF.fd
 # refuses the FAT32 volume that mtools still accepts (Phase 20a finding).
 ESP_SIZE_MB    = 64
 TOTAL_IMG_MB   = 2048
-ESP_PART_IMG   = $(BUILD)/esp_part.img
-EXT2_PART_IMG  = $(BUILD)/ext2_part.img
+ESP_PART_IMG   = $(IMG_DIR)/esp_part.img
+EXT2_PART_IMG  = $(IMG_DIR)/ext2_part.img
 MBR_SECT       = $(BUILD)/mbr.bin
 EXT2_MANIFEST  = ext2_manifest.txt
 

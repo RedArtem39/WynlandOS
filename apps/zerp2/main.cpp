@@ -239,7 +239,10 @@ int main(int argc, char **argv)
     qputenv("QT_QPA_EGLFS_DISABLE_INPUT", "1");   // no evdev here -- InputPump instead
     qputenv("QT_QPA_EGLFS_HIDECURSOR", "1");      // the GPU cursor plane is the pointer
     qputenv("QSG_RHI_BACKEND", "opengl");
-    qputenv("QSG_INFO", "1");
+    /* scene graph diagnostics on request only (BOOT_EXTRA=qsginfo): every
+       Qt client inherits it, and it all lands on the synchronous serial
+       console */
+    if (bootCfg().contains("qsginfo")) qputenv("QSG_INFO", "1");
     if (!qEnvironmentVariableIsSet("HOME")) qputenv("HOME", "/tmp");
     if (!qEnvironmentVariableIsSet("XDG_RUNTIME_DIR")) qputenv("XDG_RUNTIME_DIR", "/tmp");
 
