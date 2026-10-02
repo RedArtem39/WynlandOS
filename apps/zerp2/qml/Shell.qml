@@ -4,6 +4,7 @@
 // F fullscreen, 1..9 workspace, Shift+1..9 move window, arrows/HJKL focus.
 import QtQuick
 import QtQuick.Window
+import QtQuick.Effects
 import Zerp
 
 Window {
@@ -107,6 +108,7 @@ Window {
         Image {
             anchors.fill: parent
             source: wallpaperUrl
+            onStatusChanged: if (status === Image.Ready) grabTimer.restart()
             fillMode: Image.PreserveAspectCrop
             visible: wallpaperUrl !== ""
             asynchronous: true
@@ -114,20 +116,48 @@ Window {
         }
     }
 
+    // ---- frosted glass for the bar and the dock: the wallpaper blurred
+    // ONCE into a static image; they show their slice of it. (Blurring
+    // live in each of them redid a 48 px blur every frame the dock moved.)
+    property url blurUrl: ""
+    MultiEffect {
+        id: blurredWall
+        anchors.fill: parent
+        source: desktop
+        blurEnabled: true
+        blur: 1.0
+        blurMax: 64
+        saturation: 0.25
+        z: -1   // under the wallpaper: kept renderable for re-grabs, never seen
+    }
+    Timer {
+        id: grabTimer
+        interval: 400
+        running: true
+        onTriggered: blurredWall.grabToImage(function (r) { shell.blurUrl = r.url })
+    }
+
+    // FPS meter (mod+P)
+    property int fps: 0
+    property int frames: 0
+    onFrameSwapped: frames++
+    Timer {
+        interval: 1000; repeat: true; running: zerp.showFps
+        onTriggered: { shell.fps = shell.frames; shell.frames = 0 }
+    }
+
     // ---- tiles
     Item {
         id: tiles
         anchors.fill: parent
         Repeater {
-            model: zerp.clients
+            model: zerp.model
             delegate: Tile {
-                required property var modelData
-                client: modelData
-                target: shell.rects[modelData.id] !== undefined ? shell.rects[modelData.id] : Qt.rect(0, 0, 0, 0)
-                wsOffset: (modelData.workspace - zerp.workspace) * shell.width
+                target: shell.rects[client.id] !== undefined ? shell.rects[client.id] : Qt.rect(0, 0, 0, 0)
+                wsOffset: (client.workspace - zerp.workspace) * shell.width
                 borderWidth: shell.border
-                cornerRadius: modelData.fullscreen ? 0 : shell.radius
-                z: modelData.fullscreen ? 50 : (modelData.focused ? 2 : 1)
+                cornerRadius: client.fullscreen ? 0 : shell.radius
+                z: client.fullscreen ? 50 : (client.focused ? 2 : 1)
             }
         }
     }
@@ -135,13 +165,16 @@ Window {
     Bar {
         anchors { left: parent.left; right: parent.right; top: parent.top }
         height: shell.barHeight
-        blurSource: desktop
+        blurUrl: shell.blurUrl
+        fps: zerp.showFps ? shell.fps : -1
         z: 40
     }
 
     Dock {
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 10 }
-        blurSource: desktop
+        blurUrl: shell.blurUrl
+        screenW: shell.width
+        screenH: shell.height
         z: 40
     }
 

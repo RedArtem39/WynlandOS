@@ -14,6 +14,7 @@
 // ("ZSNAP ..." lines), since a GL scanout can't be screendumped.
 
 #include <QtCore/QBuffer>
+#include <QtCore/QElapsedTimer>
 #include <QtCore/QFile>
 #include <QtCore/QTimer>
 #include <QtCore/QUrl>
@@ -131,6 +132,7 @@ private:
         case 0x10: m_srv->closeFocused(); return true;                            // Q
         case 0x20: m_srv->spawn(QStringLiteral("/zerp_rofi.elf")); return true;   // D
         case 0x21: m_srv->toggleFullscreen(); return true;                        // F
+        case 0x19: m_srv->setShowFps(!m_srv->showFps()); return true;             // P: FPS
         case 0x24: m_srv->focusDirection(-1, 0); return true;                     // H J K L
         case 0x26: m_srv->focusDirection(1, 0); return true;
         case 0x25: m_srv->focusDirection(0, -1); return true;
@@ -266,7 +268,44 @@ int main(int argc, char **argv)
     if (bootCfg().contains("snapshot")) {
         // something to tile in the picture
         QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/zerp_files.elf")); });
-        QTimer::singleShot(6000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/qmldemo")); });
+        if (!bootCfg().contains("noqml")) QTimer::singleShot(6000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/qmldemo")); });
+
+        // measured load: frames per second while the pointer sweeps the dock
+        // (magnification) and while workspaces switch (tiles slide)
+        static int frames = 0;
+        QObject::connect(win, &QQuickWindow::frameSwapped, win, [] {
+            frames++;
+            // every 60 frames: their wall time, average and worst frame
+            static QElapsedTimer clk; static qint64 last = 0, worst = 0, start = 0; static int n = 0;
+            if (!clk.isValid()) { clk.start(); last = start = 0; }
+            const qint64 now = clk.elapsed();
+            worst = qMax(worst, now - last);
+            last = now;
+            if (++n == 60) {
+                fprintf(stderr, "[zerp2] 60 frames in %lld ms (%.1f fps), worst frame %lld ms\n",
+                        (long long)(now - start), 60000.0 / qMax<qint64>(1, now - start), (long long)worst);
+                n = 0; worst = 0; start = now;
+            }
+        }, Qt::DirectConnection);
+        auto *fpsTick = new QTimer(win);
+        QObject::connect(fpsTick, &QTimer::timeout, win, [] {
+            fprintf(stderr, "[zerp2] fps %d\n", frames);
+            frames = 0;
+        });
+        QTimer::singleShot(70000, win, [fpsTick] { fpsTick->start(1000); });
+        auto *sweep = new QTimer(win);
+        QObject::connect(sweep, &QTimer::timeout, win, [win, sweep] {
+            static int step = 0;
+            const qreal y = win->height() - 40;
+            const qreal x = win->width() / 2.0 - 140 + (step % 140) * 2;
+            QMouseEvent mv(QEvent::MouseMove, QPointF(x, y), QPointF(x, y), Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+            QCoreApplication::sendEvent(win, &mv);
+            if (++step > 280) { sweep->stop(); fprintf(stderr, "[zerp2] sweep done\n"); }
+        });
+        QTimer::singleShot(72000, win, [sweep] { fprintf(stderr, "[zerp2] dock sweep\n"); sweep->start(16); });
+        QTimer::singleShot(80000, &server, [&server] { fprintf(stderr, "[zerp2] workspace 2\n"); server.setWorkspace(2); });
+        QTimer::singleShot(82000, &server, [&server] { fprintf(stderr, "[zerp2] workspace 1\n"); server.setWorkspace(1); });
+        QTimer::singleShot(86000, win, [fpsTick] { fpsTick->stop(); });
         QTimer::singleShot(60000, win, [win] {
             QImage img = win->grabWindow().scaledToWidth(960, Qt::SmoothTransformation);
             QBuffer buf; buf.open(QIODevice::WriteOnly);

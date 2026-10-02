@@ -3,9 +3,11 @@
 
 #include <QtCore/QFileInfo>
 #include <QtGui/QImage>
+#include <QtGui/QScreen>
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
 #include <QtQuick/QSGTexture>
+#include <rhi/qrhi.h>
 
 #include <cerrno>
 #include <csignal>
@@ -91,6 +93,7 @@ void ZClient::configure(int x, int y, int w, int h)
     m_bufW = w;
     m_bufH = h;
     m_dirty = true;
+    m_damage = QRect(0, 0, w, h);
     ZerpMsg m = { ZERP_MSG_TILE_RECT, (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h };
     send(m);
     emit damaged();
@@ -181,6 +184,7 @@ bool ZClient::pump(QVector<QString> *spawnRequests)
             if (m.type == ZERP_MSG_DAMAGE) {
                 static int logged[64];
                 if (m_id < 64 && !logged[m_id]++) fprintf(stderr, "[zerp2] client %d first damage %ux%u\n", m_id, m.w, m.h);
+                m_damage |= QRect(int(m.x), int(m.y), int(m.w), int(m.h)) & QRect(0, 0, m_bufW, m_bufH);
                 m_dirty = true; emit damaged();
             }
             else if (m.type == ZERP_MSG_CLOSE) closed = true;
@@ -189,6 +193,30 @@ bool ZClient::pump(QVector<QString> *spawnRequests)
     }
     m_rx.remove(0, off);
     return !closed;
+}
+
+// ---------------------------------------------------------------- ZClientModel
+
+QVariant ZClientModel::data(const QModelIndex &i, int role) const
+{
+    if (role != ClientRole || i.row() < 0 || i.row() >= m_list.size()) return {};
+    return QVariant::fromValue<QObject *>(m_list[i.row()]);
+}
+
+void ZClientModel::add(ZClient *c)
+{
+    beginInsertRows(QModelIndex(), m_list.size(), m_list.size());
+    m_list.append(c);
+    endInsertRows();
+}
+
+void ZClientModel::remove(ZClient *c)
+{
+    const int r = m_list.indexOf(c);
+    if (r < 0) return;
+    beginRemoveRows(QModelIndex(), r, r);
+    m_list.removeAt(r);
+    endRemoveRows();
 }
 
 // ---------------------------------------------------------------- ZServer
@@ -218,6 +246,7 @@ int ZServer::spawn(const QString &path)
         return -1;
     }
     m_clients.append(c);
+    m_model.add(c);
     emit clientsChanged();
     focus(c);
     return c->id();
@@ -287,6 +316,7 @@ void ZServer::pumpAll()
     for (ZClient *c : gone) {
         fprintf(stderr, "[zerp2] client %d closed\n", c->id());
         m_clients.removeOne(c);
+        m_model.remove(c);
         if (c == m_focused) m_focused = nullptr;
         c->deleteLater();
     }
@@ -302,12 +332,84 @@ void ZServer::reap()
     for (ZClient *c : dead) {
         fprintf(stderr, "[zerp2] client %d exited\n", c->id());
         m_clients.removeOne(c);
+        m_model.remove(c);
         if (c == m_focused) m_focused = nullptr;
         c->deleteLater();
     }
     emit clientsChanged();
     if (!m_focused) refocus();
 }
+
+// ---------------------------------------------------------------- ZTexture
+//
+// One GPU texture per client, updated in place with only the damaged
+// rectangle, straight from the shared buffer. (Re-creating the texture
+// from the whole buffer on every DAMAGE cost ~100 ms for a full-screen
+// terminal and made every cursor blink a dropped frame.)
+class ZTexture : public QSGTexture
+{
+public:
+    ZTexture() : m_key(++s_keys) {}
+    ~ZTexture() override { delete m_tex; }
+    // unique per instance, never an address: a new texture allocated where
+    // a deleted one was must not look like it to the renderer's caches
+    qint64 comparisonKey() const override { return m_key; }
+    QRhiTexture *rhiTexture() const override { return m_tex; }
+    QSize textureSize() const override { return m_size; }
+    bool hasAlphaChannel() const override { return false; }
+    bool hasMipmaps() const override { return false; }
+
+    // GUI side (render thread, GUI blocked): what to upload next.
+    // `capacity` is the texture's fixed size (the whole shared buffer as
+    // a screen-sized image); `size` the part the client draws now.
+    void update(const uint32_t *pixels, QSize capacity, QSize size, QRect damage)
+    {
+        m_pixels = pixels;
+        m_size = capacity;
+        if (size != m_view) { m_view = size; damage = QRect(QPoint(0, 0), size); }
+        m_pending |= damage & QRect(QPoint(0, 0), size);
+    }
+    QSize view() const { return m_view; }
+
+    void commitTextureOperations(QRhi *rhi, QRhiResourceUpdateBatch *u) override
+    {
+        if (!m_pixels || m_size.isEmpty()) return;
+        if (!m_tex || m_tex->pixelSize() != m_size) {
+            delete m_tex;
+            m_bgra = rhi->isTextureFormatSupported(QRhiTexture::BGRA8);
+            m_tex = rhi->newTexture(m_bgra ? QRhiTexture::BGRA8 : QRhiTexture::RGBA8, m_size);
+            m_tex->create();
+            m_pending = QRect(QPoint(0, 0), m_size);
+        }
+        if (m_pending.isEmpty()) return;
+        // the client's buffer as an image (0xAARRGGBB words = BGRA bytes),
+        // laid out at its current width
+        QImage whole(reinterpret_cast<const uchar *>(m_pixels), m_view.width(), m_view.height(),
+                     m_view.width() * 4, QImage::Format_RGB32);
+        QRhiTextureSubresourceUploadDescription d;
+        if (m_bgra) {
+            d = QRhiTextureSubresourceUploadDescription(whole);
+            d.setSourceTopLeft(m_pending.topLeft());
+            d.setSourceSize(m_pending.size());
+        } else {
+            // no BGRA textures: swizzle just the damaged part
+            d = QRhiTextureSubresourceUploadDescription(
+                whole.copy(m_pending).convertToFormat(QImage::Format_RGBX8888));
+        }
+        d.setDestinationTopLeft(m_pending.topLeft());
+        u->uploadTexture(m_tex, QRhiTextureUploadDescription({ 0, 0, d }));
+        m_pending = QRect();
+    }
+
+private:
+    QRhiTexture *m_tex = nullptr;
+    QSize m_size, m_view;
+    const uint32_t *m_pixels = nullptr;
+    QRect m_pending;
+    bool m_bgra = true;
+    qint64 m_key;
+    static inline qint64 s_keys = 0;
+};
 
 // ---------------------------------------------------------------- ZSurface
 
@@ -344,16 +446,21 @@ QSGNode *ZSurface::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
         node = new QSGSimpleTextureNode;
         node->setOwnsTexture(true);
         node->setFiltering(QSGTexture::Linear);
+        node->setTexture(new ZTexture);
     }
-    if (m_client->takeDirty() || !node->texture()) {
-        // the shared buffer as an image, uploaded as is (ARGB32, the
-        // layout every Zerp client writes)
-        QImage img(reinterpret_cast<const uchar *>(m_client->pixels()),
-                   m_client->bufWidth(), m_client->bufHeight(),
-                   m_client->bufWidth() * 4, QImage::Format_RGB32);
-        QSGTexture *t = window()->createTextureFromImage(img.copy());
-        node->setTexture(t);
+    auto *tex = static_cast<ZTexture *>(node->texture());
+    const QSize bufSize(m_client->bufWidth(), m_client->bufHeight());
+    if (m_client->takeDirty() || tex->view() != bufSize) {
+        // the texture never changes size (the renderer caches it); a
+        // resized client is a different region of it
+        const QScreen *scr = window()->screen();
+        QSize cap = scr ? scr->size() : QSize(1920, 1080);
+        if (uint64_t(cap.width()) * cap.height() * 4 > m_client->bufferBytes())
+            cap = bufSize;
+        tex->update(m_client->pixels(), cap, bufSize, m_client->takeDamage());
+        node->markDirty(QSGNode::DirtyMaterial);
     }
+    node->setSourceRect(QRectF(0, 0, bufSize.width(), bufSize.height()));
     node->setRect(boundingRect());
     return node;
 }

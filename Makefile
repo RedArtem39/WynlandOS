@@ -409,7 +409,7 @@ SNAPSHOT ?= 0
 BOOT_CFG = $(BUILD)/boot.cfg
 $(BOOT_CFG): FORCE
 	@mkdir -p $(BUILD)
-	@printf 'zerp=$(ZERP)\nautotest=$(AUTOTEST)\n%s' "$(if $(filter 1,$(SNAPSHOT)),snapshot=1\n,)" | sed 's/\\n/\n/g' > $@.tmp
+	@printf 'zerp=$(ZERP)\nautotest=$(AUTOTEST)\n%s%s\n' "$(if $(filter 1,$(SNAPSHOT)),snapshot=1\n,)" "$(BOOT_EXTRA)" | sed 's/\\n/\n/g' > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt

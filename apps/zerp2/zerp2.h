@@ -9,7 +9,9 @@
 // its size.
 #pragma once
 
+#include <QtCore/QAbstractListModel>
 #include <QtCore/QObject>
+#include <QtCore/QRect>
 #include <QtCore/QTimer>
 #include <QtCore/QVector>
 #include <QtQuick/QQuickItem>
@@ -56,9 +58,13 @@ public:
 
     // pixels, for ZSurface (render thread, GUI thread blocked)
     const uint32_t *pixels() const { return m_shm; }
+    uint32_t bufferBytes() const { return m_shmBytes; }
     int bufWidth() const { return m_bufW; }
     int bufHeight() const { return m_bufH; }
     bool takeDirty() { bool d = m_dirty; m_dirty = false; return d; }
+    // union of DAMAGE since the last take, in buffer coordinates (the
+    // whole buffer after a resize)
+    QRect takeDamage() { QRect r = m_damage; m_damage = QRect(); return r; }
 
 signals:
     void workspaceChanged();
@@ -80,21 +86,43 @@ private:
     uint32_t m_shmBytes = 0;
     int m_bufW = 0, m_bufH = 0;      // size the client renders at
     bool m_dirty = false;
+    QRect m_damage;
     QByteArray m_rx;
     QVector<ZerpMsg> m_out;          // waiting for room in the s2c pipe
     bool m_outTailMotion = false;
+};
+
+// The windows as a list model: adding or removing one inserts/removes a
+// row, so QML creates/destroys just that tile (a plain list property made
+// the Repeater rebuild every tile on every change).
+class ZClientModel : public QAbstractListModel
+{
+    Q_OBJECT
+public:
+    enum { ClientRole = Qt::UserRole + 1 };
+    using QAbstractListModel::QAbstractListModel;
+    int rowCount(const QModelIndex &p = QModelIndex()) const override { return p.isValid() ? 0 : m_list.size(); }
+    QVariant data(const QModelIndex &i, int role) const override;
+    QHash<int, QByteArray> roleNames() const override { return { { ClientRole, "client" } }; }
+    void add(ZClient *c);
+    void remove(ZClient *c);
+private:
+    QVector<ZClient *> m_list;
 };
 
 class ZServer : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(QList<QObject *> clients READ clients NOTIFY clientsChanged)
+    Q_PROPERTY(QObject *model READ model CONSTANT)
     Q_PROPERTY(QObject *focusedClient READ focusedClient NOTIFY focusChanged)
     Q_PROPERTY(int workspace READ workspace WRITE setWorkspace NOTIFY workspaceChanged)
+    Q_PROPERTY(bool showFps READ showFps WRITE setShowFps NOTIFY showFpsChanged)
 public:
     explicit ZServer(uint32_t shmBytes, QObject *parent = nullptr);
 
     QList<QObject *> clients() const;
+    QObject *model() { return &m_model; }
     QObject *focusedClient() const { return m_focused; }
     ZClient *focused() const { return m_focused; }
     int workspace() const { return m_workspace; }
@@ -107,12 +135,15 @@ public:
     Q_INVOKABLE void toggleFullscreen();
     Q_INVOKABLE void focusDirection(int dx, int dy);   // QML layout picks; see Shell.qml
     Q_INVOKABLE int countOn(int workspace) const;
+    bool showFps() const { return m_showFps; }
+    void setShowFps(bool s) { if (s != m_showFps) { m_showFps = s; emit showFpsChanged(); } }
 
 signals:
     void clientsChanged();
     void focusChanged();
     void workspaceChanged();
     void focusDirectionRequested(int dx, int dy);
+    void showFpsChanged();
 
 private:
     void pumpAll();
@@ -122,7 +153,9 @@ private:
     uint32_t m_shmBytes;
     int m_nextId = 1;
     int m_workspace = 1;
+    bool m_showFps = false;
     QVector<ZClient *> m_clients;
+    ZClientModel m_model;
     ZClient *m_focused = nullptr;
     QTimer m_pump, m_reaper;
 };
@@ -152,5 +185,4 @@ protected:
 private:
     void forward(const QPointF &p, Qt::MouseButtons b, bool motion);
     ZClient *m_client = nullptr;
-    QSize m_texSize;
 };

@@ -1,27 +1,18 @@
 // The bar: one frosted strip (macOS was the reference for the feel, not
 // the layout). Left: workspaces. Centre: the focused window. Right:
-// status and clock.
+// status and clock (and the FPS meter, mod+P).
 import QtQuick
-import QtQuick.Effects
 
 Item {
     id: bar
-    property Item blurSource
+    property url blurUrl
+    property int fps: -1
 
-    ShaderEffectSource {
-        id: strip
+    // frosted: our slice of the pre-blurred wallpaper (static, no effect)
+    Item {
         anchors.fill: parent
-        sourceItem: bar.blurSource
-        sourceRect: Qt.rect(0, 0, bar.width, bar.height)
-        visible: false
-    }
-    MultiEffect {
-        anchors.fill: parent
-        source: strip
-        blurEnabled: true
-        blur: 1.0
-        blurMax: 48
-        saturation: 0.25
+        clip: true
+        Image { source: bar.blurUrl; x: -bar.x; y: -bar.y; width: bar.parent ? bar.parent.width : 0; height: bar.parent ? bar.parent.height : 0 }
     }
     Rectangle { anchors.fill: parent; color: "#10131a"; opacity: 0.55 }
     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: "white"; opacity: 0.07 }
@@ -72,6 +63,13 @@ Item {
     Row {
         anchors { right: parent.right; rightMargin: 16; verticalCenter: parent.verticalCenter }
         spacing: 16
+        Text {
+            visible: bar.fps >= 0
+            text: bar.fps + " fps"
+            color: bar.fps >= 50 ? "#7ee787" : bar.fps >= 30 ? "#e3b341" : "#ff7b72"
+            font { family: "DejaVu Sans Mono"; pixelSize: 12; bold: true }
+            anchors.verticalCenter: parent.verticalCenter
+        }
         Canvas {
             width: 18; height: 14
             anchors.verticalCenter: parent.verticalCenter
