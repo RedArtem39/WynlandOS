@@ -312,27 +312,6 @@ Window {
                 }
             }
 
-            // who you are here
-            Rectangle {
-                anchors { left: parent.left; right: parent.right; bottom: parent.bottom; margins: 12 }
-                height: 34; radius: 8
-                color: pal.panel
-                border.color: pal.line
-                Row {
-                    anchors.centerIn: parent
-                    spacing: 8
-                    Rectangle {
-                        width: 8; height: 8; radius: 4
-                        anchors.verticalCenter: parent.verticalCenter
-                        color: fs.uid === 0 ? pal.danger : pal.ok
-                    }
-                    Text {
-                        visible: !sideBar.compact
-                        text: fs.uid === 0 ? "root" : "user"
-                        color: pal.dim; font.pixelSize: 12
-                    }
-                }
-            }
             Rectangle { anchors { right: parent.right; top: parent.top; bottom: parent.bottom } width: 1; color: pal.line }
         }
 
@@ -619,7 +598,6 @@ Window {
                     anchors.centerIn: parent
                     visible: win.shown.length === 0
                     spacing: 8
-                    Text { anchors.horizontalCenter: parent.horizontalCenter; text: win.filter !== "" ? "⌕" : "∅"; color: pal.faint; font.pixelSize: 40 }
                     Text {
                         anchors.horizontalCenter: parent.horizontalCenter
                         text: win.filter !== "" ? "Nothing matches “" + win.filter + "”" : "This folder is empty"
@@ -651,7 +629,7 @@ Window {
                 Text {
                     anchors { right: parent.right; rightMargin: 14; verticalCenter: parent.verticalCenter }
                     text: win.message
-                    color: win.messageBad ? pal.danger : pal.ok
+                    color: win.messageBad ? pal.danger : pal.dim
                     font.pixelSize: 12
                 }
             }
