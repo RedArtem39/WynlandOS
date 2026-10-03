@@ -1,187 +1,115 @@
-# WynlandOS
+<p align="center">
+  <img src="docs/brand/logo.jpg" alt="WynlandOS" width="640">
+</p>
 
-> A custom x86_64 operating system built entirely from scratch — its own
-> UEFI bootloader, kernel ("**Canopy Kernel**"), and a real multi-process
-> GUI compositor ("**Zerp**"). No Linux kernel underneath, no libc
-> borrowed wholesale — a from-scratch OS that runs real, unmodified
-> userspace software (curl, nano, CMake, pkg-config...) via its own
-> Linux-numbered syscall ABI and a musl cross-toolchain.
+<p align="center">
+  <b>An x86_64 operating system written from scratch</b> — its own UEFI bootloader,
+  its own kernel, its own init and its own GPU desktop — that runs real Linux
+  software unmodified: WebKit, GStreamer, Qt 6, Python, fish, GNU coreutils.
+</p>
 
-## Status
+---
 
-This is well past "hello world kernel" territory: real per-process address
-space isolation, a real multi-process compositor, real networking with a
-real TLS stack, and a growing set of genuinely working ported userspace
-software — verified end-to-end in QEMU each time (serial logs *and*
-screenshots, not just "it compiles").
+WynlandOS is not a Linux distribution. There is no Linux kernel underneath:
+the **Canopy kernel** is our own, and it speaks the Linux x86_64 syscall ABI
+well enough that prebuilt programs from Ubuntu and Debian — glibc and all —
+load and run on it as they are. Everything is checked end to end in QEMU by
+automatic tests that boot the OS and drive the real programs.
 
-### Working
+## What it does today
 
-- **Kernel core**: UEFI boot → own bootloader (no GRUB), GDT/IDT/IRQ,
-  physical + virtual memory management, kernel heap.
-- **Real per-process isolation**: every process gets its own page table
-  (not a shared address space), its own fd table, a real UID model with
-  password-gated elevation (`sudo`-equivalent) enforced against FAT32's
-  readonly attribute.
-- **Real process primitives**: `fork()` (eager full address-space copy),
-  `execve()` with real argv/envp, `dup`/`dup2`, pipes, a real PTY
-  subsystem (master/slave, termios, window size) — the same building
-  blocks a real terminal emulator needs.
-- **Real wall-clock time**: the CMOS RTC is read at boot for a genuine
-  Unix epoch, and the system's timezone is auto-detected via IP
-  geolocation at boot (no location ever hardcoded in source) and exposed
-  to every process via `TZ`.
-- **Zerp — a real multi-process tiling compositor**, itself an ordinary
-  Ring-3 process, not kernel code:
-  - Every client (file manager, terminal, Qt6 apps) is a genuinely
-    separate OS process, spawned dynamically at runtime, tiled with a
-    simple dwindle-style layout.
-  - Zero-copy shared-memory pixel transport + small pipe messages for
-    control (damage rects, input routing, spawn/close).
-  - A real terminal (`zerp_term.elf`) that can launch and drive a truly
-    interactive program through a real PTY — `nano <file>` runs genuine
-    GNU nano, with a from-scratch VT100 interpreter rendering its actual
-    screen output into the terminal's tile.
-  - A real from-scratch PNG decoder (`zerp_png.h`, real inflate/Paeth
-    filtering) — `cat image.png` renders it inline.
-- **Qt6, ported and running as a real Zerp client**: a custom QPA
-  platform plugin backs Qt onto Zerp's own shared-memory/pipe protocol
-  (not X11, not Wayland), with real FreeType-rendered text (not
-  placeholder glyph boxes) and real keyboard/mouse input routing.
-- **Real networking**: a real virtio-net driver up through a real TCP/IP
-  stack (ARP, ICMP, UDP, DHCP, DNS, TCP with retransmission) — wired all
-  the way to userspace `socket()`/`connect()`/`read()`/`write()`, so
-  ordinary programs' own networking code works unmodified.
-- **A real, unmodified `curl` runs on WynlandOS** — real DNS resolution,
-  a real TCP handshake, a real TLS 1.3 handshake (LibreSSL), and a real
-  `200 OK` HTTP response from an actual server on the internet.
-- **A real userspace dev toolchain, ported and working**: `pkg-config`
-  (pkgconf), a full **CMake** (which also runs *natively* on WynlandOS,
-  not just cross-compiling for it), real runtime `dlopen()`/`dlsym()`,
-  `zlib`, `LibreSSL` (real SHA256/AES via EVP).
-- **Wynlang** — a small scripting language with its own VM
-  (`kernel/wynlang.c`, `kernel/wynvm.cpp`).
+**Desktop — Zerp 2.0.** A tiling window manager written in Qt Quick, drawn on
+the GPU (virtio-gpu + virgl → OpenGL ES through Mesa, KMS page flips). Live
+frosted glass over the wallpaper, a dock and a bar, transparent windows, and
+real client programs in their own processes.
 
-### In progress / dormant
+**Web — a browser.** WPE WebKit 2.54 (JavaScriptCore with its JIT) in a
+Qt Quick shell: Zen-style vertical tabs on live glass, Google search,
+HTTPS. YouTube loads and plays video (H.264 via MSE through GStreamer).
 
-- **Upstream Hyprland** (`gui/HAPRYLAND/`) is still auto-launched at boot
-  alongside Zerp but still crashes on startup (a pre-existing, contained
-  crash, not a regression) — this parallel effort is dormant while Zerp
-  is the actively-developed compositor.
-- **`git`** is next on the porting list, followed by a package manager,
-  then a from-scratch minimal browser engine (not a Chromium/Firefox
-  port — see the technical plan for why), then `zsh`/`bash` last.
+**Shell and tools.** fish 4.2 (interactive, with completions), dash as
+`/bin/sh`, GNU coreutils, grep, sed, less, find, tar, gzip, xz, ps.
 
-## Build Requirements
+**Python 3.14** with the full standard library, `pip` and `venv`: sqlite3,
+ssl/HTTPS, asyncio, threads, subprocess, multiprocessing, the interactive REPL.
 
-| Tool | Purpose |
-|------|---------|
-| `gcc` | Kernel C compiler |
-| `x86_64-w64-mingw32-gcc` | UEFI bootloader compiler |
-| `nasm` | x86_64 assembler |
-| `mtools` | FAT32 image creation |
-| `qemu-system-x86_64` | Emulator |
-| `ovmf` | UEFI firmware for QEMU |
+**Media.** GStreamer 1.28 with Ubuntu's plugins (Vorbis, Opus, H.264/AAC via
+libav, VP8/9, AV1); sound through an Intel HD Audio driver (`/dev/dsp`).
 
-Userspace ports (curl, CMake, LibreSSL, nano, ...) are built separately
-against a musl cross-toolchain — see the technical plan file for exact
-build commands per port.
+**Also:** Qt 6 apps (a file manager), curl, nano, CMake, pkg-config.
 
-## Quick Start
+## The kernel
 
-### 1. Setup (Ubuntu / WSL2)
+- UEFI boot through our own bootloader; GDT/IDT, a 1 kHz timer (PIT),
+  XSAVE/AVX state per thread.
+- Per-process address spaces with demand paging, copy-on-write `fork()`,
+  `vfork`/`posix_spawn`, shared and file-backed `mmap`, a page cache,
+  W^X with an opt-in for JITs.
+- Threads, futexes, POSIX signals (`SA_SIGINFO`, `SA_RESTART`, masks,
+  `sigsuspend`), process groups and sessions, `wait4`/`waitid`.
+- ext2 on AHCI with a write-back block cache: symlinks, hard links,
+  permissions, a working directory and the `*at()` calls.
+- Pseudo-terminals with a real line discipline (`/dev/ptmx`, `/dev/pts/N`,
+  canonical mode, ^C to the foreground group, `SIGWINCH`).
+- Networking: virtio-net, ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS; Unix domain
+  sockets with fd passing; `poll`, `select`, `epoll`, `eventfd`, `timerfd`,
+  `memfd`.
+- Graphics: a virtio-gpu DRM driver with virgl 3D, GEM buffers, PRIME and
+  KMS. Sound: Intel HD Audio.
+- **wynrc**, an OpenRC-style init: declarative services, parallel start,
+  supervision; the desktop is up a few seconds after boot. Login and
+  `su`/`ary` with hashed passwords.
+
+## Build and run
+
+Ubuntu 26.04 (native or WSL2) with KVM:
 
 ```bash
-chmod +x setup.sh
-./setup.sh
+./setup.sh          # toolchain, QEMU, OVMF
+make                # kernel, bootloader, the disk image with everything staged
+make run-gl         # boot it in QEMU with virgl 3D
 ```
 
-### 2. Build
+The userland (Qt, WebKit, GStreamer, Python, fish, coreutils) comes from
+Ubuntu's and Debian's packages, fetched and staged into the image by
+`tools/stage_*.sh`. `WITH_QT6=0`, `WITH_GST=0`, `WITH_WPE=0`, `WITH_BASE=0`
+leave parts out.
 
-```bash
-make
-```
+### Tests
 
-### 3. Run
+`make run-gl AUTOTEST=1` boots into the test programs instead of the desktop
+(`tests/`): process lifecycle (`forktest`), OpenGL on the GPU (`gltest`), KMS
+page flips (`kmstest`), sound, the JIT memory policy, GStreamer playback,
+WebKit pages including YouTube (`wpetest`), and the shell, coreutils and
+Python (`shtest`). `AUTOTEST=sh` runs just the last one.
 
-```bash
-make run
-```
-
-### 4. Debug
-
-```bash
-make debug
-# In another terminal:
-gdb -ex "target remote localhost:1234" build/kernel.elf
-```
-
-## Project Structure
+## Layout
 
 ```
-WynlandOs/
-├── boot/               # UEFI bootloader
-├── kernel/             # Canopy Kernel: mm, sched, syscalls, ELF loader,
-│                       #   real RTC/timezone (rtc.c), per-process
-│                       #   isolation (process.c), Wynlang VM
-├── drivers/            # Device drivers
-│   ├── video/          #   Framebuffer / virtio-gpu
-│   ├── input/          #   Keyboard, mouse
-│   ├── net/            #   virtio-net, ARP/ICMP/UDP/DHCP/DNS/TCP
-│   ├── fs/              #   FAT32 (long filenames)
-│   └── pci/             #   PCI bus
-├── include/wynland/    # Shared kernel headers
-├── zerp*.c/.h          # Zerp: the real multi-process compositor, its
-│                       #   client library, and demo/regression clients
-├── qt_qpa/             # Qt6 platform plugin -- a real Zerp client, not
-│                       #   a raw-framebuffer app
-├── gui/                # Legacy Ring-0 desktop env + dormant Hyprland
-│                       #   port (see Status above)
-├── lib/                # Shared kernel library
-├── pkg/                # wynpkg package manager (+ vendored quickjs)
-├── test_*.c            # Permanent regression binaries (fork, TCP, DNS,
-│                       #   dlopen, RTC/timezone, ...)
-├── external_src/       # Downloaded upstream source for ported userspace
-│                       #   tools (curl, LibreSSL, zlib, CMake, nano,
-│                       #   ncurses, pkgconf) -- gitignored, not vendored
-├── tools/               # musl cross-toolchain wrappers, OVMF firmware
-├── Makefile             # Build system
-├── setup.sh             # Toolchain setup
-└── run.sh               # QEMU launcher
+boot/          UEFI bootloader
+kernel/        the Canopy kernel: memory, scheduler, syscalls, signals,
+               ELF loader, PTYs (tty.c), Unix sockets, futexes
+drivers/       AHCI + ext2, virtio-net + TCP/IP, virtio-gpu (DRM/virgl),
+               HD Audio, PCI, input
+apps/zerp2/    Zerp 2.0, the desktop
+apps/web/      the browser (WPE WebKit in Qt Quick)
+apps/files/    the file manager
+apps/wynrc/    the init system
+qt_qpa/        Qt's platform plugin for Zerp
+tests/         the boot-time test programs
+tools/         staging of the userland, toolchain helpers
+rootfs/        files copied into the image (services, configs)
 ```
 
-## Architecture
+## Next
 
-```
-┌───────────────────────────────────────────────────────┐
-│  Real Ring-3 userspace: curl, nano, CMake, pkg-config,  │
-│  Zerp clients (file manager, terminal, Qt6 apps)         │
-├───────────────────────────────────────────────────────┤
-│         Zerp -- real multi-process compositor            │
-│  ┌───────────┬────────────┬──────────────────────────┐  │
-│  │ Dwindle   │ Zero-copy  │ Real PTY-backed terminal   │  │
-│  │ tiling    │ SHM + pipe │ (fork/dup2/execve, VT100)  │  │
-│  └───────────┴────────────┴──────────────────────────┘  │
-├───────────────────────────────────────────────────────┤
-│    Ring 3 / Linux-numbered syscalls (real ELF64 ABI)     │
-├───────────────────────────────────────────────────────┤
-│                    Canopy Kernel                          │
-│  ┌───────────┬────────────┬──────────────────────────┐  │
-│  │ Per-proc  │ Real TCP/  │ VFS / FAT32               │  │
-│  │ isolation │ IP + DNS   │ + real RTC/timezone        │  │
-│  │ + fork()  │            │                            │  │
-│  └───────────┴────────────┴──────────────────────────┘  │
-│  ┌───────────┬────────────┬──────────────────────────┐  │
-│  │ PCI       │ virtio-net │ virtio-gpu / Input Drivers │  │
-│  │ Driver    │            │                            │  │
-│  └───────────┴────────────┴──────────────────────────┘  │
-├───────────────────────────────────────────────────────┤
-│                 UEFI Bootloader                            │
-├───────────────────────────────────────────────────────┤
-│                  Hardware (x86_64)                          │
-└───────────────────────────────────────────────────────┘
-```
+A terminal for Zerp 2.0, Wayland in Zerp (and with it kitty), a package
+manager, a login screen, and real hardware: USB, NVMe, Realtek 2.5GbE.
+
+<p align="center">
+  <img src="docs/brand/mascot.jpg" alt="the WynlandOS snail" width="200">
+</p>
 
 ## License
 
-This project is for educational purposes.
+Educational project. Third-party software in the image keeps its own licenses.
