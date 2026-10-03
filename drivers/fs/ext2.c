@@ -195,6 +195,7 @@ static uint32_t        g_inode_size = 128;
 #define DEV_KBD        0xFFFFFFF3
 #define DEV_NULL       0xFFFFFFFE
 #define DEV_URANDOM    0xFFFFFFF8
+#define DEV_ZERO       0xFFFFFFED   /* /dev/zero: reads zeros, writes vanish */
 #define DEV_DSP        0xFFFFFFC0   /* include/wynland/hda.h */
 
 /* ============================================================
@@ -1193,6 +1194,64 @@ bool ext2_dir_lookup(const Ext2Inode *dir, const char *name,
     return false;
 }
 
+/* The name under which directory `dir` lists inode `inum` (not "." or
+   ".."); false if it does not. */
+static bool ext2_dir_name_of(const Ext2Inode *dir, uint32_t inum, char *name, uint32_t cap) {
+    uint8_t *blk = (uint8_t *)kmalloc(g_block_size);
+    if (!blk) return false;
+    bool found = false;
+    for (uint32_t lb = 0; lb * g_block_size < dir->i_size && !found; lb++) {
+        uint32_t phys = ext2_resolve_block((Ext2Inode *)dir, lb, false);
+        if (!phys || !ext2_read_block(phys, blk)) break;
+        uint32_t off = 0;
+        while (off + sizeof(Ext2DirEntry) <= g_block_size) {
+            Ext2DirEntry *ent = (Ext2DirEntry *)(blk + off);
+            if (ent->rec_len < sizeof(Ext2DirEntry) || off + ent->rec_len > g_block_size || (ent->rec_len & 3)) break;
+            const char *en = (const char *)(blk + off + sizeof(Ext2DirEntry));
+            uint32_t nl = ent->name_len;
+            bool dots = (nl == 1 && en[0] == '.') || (nl == 2 && en[0] == '.' && en[1] == '.');
+            if (ent->inode == inum && !dots && nl < cap && nl <= ent->rec_len - sizeof(Ext2DirEntry)) {
+                for (uint32_t i = 0; i < nl; i++) name[i] = en[i];
+                name[nl] = 0;
+                found = true;
+                break;
+            }
+            off += ent->rec_len;
+        }
+    }
+    kfree(blk);
+    return found;
+}
+
+/* The absolute path of directory inode `inum`, found the way getcwd()
+   did on old Unixes: up through "..", looking each name up in the
+   parent. What getcwd() and the *at() calls' dirfds are resolved by. */
+bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap) {
+    if (!g_group_desc || cap < 2) return false;
+    char tmp[MAX_PATH];
+    uint32_t pos = MAX_PATH - 1;      /* built backwards from the end */
+    tmp[pos] = 0;
+    for (int depth = 0; inum != EXT2_ROOT_INO; depth++) {
+        Ext2Inode dir, parent;
+        uint32_t pinum;
+        char name[MAX_FILENAME];
+        if (depth > 64 || !ext2_read_inode(inum, &dir) || (dir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
+        if (!ext2_dir_lookup(&dir, "..", &pinum, NULL) || !ext2_read_inode(pinum, &parent)) return false;
+        if (!ext2_dir_name_of(&parent, inum, name, sizeof(name))) return false;
+        uint32_t nl = str_len_local(name);
+        if (nl + 1 > pos) return false;
+        pos -= nl;
+        for (uint32_t i = 0; i < nl; i++) tmp[pos + i] = name[i];
+        tmp[--pos] = '/';
+        inum = pinum;
+    }
+    if (tmp[pos] == 0) tmp[--pos] = '/';
+    uint32_t len = MAX_PATH - 1 - pos;
+    if (len + 1 > cap) return false;
+    for (uint32_t i = 0; i <= len; i++) out[i] = tmp[pos + i];
+    return true;
+}
+
 /* ============================================================
  * Directory entry insertion
  * ============================================================ */
@@ -1753,6 +1812,30 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
     return true;
 }
 
+/* Like ext2_lookup_path, but a symlink as the LAST component is not
+   followed (lstat, readlink, unlink, rename, link). Trailing slashes are
+   ignored. *out_parent gets the directory holding it. */
+static bool ext2_lookup_nofollow(const char *path, uint32_t *out_inum, Ext2Inode *out_inode,
+                                 uint32_t *out_parent) {
+    char p[MAX_PATH], dir[MAX_PATH], base[MAX_FILENAME];
+    uint32_t n = str_len_local(path);
+    if (!n || n >= MAX_PATH || path[0] != '/') return false;
+    str_copy(p, path);
+    while (n > 1 && p[n - 1] == '/') p[--n] = 0;
+    if (!split_path(p, dir, base)) return false;
+    if (!base[0] || !str_compare(base, ".") || !str_compare(base, "..")) {
+        if (out_parent) *out_parent = 0;
+        return ext2_lookup_path(p, out_inum, out_inode);
+    }
+    uint32_t dinum;
+    Ext2Inode d;
+    if (!ext2_lookup_path(dir, &dinum, &d)) return false;
+    if ((d.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
+    if (!ext2_dir_lookup(&d, base, out_inum, NULL)) return false;
+    if (out_parent) *out_parent = dinum;
+    return ext2_read_inode(*out_inum, out_inode);
+}
+
 /* ============================================================
  * VfsNode filling
  * ============================================================ */
@@ -1866,6 +1949,10 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         if (!hda_present()) return NULL;
         hda_dsp_open();
         return alloc_device_file("dsp", 0, false, DEV_DSP, flags);
+    }
+
+    if (str_compare(path, "/dev/zero") == 0) {
+        return alloc_device_file("zero", 0, false, DEV_ZERO, flags);
     }
 
     /* Real /dev/urandom|/dev/random semantics for this driver v1:
@@ -2001,6 +2088,7 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_DSP) return -1;  /* playback only */
+    if (file->node.first_cluster == DEV_ZERO) { memset(buf, 0, size); return (int)size; }
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* always EOF */
@@ -2103,6 +2191,7 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
         return r < 0 ? -1 : (int)r;
     }
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
+    if (file->node.first_cluster == DEV_ZERO) return (int)size;
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* discard everything */
@@ -2385,7 +2474,8 @@ bool vfs_delete(const char *path) {
 
     uint32_t inum;
     Ext2Inode inode;
-    if (!ext2_lookup_path(path, &inum, &inode)) return false;
+    /* a symlink is removed itself, never what it points to */
+    if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return false;
 
     bool is_dir = ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
 
@@ -2457,12 +2547,107 @@ bool vfs_delete(const char *path) {
  * VFS API -- stat
  * ============================================================ */
 
+/* statfs(): the filesystem's size and what is free */
+void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *files, uint64_t *ffree) {
+    *bsize = g_block_size;
+    *blocks = g_sb.s_blocks_count;
+    *bfree = g_sb.s_free_blocks_count;
+    *files = g_sb.s_inodes_count;
+    *ffree = g_sb.s_free_inodes_count;
+}
+
+/* utimensat(): set the access and modification times (unix seconds;
+   ~0u leaves one as it is). The path's last symlink is followed unless
+   nofollow. 0, or -errno. */
+static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t mtime);
+
+int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) {
+    uint32_t inum;
+    Ext2Inode inode;
+    bool ok = nofollow ? ext2_lookup_nofollow(path, &inum, &inode, NULL)
+                       : ext2_lookup_path(path, &inum, &inode);
+    if (!ok) return -2;
+    return utimes_inode(inum, inode, atime, mtime);
+}
+
+int vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime) {
+    Ext2Inode inode;
+    if (!file || !ext2_read_inode(file->node.first_cluster, &inode)) return -9;   /* -EBADF */
+    return utimes_inode(file->node.first_cluster, inode, atime, mtime);
+}
+
+static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t mtime) {
+    uint32_t uid = current_uid_or_root();
+    if (uid != 0 && uid != inode.i_uid) return -1;     /* -EPERM */
+    if (atime != ~0u) inode.i_atime = atime;
+    if (mtime != ~0u) inode.i_mtime = mtime;
+    inode.i_ctime = (uint32_t)rtc_get_unix_time();
+    ext2_write_inode(inum, &inode);
+    return 0;
+}
+
+static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2Inode *ip);
+
 bool vfs_stat(const char *path, VfsStat *out) {
     if (!out) return false;
-
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return false;
+    fill_stat(out, path, inum, &inode);
+    return true;
+}
+
+bool vfs_lstat(const char *path, VfsStat *out) {
+    if (!out) return false;
+    uint32_t inum;
+    Ext2Inode inode;
+    if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return false;
+    fill_stat(out, path, inum, &inode);
+    return true;
+}
+
+int vfs_readlink(const char *path, char *buf, uint32_t cap) {
+    uint32_t inum;
+    Ext2Inode inode;
+    if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return -1;
+    if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFLNK) return -2;
+    return (int)ext2_read_symlink(&inode, buf, cap);
+}
+
+bool vfs_symlink(const char *target, const char *linkpath) {
+    char dirname[MAX_PATH], basename[MAX_FILENAME];
+    if (!split_path(linkpath, dirname, basename) || !basename[0]) return false;
+    uint32_t dinum, x;
+    Ext2Inode dir;
+    if (!ext2_lookup_path(dirname, &dinum, &dir)) return false;
+    if ((dir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
+    if (ext2_dir_lookup(&dir, basename, &x, NULL)) return false;
+    return ext2_create_symlink(dinum, &dir, basename, target);
+}
+
+int vfs_link(const char *oldpath, const char *newpath) {
+    uint32_t inum, dinum, x;
+    Ext2Inode inode, dir;
+    char dirname[MAX_PATH], basename[MAX_FILENAME];
+    if (!ext2_lookup_nofollow(oldpath, &inum, &inode, NULL)) return -2;           /* -ENOENT */
+    if ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) return -1;                    /* -EPERM */
+    if (!split_path(newpath, dirname, basename) || !basename[0]) return -2;
+    if (!ext2_lookup_path(dirname, &dinum, &dir)) return -2;
+    if ((dir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return -20;                     /* -ENOTDIR */
+    if (ext2_dir_lookup(&dir, basename, &x, NULL)) return -17;                      /* -EEXIST */
+    if (!may_write_dir(&dir)) return -13;
+    if (inode.i_links_count >= 0xFFFF) return -31;                                  /* -EMLINK */
+    uint8_t type = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK ? EXT2_FT_LNK : EXT2_FT_REG;
+    if (!ext2_dir_add_entry(dinum, &dir, basename, inum, type)) return -28;         /* -ENOSPC */
+    if (!ext2_read_inode(inum, &inode)) return -5;
+    inode.i_links_count++;
+    inode.i_ctime = (uint32_t)rtc_get_unix_time();
+    ext2_write_inode(inum, &inode);
+    return 0;
+}
+
+static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2Inode *ip) {
+    Ext2Inode inode = *ip;
 
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
@@ -2484,8 +2669,8 @@ bool vfs_stat(const char *path, VfsStat *out) {
     out->mtime = inode.i_mtime;
     out->atime = inode.i_atime;
     out->ctime = inode.i_ctime;
-
-    return true;
+    out->is_link = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK;
+    out->nlink = inode.i_links_count;
 }
 
 /* ============================================================
@@ -2630,9 +2815,23 @@ bool vfs_rename(const char *oldpath, const char *newpath) {
             new_dir_inode.i_links_count++;
             ext2_write_inode(new_dir_inum, &new_dir_inode);
         }
-        /* fix the moved directory's own ".." to point at its new parent */
-        uint32_t moved_parent_group = (new_dir_inum - 1) / g_sb.s_inodes_per_group;
-        (void)moved_parent_group;
+        /* the moved directory's own ".." now names its new parent */
+        uint32_t phys = old_inode.i_block[0];
+        uint8_t *blk = phys ? (uint8_t *)kmalloc(g_block_size) : NULL;
+        if (blk && ext2_read_block(phys, blk)) {
+            for (uint32_t off = 0; off + sizeof(Ext2DirEntry) <= g_block_size; ) {
+                Ext2DirEntry *ent = (Ext2DirEntry *)(blk + off);
+                if (ent->rec_len < sizeof(Ext2DirEntry) || off + ent->rec_len > g_block_size) break;
+                const char *nm = (const char *)(blk + off + sizeof(Ext2DirEntry));
+                if (ent->name_len == 2 && nm[0] == '.' && nm[1] == '.') {
+                    ent->inode = new_dir_inum;
+                    ext2_write_block(phys, blk);
+                    break;
+                }
+                off += ent->rec_len;
+            }
+        }
+        if (blk) kfree(blk);
     }
 
     return true;

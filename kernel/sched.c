@@ -207,6 +207,7 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     t->sig_pending = 0;
     t->sig_mask = 0;
     t->sig_frame = NULL;
+    t->sig_restore_mask = false;
     t->proc = proc ? proc : current_thread->proc;
 
     // Allocate stack

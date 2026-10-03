@@ -25,6 +25,7 @@ Manifest format (one entry per line, '#' starts a comment):
                               missing source or failed write = build error)
     Fo /dest/path host/src    optional variant: skip silently if the host
                               source doesn't exist
+    S  /dest/path target      symbolic link (e.g. S /bin usr/bin)
 
 Usage: python3 build_ext2_image.py <out.img> <size_mb> <manifest.txt>
 """
@@ -53,6 +54,7 @@ def main() -> None:
     optional: list[tuple[str, str]] = []
 
     perms: list[tuple[str, int, int]] = []
+    links: list[tuple[str, str]] = []
     with open(manifest_path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.split("#", 1)[0].strip()
@@ -66,6 +68,8 @@ def main() -> None:
                 # P <path> <uid> <octal mode incl. type>, e.g. P /tmp 0 41777
                 uid, mode = parts[2].split()
                 perms.append((parts[1], int(uid), int(mode, 8)))
+            elif kind == "S" and len(parts) == 3:
+                links.append((parts[1], parts[2]))
             elif kind in ("F", "Fo") and len(parts) == 3:
                 (required if kind == "F" else optional).append((parts[1], parts[2]))
             else:
@@ -98,15 +102,19 @@ def main() -> None:
 
     add_writes(required, True)
     add_writes(optional, False)
+    for dest, target in links:
+        cmds.append(f"symlink {dest} {target}")
 
     # Ownership and modes: everything root's, directories 0755, programs
-    # (ELF) 0755, other files 0644 -- sources on a Windows drive all read
-    # as 0777, which made every file in the image world-writable. "P"
-    # lines then set the exceptions (/tmp, the user's home).
+    # (ELF or #! script) 0755, other files 0644 -- sources on a Windows
+    # drive all read as 0777, which made every file in the image
+    # world-writable. "P" lines then set the exceptions (/tmp, the user's
+    # home).
     def is_elf(src: str) -> bool:
         try:
             with open(src, "rb") as h:
-                return h.read(4) == b"\x7fELF"
+                head = h.read(4)
+                return head == b"\x7fELF" or head[:2] == b"#!"
         except OSError:
             return False
     for d in dirs:

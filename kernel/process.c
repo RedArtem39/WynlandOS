@@ -6,6 +6,7 @@
  * by pointer, see vmm_new_process_pml4()) and its own fd table.
  */
 #include <wynland/process.h>
+#include <wynland/signal.h>
 #include <wynland/sched.h>
 #include <wynland/vmm.h>
 #include <wynland/elf.h>
@@ -77,8 +78,14 @@ void process_mark_exited(Process *p, int wait_status) {
         waitqueue_wake_all(&parent->child_wq);
         /* SIGCHLD (17): ignored unless the parent installed a handler */
         extern bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig);
-        if (parent->main_thread && parent->pid != 0)
-            signal_raise_thread(parent->main_thread->id, parent->pid, 17);
+        if (parent->main_thread && parent->pid != 0) {
+            Thread *pt = parent->main_thread;
+            signal_raise_thread(pt->id, parent->pid, 17);
+            /* a handler waits: a parent asleep in poll()/read() is woken
+               (fish learns of its children this way) */
+            if (pt->state == THREAD_STATE_BLOCKED && signal_wants_wake(pt, 17))
+                sched_unblock(pt, -4 /* EINTR */);
+        }
     }
 }
 

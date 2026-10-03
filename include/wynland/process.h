@@ -116,6 +116,12 @@ typedef struct Process {
     /* path of the running image (process_spawn/execve, inherited by fork):
        what readlink("/proc/self/exe") returns */
     char       exe_path[128];
+    /* working directory, absolute ("" = "/"): set by chdir()/fchdir(),
+       inherited by fork(), kept across execve() */
+    char       cwd[256];
+    uint32_t   umask;            /* umask(): remembered, not applied */
+    int        ctty;             /* controlling terminal: PTY index + 1, 0 none (kernel/tty.c) */
+    bool       umask_set;        /* false: never set, reads as 022 */
     /* where its time goes (sched_dump_user_threads()): timer ticks (1 ms)
        that found it in user code / in the kernel, page faults served and
        syscalls made, with their TSC cycles */

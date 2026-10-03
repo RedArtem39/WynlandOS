@@ -136,7 +136,7 @@ static const char *fact(const char *key)
     return NULL;
 }
 
-// "k=v k2=v2": all must hold. A missing fact compares as "0".
+// "k=v k2=v2": all must hold; "k=a|b" takes either. A missing fact compares as "0".
 static int conditions_hold(const char *when, char *why, size_t whylen)
 {
     char terms[MAX_LIST][32];
@@ -149,7 +149,14 @@ static int conditions_hold(const char *when, char *why, size_t whylen)
         if (eq) *eq = 0;
         const char *have = fact(k);
         if (!have) have = "0";
-        if (strcmp(have, want)) { snprintf(why, whylen, "%s=%s (want %s)", k, have, want); return 0; }
+        // "k=a|b": either value
+        int ok = 0;
+        for (const char *w = want; *w && !ok; ) {
+            size_t len = strcspn(w, "|");
+            ok = strlen(have) == len && !strncmp(have, w, len);
+            w += len + (w[len] == '|');
+        }
+        if (!ok) { snprintf(why, whylen, "%s=%s (want %s)", k, have, want); return 0; }
     }
     return 1;
 }

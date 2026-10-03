@@ -26,14 +26,62 @@ typedef struct SignalFrame {
     int sig;
     uint64_t rax; /* the interrupted syscall's result: handed back by
                      rt_sigreturn so the code after the handler sees it */
+    uint64_t mask;    /* the blocked set to go back to (rt_sigreturn) */
+    struct SignalFrame *prev;   /* the frame of a handler this one interrupted */
     uint8_t fx[FPU_AREA_MAX]; /* the interrupted code's FPU state: the handler may
                         use those registers; rt_sigreturn puts it back */
 } SignalFrame;
 
+#define SA_SIGINFO_   0x00000004u
+#define SA_RESTART_   0x10000000u
+#define SA_NODEFER_   0x40000000u
+#define SA_RESETHAND_ 0x80000000u
+#define SIG_UNBLOCKABLE ((1ULL << 9) | (1ULL << 19))
+
 /* signal numbers with default-ignore semantics (everything else with no
-   handler terminates the process -- the classic Linux default set) */
+   handler terminates the process -- the classic Linux default set). The
+   stop signals (STOP, TSTP, TTIN, TTOU) are ignored too: nothing is ever
+   stopped here, and killing a shell's job for ^Z would be worse. */
 static int default_ignored(int sig) {
-    return sig == 13 /* PIPE */ || sig == 17 /* CHLD */ || sig == 23 /* URG */;
+    return sig == 13 /* PIPE */ || sig == 17 /* CHLD */ || sig == 23 /* URG */ ||
+           sig == 18 /* CONT */ || sig == 28 /* WINCH */ ||
+           sig == 19 || sig == 20 || sig == 21 || sig == 22;
+}
+
+/* Would `sig` do anything to t right now (run a handler, or kill)? What
+   decides whether a sleeping thread is woken for it: an ignored or
+   blocked signal must not cut a read() short with -EINTR. */
+bool signal_wants_wake(Thread *t, int sig) {
+    if (!t || !t->proc || sig <= 0 || sig >= 65) return false;
+    if (sig == 9) return true;
+    if (t->sig_mask & (1ULL << sig)) return false;
+    uint64_t h = t->proc->sig_acts[sig].handler;
+    if (h == 1) return false;
+    if (h == 0 && default_ignored(sig)) return false;
+    return true;
+}
+
+/* syscalls SA_RESTART restarts after the handler (Linux restarts these;
+   poll/select/epoll/nanosleep/sigsuspend always end with -EINTR) */
+static bool restartable(uint64_t nr) {
+    switch (nr) {
+        case 0: case 1: case 17: case 18: case 19: case 20:       /* read write pread pwrite readv writev */
+        case 16: case 72: case 73:                                 /* ioctl fcntl flock */
+        case 61: case 247:                                         /* wait4 waitid */
+        case 43: case 288: case 42: case 44: case 45: case 46: case 47:  /* accept connect send/recv */
+        case 2: case 257: case 202:                                /* open openat futex */
+            return true;
+    }
+    return false;
+}
+
+/* rt_sigsuspend()'s temporary mask goes back once the signal it waited
+   for was dealt with without a handler frame to carry it */
+static void restore_suspend_mask(Thread *t) {
+    if (t->sig_restore_mask) {
+        t->sig_mask = t->sig_saved_mask;
+        t->sig_restore_mask = false;
+    }
 }
 
 /* Kill a whole process with `sig` (its wait status says so): every one
@@ -54,6 +102,22 @@ void signal_kill_process(Process *p, int sig) {
     }
 }
 
+/* execve(): handlers were addresses in the old image -- back to the
+   default action (an ignored signal stays ignored, as on Linux); frames of
+   handlers that were running are gone with it. The mask is kept. */
+void signal_exec_reset(Thread *t, Process *p) {
+    for (int sig = 1; sig < 65; sig++) {
+        SigAct *sa = &p->sig_acts[sig];
+        if (sa->handler != 1) memset(sa, 0, sizeof(*sa));
+    }
+    while (t->sig_frame) {
+        SignalFrame *f = (SignalFrame *)t->sig_frame;
+        t->sig_frame = f->prev;
+        kfree(f);
+    }
+    t->sig_restore_mask = false;
+}
+
 void signal_init(void) {
     /* state lives in Process/Thread structs; nothing global to set up */
 }
@@ -69,19 +133,22 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
     Thread *t = sched_current();
     if (!t || !t->proc) return 0;
 
-    uint64_t pending = t->sig_pending & ~t->sig_mask;
-    if (!pending) return 0;
+    int sig;
+    SigAct *act;
+    for (;;) {
+        uint64_t pending = t->sig_pending & ~t->sig_mask;
+        if (!pending) { restore_suspend_mask(t); return 0; }
+        sig = 1;
+        while (sig < 65 && !(pending & (1ULL << sig))) sig++;
+        if (sig >= 65) { t->sig_pending &= ~pending; restore_suspend_mask(t); return 0; }
+        t->sig_pending &= ~(1ULL << sig);
+        act = &t->proc->sig_acts[sig];
+        if (act->handler == 1) continue;                            /* SIG_IGN */
+        if (act->handler == 0 && default_ignored(sig)) continue;
+        break;
+    }
 
-    int sig = 1;
-    while (sig < 65 && !(pending & (1ULL << sig))) sig++;
-    if (sig >= 65) { t->sig_pending &= ~pending; return 0; }
-    t->sig_pending &= ~(1ULL << sig);
-
-    SigAct *act = &t->proc->sig_acts[sig];
-
-    if (act->handler == 1) return 0; /* SIG_IGN: used to be "called" at address 1 */
     if (act->handler == 0) {
-        if (default_ignored(sig)) return 0;
         /* fatal by default: terminate the whole process. Mark every thread
            of this process TERMINATED; the current one schedules away and
            never returns to userspace.
@@ -119,12 +186,28 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
 
     /* handler installed: build delivery context */
     SignalFrame *kf = (SignalFrame *)kmalloc(sizeof(SignalFrame));
-    if (!kf) return 0; /* out of memory: drop the signal, keep running */
+    if (!kf) { restore_suspend_mask(t); return 0; } /* out of memory: drop the signal */
     memcpy(&kf->r15, regs, 16 * 8);
     kf->sig = sig;
     kf->rax = sysret;
+    /* SA_RESTART: back to the syscall instruction with its number in RAX
+       -- the interrupted call runs again after the handler */
+    if ((int64_t)sysret == -4 /* EINTR */ && (act->flags & SA_RESTART_) && restartable(t->last_syscall)) {
+        kf->rip -= 2;
+        kf->rax = t->last_syscall;
+    }
     memcpy(kf->fx, thread_fx_user(t), FPU_AREA_MAX);
+    /* the mask the handler returns to: sigsuspend's caller's, not its
+       temporary one */
+    kf->mask = t->sig_restore_mask ? t->sig_saved_mask : t->sig_mask;
+    t->sig_restore_mask = false;
+    kf->prev = (SignalFrame *)t->sig_frame;
     t->sig_frame = (void *)kf;
+    /* while it runs: sa_mask, and the signal itself unless SA_NODEFER */
+    t->sig_mask |= (act->mask << 1) | ((act->flags & SA_NODEFER_) ? 0 : (1ULL << sig));
+    t->sig_mask &= ~SIG_UNBLOCKABLE;
+    uint64_t handler = act->handler, restorer = act->restorer, flags = act->flags;
+    if (flags & SA_RESETHAND_) { act->handler = 0; act->flags &= ~SA_SIGINFO_; }
 
     /* Skip the 128-byte red zone below the interrupted RSP first (SysV
        x86-64 ABI: leaf code keeps live locals there without moving RSP).
@@ -132,24 +215,41 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
        glibc saw it as "*** stack smashing detected ***" when a SIGCHLD
        handler ran on the way back from wait4(). */
     uint64_t sp = (regs->rsp - 128) & ~0xFULL;
+    /* SA_SIGINFO: handler(sig, siginfo_t *, ucontext_t *), both on the
+       user stack -- glibc-sized, zeroed, with what a handler may read:
+       si_signo/si_code, uc_sigmask, and RIP/RSP in uc_mcontext */
+    uint64_t uc = 0, si = 0;
+    if (flags & SA_SIGINFO_) {
+        sp -= 1024; uc = sp;
+        sp -= 128;  si = sp;
+    }
     sp -= 8; /* handler entry: RSP = 8 mod 16, as after a CALL */
-    if (!user_prepare_write(sp, sizeof(uint64_t))) {
+    if (!user_prepare_write(sp, si ? (uc + 1024 - sp) : sizeof(uint64_t))) {
         /* no usable user stack for the handler: like Linux, the process
            dies of SIGSEGV instead of the kernel faulting on the store */
-        t->sig_frame = NULL;
+        t->sig_frame = kf->prev;
         kfree(kf);
         process_mark_exited(t->proc, 11);
         t->state = THREAD_STATE_TERMINATED;
         sched_schedule();
         while (1) __asm__ volatile("cli; hlt");
     }
-    *(uint64_t *)(uintptr_t)sp = act->restorer; /* handler's RET target */
+    *(uint64_t *)(uintptr_t)sp = restorer; /* handler's RET target */
+    if (si) {
+        memset((void *)(uintptr_t)si, 0, (size_t)(uc + 1024 - si));
+        int32_t *sif = (int32_t *)(uintptr_t)si;
+        sif[0] = sig;                                   /* si_signo; si_code 0 = SI_USER */
+        uint64_t *ucq = (uint64_t *)(uintptr_t)uc;
+        ucq[5 + 15] = kf->rsp;                          /* uc_mcontext.gregs[REG_RSP] */
+        ucq[5 + 16] = kf->rip;                          /* gregs[REG_RIP] */
+        ucq[37] = kf->mask >> 1;                        /* uc_sigmask (offset 296) */
+    }
 
-    regs->rip = act->handler;
+    regs->rip = handler;
     regs->rsp = sp;
-    regs->rdi = (uint64_t)(uint32_t)sig; /* handler(signum) */
-    regs->rsi = 0;                        /* siginfo* -- v1: none */
-    regs->rdx = 0;                        /* ucontext* -- v1: none */
+    regs->rdi = (uint64_t)(uint32_t)sig; /* handler(signum, ...) */
+    regs->rsi = si;
+    regs->rdx = uc;
     return 1;
 }
 
@@ -253,7 +353,8 @@ uint64_t signal_rt_return(void *regs_v) {
         while (1) __asm__ volatile("cli; hlt");
     }
     memcpy(regs, &f->r15, 16 * 8);
-    t->sig_frame = NULL;
+    t->sig_frame = f->prev;
+    t->sig_mask = f->mask & ~SIG_UNBLOCKABLE;
     /* rax is not part of SyscallRegs (it travels in the dispatcher's return
        register): the syscall the handler interrupted had its result saved
        in the frame at delivery -- returning it here puts it back in RAX.

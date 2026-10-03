@@ -397,6 +397,11 @@ $(BUILD)/sndtest.elf: tests/sndtest.c
 	@echo "  CC(HOST)   $< (glibc, sound check)"
 	@gcc -O2 -o $@ $< -lm
 
+$(BUILD)/shtest.elf: tests/shtest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, shell + coreutils check)"
+	@gcc -O2 -o $@ $<
+
 $(BUILD)/forktest.elf: tests/forktest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, process lifecycle test)"
@@ -466,6 +471,16 @@ $(WPE_MANIFEST): tools/stage_wpe.sh tools/wpe_deps.py tests/wpeshot.c $(wildcard
 else
 WPE_MANIFEST =
 endif
+# The base userland (Ubuntu's): GNU coreutils, fish, dash as /bin/sh,
+# grep, sed, less, tar ... and the shtest check. WITH_BASE=0 leaves it out.
+WITH_BASE ?= 1
+ifeq ($(WITH_BASE),1)
+BASE_MANIFEST = $(BUILD)/base_manifest.txt
+$(BASE_MANIFEST): tools/stage_base.sh $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
+	@bash tools/stage_base.sh
+else
+BASE_MANIFEST =
+endif
 # Boot choices, read by the kernel from /etc/wynland/boot.cfg:
 #   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
 #   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
@@ -499,12 +514,12 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
-$(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf
+$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

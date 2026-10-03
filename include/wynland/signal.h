@@ -56,6 +56,14 @@ uint64_t signal_do_procmask(int how, uint64_t set_ptr, uint64_t oldset_ptr);
    return register IS the syscall-result channel on this kernel). */
 uint64_t signal_rt_return(void *regs);
 
+struct Thread;
+/* execve(): handlers back to default, pending handler frames dropped */
+struct Process;
+void signal_exec_reset(struct Thread *t, struct Process *p);
+
+/* Would sig run a handler on t or kill it (not blocked, not ignored)? */
+bool signal_wants_wake(struct Thread *t, int sig);
+
 /* Mark a signal pending on the CALLING thread (raise()/tgkill-on-self). */
 void signal_raise_current(int sig);
 

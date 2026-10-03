@@ -73,6 +73,8 @@ typedef struct {
     uint16_t mode;          /* ext2 i_mode & 07777 */
     uint32_t uid;           /* ext2 i_uid */
     uint32_t mtime, atime, ctime; /* unix seconds */
+    bool     is_link;       /* vfs_lstat(): the path names a symlink */
+    uint16_t nlink;         /* ext2 i_links_count */
 } VfsStat;
 
 /* ---- Core VFS API ---- */
@@ -97,6 +99,18 @@ bool vfs_create(const char *path);
 bool vfs_delete(const char *path);
 bool vfs_rename(const char *oldpath, const char *newpath);
 bool vfs_stat(const char *path, VfsStat *out);
+/* the last component not followed (lstat): is_link tells a symlink */
+bool vfs_lstat(const char *path, VfsStat *out);
+/* a symlink's target: its length, -1 no such path, -2 not a symlink */
+int  vfs_readlink(const char *path, char *buf, uint32_t cap);
+bool vfs_symlink(const char *target, const char *linkpath);
+/* a hard link: 0, or -errno */
+int  vfs_link(const char *oldpath, const char *newpath);
+void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *files, uint64_t *ffree);
+int  vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow);
+int  vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime);
+/* absolute path of a directory inode (drivers/fs/ext2.c) */
+bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap);
 bool vfs_set_readonly(const char *path); /* clears all write bits in i_mode */
 bool vfs_chmod(const char *path, uint32_t mode); /* owner or root */
 int  vfs_fchmod(VfsFile *file, uint32_t mode);
