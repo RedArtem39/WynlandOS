@@ -2251,6 +2251,93 @@ bool vfs_chmod(const char *path, uint32_t mode) {
     return ext2_write_inode(inum, &inode);
 }
 
+/* Free the data blocks at logical index >= first (and the indirect blocks
+   left empty), keeping i_blocks exact. */
+static void ext2_free_blocks_from(Ext2Inode *inode, uint32_t first)
+{
+    uint32_t ppb = g_block_size / 4;
+    for (uint32_t i = first; i < 12; i++) {
+        if (inode->i_block[i]) {
+            ext2_free_block(inode->i_block[i]);
+            inode->i_block[i] = 0;
+            inode->i_blocks -= g_sectors_per_block;
+        }
+    }
+    uint32_t *ptrs = (uint32_t *)kmalloc(g_block_size);
+    uint32_t *inner = (uint32_t *)kmalloc(g_block_size);
+    if (!ptrs || !inner) { if (ptrs) kfree(ptrs); if (inner) kfree(inner); return; }
+
+    /* singly indirect: logical 12 .. 12+ppb-1 */
+    if (inode->i_block[12] && ext2_read_block(inode->i_block[12], ptrs)) {
+        uint32_t from = first > 12 ? first - 12 : 0;
+        bool any = false;
+        for (uint32_t i = 0; i < ppb; i++) {
+            if (!ptrs[i]) continue;
+            if (i >= from) { ext2_free_block(ptrs[i]); ptrs[i] = 0; inode->i_blocks -= g_sectors_per_block; }
+            else any = true;
+        }
+        if (any) ext2_write_block(inode->i_block[12], ptrs);
+        else { ext2_free_block(inode->i_block[12]); inode->i_block[12] = 0; inode->i_blocks -= g_sectors_per_block; }
+    }
+
+    /* doubly indirect: logical 12+ppb .. */
+    uint32_t base = 12 + ppb;
+    if (inode->i_block[13] && ext2_read_block(inode->i_block[13], ptrs)) {
+        bool any_outer = false;
+        for (uint32_t o = 0; o < ppb; o++) {
+            if (!ptrs[o]) continue;
+            uint32_t ostart = base + o * ppb;
+            if (ostart + ppb <= first) { any_outer = true; continue; }     /* wholly kept */
+            if (!ext2_read_block(ptrs[o], inner)) { any_outer = true; continue; }
+            bool any = false;
+            for (uint32_t i = 0; i < ppb; i++) {
+                if (!inner[i]) continue;
+                if (ostart + i >= first) { ext2_free_block(inner[i]); inner[i] = 0; inode->i_blocks -= g_sectors_per_block; }
+                else any = true;
+            }
+            if (any) { ext2_write_block(ptrs[o], inner); any_outer = true; }
+            else { ext2_free_block(ptrs[o]); ptrs[o] = 0; inode->i_blocks -= g_sectors_per_block; }
+        }
+        if (any_outer) ext2_write_block(inode->i_block[13], ptrs);
+        else { ext2_free_block(inode->i_block[13]); inode->i_block[13] = 0; inode->i_blocks -= g_sectors_per_block; }
+    }
+    kfree(ptrs);
+    kfree(inner);
+}
+
+/* ftruncate(): the open file to `len` bytes -- shorter frees the blocks
+   past it and zeroes the rest of the last one (so growing again reads
+   zeros), longer leaves a hole. SQLite truncates its WAL and journals with
+   it (it was ENOSYS: those operations failed). 0 ok, -1 error. */
+int vfs_ftruncate(VfsFile *file, uint32_t len)
+{
+    if (!file) return -1;
+    uint32_t inum = file->node.first_cluster;
+    if (inum == 0 || inum >= 0xFFFFFF00u) return -1;
+    Ext2Inode inode;
+    if (!ext2_read_inode(inum, &inode)) return -1;
+    if ((inode.i_mode & 0xF000) != 0x8000) return -1;          /* regular files only */
+    pcache_drop_inode(inum);
+    if (len < inode.i_size) {
+        uint32_t bs = g_block_size;
+        ext2_free_blocks_from(&inode, (len + bs - 1) / bs);
+        if (len % bs) {
+            uint32_t blk = ext2_resolve_block(&inode, len / bs, false);
+            uint8_t *buf = blk ? (uint8_t *)kmalloc(bs) : NULL;
+            if (buf && ext2_read_block(blk, buf)) {
+                memset(buf + len % bs, 0, bs - len % bs);
+                ext2_write_block(blk, buf);
+            }
+            if (buf) kfree(buf);
+        }
+    }
+    inode.i_size = len;
+    inode.i_mtime = inode.i_ctime = (uint32_t)rtc_get_unix_time();
+    if (!ext2_write_inode(inum, &inode)) return -1;
+    file->node.size = len;
+    return 0;
+}
+
 /* fchmod(): the open file's inode, owner or root only. -1 not an ext2
    file, 0 not allowed, 1 done. */
 int vfs_fchmod(VfsFile *file, uint32_t mode) {

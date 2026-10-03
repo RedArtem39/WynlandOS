@@ -82,6 +82,35 @@ static const char VIDEO_STATUS_JS[] =
     " + ' frames=' + (q ? q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames : '?')"
     " + ' ' + v.videoWidth + 'x' + v.videoHeight; })()";
 
+/* the network's speed, for the page timings below: curl downloads 1.25 MB
+   over HTTPS (bytes, seconds, bytes/s on stdout) */
+static void netspeed(void)
+{
+    int fd[2];
+    if (pipe(fd) != 0) return;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fd[1], 1);
+    posix_spawn_file_actions_addclose(&fa, fd[0]);
+    char *argv[] = { "/usr/bin/curl", "-s", "-o", "/dev/null", "--max-time", "120",
+                     "-w", "%{size_download} bytes in %{time_total} s (%{speed_download} B/s), first byte %{time_starttransfer} s",
+                     "https://proof.ovh.net/files/10Mb.dat", NULL };
+    char *env[] = { "CURL_CA_BUNDLE=/etc/ssl/cert.pem", NULL };
+    pid_t pid;
+    char out[256] = "";
+    if (posix_spawn(&pid, argv[0], &fa, NULL, argv, env) == 0) {
+        close(fd[1]);
+        ssize_t n = read(fd[0], out, sizeof out - 1);
+        if (n > 0) out[n] = 0;
+        waitpid(pid, NULL, 0);
+    } else {
+        close(fd[1]);
+    }
+    close(fd[0]);
+    posix_spawn_file_actions_destroy(&fa);
+    fprintf(stderr, "[wpetest] network: %s\n", out[0] ? out : "curl failed");
+}
+
 int main(void)
 {
     FILE *cfg = fopen("/etc/wynland/boot.cfg", "r");
@@ -92,6 +121,7 @@ int main(void)
             g_only[strcspn(g_only, "\r\n")] = 0;
         }
     if (cfg) fclose(cfg);
+    if (wanted("net")) netspeed();
     /* JavaScript speed: 10 million loop steps (JIT: tens of ms; the
        interpreter alone: about a second) */
     shot_js("local", "file:///usr/share/wynland/web/test.html", "1500", "120000", NULL,
@@ -107,7 +137,20 @@ int main(void)
             " + ' timer10ms=' + window.__tick + ' yt-icon=' + document.querySelectorAll('yt-icon').length"
             " + ' with-svg=' + document.querySelectorAll('yt-icon svg').length"
             " + ' guide=' + !!document.querySelector('ytd-mini-guide-renderer')"
-            " + ' logo=' + document.querySelectorAll('#logo-icon svg').length");
+            " + ' logo=' + document.querySelectorAll('#logo-icon svg').length"
+            /* where the load time went: the page itself and the slowest
+               resources -- dns / connect (incl. TLS) / wait for the first
+               byte / transfer, in ms, and their size */
+            " + (() => { const r = (e) => Math.round(e); const ph = (e) => (e.name.split('?')[0].slice(-48))"
+            " + ' start=' + r(e.startTime) + ' dns=' + r(e.domainLookupEnd - e.domainLookupStart)"
+            " + ' conn=' + r(e.connectEnd - e.connectStart) + ' ttfb=' + r(e.responseStart - e.requestStart)"
+            " + ' xfer=' + r(e.responseEnd - e.responseStart) + ' kb=' + r((e.encodedBodySize || 0) / 1024);"
+            " const nav = performance.getEntriesByType('navigation')[0];"
+            " const res = performance.getEntriesByType('resource');"
+            " const slow = res.slice().sort((a, b) => b.duration - a.duration).slice(0, 8);"
+            " return ' | page: ' + (nav ? ph(nav) + ' domready=' + r(nav.domContentLoadedEventEnd) : '?')"
+            " + ' | ' + res.length + ' resources, ' + r(res.reduce((s, e) => s + (e.encodedBodySize || 0), 0) / 1024) + ' kb'"
+            " + ' | slowest: ' + slow.map(e => r(e.duration) + 'ms ' + ph(e)).join(' ; '); })()");
     /* a video: Big Buck Bunny (Blender Foundation, CC BY), no DRM */
     shot_js("ytwatch", "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "30000", "300000",
             PLAY_JS, VIDEO_STATUS_JS);

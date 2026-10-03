@@ -107,6 +107,23 @@ int main(int argc, char **argv)
         check((pid_t)syscall(SYS_gettid) == getpid(), "main thread: gettid() == getpid()");
         check(other > 0 && other != getpid(), "second thread: its own tid");
     }
+    {   /* ftruncate and record locks, as SQLite (WebKit's storage) uses them */
+        const char *p = "/tmp/forktest-trunc";
+        int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        static char buf[10000];
+        memset(buf, 'x', sizeof buf);
+        int ok = fd >= 0 && write(fd, buf, sizeof buf) == (ssize_t)sizeof buf;
+        struct stat st;
+        check(ok && ftruncate(fd, 3000) == 0 && fstat(fd, &st) == 0 && st.st_size == 3000, "ftruncate shrinks a file");
+        char back[5000];
+        int zeros = ftruncate(fd, 8000) == 0 && pread(fd, back, 5000, 3000) == 5000;
+        for (int i = 0; zeros && i < 5000; i++) if (back[i]) zeros = 0;
+        check(zeros, "ftruncate grows it with zeros (not the old bytes)");
+        struct flock fl = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1 };
+        check(fd >= 0 && fcntl(fd, F_GETLK, &fl) == 0 && fl.l_type == F_UNLCK, "F_GETLK: no conflicting lock");
+        if (fd >= 0) close(fd);
+        unlink(p);
+    }
     {   /* eventfd is a counter: GLib wakes its loop with one write each and
            drains it once -- as a pipe of records it filled up and the
            writer blocked on itself */

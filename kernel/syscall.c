@@ -3712,8 +3712,19 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         }
                         return (uint64_t)-24; /* -EMFILE */
                     }
+                    case 5:   /* F_GETLK */
+                    case 36:  /* F_OFD_GETLK */
+                        /* Locks are not tracked (every F_SETLK succeeds), so
+                           no lock can conflict: say F_UNLCK. Returning 0 with
+                           the struct untouched told SQLite that another
+                           process held its WAL lock -- it then retried with
+                           sleeps for about a minute (WebKit's localStorage,
+                           YouTube's load). */
+                        if (!a3 || !user_prepare_write(a3, 2)) return (uint64_t)-14;   /* -EFAULT */
+                        *(int16_t *)(uintptr_t)a3 = 2;                             /* l_type = F_UNLCK */
+                        return 0;
                     default:
-                        return 0; /* Stub: unknown fcntl commands succeed silently */
+                        return 0; /* Stub: unknown fcntl commands (F_SETLK & co.) succeed silently */
                 }
             }
 
@@ -4207,7 +4218,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if ((int64_t)a2 < 0) return (uint64_t)-22;
                 return (uint64_t)memfd_truncate((int)fd_table[a1]->current_cluster, a2);
             }
-            return (uint64_t)-38; /* regular files: no truncate in the VFS yet */
+            if ((fd_oflags[a1] & 3) == LINUX_O_RDONLY) return (uint64_t)-22;  /* -EINVAL: not open for writing */
+            if ((int64_t)a2 < 0) return (uint64_t)-22;
+            if (a2 > 0xFFFFFFFFull) return (uint64_t)-27;                     /* -EFBIG: 32-bit sizes */
+            return vfs_ftruncate(fd_table[a1], (uint32_t)a2) == 0 ? 0 : (uint64_t)-22;
 
         case 285: // SYS_fallocate(fd, mode, offset, len)
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) return (uint64_t)-9; /* -EBADF */

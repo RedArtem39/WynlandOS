@@ -237,6 +237,14 @@ static void progress(GObject *obj, GParamSpec *ps, gpointer data)
     if (p != last) { last = p; fprintf(stderr, "[wpeshot] %s: %d%% (%ld ms)\n", g_name, p * 10, ms()); }
 }
 
+static gboolean profile_tick(gpointer data)
+{
+    (void)data;
+    if (g_shot_started) return G_SOURCE_REMOVE;
+    syscall(1000);
+    return G_SOURCE_CONTINUE;
+}
+
 static gboolean timed_out(gpointer data)
 {
     (void)data;
@@ -288,6 +296,12 @@ int main(int argc, char **argv)
     g_signal_connect(g_view, "load-failed-with-tls-errors", G_CALLBACK(tls_failed), NULL);
     g_signal_connect(g_view, "web-process-terminated", G_CALLBACK(process_died), NULL);
     g_signal_connect(g_view, "notify::estimated-load-progress", G_CALLBACK(progress), NULL);
+
+    /* WPESHOT_PROFILE=ms: a thread dump that often while the page loads
+       (WynlandOS syscall 1000) -- what the web process does meanwhile */
+    const char *prof = g_getenv("WPESHOT_PROFILE");
+    if (prof && atoi(prof) > 0)
+        g_timeout_add((guint)atoi(prof), profile_tick, NULL);
 
     fprintf(stderr, "[wpeshot] %s: loading %s\n", g_name, argv[1]);
     webkit_web_view_load_uri(g_view, argv[1]);
