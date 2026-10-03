@@ -74,6 +74,7 @@ typedef struct {
     uint32_t uid;           /* ext2 i_uid */
     uint32_t mtime, atime, ctime; /* unix seconds */
     bool     is_link;       /* vfs_lstat(): the path names a symlink */
+    bool     is_sock;       /* an AF_UNIX socket's name */
     uint16_t nlink;         /* ext2 i_links_count */
 } VfsStat;
 
@@ -104,6 +105,7 @@ bool vfs_lstat(const char *path, VfsStat *out);
 /* a symlink's target: its length, -1 no such path, -2 not a symlink */
 int  vfs_readlink(const char *path, char *buf, uint32_t cap);
 bool vfs_symlink(const char *target, const char *linkpath);
+bool vfs_mksock(const char *path);
 /* a hard link: 0, or -errno */
 int  vfs_link(const char *oldpath, const char *newpath);
 void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *files, uint64_t *ffree);

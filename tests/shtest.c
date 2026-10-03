@@ -126,6 +126,33 @@ static const struct sh_case CASES[] = {
     { "/usr/bin/fish", "fish: completions for ls", "complete -C 'ls --colo' | head -1 | string split \\t -f1", "--color\n" },
     { "/usr/bin/fish", "fish: background job + wait", "sleep 1 &; wait; echo done", "done\n" },
     { "/usr/bin/fish", "fish: universal variables (~/.config/fish)", "set -U wyn 1; and echo ok", "ok\n" },
+    /* Python 3 */
+    { "/usr/bin/python3", "python3: runs, json, os",
+      "import sys, json, os; print(sys.version_info[:2], json.dumps({'a': [1, 2]}), os.getcwd())",
+      "(3, 14) {\"a\": [1, 2]} /tmp/shhome\n" },
+    { "/usr/bin/python3", "python3: pathlib, sqlite3, zlib, hashlib",
+      "import pathlib, sqlite3, zlib, hashlib\n"
+      "p = pathlib.Path('py'); p.mkdir(exist_ok=True); (p / 't.txt').write_text('hi')\n"
+      "db = sqlite3.connect('py/d.db'); db.execute('create table t(x)'); db.execute('insert into t values (42)'); db.commit()\n"
+      "print(db.execute('select x from t').fetchone()[0], zlib.decompress(zlib.compress(b'ok')).decode(),\n"
+      "      hashlib.sha256(b'abc').hexdigest()[:8], sorted(x.name for x in p.iterdir()))",
+      "42 ok ba7816bf ['d.db', 't.txt']\n" },
+    { "/usr/bin/python3", "python3: subprocess, threads, asyncio",
+      "import subprocess, threading, asyncio\n"
+      "r = subprocess.run(['ls', '/bin/ls'], capture_output=True, text=True).stdout.strip()\n"
+      "out = []; t = threading.Thread(target=lambda: out.append(7)); t.start(); t.join()\n"
+      "async def f():\n    await asyncio.sleep(0.05); return 'aio'\n"
+      "print(r, out[0], asyncio.run(f()))",
+      "/bin/ls 7 aio\n" },
+    { "/usr/bin/python3", "python3: multiprocessing pool",
+      "import multiprocessing as mp\n"
+      "if __name__ == '__main__':\n    with mp.Pool(2) as p: print(p.map(abs, [-1, -4, 9]))",
+      "[1, 4, 9]\n" },
+    { "/usr/bin/python3", "python3: https (ssl, CA bundle)",
+      "import urllib.request; print(urllib.request.urlopen('https://example.com', timeout=30).status)", "200\n" },
+    { "/bin/sh", "python3: venv, pip",
+      "python3 -m venv --without-pip ve && ve/bin/python -c 'import sys; print(sys.prefix)' && python3 -m pip --version | cut -c1-4",
+      "/tmp/shhome/ve\npip \n" },
 };
 
 static void run_cases(void)
@@ -232,6 +259,18 @@ static void run_pty(void)
     int ran = pty_read_until(m, buf, sizeof buf, &len, "wyn42", 10000);
     check(ran, "fish -i: a typed command runs");
     if (!ran) dump_tail(buf, len);
+
+    /* Python's REPL (3.14's own line editor) inside it, and back */
+    write(m, "python3\r", 8);
+    int py = pty_read_until(m, buf, sizeof buf, &len, ">>> ", 15000);
+    if (py) {
+        write(m, "6 * 7 + 1000\r", 13);
+        py = pty_read_until(m, buf, sizeof buf, &len, "1042", 10000);
+        write(m, "exit()\r", 7);
+        usleep(1000000);   /* back in fish (the REPL colours what it echoes: no plain "exit()" to wait for) */
+    }
+    check(py, "python3 REPL on the PTY");
+    if (!py) dump_tail(buf, len);
 
     /* "sha256s" + Tab completes to sha256sum */
     write(m, "sha256s\t", 8);

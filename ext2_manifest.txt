@@ -32,6 +32,7 @@ D /lib64
 D /lib64/dri
 D /dev
 D /dev/dri
+D /dev/shm
 D /etc/glvnd
 D /etc/glvnd/egl_vendor.d
 D /usr
@@ -1501,6 +1502,7 @@ F  /home/user/Pictures/wallpaper.png build/wall.png
 
 # permissions beyond the defaults (root, 0755 dirs/programs, 0644 files)
 P /tmp 0 41777
+P /dev/shm 0 41777
 P /home/user 1000 40755
 P /dev/dri/card0 0 100666
 P /dev/dri/renderD128 0 100666

@@ -20,7 +20,11 @@ MAN=$OUT/base_manifest.txt
 
 PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  xz-utils bzip2 diffutils debianutils ncurses-base ncurses-bin bsdextrautils
- file libmagic1t64 libmagic-mgc procps psmisc util-linux hostname"
+ file libmagic1t64 libmagic-mgc procps psmisc util-linux hostname
+ python3 python3-minimal python3.14 python3.14-minimal libpython3.14-minimal libpython3.14
+ libpython3.14-stdlib libpython3-stdlib python3-pip python3-wheel
+ python3-packaging python3-setuptools python3-venv python3.14-venv
+ python3-pip-whl python3-setuptools-whl tzdata netbase media-types"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)
@@ -38,6 +42,15 @@ if [ "$(cat "$CACHE/.unpacked" 2>/dev/null)" != "$stamp" ]; then
 fi
 echo "  BASE       $(ls "$CACHE"/debs/*.deb | wc -l) packages from $CACHE"
 
+# Python's bytecode, made here by the host's Python 3.14 (the same
+# version): unchecked-hash .pycs, as the image's files do not keep the
+# mtimes a timestamp .pyc is checked against
+PYDIRS="$ROOT/usr/lib/python3.14 $ROOT/usr/lib/python3/dist-packages"
+if [ "$(cat "$CACHE/.pyc" 2>/dev/null)" != "$stamp" ]; then
+    python3.14 -m compileall -q -j0 --invalidation-mode unchecked-hash -s "$ROOT" -p / $PYDIRS >/dev/null 2>&1 || true
+    echo "$stamp" > "$CACHE/.pyc"
+fi
+
 skip() {
     case "$1" in
         /usr/share/doc/*|/usr/share/man/*|/usr/share/locale/*|/usr/share/info/*) return 0 ;;
@@ -46,6 +59,8 @@ skip() {
         /usr/share/pixmaps/*|/usr/share/icons/*|/etc/init.d/*|/etc/cron*|/usr/lib/systemd/*) return 0 ;;
         /usr/lib/x86_64-linux-gnu/*.so*) return 0 ;;   # libraries go by soname below
         /lib/systemd/*|/usr/share/bash-completion/*|/usr/share/zsh/*) return 0 ;;
+        # Debian's "use apt, not pip" marker: there is no apt here
+        /usr/lib/python3*/EXTERNALLY-MANAGED) return 0 ;;
     esac
     return 1
 }
@@ -67,10 +82,18 @@ for d in "$CACHE"/debs/*.deb; do
         case "$mode" in
             d*) echo "$path" >> "$dirs" ;;
             l*) echo "$(plain "$path") ${rest#-> }" >> "$links" ;;
-            -*) echo "$path" >> "$files" ;;
+            -*) if [ -z "$rest" ]; then echo "$path" >> "$files"; fi ;;   # (a name with spaces: not expressible in a manifest)
         esac
     done
 done
+
+# python3.14 itself is not PIE (linked at 0x400000, where the kernel's
+# identity map is): a PIE main() over libpython3.14.so stands in for it
+gcc -O2 -fPIE -pie -o "$OUT/python3.14" tools/python_launcher.c     "$ROOT/usr/lib/x86_64-linux-gnu/libpython3.14.so.1.0" -Wl,-rpath-link,"$ROOT/usr/lib/x86_64-linux-gnu"
+
+# the .pycs made above are in no package
+find $PYDIRS -type d -name __pycache__ | sed "s|^$ROOT||" >> "$dirs"
+find $PYDIRS -name '*.pyc' | sed "s|^$ROOT||" >> "$files"
 
 BINS=""
 {
@@ -83,6 +106,7 @@ BINS=""
         echo "D $d"
     done
     sort -u "$files" | while read -r f; do
+        if [ "$f" = /usr/bin/python3.14 ]; then echo "F $f $OUT/python3.14"; continue; fi
         echo "F $(plain "$f") $ROOT$f"
     done
     sort -u "$links" | while read -r l t; do
@@ -91,6 +115,10 @@ BINS=""
     done
     grep -q '^/usr/bin/sh ' "$links" || echo "S /usr/bin/sh dash"
     grep -q '^/usr/bin/which ' "$links" || echo "S /usr/bin/which which.debianutils"
+    # OpenSSL's own directory (Python's ssl looks there): the CA bundle
+    echo "D /usr/lib/ssl"
+    echo "S /usr/lib/ssl/certs /etc/ssl/certs"
+    echo "S /usr/lib/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt"
 } > "$MAN"
 
 # one line per path; drop dirs the other manifests make

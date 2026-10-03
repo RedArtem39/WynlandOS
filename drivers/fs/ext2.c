@@ -77,6 +77,8 @@ extern int sata_port_num;
 #define EXT2_S_IFREG  0x8000
 #define EXT2_S_IFDIR  0x4000
 #define EXT2_S_IFLNK  0xA000
+#define EXT2_S_IFSOCK 0xC000
+#define EXT2_FT_SOCK  6
 
 /* directory entry file_type byte (FILETYPE feature) */
 #define EXT2_FT_UNKNOWN 0
@@ -2263,7 +2265,18 @@ uint32_t vfs_tell(VfsFile *file) {
  * VFS API -- create
  * ============================================================ */
 
+static bool create_node(const char *path, uint16_t mode, uint8_t ft);
+
 bool vfs_create(const char *path) {
+    return create_node(path, EXT2_S_IFREG | 0644, EXT2_FT_REG);
+}
+
+/* the name of a bound AF_UNIX socket: an inode of its own type, as on Linux */
+bool vfs_mksock(const char *path) {
+    return create_node(path, EXT2_S_IFSOCK | 0755, EXT2_FT_SOCK);
+}
+
+static bool create_node(const char *path, uint16_t mode, uint8_t ft) {
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
 
@@ -2280,7 +2293,7 @@ bool vfs_create(const char *path) {
 
     Ext2Inode newf;
     memset(&newf, 0, sizeof(newf));
-    newf.i_mode = EXT2_S_IFREG | 0644;
+    newf.i_mode = mode;
     newf.i_links_count = 1;
     /* Real ownership: a file created by a uid-1000 process needs its own
        uid on the inode, or the very next SYS_open()'s owner check would
@@ -2298,7 +2311,7 @@ bool vfs_create(const char *path) {
         return false;
     }
 
-    if (!ext2_dir_add_entry(dir_inum, &dir, basename, new_inum, EXT2_FT_REG)) {
+    if (!ext2_dir_add_entry(dir_inum, &dir, basename, new_inum, ft)) {
         ext2_free_inode(new_inum);
         return false;
     }
@@ -2670,6 +2683,7 @@ static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2I
     out->atime = inode.i_atime;
     out->ctime = inode.i_ctime;
     out->is_link = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK;
+    out->is_sock = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFSOCK;
     out->nlink = inode.i_links_count;
 }
 

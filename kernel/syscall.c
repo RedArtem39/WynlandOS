@@ -1347,6 +1347,22 @@ static int64_t sun_from_user(uint64_t uaddr, uint64_t alen, char *name, uint32_t
     if ((buf[0] | (buf[1] << 8)) != 1 /* AF_UNIX */) return -97; /* EAFNOSUPPORT */
     *nlen = (uint32_t)alen - 2;
     memcpy(name, buf + 2, *nlen);
+    /* a relative filesystem name is the working directory's: made
+       absolute, so bind() and connect() from elsewhere name one socket */
+    if (*nlen && name[0] && name[0] != '/') {
+        const char *cwd = sched_current()->proc->cwd[0] ? sched_current()->proc->cwd : "/";
+        uint32_t rl = 0, cl = 0;
+        while (rl < *nlen && name[rl]) rl++;
+        while (cwd[cl]) cl++;
+        if (cl + 1 + rl < 108) {
+            char tmp[108];
+            memcpy(tmp, cwd, cl);
+            if (cwd[cl - 1] != '/') tmp[cl++] = '/';
+            memcpy(tmp + cl, name, rl);
+            *nlen = cl + rl;
+            memcpy(name, tmp, *nlen);
+        }
+    }
     return 0;
 }
 
@@ -3268,8 +3284,29 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             sched_current()->clear_tid = (uint32_t *)a1;
             return (uint64_t)sched_current()->id;
 
-        case 229: // legacy duplicate seen in some musl paths
-            return (uint64_t)sched_current()->id;
+        case 229: // SYS_clock_getres(clock, struct timespec *): it returned the tid
+            {
+                if ((int64_t)a1 < 0 || a1 > 11) return (uint64_t)-22;
+                if (a2) {
+                    struct { int64_t s, ns; } r = { 0, 1 };   /* clock_gettime is TSC-precise */
+                    if (copy_to_user((void *)a2, &r, sizeof(r)) != 0) return (uint64_t)-14;
+                }
+                return 0;
+            }
+
+        case 307: // SYS_sendmmsg(fd, struct mmsghdr *, vlen, flags): glibc's resolver sends A + AAAA so
+            {
+                uint64_t vlen = a3 > 64 ? 64 : a3;
+                uint64_t sent = 0;
+                for (; sent < vlen; sent++) {
+                    uint64_t hdr = a2 + sent * 64;   /* struct msghdr (56) + msg_len, padded */
+                    int64_t r = (int64_t)syscall_dispatcher(46, a1, hdr, a4, 0, 0, regs);
+                    if (r < 0) return sent ? sent : (uint64_t)r;
+                    uint32_t len = (uint32_t)r;
+                    if (copy_to_user((void *)(hdr + 56), &len, 4) != 0) return sent ? sent : (uint64_t)-14;
+                }
+                return sent;
+            }
 
         /* Custom / Extended Syscalls */
         case 400: // SYS_draw_rect
@@ -3596,6 +3633,17 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint64_t request = a2;
                 void *argp = (void *)a3;
 
+                /* any fd: FIONBIO sets O_NONBLOCK (Python's setblocking() for
+                   sockets), FIOCLEX/FIONCLEX the close-on-exec flag */
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    (request == 0x5421 || request == 0x5451 || request == 0x5450)) {
+                    if (request == 0x5451) { fd_flags[fd] |= FD_CLOEXEC; return 0; }
+                    if (request == 0x5450) { fd_flags[fd] &= ~FD_CLOEXEC; return 0; }
+                    int on;
+                    if (copy_from_user(&on, argp, 4) != 0) return (uint64_t)-14;
+                    if (on) fd_oflags[fd] |= LINUX_O_NONBLOCK; else fd_oflags[fd] &= ~LINUX_O_NONBLOCK;
+                    return 0;
+                }
                 /* DRM render/card node: straight to the virtio-gpu DRM layer
                    (hot path -- EXECBUFFER per draw batch -- so before the
                    per-call serial log below). */
@@ -4301,6 +4349,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                 }
                 if (vst.is_link) user_stat->st_mode = S_IFLNK | 0777;   /* size: the target's length */
+                if (vst.is_sock) { user_stat->st_mode = 0140000 /* S_IFSOCK */ | (vst.mode ? vst.mode : 0755); user_stat->st_size = 0; }
                 user_stat->st_blocks = (user_stat->st_size + 511) / 512;
                 return 0;
             }
@@ -5073,6 +5122,19 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 char name[108]; uint32_t nlen;
                 int64_t r = sun_from_user(a2, a3, name, &nlen);
                 if (r < 0) return (uint64_t)r;
+                if (nlen && name[0]) {
+                    /* a filesystem name is a node in the filesystem (chmod,
+                       stat, unlink work on it); taken already -> EADDRINUSE */
+                    char path[MAX_PATH];
+                    uint32_t k = 0;
+                    while (k < nlen && name[k] && k < sizeof(path) - 1) { path[k] = name[k]; k++; }
+                    path[k] = 0;
+                    VfsStat bst;
+                    if (vfs_lstat(path, &bst)) return (uint64_t)-98;   /* -EADDRINUSE */
+                    r = usock_bind((int)fd_table[a1]->current_cluster, name, nlen);
+                    if (r == 0 && !vfs_mksock(path)) r = -2;              /* no such directory */
+                    return (uint64_t)r;
+                }
                 return (uint64_t)usock_bind((int)fd_table[a1]->current_cluster, name, nlen);
             }
             return 0; // other sockets: pretend success (unchanged)
@@ -5115,6 +5177,31 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (copy_from_user(&have, (const void *)a5, sizeof(have)) != 0) return (uint64_t)-14;
                     uint32_t c = vlen < have ? vlen : have;
                     if (c && copy_to_user((void *)a4, val, c) != 0) return (uint64_t)-14;
+                    if (copy_to_user((void *)a5, &vlen, sizeof(vlen)) != 0) return (uint64_t)-14;
+                }
+                return 0;
+            }
+            if (a1 < MAX_OPEN_FILES && fd_table[a1] &&
+                (fd_table[a1]->node.first_cluster == SOCK_FD_UDP ||
+                 fd_table[a1]->node.first_cluster == SOCK_FD_TCP)) {
+                /* IPv4 sockets: what they are (Python's ssl checks SO_TYPE);
+                   other options read as 0. It used to write nothing. */
+                bool tcp = fd_table[a1]->node.first_cluster == SOCK_FD_TCP;
+                int iv = 0;
+                if ((int)a2 == SOL_SOCKET_LVL) {
+                    switch ((int)a3) {
+                        case 3:  iv = tcp ? 1 : 2; break;          /* SO_TYPE: STREAM / DGRAM */
+                        case 7:
+                        case 8:  iv = 208 * 1024; break;           /* SO_SNDBUF, SO_RCVBUF */
+                        case 38: iv = tcp ? 6 : 17; break;         /* SO_PROTOCOL */
+                        case 39: iv = 2; break;                    /* SO_DOMAIN: AF_INET */
+                    }
+                }
+                if (a4 && a5) {
+                    uint32_t have, vlen = sizeof(int);
+                    if (copy_from_user(&have, (const void *)a5, sizeof(have)) != 0) return (uint64_t)-14;
+                    uint32_t c = vlen < have ? vlen : have;
+                    if (c && copy_to_user((void *)a4, &iv, c) != 0) return (uint64_t)-14;
                     if (copy_to_user((void *)a5, &vlen, sizeof(vlen)) != 0) return (uint64_t)-14;
                 }
                 return 0;
@@ -5738,8 +5825,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
             return 0;
 
+        case 122: // SYS_setfsuid / 123 SYS_setfsgid: the filesystem id is the uid
+        case 123:
+            return num == 122 ? proc->uid : 0;   /* the previous value; nothing changes */
+
         case 294: // SYS_inotify_init1
         case 326: // SYS_copy_file_range: cp falls back to read/write
+        case 40:  // SYS_sendfile: callers (Python's shutil) copy by hand
+        case 434: // SYS_pidfd_open: asyncio/subprocess fall back to waitpid
         case 435: // SYS_clone3: glibc falls back to clone()
         case 444: // SYS_landlock_create_ruleset
         case 445: // SYS_landlock_add_rule
