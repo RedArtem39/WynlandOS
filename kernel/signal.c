@@ -6,6 +6,7 @@
 #include <wynland/types.h>
 #include <wynland/heap.h>
 #include <wynland/sched.h>
+#include <wynland/vma.h>
 #include <wynland/process.h>
 #include <wynland/usercopy.h>
 
@@ -25,7 +26,7 @@ typedef struct SignalFrame {
     int sig;
     uint64_t rax; /* the interrupted syscall's result: handed back by
                      rt_sigreturn so the code after the handler sees it */
-    uint8_t fx[512]; /* the interrupted code's x87/SSE state: the handler may
+    uint8_t fx[FPU_AREA_MAX]; /* the interrupted code's FPU state: the handler may
                         use those registers; rt_sigreturn puts it back */
 } SignalFrame;
 
@@ -96,6 +97,13 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
             for (int k = 0; k < 16; k++)
                 m[50 + k] = "0123456789abcdef"[(regs->rip >> (60 - 4 * k)) & 0xF];
             serial_write_string(m);
+            /* who, and where: the file under RIP and the probable callers */
+            serial_write_string("  in ");
+            serial_write_string(t->proc->exe_path);
+            serial_write_string("\r\n  rip: ");
+            if (!vma_print_addr(t->proc, regs->rip)) serial_write_string("?");
+            serial_write_string("\r\n");
+            vma_print_stack(t->proc, regs->rsp);
         }
         sched_schedule();
         while (1) __asm__ volatile("cli; hlt");
@@ -115,7 +123,7 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
     memcpy(&kf->r15, regs, 16 * 8);
     kf->sig = sig;
     kf->rax = sysret;
-    memcpy(kf->fx, thread_fx_user(t), 512);
+    memcpy(kf->fx, thread_fx_user(t), FPU_AREA_MAX);
     t->sig_frame = (void *)kf;
 
     /* Skip the 128-byte red zone below the interrupted RSP first (SysV
@@ -252,7 +260,7 @@ uint64_t signal_rt_return(void *regs_v) {
        Restoring 0 instead (the old v1 contract) made e.g. waitpid() report
        0 whenever SIGCHLD's handler ran on its way back. */
     uint64_t rax = f->rax;
-    memcpy(thread_fx_user(t), f->fx, 512); /* restored by the syscall exit path */
+    memcpy(thread_fx_user(t), f->fx, FPU_AREA_MAX); /* restored by the syscall exit path */
     kfree(f);
     return rax;
 }
@@ -273,7 +281,7 @@ bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig) {
     Thread *t = start;
     int guard = 0;
     do {
-        if (t->id == tid) {
+        if (t->id == tid && t->proc && t->proc->pid != 0) {
             if (tgid != 0 && (!t->proc || t->proc->pid != tgid)) {
                 return false; /* real tgkill(2): ESRCH if tid isn't in thread group tgid */
             }

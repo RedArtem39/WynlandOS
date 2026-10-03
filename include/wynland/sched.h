@@ -13,6 +13,10 @@
    -- often another thread's kernel stack with its saved user registers,
    which came back as glibc "stack smashing detected" in that process. */
 #define THREAD_STACK_SIZE 65536 // 64 KB stack
+
+/* One thread's FPU image: XSAVE of x87 + SSE + AVX is 832 bytes (the CPU
+   says, fpu_init() checks); FXSAVE uses the first 512 */
+#define FPU_AREA_MAX 1024
 /* Written at the lowest word of every kernel stack, checked at each
    context switch: an overflow is reported instead of silently corrupting
    the heap. */
@@ -69,8 +73,9 @@ typedef struct Thread {
     uint64_t sig_pending;     /* bitmask, bit N = signal N pending */
     uint64_t sig_mask;        /* blocked-set (9 KILL / 19 STOP unblockable) */
     void *sig_frame;          /* kernel-side frame copy for SYS_rt_sigreturn */
-    /* Two x87/SSE register images (FXSAVE, 512 bytes, 16-byte aligned via
-       the accessors below). Kernel C code uses SSE too (it is NOT built
+    /* Two FPU register images (x87/SSE/AVX: XSAVE, or FXSAVE on a CPU
+       without it; FPU_AREA_MAX bytes, 64-byte aligned via the accessors
+       below). Kernel C code uses SSE too (it is NOT built
        with -mno-sse: GUI/OpenGL/QuickJS need floating point), so:
        - fx_user: the thread's USER state, saved on every entry into the
          kernel from user mode (syscall, interrupt, exception) and restored
@@ -78,22 +83,44 @@ typedef struct Thread {
        - fx_raw: the live state at a context switch, i.e. whatever kernel
          code was doing with the registers when it got preempted.
        Last fields on purpose: nothing before them moves. */
-    uint8_t fx_raw[512 + 16];
-    uint8_t fx_user_raw[512 + 16];
+    uint64_t last_syscall;    /* the syscall this thread last entered (sched_dump_user_threads) */
+    uint8_t fx_raw[FPU_AREA_MAX + 64];
+    uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;
 
 static inline uint8_t *thread_fx_area(Thread *t)
 {
-    return (uint8_t *)(((uintptr_t)t->fx_raw + 15) & ~(uintptr_t)15);
+    return (uint8_t *)(((uintptr_t)t->fx_raw + 63) & ~(uintptr_t)63);
 }
 
 static inline uint8_t *thread_fx_user(Thread *t)
 {
-    return (uint8_t *)(((uintptr_t)t->fx_user_raw + 15) & ~(uintptr_t)15);
+    return (uint8_t *)(((uintptr_t)t->fx_user_raw + 63) & ~(uintptr_t)63);
+}
+
+/* XSAVE in use (set once by fpu_init(); kernel/fpu.inc reads it too) */
+extern uint8_t g_fpu_xsave;
+
+/* At boot, before any thread: XSAVE + AVX when the CPU has them
+   (CR4.OSXSAVE, XCR0 = x87|SSE|AVX), else FXSAVE as before. Without it
+   AVX instructions are #UD -- and code that picks them by CPUID alone
+   (libatomic's 16-byte atomics) dies. */
+void fpu_init(void);
+
+static inline void fpu_save(uint8_t *area)
+{
+    if (g_fpu_xsave) __asm__ volatile("xsave64 (%0)" :: "r"(area), "a"(0xFFFFFFFFu), "d"(0xFFFFFFFFu) : "memory");
+    else             __asm__ volatile("fxsave64 (%0)" :: "r"(area) : "memory");
+}
+
+static inline void fpu_restore(uint8_t *area)
+{
+    if (g_fpu_xsave) __asm__ volatile("xrstor64 (%0)" :: "r"(area), "a"(0xFFFFFFFFu), "d"(0xFFFFFFFFu) : "memory");
+    else             __asm__ volatile("fxrstor64 (%0)" :: "r"(area) : "memory");
 }
 
 /* The running thread's fx_user image: the syscall/interrupt entry stubs
-   FXSAVE into it on entry from user mode and FXRSTOR from it on return. */
+   save into it on entry from user mode and restore from it on return. */
 extern uint8_t *current_fx_user;
 
 /* Power-on-like user FPU state: x87 control word 0x37F, MXCSR 0x1F80
@@ -101,6 +128,11 @@ extern uint8_t *current_fx_user;
 void thread_fx_default(uint8_t *area);
 
 void sched_init(void);
+
+/* Debugging: every user thread on the serial log -- process, state, the
+   syscall it is in, its user RIP and probable return addresses as
+   "libfoo.so+0x1234" (what is a hung program doing?). Syscall 1000. */
+void sched_dump_user_threads(void);
 Thread *thread_create(void (*entry)(void*), void *arg);
 Thread *thread_create_ex(void (*entry)(void*), void *arg, struct Process *proc); /* proc == NULL means "inherit caller's proc", same as thread_create() */
 /* Same as thread_create_ex(), but also sets Thread.tls_base inside the same

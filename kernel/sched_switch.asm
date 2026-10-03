@@ -10,6 +10,7 @@ global thread_trampoline
 global fork_child_entry
 extern thread_exit
 extern current_fx_user
+%include "fpu.inc"
 
 ; void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 ; System V ABI: RDI = old_rsp, RSI = new_rsp
@@ -84,8 +85,8 @@ thread_trampoline:
 fork_child_entry:
     ; the child's user x87/SSE state (a copy of the parent's, see
     ; thread_create_ex_tls()) before going back to user mode
-    mov rax, [rel current_fx_user]
-    fxrstor64 [rax]
+    mov rcx, [rel current_fx_user]
+    FPU_RESTORE rcx
     mov rax, rdi             ; rax = base pointer to the copied SyscallRegs
 
     mov r15, [rax + 0]

@@ -1,5 +1,6 @@
 global gdt_flush
 extern current_fx_user
+%include "fpu.inc"
 
 section .text
 gdt_flush:
@@ -27,8 +28,8 @@ thread_enter_user_mode:
     ; RDI = user_entry
     ; RSI = user_stack
     cli
-    mov rax, [rel current_fx_user]   ; fresh program: default user FPU state
-    fxrstor64 [rax]
+    mov rcx, [rel current_fx_user]   ; fresh program: default user FPU state
+    FPU_RESTORE rcx
     
     ; Reload data segment registers with User Data selector (0x18 | RPL 3 = 0x1B)
     ; This is required to satisfy hardware virtualization checks (DPL must match CPL) on WHPX/VT-x.
@@ -49,8 +50,8 @@ global thread_enter_user_mode_clone
 thread_enter_user_mode_clone:
     ; RDI = pointer to SyscallRegs structure
     cli
-    mov rax, [rel current_fx_user]   ; the new thread's user FPU state (creator's copy)
-    fxrstor64 [rax]
+    mov rcx, [rel current_fx_user]   ; the new thread's user FPU state (creator's copy)
+    FPU_RESTORE rcx
     mov rbx, rdi ; Save pointer to regs in rbx (which is callee-saved, so wrmsr won't touch it!)
 
     mov ax, 0x1B

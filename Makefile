@@ -110,7 +110,7 @@ LDFLAGS_KERNEL = -T $(SRC_KERNEL)/linker.ld \
                  -nostdlib                  \
                  -z max-page-size=0x1000
 
-ASFLAGS        = -f elf64 -g
+ASFLAGS        = -f elf64 -g -I kernel/
 
 # ============================================================================
 # Source Files
@@ -242,7 +242,7 @@ $(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.cpp
 	@echo "  CXX(KERN)  $<"
 	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -c $< -o $@
 
-$(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.asm
+$(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.asm $(SRC_KERNEL)/fpu.inc
 	@mkdir -p $(dir $@)
 	@echo "  AS(KERN)   $<"
 	@$(AS) $(ASFLAGS) $< -o $@
@@ -387,6 +387,11 @@ $(BUILD)/gsttest.elf: tests/gsttest.c
 	@echo "  CC(HOST)   $< (glibc, GStreamer check)"
 	@gcc -O2 -o $@ $<
 
+$(BUILD)/wpetest.elf: tests/wpetest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, WPE WebKit check)"
+	@gcc -O2 -o $@ $<
+
 $(BUILD)/sndtest.elf: tests/sndtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, sound check)"
@@ -451,6 +456,16 @@ $(GST_MANIFEST): tools/stage_gst.sh $(EXT2_MANIFEST) $(QT6_MANIFEST) $(BUILD)/gs
 else
 GST_MANIFEST =
 endif
+# WPE WebKit (Debian sid's, with Ubuntu's libraries where they fit) and
+# the wpetest check. WITH_WPE=0 builds the image without it.
+WITH_WPE ?= 1
+ifeq ($(WITH_WPE),1)
+WPE_MANIFEST = $(BUILD)/wpe_manifest.txt
+$(WPE_MANIFEST): tools/stage_wpe.sh tools/wpe_deps.py tests/wpeshot.c $(BUILD)/wpetest.elf rootfs/etc/wynrc/services/wpetest $(wildcard rootfs/usr/share/wynland/web/*) $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST)
+	@bash tools/stage_wpe.sh
+else
+WPE_MANIFEST =
+endif
 # Boot choices, read by the kernel from /etc/wynland/boot.cfg:
 #   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
 #   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
@@ -458,6 +473,9 @@ endif
 ZERP     ?= 2
 AUTOTEST ?= 0
 QEMU_EXTRA ?=
+# RAM of the run-gl VM (a browser on YouTube wants a few GB; 4096M and up
+# can starve WSL's own VM, which has half the host's RAM by default)
+MEM ?= 3072M
 # Sound: an Intel HDA card with an output codec. AUDIO=pa plays through
 # PulseAudio (WSLg's server when there is one: the Windows speakers),
 # AUDIO=wav records into AUDIO_WAV (for checking it without ears),
@@ -481,9 +499,9 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
 $(EXT2_PART_IMG): $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf
@@ -565,7 +583,7 @@ run-gl: all
 	qemu-system-x86_64                                    \
 		-machine q35,accel=kvm                            \
 		-cpu host                                         \
-		-m 2048M                                          \
+		-m $(MEM)                                         \
 		-vga none                                         \
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \

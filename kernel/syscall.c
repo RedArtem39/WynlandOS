@@ -1280,6 +1280,7 @@ bool g_syscall_trace = false;
 volatile uint64_t g_last_syscall;   /* for the latency report in kernel/irq.c */
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     g_last_syscall = num;
+    sched_current()->last_syscall = num;
     /* Per-process fd namespace -- shadows the identifiers every case below
        already uses, so this is the only change needed to make fd_table/
        fd_flags/fd_oflags per-process instead of one shared global table. */
@@ -2548,6 +2549,10 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
             sched_yield();
             return 0;
 
+        case 1000: // WynlandOS debugging: dump every user thread to the serial log
+            sched_dump_user_threads();
+            return 0;
+
         case 39: // SYS_getpid (Linux standard)
             return sched_current()->proc->pid;
 
@@ -2614,6 +2619,9 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 extern Thread *thread_create(void (*entry)(void*), void *arg);
                 Thread *t = thread_create(clone_child_entry, ca);
+                /* a user thread's tid: from the pid space (it runs only
+                   after this syscall returns: IF=0 here) */
+                t->id = process_alloc_pid();
                 /* CLONE_SETTLS (0x80000): tls = a5, user half only (see
                    arch_prctl). Without the flag the child keeps ours. */
                 if (a1 & 0x80000) t->tls_base = (a5 < 0x0000800000000000ULL) ? a5 : 0;
@@ -2744,6 +2752,7 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
 
                 extern void fork_child_entry(void *arg);
                 Thread *child_thread = thread_create_ex_tls(fork_child_entry, regs_copy, child, sched_current()->tls_base);
+                if (child_thread) child_thread->id = child->pid; /* main thread: tid == pid */
                 child->main_thread = child_thread;
                 child->thread_count = 1;
 
@@ -4389,6 +4398,15 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                     return (uint64_t)install_usock(fd_table, fd_flags, fd_oflags, s, (uint32_t)a2);
                 }
 
+                /* Netlink and every other family: not supported, said so.
+                   There used to be a mock fd here (sharing DEV_URANDOM's
+                   sentinel: reads gave random bytes) -- GLib's network
+                   monitor took those for routing messages and the WebKit
+                   network process died on them. With the error it falls
+                   back to its plain monitor, getifaddrs() to ioctls. */
+                if (domain != 2 /* AF_INET */) return (uint64_t)-97;      // -EAFNOSUPPORT
+                if (type != 1 && type != 2) return (uint64_t)-94;          // -ESOCKTNOSUPPORT (raw, seqpacket)
+
                 int fd = get_free_fd(fd_table);
                 if (fd < 0) return -24; // EMFILE
 
@@ -4796,9 +4814,53 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (r < 0) return (uint64_t)r;
                 return (uint64_t)sun_to_user(a2, a3, name, nlen);
             }
-            // Other sockets: pretend success, libwayland doesn't strictly
-            // check the name if it bound successfully
-            return 0;
+            if (a1 < MAX_OPEN_FILES && fd_table[a1] &&
+                (fd_table[a1]->node.first_cluster == SOCK_FD_UDP ||
+                 fd_table[a1]->node.first_cluster == SOCK_FD_TCP)) {
+                /* IPv4 names. glibc's getaddrinfo() connect()s a UDP
+                   socket to each answer and asks getsockname() for the
+                   source address to sort them -- it asserts the family
+                   (the old "return 0, write nothing" killed WebKit's
+                   network process on the first HTTPS name lookup). */
+                VfsFile *f = fd_table[a1];
+                uint32_t ip = 0;
+                uint16_t port = 0;
+                if (f->node.first_cluster == SOCK_FD_UDP) {
+                    int idx = (int)f->current_cluster;
+                    bool connected = udp_socket_remote(idx, &ip, &port);
+                    if (num == 52) {
+                        if (!connected) return (uint64_t)-107;          /* -ENOTCONN */
+                    } else {
+                        ip = connected ? net_get_ip() : 0;               /* source address once connected */
+                        port = udp_socket_local_port(idx);
+                    }
+                } else {
+                    TcpConnection *conn = f->current_cluster == TCP_FD_NOT_CONNECTED
+                                        ? NULL : tcp_get_connection((int)f->current_cluster);
+                    if (num == 52) {
+                        if (!conn) return (uint64_t)-107;                /* -ENOTCONN */
+                        ip = conn->remote_ip;
+                        port = conn->remote_port;
+                    } else if (conn) {
+                        ip = conn->local_ip;
+                        port = conn->local_port;
+                    }
+                }
+                struct linux_sockaddr_in sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sin_family = 2; /* AF_INET */
+                sa.sin_port = htons(port);
+                sa.sin_addr = ip;
+                uint32_t len;
+                if (!a2 || !a3 || copy_from_user(&len, (const void *)a3, sizeof(len)) != 0) return (uint64_t)-14;
+                uint32_t n = len < sizeof(sa) ? len : (uint32_t)sizeof(sa);
+                uint32_t full = (uint32_t)sizeof(sa);
+                if (copy_to_user((void *)a2, &sa, n) != 0 ||
+                    copy_to_user((void *)a3, &full, sizeof(full)) != 0) return (uint64_t)-14;
+                return 0;
+            }
+            if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;  /* -EBADF */
+            return (uint64_t)-88;                                            /* -ENOTSOCK */
 
         case 43:  // SYS_accept(fd, addr, addrlen*)
         case 288: // SYS_accept4(fd, addr, addrlen*, flags)
@@ -4959,8 +5021,31 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 return ext2_flush() ? 0 : (uint64_t)-5;   /* -EIO: not all of it reached the disk */
             }
 
-        case 28: // SYS_madvise (stub - returning 0 is always safe)
-            return 0;
+        case 28: // SYS_madvise(addr, len, advice)
+            {
+                /* MADV_DONTNEED (4) / MADV_FREE (8): Linux promises that a
+                   private anonymous page reads as zero afterwards, a private
+                   file page as the file again -- allocators (WebKit's libpas,
+                   glibc) give memory back this way and may count on it. On
+                   demand-paged regions: drop the page, the next touch faults
+                   a fresh one in. Shared pages keep their data (and are
+                   left alone); everything else is advice and ignored. */
+                if (a3 != 4 && a3 != 8) return 0;
+                if (a1 & (PAGE_SIZE - 1)) return (uint64_t)-22;
+                uint64_t len = (a2 + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+                if (len == 0) return 0;
+                if (!user_map_range_ok(a1, len)) return (uint64_t)-22;
+                PageTable *pml4 = vmm_get_current_pml4();
+                uint64_t end = a1 + len;
+                for (uint64_t a = vmm_next_mapped(pml4, a1, end); a < end;
+                     a = vmm_next_mapped(pml4, a + PAGE_SIZE, end)) {
+                    VMA *v = vma_find(proc, a);
+                    if (!v || !(v->flags & VMA_LAZY)) continue;
+                    if (vmm_get_pte(pml4, a) & PAGE_SHARED_MAP) continue;
+                    user_unmap_page(pml4, a);
+                }
+                return 0;
+            }
 
         case 35: // SYS_nanosleep (Linux standard)
             {

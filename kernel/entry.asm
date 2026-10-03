@@ -126,6 +126,7 @@ kernel_stack_top:
 section .text
 
 extern current_fx_user
+%include "fpu.inc"
 extern exception_handler
 
 isr_common_stub:
@@ -150,8 +151,8 @@ isr_common_stub:
     ; SSE). CS sits after 15 saved GPRs + vector + error code + RIP.
     test qword [rsp + 144], 3
     jz .exception_handler_nosave
-    mov rax, [rel current_fx_user]
-    fxsave64 [rax]
+    mov rbx, [rel current_fx_user]
+    FPU_SAVE rbx
 .exception_handler_nosave:
 
     ; First argument to System V ABI is RDI (pointer to registers on stack)
@@ -164,8 +165,8 @@ isr_common_stub:
     ; thread's again even if we were switched away meanwhile)
     test qword [rsp + 144], 3
     jz .exception_handler_norestore
-    mov rax, [rel current_fx_user]
-    fxrstor64 [rax]
+    mov rbx, [rel current_fx_user]
+    FPU_RESTORE rbx
 .exception_handler_norestore:
 
     ; Restore all registers
@@ -269,8 +270,8 @@ irq_common_stub:
     ; SSE). CS sits after 15 saved GPRs + vector + error code + RIP.
     test qword [rsp + 144], 3
     jz .irq_handler_nosave
-    mov rax, [rel current_fx_user]
-    fxsave64 [rax]
+    mov rbx, [rel current_fx_user]
+    FPU_SAVE rbx
 .irq_handler_nosave:
 
     ; First argument to System V ABI is RDI (pointer to registers on stack)
@@ -283,8 +284,8 @@ irq_common_stub:
     ; thread's again even if we were switched away meanwhile)
     test qword [rsp + 144], 3
     jz .irq_handler_norestore
-    mov rax, [rel current_fx_user]
-    fxrstor64 [rax]
+    mov rbx, [rel current_fx_user]
+    FPU_RESTORE rbx
 .irq_handler_norestore:
 
     ; Restore all registers

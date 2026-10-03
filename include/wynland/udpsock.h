@@ -46,6 +46,10 @@ void udp_socket_close(int idx);
 
 uint16_t udp_socket_local_port(int idx);
 
+/* The peer set by udp_socket_connect() (ip in network order, port in host
+   order); false when not connected. */
+bool udp_socket_remote(int idx, uint32_t *ip, uint16_t *port);
+
 /* Called by net.c's handle_udp() for any datagram not consumed by the
    OS's own legacy DHCP/DNS Ring-0 clients. Returns true if some live
    socket's local_port matched and the datagram was delivered. */

@@ -271,6 +271,18 @@ void exception_handler(InterruptRegisters *regs)
         char buf[64];
         uint_to_hex(regs->rip, buf);
         serial_write_string(buf);
+        {
+            /* in which file: "libfoo.so+0x1234" (a file offset, what
+               objdump/addr2line take) and the probable callers --
+               crashes in shared libraries are otherwise just numbers */
+            Thread *ct = sched_current();
+            if (ct && ct->proc) {
+                serial_write_string("  in ");
+                if (!vma_print_addr(ct->proc, regs->rip)) serial_write_string("?");
+                serial_write_string("\r\n");
+                vma_print_stack(ct->proc, regs->rsp);
+            }
+        }
         serial_write_string("\r\n");
 
         serial_write_string("RSP: 0x");

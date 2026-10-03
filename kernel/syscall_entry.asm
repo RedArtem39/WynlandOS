@@ -3,6 +3,7 @@ extern syscall_dispatcher
 extern current_kernel_stack
 extern signal_deliver_check
 extern current_fx_user
+%include "fpu.inc"
 
 section .data
 user_stack_temp: dq 0
@@ -46,7 +47,11 @@ syscall_entry:
     ; too, and user code (glibc) relies on them surviving a syscall. RBX was
     ; saved above and is free here; RAX (the syscall number) is untouched.
     mov rbx, [rel current_fx_user]
-    fxsave64 [rbx]
+    push rax
+    push rdx
+    FPU_SAVE rbx
+    pop rdx
+    pop rax
 
     ; 3. Setup arguments for syscall_dispatcher(num, a1, a2, a3, a4, a5)
     mov r9, r8         ; a5 (User R8 -> R9)
@@ -83,8 +88,10 @@ syscall_entry:
 
     ; 3c. The user's x87/SSE state back (possibly replaced by rt_sigreturn or
     ; reset by execve). RDI is restored from the stack below.
+    mov rbx, rax
     mov rdi, [rel current_fx_user]
-    fxrstor64 [rdi]
+    FPU_RESTORE rdi
+    mov rax, rbx
 
     ; 4. Restore all registers
     pop r15

@@ -132,6 +132,7 @@ void      process_mark_exited(Process *p, int wait_status);
 Process  *process_list_head(void);      /* walk with ->next */
 Process  *process_create(PageTable *pml4);
 Process  *process_kernel(void);         /* Process 0 -- pml4 = boot snapshot */
+uint64_t  process_alloc_pid(void); /* a fresh number for a pid or a user thread's tid */
 Process  *process_find_by_pid(uint64_t pid); /* Phase 18: NULL if never existed. Never freed once created (see g_process_list), so safe to hold across calls -- check ->exited, don't assume liveness from non-NULL alone. */
 Process  *process_spawn(const char *path, const char **argv, uint32_t uid); /* Loads path into a fresh address space, spawns its entry thread. argv may be NULL (historical default args) or a NULL-terminated array of kernel-owned strings. uid: PROC_UID_INHERIT to keep the caller's current uid, or a specific value (e.g. boot launches demoting to 1000). */
 

@@ -7,14 +7,46 @@
 #include <wynland/irq.h>
 #include <wynland/process.h>
 #include <wynland/usercopy.h>
+#include <wynland/vma.h>
+#include <wynland/vmm.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 
 uint8_t *current_fx_user = NULL;
+uint8_t g_fpu_xsave = 0;
+
+extern void serial_write_string(const char *str);
+
+void fpu_init(void)
+{
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (!(c & (1u << 26))) {                       /* no XSAVE: FXSAVE, no AVX */
+        serial_write_string("FPU: FXSAVE (x87, SSE)\r\n");
+        return;
+    }
+    uint64_t cr4;
+    __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= 1ULL << 18;                             /* OSXSAVE */
+    __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+    uint64_t xcr0 = 0x3;                           /* x87 | SSE */
+    if (c & (1u << 28)) xcr0 |= 0x4;               /* AVX (YMM upper halves) */
+    __asm__ volatile("xsetbv" :: "c"(0), "a"((uint32_t)xcr0), "d"((uint32_t)(xcr0 >> 32)));
+    /* the save area those components need must fit FPU_AREA_MAX */
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0xD), "c"(0));
+    if (b > FPU_AREA_MAX) {
+        xcr0 = 0x3;
+        __asm__ volatile("xsetbv" :: "c"(0), "a"((uint32_t)xcr0), "d"(0u));
+    }
+    g_fpu_xsave = 1;
+    serial_write_string((xcr0 & 0x4) ? "FPU: XSAVE (x87, SSE, AVX)\r\n" : "FPU: XSAVE (x87, SSE)\r\n");
+}
 
 void thread_fx_default(uint8_t *area)
 {
-    memset(area, 0, 512);
+    /* zero XSAVE header too: XRSTOR then gives each component its
+       initial state (x87 control word 0x37F); MXCSR is read from here */
+    memset(area, 0, FPU_AREA_MAX);
     *(uint16_t *)(area + 0)  = 0x037F; /* FCW: all x87 exceptions masked */
     *(uint32_t *)(area + 24) = 0x1F80; /* MXCSR: all SSE exceptions masked */
 }
@@ -165,7 +197,7 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
        process_spawn()/execve() reset it for a fresh program image. */
     thread_fx_default(thread_fx_area(t));
     if (current_thread && current_thread->proc && current_thread->proc->pid != 0)
-        memcpy(thread_fx_user(t), thread_fx_user(current_thread), 512);
+        memcpy(thread_fx_user(t), thread_fx_user(current_thread), FPU_AREA_MAX);
     else
         thread_fx_default(thread_fx_user(t));
     t->id = next_thread_id++;
@@ -441,8 +473,8 @@ void sched_schedule(void) {
        by the entry stubs). No SSE is used between here and the stack
        switch. */
     if (prev_thread != next_thread) {
-        __asm__ volatile("fxsave (%0)"  :: "r"(thread_fx_area(prev_thread)) : "memory");
-        __asm__ volatile("fxrstor (%0)" :: "r"(thread_fx_area(next_thread)) : "memory");
+        fpu_save(thread_fx_area(prev_thread));
+        fpu_restore(thread_fx_area(next_thread));
         current_fx_user = thread_fx_user(next_thread);
     }
     context_switch(&prev_thread->rsp, next_thread->rsp);
@@ -592,6 +624,66 @@ void sched_print_tasks(BootInfo *info, uint32_t bg_color) {
     if (rflags & 0x200) {
         __asm__ volatile("sti");
     }
+}
+
+/* ---- debugging: what are the user threads doing? ---------------------- */
+
+static bool dump_read_u64(PageTable *pml4, uint64_t va, uint64_t *out)
+{
+    if ((va & 7) || va >= 0x0000800000000000ULL || !vmm_is_user_page(pml4, va)) return false;
+    uint64_t phys = vmm_get_phys(pml4, va);
+    if (!phys) return false;
+    *out = *(volatile uint64_t *)(uintptr_t)phys;   /* RAM is identity-mapped */
+    return true;
+}
+
+void sched_dump_user_threads(void)
+{
+    extern void uint_to_str(uint64_t val, char *buf);
+    static const char *states[] = { "ready", "running", "blocked", "terminated" };
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    serial_write_string("==== user threads ====\r\n");
+    Thread *t = thread_list;
+    int guard = 0;
+    if (t) do {
+        if (t->proc && t->proc->pid != 0 && t->state != THREAD_STATE_TERMINATED && t->stack_orig) {
+            char buf[32];
+            serial_write_string("tid ");
+            uint_to_str(t->id, buf); serial_write_string(buf);
+            serial_write_string(" pid ");
+            uint_to_str(t->proc->pid, buf); serial_write_string(buf);
+            serial_write_string(" ");
+            serial_write_string(t->proc->exe_path);
+            serial_write_string(" ");
+            serial_write_string(states[t->state <= THREAD_STATE_TERMINATED ? t->state : 0]);
+            serial_write_string(" syscall ");
+            uint_to_str(t->last_syscall, buf); serial_write_string(buf);
+            /* the user context at the top of its kernel stack: an interrupt
+               frame from ring 3 (SS 0x1B, CS 0x23) or syscall_entry's */
+            uint64_t *top = (uint64_t *)((((uint64_t)t->stack_orig + THREAD_STACK_SIZE) & ~0xFULL));
+            uint64_t rip, rsp;
+            if (top[-1] == 0x1B && top[-4] == 0x23) { rip = top[-5]; rsp = top[-2]; serial_write_string(" (preempted)"); }
+            else                                     { rip = top[-4]; rsp = top[-2]; }
+            serial_write_string("\r\n  rip ");
+            if (!vma_print_addr(t->proc, rip)) serial_write_string("?");
+            serial_write_string("\r\n");
+            int shown = 0;
+            for (int k = 0; k < 4096 && shown < 14; k++) {
+                uint64_t w;
+                if (!dump_read_u64(t->proc->pml4, rsp + 8 * (uint64_t)k, &w)) break;
+                VMA *v = vma_find(t->proc, w);
+                if (!v || !(v->prot & VMA_PROT_EXEC) || !(v->flags & VMA_FILE)) continue;
+                serial_write_string("  stack ");
+                vma_print_addr(t->proc, w);
+                serial_write_string("\r\n");
+                shown++;
+            }
+        }
+        t = t->next;
+    } while (t != thread_list && ++guard < 10000);
+    serial_write_string("==== end ====\r\n");
+    if (rflags & 0x200) __asm__ volatile("sti");
 }
 
 Thread *sched_get_thread_list(void) {

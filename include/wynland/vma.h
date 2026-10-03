@@ -68,6 +68,13 @@ void vma_free_list(struct Process *proc);
 /* The VMA covering address `addr`, or NULL if none does. */
 VMA *vma_find(struct Process *proc, uint64_t addr);
 
+/* Crash reports: print "libfoo.so+0x1234" (a file offset, what objdump
+   and addr2line take) for an address in a file mapping (false: it is
+   not in one), and the probable return addresses found on a user stack
+   (no frame pointers needed). The process must be the current one. */
+bool vma_print_addr(struct Process *proc, uint64_t addr);
+void vma_print_stack(struct Process *proc, uint64_t rsp);
+
 /* Demand paging: give the not-yet-present page holding `addr` a zeroed
    frame if it lies in a VMA_LAZY region that allows `access` (VMA_PROT_*).
    True when the page is now mapped -- the faulting access can be retried.

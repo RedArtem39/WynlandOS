@@ -102,6 +102,40 @@ VMA *vma_find(Process *proc, uint64_t addr)
     return NULL;
 }
 
+extern void serial_write_string(const char *str);
+extern void uint_to_hex(uint64_t val, char *buf);
+extern int copy_from_user(void *kdst, const void *usrc, uint64_t len);
+
+bool vma_print_addr(Process *proc, uint64_t addr)
+{
+    VMA *v = proc ? vma_find(proc, addr) : NULL;
+    if (!v || !(v->flags & VMA_FILE) || !v->file) return false;
+    const VfsFile *vf = (const VfsFile *)(const void *)v->file->vf;
+    char buf[24];
+    serial_write_string(vf->node.name);
+    serial_write_string("+");
+    uint_to_hex(addr - v->start + v->file_off, buf);
+    serial_write_string(buf);
+    return true;
+}
+
+void vma_print_stack(Process *proc, uint64_t rsp)
+{
+    /* no frame pointers in most libraries: every stack word that points
+       into a file's executable mapping is a probable return address */
+    int shown = 0;
+    for (int k = 0; k < 2048 && shown < 20; k++) {
+        uint64_t w;
+        if (copy_from_user(&w, (const void *)(rsp + 8 * (uint64_t)k), 8) != 0) break;
+        VMA *v = vma_find(proc, w);
+        if (!v || !(v->prot & VMA_PROT_EXEC) || !(v->flags & VMA_FILE)) continue;
+        serial_write_string("  stack: ");
+        vma_print_addr(proc, w);
+        serial_write_string("\r\n");
+        shown++;
+    }
+}
+
 /* Read-ahead for file-backed faults: one disk request fills this many
    pages. Read page by page, a big library took tens of thousands of
    separate disk commands (each polled with interrupts off) where the old

@@ -76,8 +76,23 @@ static int run_capture(const char *path, const char *arg, const char *arg2, char
     return WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
 }
 
+static void *report_tid(void *out)
+{
+    *(pid_t *)out = (pid_t)syscall(SYS_gettid);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
+    {   /* Linux thread ids: the main thread's is the pid (WebKit finds its
+           main thread that way), another thread's is neither */
+        pid_t other = 0;
+        pthread_t th;
+        pthread_create(&th, NULL, report_tid, &other);
+        pthread_join(th, NULL);
+        check((pid_t)syscall(SYS_gettid) == getpid(), "main thread: gettid() == getpid()");
+        check(other > 0 && other != getpid(), "second thread: its own tid");
+    }
     /* re-exec'd by the posix_spawn test */
     if (argc > 1 && strcmp(argv[1], "child5") == 0) return 5;
 

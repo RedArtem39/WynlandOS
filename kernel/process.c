@@ -18,6 +18,15 @@ static Process *g_process_list = NULL;
 static Process *g_kernel_process = NULL;
 static uint64_t g_next_pid = 1;
 
+/* pids and user thread ids are one number space, like Linux: a process's
+   first thread has tid == pid (glibc, WebKit's main-thread check
+   getpid() == gettid() rely on it), its other threads take fresh numbers
+   from here so no tid ever equals another process's pid */
+uint64_t process_alloc_pid(void)
+{
+    return g_next_pid++;
+}
+
 Process *process_create(PageTable *pml4) {
     Process *p = (Process *)kmalloc(sizeof(Process));
     if (!p) return NULL;
@@ -237,6 +246,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        assignment could let the scheduler run this thread with the
        CALLER's page tables still loaded). */
     Thread *t = thread_create_ex(user_exec_wrapper, earg, p);
+    if (t) t->id = p->pid; /* the main thread's tid is the pid */
     p->main_thread = t;
     if (t) thread_fx_default(thread_fx_user(t)); /* a fresh program image */
     p->thread_count = 1;

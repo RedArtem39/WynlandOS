@@ -2524,6 +2524,7 @@ void kernel_main(BootInfo *boot_info)
         cr4 |= (1ULL << 9);  // Set OSFXSR (bit 9) - enable fxsave/fxrstor
         cr4 |= (1ULL << 10); // Set OSXMMEXCPT (bit 10) - enable unmasked SSE exceptions
         __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+        fpu_init();          // XSAVE + AVX when the CPU has them
     }
 
     /* ---- Initialize IDT ---- */

@@ -126,6 +126,15 @@ uint16_t udp_socket_local_port(int idx)
     return sockets[idx].local_port;
 }
 
+bool udp_socket_remote(int idx, uint32_t *ip, uint16_t *port)
+{
+    if (idx < 0 || idx >= UDP_MAX_SOCKETS || !sockets[idx].in_use || !sockets[idx].remote_ip)
+        return false;
+    *ip = sockets[idx].remote_ip;
+    *port = sockets[idx].remote_port;
+    return true;
+}
+
 bool udp_socket_deliver(uint32_t src_ip, uint16_t src_port,
                         uint16_t dst_port, const void *data, uint32_t len)
 {
