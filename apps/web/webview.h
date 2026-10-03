@@ -19,6 +19,10 @@ class WebView : public QQuickPaintedItem
     Q_PROPERTY(bool canGoForward READ canGoForward NOTIFY historyChanged)
     Q_PROPERTY(QString error READ error NOTIFY errorChanged)
     Q_PROPERTY(bool secure READ secure NOTIFY urlChanged)
+    /* the tab shown: a hidden one tells WebKit so (it stops drawing) */
+    Q_PROPERTY(bool active READ active WRITE setActive NOTIFY activeChanged)
+    /* corner radius of the page (the card look); 0 = square */
+    Q_PROPERTY(qreal radius READ radius WRITE setRadius NOTIFY radiusChanged)
 
 public:
     explicit WebView(QQuickItem *parent = nullptr);
@@ -32,6 +36,10 @@ public:
     bool canGoForward() const;
     QString error() const { return m_error; }
     bool secure() const { return m_url.startsWith(QLatin1String("https://")); }
+    bool active() const { return m_active; }
+    void setActive(bool a);
+    qreal radius() const { return m_radius; }
+    void setRadius(qreal r) { if (r != m_radius) { m_radius = r; update(); Q_EMIT radiusChanged(); } }
 
     Q_INVOKABLE void load(const QString &text);   // a URL, a host, or words to search for
     Q_INVOKABLE void goBack();
@@ -53,6 +61,10 @@ Q_SIGNALS:
     void loadingChanged();
     void historyChanged();
     void errorChanged();
+    void activeChanged();
+    void radiusChanged();
+    /* a link wants a new window (target=_blank, window.open): a new tab */
+    void newTabRequested(const QString &url);
 
 protected:
     void geometryChange(const QRectF &newGeometry, const QRectF &oldGeometry) override;
@@ -78,5 +90,8 @@ private:
     QString m_url, m_title, m_error;
     double m_progress = 0;
     bool m_loading = false;
+    bool m_active = true;
+    qreal m_radius = 0;
+    int m_frames = 0;
     Qt::MouseButtons m_buttons;
 };

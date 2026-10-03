@@ -216,6 +216,10 @@ bool ZClient::pump(QVector<QString> *spawnRequests)
                 }
             }
             else if (m.type == ZERP_MSG_CLOSE) closed = true;
+            else if (m.type == ZERP_MSG_ALPHA) {
+                const bool a = m.x != 0;
+                if (a != m_alpha) { m_alpha = a; m_dirty = true; emit alphaChanged(); emit damaged(); }
+            }
         }
         off += size;
     }
@@ -322,7 +326,10 @@ void ZServer::moveFocusedTo(int w)
 
 void ZServer::toggleFullscreen()
 {
-    if (m_focused) m_focused->setFullscreen(!m_focused->fullscreen());
+    if (!m_focused) return;
+    m_focused->setFullscreen(!m_focused->fullscreen());
+    emit layoutChanged();   // the layout only followed client/workspace changes: the
+                            // window stayed tiled (bar and dock hidden) until one
 }
 
 void ZServer::focusDirection(int dx, int dy)
@@ -386,7 +393,9 @@ public:
     qint64 comparisonKey() const override { return m_key; }
     QRhiTexture *rhiTexture() const override { return m_tex; }
     QSize textureSize() const override { return m_size; }
-    bool hasAlphaChannel() const override { return false; }
+    bool hasAlphaChannel() const override { return m_alpha; }
+    bool alpha() const { return m_alpha; }
+    void setAlpha(bool a) { if (a != m_alpha) { m_alpha = a; m_pending = QRect(QPoint(0, 0), m_view); } }
     bool hasMipmaps() const override { return false; }
 
     // GUI side (render thread, GUI blocked): what to upload next.
@@ -415,7 +424,7 @@ public:
         // the client's buffer as an image (0xAARRGGBB words = BGRA bytes),
         // laid out at its current width
         QImage whole(reinterpret_cast<const uchar *>(m_pixels), m_view.width(), m_view.height(),
-                     m_view.width() * 4, QImage::Format_RGB32);
+                     m_view.width() * 4, m_alpha ? QImage::Format_ARGB32_Premultiplied : QImage::Format_RGB32);
         QRhiTextureSubresourceUploadDescription d;
         if (m_bgra) {
             d = QRhiTextureSubresourceUploadDescription(whole);
@@ -424,7 +433,8 @@ public:
         } else {
             // no BGRA textures: swizzle just the damaged part
             d = QRhiTextureSubresourceUploadDescription(
-                whole.copy(m_pending).convertToFormat(QImage::Format_RGBX8888));
+                whole.copy(m_pending).convertToFormat(m_alpha ? QImage::Format_RGBA8888_Premultiplied
+                                                              : QImage::Format_RGBX8888));
         }
         d.setDestinationTopLeft(m_pending.topLeft());
         u->uploadTexture(m_tex, QRhiTextureUploadDescription({ 0, 0, d }));
@@ -437,6 +447,7 @@ private:
     const uint32_t *m_pixels = nullptr;
     QRect m_pending;
     bool m_bgra = true;
+    bool m_alpha = false;   // premultiplied alpha: the node blends
     qint64 m_key;
     static inline qint64 s_keys = 0;
 };
@@ -472,11 +483,17 @@ QSGNode *ZSurface::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
         delete node;
         return nullptr;
     }
+    if (node && static_cast<ZTexture *>(node->texture())->alpha() != m_client->alpha()) {
+        delete node;          // blending is decided when the texture is set
+        node = nullptr;
+    }
     if (!node) {
         node = new QSGSimpleTextureNode;
         node->setOwnsTexture(true);
         node->setFiltering(QSGTexture::Linear);
-        node->setTexture(new ZTexture);
+        auto *t = new ZTexture;
+        t->setAlpha(m_client->alpha());
+        node->setTexture(t);
     }
     auto *tex = static_cast<ZTexture *>(node->texture());
     const QSize bufSize(m_client->bufWidth(), m_client->bufHeight());

@@ -7,7 +7,6 @@ import QtQuick.Effects
 
 Item {
     id: dock
-    property url blurUrl
     property real screenW: 0
     property real screenH: 0
     readonly property int baseSize: 48
@@ -52,7 +51,7 @@ Item {
             maskThresholdMin: 0.5
             maskSpreadAtMin: 1.0
         }
-        Image { source: dock.blurUrl; x: -dock.x; y: -dock.y; width: dock.screenW; height: dock.screenH }
+        Glass { anchors.fill: parent; gx: dock.x; gy: dock.y }
         Rectangle { anchors.fill: parent; color: "#10131a"; opacity: 0.5 }
     }
     Item {

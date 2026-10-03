@@ -74,6 +74,7 @@ Window {
         target: zerp
         function onClientsChanged() { shell.relayout() }
         function onWorkspaceChanged() { shell.relayout() }
+        function onLayoutChanged() { shell.relayout() }
         function onFocusDirectionRequested(dx, dy) { shell.focusTowards(dx, dy) }
     }
     onWidthChanged: relayout()
@@ -115,7 +116,7 @@ Window {
         Image {
             anchors.fill: parent
             source: wallpaperUrl
-            onStatusChanged: if (status === Image.Ready) grabTimer.restart()
+
             fillMode: Image.PreserveAspectCrop
             visible: wallpaperUrl !== ""
             asynchronous: true
@@ -123,10 +124,11 @@ Window {
         }
     }
 
-    // ---- frosted glass for the bar and the dock: the wallpaper blurred
-    // ONCE into a static image; they show their slice of it. (Blurring
-    // live in each of them redid a 48 px blur every frame the dock moved.)
-    property url blurUrl: ""
+    // ---- frosted glass: the wallpaper through ONE blur for the whole
+    // screen, live (a wallpaper that moves -- a video -- shows through as it
+    // changes), re-rendered only when the wallpaper does. The bar, the dock
+    // and see-through windows (ZERP_MSG_ALPHA) each show their slice of it
+    // (Glass.qml); blurring in each of them redid the blur per item.
     MultiEffect {
         id: blurredWall
         anchors.fill: parent
@@ -135,13 +137,7 @@ Window {
         blur: 1.0
         blurMax: 64
         saturation: 0.25
-        z: -1   // under the wallpaper: kept renderable for re-grabs, never seen
-    }
-    Timer {
-        id: grabTimer
-        interval: 400
-        running: true
-        onTriggered: blurredWall.grabToImage(function (r) { shell.blurUrl = r.url })
+        z: -1   // under the wallpaper: rendered for the slices, never seen itself
     }
 
     // FPS meter (mod+P)
@@ -172,7 +168,6 @@ Window {
     Bar {
         anchors { left: parent.left; right: parent.right; top: parent.top }
         height: shell.barHeight
-        blurUrl: shell.blurUrl
         fps: zerp.showFps ? shell.fps : -1
         visible: !shell.fullscreenOn
         z: 40
@@ -180,7 +175,6 @@ Window {
 
     Dock {
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 10 }
-        blurUrl: shell.blurUrl
         screenW: shell.width
         screenH: shell.height
         visible: !shell.fullscreenOn

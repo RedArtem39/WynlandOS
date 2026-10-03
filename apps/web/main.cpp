@@ -9,11 +9,15 @@
 
 #include "webview.h"
 
+#include <QtCore/QFile>
 #include <QtCore/QUrl>
 #include <QtCore/QtPlugin>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QPainter>
+#include <QtGui/QPainterPath>
 #include <QtGui/QScreen>
+#include <QtGui/QSurfaceFormat>
+#include <QtQuick/QQuickWindow>
 #include <QtQml/QQmlApplicationEngine>
 #include <QtQml/QQmlContext>
 #include <QtQml/qqml.h>
@@ -30,6 +34,7 @@ extern "C" {
 Q_IMPORT_PLUGIN(QWynlandFbIntegrationPlugin)
 
 static WPEDisplay *g_display;
+
 
 // ---------------------------------------------------------------- GLib side
 
@@ -58,14 +63,21 @@ static gboolean on_load_failed(WebKitWebView *, WebKitLoadEvent, char *uri, GErr
     return FALSE;
 }
 
-// target=_blank and window.open(): one window, one page -- open it here
-static gboolean on_decide_policy(WebKitWebView *web, WebKitPolicyDecision *decision,
-                                 WebKitPolicyDecisionType type, gpointer)
+static void on_process_died(WebKitWebView *, WebKitWebProcessTerminationReason why, gpointer user)
+{
+    fprintf(stderr, "[web] view %p: page process ended (%d)\n", user, (int)why);
+    static_cast<WebView *>(user)->setError(QStringLiteral("The page's process ended -- reload to try again"));
+}
+
+// target=_blank and window.open(): a new tab
+static gboolean on_decide_policy(WebKitWebView *, WebKitPolicyDecision *decision,
+                                 WebKitPolicyDecisionType type, gpointer user)
 {
     if (type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) return FALSE;
     WebKitNavigationAction *action =
         webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
-    webkit_web_view_load_request(web, webkit_navigation_action_get_request(action));
+    const char *uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(action));
+    Q_EMIT static_cast<WebView *>(user)->newTabRequested(QString::fromUtf8(uri ? uri : ""));
     webkit_policy_decision_ignore(decision);
     return TRUE;
 }
@@ -78,7 +90,8 @@ WebView::WebView(QQuickItem *parent) : QQuickPaintedItem(parent)
     setAcceptHoverEvents(true);
     setFlag(ItemIsFocusScope, false);
     setActiveFocusOnTab(true);
-    setFillColor(Qt::white);
+    setFillColor(Qt::transparent);   /* rounded corners show what's behind */
+    setOpaquePainting(false);
 
     m_web = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", g_display, NULL));
     m_view = webkit_web_view_get_wpe_view(m_web);
@@ -95,6 +108,7 @@ WebView::WebView(QQuickItem *parent) : QQuickPaintedItem(parent)
     g_signal_connect(m_web, "load-changed", G_CALLBACK(on_load_changed), this);
     g_signal_connect(m_web, "load-failed", G_CALLBACK(on_load_failed), this);
     g_signal_connect(m_web, "decide-policy", G_CALLBACK(on_decide_policy), this);
+    g_signal_connect(m_web, "web-process-terminated", G_CALLBACK(on_process_died), this);
 
     wpe_view_map(m_view);
     wpe_view_set_visible(m_view, TRUE);
@@ -122,7 +136,7 @@ void WebView::load(const QString &text)
     else if (!t.contains(QLatin1Char(' ')) && (t.contains(QLatin1Char('.')) || t.startsWith(QLatin1String("localhost"))))
         url = QStringLiteral("https://") + t;
     else
-        url = QStringLiteral("https://duckduckgo.com/html/?q=") + QString::fromUtf8(QUrl::toPercentEncoding(t));
+        url = QStringLiteral("https://www.google.com/search?q=") + QString::fromUtf8(QUrl::toPercentEncoding(t));
     webkit_web_view_load_uri(m_web, url.toUtf8().constData());
     forceActiveFocus();
 }
@@ -154,8 +168,8 @@ void WebView::syncState()
 
 void WebView::frame(const unsigned char *px, int w, int h, unsigned stride)
 {
-    static int frames;
-    if (++frames == 1 || frames % 500 == 0) fprintf(stderr, "[web] frame %d: %dx%d\n", frames, w, h);
+    if (++m_frames == 1 || m_frames % 500 == 0)
+        fprintf(stderr, "[web] view %p frame %d: %dx%d\n", (void *)this, m_frames, w, h);
     // WebKit's ARGB8888 is QImage's premultiplied ARGB32
     m_frame = QImage(px, w, h, int(stride), QImage::Format_ARGB32_Premultiplied).copy();
     update();
@@ -163,7 +177,22 @@ void WebView::frame(const unsigned char *px, int w, int h, unsigned stride)
 
 void WebView::paint(QPainter *painter)
 {
-    if (!m_frame.isNull()) painter->drawImage(QPointF(0, 0), m_frame);
+    if (m_frame.isNull() || !m_active) return;
+    if (m_radius > 0) {
+        QPainterPath clip;
+        clip.addRoundedRect(QRectF(0, 0, width(), height()), m_radius, m_radius);
+        painter->setClipPath(clip);
+    }
+    painter->drawImage(QPointF(0, 0), m_frame);
+}
+
+void WebView::setActive(bool a)
+{
+    if (a == m_active) return;
+    m_active = a;
+    wpe_view_set_visible(m_view, a);   /* hidden: WebKit stops rendering it */
+    if (a) { resizeView(); update(); }
+    Q_EMIT activeChanged();
 }
 
 void WebView::resizeView()
@@ -220,7 +249,7 @@ void WebView::pointer(int type, Qt::MouseButton button, const QPointF &p, Qt::Ke
     else {
         const guint b = wpe_button(button);
         const guint count = type == WPE_EVENT_POINTER_DOWN
-            ? wpe_view_compute_press_count(m_view, p.x(), p.y(), b, now_ms()) : 1;
+            ? wpe_view_compute_press_count(m_view, p.x(), p.y(), b, now_ms()) : 0;   /* only a press has a count */
         ev = wpe_event_pointer_button_new(WPEEventType(type), m_view, WPE_INPUT_SOURCE_MOUSE, now_ms(),
                                           mods(m, m_buttons), b, p.x(), p.y(), count);
     }
@@ -325,6 +354,13 @@ int main(int argc, char **argv)
     if (!qEnvironmentVariableIsSet("LD_LIBRARY_PATH")) qputenv("LD_LIBRARY_PATH", "/lib64");
     if (!qEnvironmentVariableIsSet("GST_DEBUG")) qputenv("GST_DEBUG", "1");
 
+    // see-through window: Zerp shows live frosted glass under the parts we
+    // leave transparent (the sidebar), the page itself is opaque
+    QSurfaceFormat fmt = QSurfaceFormat::defaultFormat();
+    fmt.setAlphaBufferSize(8);
+    QSurfaceFormat::setDefaultFormat(fmt);
+    QQuickWindow::setDefaultAlphaBuffer(true);
+
     QGuiApplication app(argc, argv);
 
     // WebKit's main-thread setup before any other WebKit/WPE object
@@ -335,8 +371,19 @@ int main(int argc, char **argv)
     qmlRegisterType<WebView>("Wynland.Web", 1, 0, "WebView");
     QQmlApplicationEngine engine;
     engine.addImportPath(QStringLiteral("/usr/lib/x86_64-linux-gnu/qt6/qml"));
-    engine.rootContext()->setContextProperty(QStringLiteral("startUrl"),
-        argc > 4 ? QString::fromLocal8Bit(argv[4]) : QStringLiteral("https://www.youtube.com/"));
+    // the first tabs: argv[4..], else boot.cfg's "weburls=a b c" (a debugging
+    // aid, as for wpetest), else the home page
+    QStringList urls;
+    for (int i = 4; i < argc; i++) urls << QString::fromLocal8Bit(argv[i]);
+    if (urls.isEmpty()) {
+        QFile cfg(QStringLiteral("/etc/wynland/boot.cfg"));
+        if (cfg.open(QIODevice::ReadOnly))
+            for (const QByteArray &line : cfg.readAll().split('\n'))
+                if (line.startsWith("weburls="))
+                    for (const QByteArray &u : line.mid(8).trimmed().split(' '))
+                        if (!u.isEmpty()) urls << QString::fromUtf8(u);
+    }
+    engine.rootContext()->setContextProperty(QStringLiteral("startUrls"), urls);
     QObject::connect(&engine, &QQmlApplicationEngine::warnings, [](const QList<QQmlError> &ws) {
         for (const QQmlError &w : ws) fprintf(stderr, "[web] %s\n", qPrintable(w.toString()));
     });

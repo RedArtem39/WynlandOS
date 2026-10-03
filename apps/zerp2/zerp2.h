@@ -30,6 +30,8 @@ class ZClient : public QObject
     Q_PROPERTY(int workspace READ workspace WRITE setWorkspace NOTIFY workspaceChanged)
     Q_PROPERTY(bool focused READ focused NOTIFY focusedChanged)
     Q_PROPERTY(bool fullscreen READ fullscreen WRITE setFullscreen NOTIFY fullscreenChanged)
+    /* the client draws with alpha (ZERP_MSG_ALPHA): blended, glass behind */
+    Q_PROPERTY(bool alpha READ alpha NOTIFY alphaChanged)
 public:
     ZClient(int id, const QString &path, QObject *parent);
     ~ZClient() override;
@@ -43,6 +45,7 @@ public:
     bool focused() const { return m_focused; }
     void setFocused(bool f) { if (f != m_focused) { m_focused = f; emit focusedChanged(); } }
     bool fullscreen() const { return m_fullscreen; }
+    bool alpha() const { return m_alpha; }
     void setFullscreen(bool f) { if (f != m_fullscreen) { m_fullscreen = f; emit fullscreenChanged(); } }
 
     // QML: the size the client should render at (the layout's target,
@@ -70,6 +73,7 @@ signals:
     void workspaceChanged();
     void focusedChanged();
     void fullscreenChanged();
+    void alphaChanged();
     void damaged();
 
 private:
@@ -79,7 +83,7 @@ private:
     int m_id;
     QString m_path, m_title, m_appId;
     int m_workspace = 1;
-    bool m_focused = false, m_fullscreen = false;
+    bool m_focused = false, m_fullscreen = false, m_alpha = false;
     int m_c2s = -1, m_s2c = -1;
     long m_pid = -1;
     uint32_t *m_shm = nullptr;
@@ -145,6 +149,7 @@ public:
 
 signals:
     void clientsChanged();
+    void layoutChanged();   // a window went full screen or back: tiles move
     void focusChanged();
     void workspaceChanged();
     void focusDirectionRequested(int dx, int dy);

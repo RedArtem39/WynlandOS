@@ -19,12 +19,26 @@ class QWynlandFbBackingStore : public QPlatformBackingStore
 {
 public:
     QWynlandFbBackingStore(QWindow *window, QWynlandFbScreen *screen, int c2sFd)
-        : QPlatformBackingStore(window), m_screen(screen), m_c2sFd(c2sFd) {}
+        : QPlatformBackingStore(window), m_screen(screen), m_c2sFd(c2sFd),
+          m_alpha(window->requestedFormat().hasAlpha())
+    {
+        /* a window that asked for an alpha channel: Zerp blends it over
+           frosted glass (ZERP_MSG_ALPHA) */
+        if (m_alpha && m_c2sFd >= 0) {
+            ZerpMsg msg = { ZERP_MSG_ALPHA, 1, 0, 0, 0 };
+            if (write(m_c2sFd, &msg, sizeof(msg)) < 0) { /* Zerp gone */ }
+        }
+    }
 
     QPaintDevice *paintDevice() override { return &m_image; }
 
     void beginPaint(const QRegion &region) override {
-        Q_UNUSED(region);
+        /* translucent: what gets repainted starts transparent, not as the
+           last frame's pixels */
+        if (!m_alpha) return;
+        QPainter p(&m_image);
+        p.setCompositionMode(QPainter::CompositionMode_Source);
+        for (const QRect &r : region) p.fillRect(r, Qt::transparent);
     }
 
     void endPaint() override {
@@ -39,6 +53,7 @@ public:
         if (!tileImage || tileImage->isNull()) return;
 
         QPainter painter(tileImage);
+        painter.setCompositionMode(QPainter::CompositionMode_Source);   /* alpha as is, not blended */
         for (const QRect &rect : region) {
             painter.drawImage(rect, m_image, rect);
         }
@@ -60,6 +75,7 @@ private:
     QImage m_image;
     QWynlandFbScreen *m_screen;
     int m_c2sFd;
+    bool m_alpha;
 };
 
 QWynlandFbIntegration::QWynlandFbIntegration(const QStringList &paramList)

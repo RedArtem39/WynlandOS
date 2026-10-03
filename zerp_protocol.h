@@ -15,6 +15,9 @@
 #define ZERP_MSG_DAMAGE 1   /* x,y,w,h = dirty rect in the client's own SHM buffer */
 #define ZERP_MSG_CLOSE  2   /* client is exiting; fields unused */
 #define ZERP_MSG_SPAWN  6   /* path = binary to launch as a new Zerp client (ZerpSpawnMsg shape, not ZerpMsg) */
+#define ZERP_MSG_ALPHA  7   /* x = 1: the buffer's alpha is meant (premultiplied ARGB) -- Zerp
+                               blends the window and shows live frosted glass under its
+                               see-through parts; 0: opaque (the default) */
 
 /* compositor -> client (over the client's s2c pipe) */
 #define ZERP_MSG_TILE_RECT   3   /* x,y,w,h = this client's newly (re)assigned screen tile */

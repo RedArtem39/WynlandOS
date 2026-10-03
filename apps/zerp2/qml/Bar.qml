@@ -5,15 +5,10 @@ import QtQuick
 
 Item {
     id: bar
-    property url blurUrl
     property int fps: -1
 
-    // frosted: our slice of the pre-blurred wallpaper (static, no effect)
-    Item {
-        anchors.fill: parent
-        clip: true
-        Image { source: bar.blurUrl; x: -bar.x; y: -bar.y; width: bar.parent ? bar.parent.width : 0; height: bar.parent ? bar.parent.height : 0 }
-    }
+    // frosted: our slice of the live blurred wallpaper
+    Glass { anchors.fill: parent; gx: bar.x; gy: bar.y }
     Rectangle { anchors.fill: parent; color: "#10131a"; opacity: 0.55 }
     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: "white"; opacity: 0.07 }
 

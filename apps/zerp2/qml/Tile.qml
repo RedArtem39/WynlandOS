@@ -54,6 +54,15 @@ Item {
         }
     }
 
+    // a see-through client (ZERP_MSG_ALPHA): live frosted glass under it,
+    // over the border plate
+    Glass {
+        anchors.fill: surface
+        visible: tile.client && tile.client.alpha
+        gx: tile.x + surface.x
+        gy: tile.y + surface.y
+    }
+
     ZSurface {
         id: surface
         anchors { fill: parent; margins: tile.cornerRadius > 0 ? tile.borderWidth : 0 }
