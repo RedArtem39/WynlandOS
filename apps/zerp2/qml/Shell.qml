@@ -27,6 +27,13 @@ Window {
                                          width - 2 * gapOut,
                                          height - barHeight - dockReserve - 2 * gapOut)
 
+    // a full-screen window in front: the bar and the dock step aside (they
+    // sit above the windows and covered its top -- a browser's toolbar)
+    readonly property bool fullscreenOn: {
+        const f = zerp.focusedClient
+        return !!f && f.fullscreen && f.workspace === zerp.workspace
+    }
+
     // id -> target rect, recomputed whenever clients/workspace change
     property var rects: ({})
 
@@ -167,6 +174,7 @@ Window {
         height: shell.barHeight
         blurUrl: shell.blurUrl
         fps: zerp.showFps ? shell.fps : -1
+        visible: !shell.fullscreenOn
         z: 40
     }
 
@@ -175,6 +183,7 @@ Window {
         blurUrl: shell.blurUrl
         screenW: shell.width
         screenH: shell.height
+        visible: !shell.fullscreenOn
         z: 40
     }
 

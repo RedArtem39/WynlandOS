@@ -177,6 +177,13 @@ void irq_handler(InterruptRegisters *regs)
     if (irq == 0) {
         /* Timer interrupt (1 kHz) */
         timer_ms++;
+        {   /* time accounting: whose tick, user or kernel */
+            Thread *at = sched_current();
+            if (at && at->proc && at->proc->pid != 0) {
+                if ((regs->cs & 3) == 3) at->proc->st_user_ticks++;
+                else at->proc->st_kernel_ticks++;
+            }
+        }
         /* Send End of Interrupt (EOI) to PIC before yielding */
         outb(PIC1_COMMAND, PIC_EOI);
 

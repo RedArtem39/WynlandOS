@@ -37,6 +37,7 @@
 #include <wynland/vfs.h>
 #include <wynland/ahci.h>
 #include <wynland/heap.h>
+#include <wynland/vma.h>
 #include <wynland/types.h>
 #include <wynland/boot_info.h>
 #include <wynland/mbr.h>
@@ -1099,6 +1100,7 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
    content, so this hasn't mattered in practice; revisit if it ever
    does. */
 uint32_t ext2_write_file_data(uint32_t inum, Ext2Inode *inode, uint32_t offset, uint32_t len, const void *buf) {
+    pcache_drop_inode(inum);   /* mapped copies of the old contents (kernel/vma.c) */
     const uint8_t *in = (const uint8_t *)buf;
     uint32_t bytes_written = 0;
     uint8_t *block_buf = (uint8_t *)kmalloc(g_block_size);
@@ -1551,6 +1553,7 @@ bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
 
 /* Free an inode with no links left: its blocks, then the inode itself. */
 static void ext2_destroy_inode(uint32_t found_inode, Ext2Inode *inode) {
+    pcache_drop_inode(found_inode);
     Ext2Inode target = *inode;
     ext2_free_all_blocks(&target);
     /* Real bug found via independent e2fsck cross-check (see
@@ -1912,6 +1915,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     file->dirty = false;
 
     if (flags & VFS_O_TRUNC) {
+        pcache_drop_inode(inum);
         ext2_free_all_blocks(&inode);
         /* the contents go; the file's mode, owner and links stay (it was
            reset to 0644 owned by whoever truncated it) */

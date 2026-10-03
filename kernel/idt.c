@@ -239,7 +239,13 @@ void exception_handler(InterruptRegisters *regs)
         uint32_t access = VMA_PROT_READ;
         if (regs->err_code & 0x2) access = VMA_PROT_WRITE;
         if (regs->err_code & 0x10) access = VMA_PROT_EXEC;
-        if (ft && ft->proc && vma_fault_in(ft->proc, pf_cr2, access)) return;
+        if (ft && ft->proc) {
+            uint64_t t0 = __builtin_ia32_rdtsc();
+            bool ok = vma_fault_in(ft->proc, pf_cr2, access);
+            ft->proc->st_faults++;
+            ft->proc->st_fault_tsc += __builtin_ia32_rdtsc() - t0;
+            if (ok) return;
+        }
     }
     if (regs->int_no == 14 && (regs->err_code & 0x3) == 0x3 &&
         ((regs->cs & 0x03) == 3 || pf_cr2 < 0x0000800000000000ULL)) {

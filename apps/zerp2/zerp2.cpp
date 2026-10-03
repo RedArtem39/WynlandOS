@@ -38,6 +38,7 @@ ZClient::ZClient(int id, const QString &path, QObject *parent)
     else if (base == QLatin1String("zerp_files") || base == QLatin1String("files")) m_title = QStringLiteral("Files");
     else if (base == QLatin1String("zerp_rofi")) m_title = QStringLiteral("Launcher");
     else if (base == QLatin1String("qmldemo")) m_title = QStringLiteral("Qt Quick demo");
+    else if (base == QLatin1String("web")) m_title = QStringLiteral("Web");
     else m_title = base;
 }
 

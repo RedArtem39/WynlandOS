@@ -65,6 +65,11 @@ void vma_clone_list(struct Process *to, struct Process *from);
 void vma_free(VMA *v);
 void vma_free_list(struct Process *proc);
 
+/* The page cache behind file mappings (kernel/vma.c): a file's contents
+   changed -- forget its cached pages. */
+void pcache_drop_inode(uint32_t inum);
+uint32_t pcache_pages(void);   /* pages it holds now */
+
 /* The VMA covering address `addr`, or NULL if none does. */
 VMA *vma_find(struct Process *proc, uint64_t addr);
 

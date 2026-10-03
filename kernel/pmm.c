@@ -158,6 +158,13 @@ void pmm_init(BootInfo *boot_info)
     }
 }
 
+/* Where the search for a free frame starts: the byte of the last frame
+   handed out, moved back when a lower one is freed. Every allocation used
+   to scan the bitmap from the start, a byte at a time, with interrupts
+   off -- with a few GB in use that was ~50 us per page fault, and WebKit
+   takes hundreds of thousands of them. */
+static uint64_t g_alloc_hint;
+
 void *pmm_alloc_page(void)
 {
     uint64_t rflags;
@@ -165,7 +172,16 @@ void *pmm_alloc_page(void)
 
     void *result = NULL;
     uint64_t bitmap_bytes = (total_pages + 7) / 8;
-    for (uint64_t i = 0; i < bitmap_bytes; i++) {
+    uint64_t start = g_alloc_hint < bitmap_bytes ? g_alloc_hint : 0;
+    for (uint64_t n = 0; n < bitmap_bytes; n++) {
+        uint64_t i = start + n;
+        if (i >= bitmap_bytes) i -= bitmap_bytes;
+        /* eight full bytes at once */
+        if ((i & 7) == 0 && i + 8 <= bitmap_bytes && n + 8 <= bitmap_bytes &&
+            *(const uint64_t *)(const void *)(bitmap + i) == ~0ULL) {
+            n += 7;
+            continue;
+        }
         if (bitmap[i] != 0xFF) { /* At least one free bit */
             for (int bit = 0; bit < 8; bit++) {
                 uint64_t idx = i * 8 + bit;
@@ -176,6 +192,7 @@ void *pmm_alloc_page(void)
                     bitmap_set(idx);
                     free_pages--;
                     refcount[idx] = 1;
+                    g_alloc_hint = i;
                     result = (void *)(idx * PAGE_SIZE);
                     {
                         extern uint64_t heap_end_addr;
@@ -268,6 +285,7 @@ void pmm_free_page(void *addr)
                 bitmap_clear(idx);
                 refcount[idx] = 0;
                 free_pages++;
+                if (idx / 8 < g_alloc_hint) g_alloc_hint = idx / 8;
             }
         }
     }

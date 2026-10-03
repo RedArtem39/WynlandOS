@@ -1295,7 +1295,18 @@ void process_teardown(Process *proc) {
 bool g_syscall_trace = false;
 
 volatile uint64_t g_last_syscall;   /* for the latency report in kernel/irq.c */
+static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs);
+
+/* syscall_entry calls this: the dispatch, counted (Process.st_*) */
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
+    uint64_t t0 = __builtin_ia32_rdtsc();
+    uint64_t r = syscall_dispatch(num, a1, a2, a3, a4, a5, regs);
+    Process *p = sched_current()->proc;   /* after execve: the new image's */
+    if (p) { p->st_syscalls++; p->st_sys_tsc += __builtin_ia32_rdtsc() - t0; }
+    return r;
+}
+
+static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     g_last_syscall = num;
     sched_current()->last_syscall = num;
     /* Per-process fd namespace -- shadows the identifiers every case below
@@ -2453,7 +2464,14 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                            grant has to go through the fault handler's COW
                            resolution on the next write, same as it would
                            without this mprotect() call. */
-                        pte_flags |= (old_flags & PAGE_COW) ? PAGE_COW : PAGE_WRITE;
+                        /* Also a frame that is shared without the bit (a
+                           read-only stretch dropped it, or a page-cache page,
+                           kernel/vma.c): never written in place. Not for
+                           SHARED_MAP pages -- those are meant to be shared. */
+                        bool shared = (old_flags & PAGE_COW) ||
+                            (!(old_flags & PAGE_SHARED_MAP) &&
+                             pmm_page_refcount((void *)(uintptr_t)vmm_get_phys(pml4, a)) > 1);
+                        pte_flags |= shared ? PAGE_COW : PAGE_WRITE;
                     }
                     if (!(prot & 0x4)) { // !PROT_EXEC
                         pte_flags |= PAGE_NX;

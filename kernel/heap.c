@@ -23,6 +23,8 @@ typedef struct HeapHeader {
 
 #define HEAP_MAGIC_USED 0x4B4D5553u   /* "KMUS" */
 #define HEAP_MAGIC_FREE 0x4B4D4652u   /* "KMFR" */
+#define HEAP_MAGIC_SMALL 0x4B4D534Du  /* "KMSM": a size-class object, in use */
+#define HEAP_MAGIC_SMALLFREE 0x4B4D5346u  /* "KMSF": one on its class's free list */
 
 /* b absorbs the free block right after it */
 static void merge_next(HeapHeader *b)
@@ -125,7 +127,67 @@ static bool heap_grow(size_t size_needed)
     return true;
 }
 
+/* ---- small objects ---------------------------------------------------------
+   kmalloc() finds a block by walking every block of the heap, used and
+   free, from the start: with tens of thousands of small objects (VMAs,
+   page cache entries, open files) every allocation in the kernel walked
+   them all with interrupts off -- the whole machine slowed down. Objects up
+   to 512 bytes come from per-size free lists instead: O(1), carved 16 KB
+   at a time out of one big heap block (one entry in the walked list). They
+   keep a HeapHeader (magic SMALL, size = the class) so kfree() and
+   heap_get_block_size() work on them unchanged; they are not merged back. */
+static const uint16_t g_small_size[] = { 16, 32, 48, 64, 80, 96, 128, 160, 192, 256, 320, 384, 512 };
+#define SMALL_CLASSES (sizeof(g_small_size) / sizeof(g_small_size[0]))
+#define SMALL_CHUNK 16384
+static HeapHeader *g_small_free[SMALL_CLASSES];   /* linked through ->next */
+
+static void *kmalloc_general(size_t size);
+
+static int small_class(size_t size)
+{
+    for (unsigned i = 0; i < SMALL_CLASSES; i++)
+        if (size <= g_small_size[i]) return (int)i;
+    return -1;
+}
+
 void *kmalloc(size_t size)
+{
+    if (size == 0) return NULL;
+    int c = small_class(size);
+    if (c < 0) return kmalloc_general(size);
+
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    if (!g_small_free[c]) {
+        /* a chunk of objects of this class */
+        uint8_t *chunk = (uint8_t *)kmalloc_general(SMALL_CHUNK);
+        if (chunk) {
+            size_t stride = sizeof(HeapHeader) + g_small_size[c];
+            for (size_t off = 0; off + stride <= SMALL_CHUNK; off += stride) {
+                HeapHeader *h = (HeapHeader *)(chunk + off);
+                h->size = g_small_size[c];
+                h->prev = NULL;
+                h->is_free = true;
+                h->magic = HEAP_MAGIC_SMALLFREE;
+                h->next = g_small_free[c];
+                g_small_free[c] = h;
+            }
+        }
+    }
+    void *result = NULL;
+    HeapHeader *h = g_small_free[c];
+    if (h) {
+        g_small_free[c] = h->next;
+        h->next = NULL;
+        h->is_free = false;
+        h->magic = HEAP_MAGIC_SMALL;
+        result = (void *)((uintptr_t)h + sizeof(HeapHeader));
+    }
+    if (rflags & 0x200) __asm__ volatile("sti");
+    return result;
+}
+
+static void *kmalloc_general(size_t size)
 {
     if (size == 0) {
         return NULL;
@@ -209,11 +271,19 @@ void kfree(void *ptr)
         HeapHeader *block = (HeapHeader *)((uintptr_t)ptr - sizeof(HeapHeader));
         uint64_t a = (uint64_t)(uintptr_t)block;
         bool in_heap = a >= HEAP_START && a < heap_end_addr && !((uintptr_t)ptr & 15);
-        if (!in_heap || block->magic != HEAP_MAGIC_USED || block->is_free) {
+        int c = (in_heap && block->magic == HEAP_MAGIC_SMALL) ? small_class(block->size) : -1;
+        if (c >= 0 && g_small_size[c] == block->size) {
+            /* a size-class object: back on its list */
+            block->is_free = true;
+            block->magic = HEAP_MAGIC_SMALLFREE;
+            block->next = g_small_free[c];
+            g_small_free[c] = block;
+        } else if (!in_heap || block->magic != HEAP_MAGIC_USED || block->is_free) {
             /* a double free, or a pointer kmalloc() never returned:
                ignore it rather than corrupt the heap, and say so */
             char buf[32];
-            serial_write_string(in_heap && block->magic == HEAP_MAGIC_FREE ? "Heap: double kfree " : "Heap: bad kfree ");
+            serial_write_string(in_heap && (block->magic == HEAP_MAGIC_FREE || block->magic == HEAP_MAGIC_SMALLFREE)
+                                ? "Heap: double kfree " : "Heap: bad kfree ");
             uint_to_hex((uint64_t)(uintptr_t)ptr, buf);
             serial_write_string(buf);
             serial_write_string("\r\n");

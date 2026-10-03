@@ -17,6 +17,7 @@
 #include <wpe/webkit.h>
 #include <wpe/headless/wpe-headless.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -182,6 +183,13 @@ static gboolean take_snapshot(gpointer data)
     (void)data;
     if (g_shot_started) return G_SOURCE_REMOVE;
     g_shot_started = TRUE;
+    /* WPESHOT_SAMPLES=n: n thread dumps a second apart first -- where the
+       page's time goes (a poor man's profiler, WynlandOS syscall 1000) */
+    const char *samples = g_getenv("WPESHOT_SAMPLES");
+    for (int i = 0; samples && i < atoi(samples); i++) {
+        if (i) g_usleep(1000000);
+        syscall(1000);
+    }
     if (g_status_js) run_js(g_status_js, "status");   /* then the snapshot */
     else start_snapshot();
     return G_SOURCE_REMOVE;

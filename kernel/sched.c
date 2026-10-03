@@ -643,7 +643,15 @@ void sched_dump_user_threads(void)
     static const char *states[] = { "ready", "running", "blocked", "terminated" };
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-    serial_write_string("==== user threads ====\r\n");
+    {
+        extern uint64_t pmm_get_free_memory(void);
+        char b[32];
+        serial_write_string("==== user threads ==== free ");
+        uint_to_str(pmm_get_free_memory() >> 20, b); serial_write_string(b);
+        serial_write_string(" MB, page cache ");
+        uint_to_str((uint64_t)pcache_pages() * 4 / 1024, b); serial_write_string(b);
+        serial_write_string(" MB\r\n");
+    }
     Thread *t = thread_list;
     int guard = 0;
     if (t) do {
@@ -659,6 +667,27 @@ void sched_dump_user_threads(void)
             serial_write_string(states[t->state <= THREAD_STATE_TERMINATED ? t->state : 0]);
             serial_write_string(" syscall ");
             uint_to_str(t->last_syscall, buf); serial_write_string(buf);
+            if (t == t->proc->main_thread) {
+                /* the process's time: ms in user code / in the kernel, page
+                   faults and syscalls with their cost (Mcycles) */
+                Process *pp = t->proc;
+                serial_write_string("\r\n  time: user ");
+                uint_to_str(pp->st_user_ticks, buf); serial_write_string(buf);
+                serial_write_string(" ms, kernel ");
+                uint_to_str(pp->st_kernel_ticks, buf); serial_write_string(buf);
+                serial_write_string(" ms; faults ");
+                uint_to_str(pp->st_faults, buf); serial_write_string(buf);
+                serial_write_string(" (");
+                uint_to_str(pp->st_fault_tsc / 1000000, buf); serial_write_string(buf);
+                serial_write_string(" Mcyc); syscalls ");
+                uint_to_str(pp->st_syscalls, buf); serial_write_string(buf);
+                serial_write_string(" (");
+                uint_to_str(pp->st_sys_tsc / 1000000, buf); serial_write_string(buf);
+                serial_write_string(" Mcyc); vmas ");
+                uint64_t nv = 0;
+                for (VMA *v = pp->vma_list; v; v = v->next) nv++;
+                uint_to_str(nv, buf); serial_write_string(buf);
+            }
             /* the user context at the top of its kernel stack: an interrupt
                frame from ring 3 (SS 0x1B, CS 0x23) or syscall_entry's */
             uint64_t *top = (uint64_t *)((((uint64_t)t->stack_orig + THREAD_STACK_SIZE) & ~0xFULL));

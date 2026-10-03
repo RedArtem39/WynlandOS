@@ -461,7 +461,7 @@ endif
 WITH_WPE ?= 1
 ifeq ($(WITH_WPE),1)
 WPE_MANIFEST = $(BUILD)/wpe_manifest.txt
-$(WPE_MANIFEST): tools/stage_wpe.sh tools/wpe_deps.py tests/wpeshot.c $(BUILD)/wpetest.elf rootfs/etc/wynrc/services/wpetest $(wildcard rootfs/usr/share/wynland/web/*) $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST)
+$(WPE_MANIFEST): tools/stage_wpe.sh tools/wpe_deps.py tests/wpeshot.c $(wildcard apps/web/*.c apps/web/*.cpp apps/web/*.h apps/web/qml/*.qml) $(BUILD)/wpetest.elf rootfs/etc/wynrc/services/wpetest $(wildcard rootfs/usr/share/wynland/web/*) $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST)
 	@bash tools/stage_wpe.sh
 else
 WPE_MANIFEST =

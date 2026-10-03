@@ -78,6 +78,7 @@ typedef struct Process {
        handler's COW path have something to look up. Zeroed by
        process_create()'s memset (NULL = empty list). */
     struct VMA *vma_list;
+    struct VMA *vma_cache;   /* the last vma_find() hit (kernel/vma.c); NULL when a node is freed */
     /* Phase 2 (sec hardening): process-local brk state, private to this
        address space -- see HEAP_BASE/HEAP_MAX above. brk_start is the
        fixed base (== HEAP_BASE for every process); brk_current is the
@@ -115,6 +116,12 @@ typedef struct Process {
     /* path of the running image (process_spawn/execve, inherited by fork):
        what readlink("/proc/self/exe") returns */
     char       exe_path[128];
+    /* where its time goes (sched_dump_user_threads()): timer ticks (1 ms)
+       that found it in user code / in the kernel, page faults served and
+       syscalls made, with their TSC cycles */
+    uint64_t   st_user_ticks, st_kernel_ticks;
+    uint64_t   st_faults, st_fault_tsc;
+    uint64_t   st_syscalls, st_sys_tsc;
     struct Process *next;
 } Process;
 

@@ -92,9 +92,22 @@ int main(void)
             g_only[strcspn(g_only, "\r\n")] = 0;
         }
     if (cfg) fclose(cfg);
-    shot("local", "file:///usr/share/wynland/web/test.html", "1500", "120000");
+    /* JavaScript speed: 10 million loop steps (JIT: tens of ms; the
+       interpreter alone: about a second) */
+    shot_js("local", "file:///usr/share/wynland/web/test.html", "1500", "120000", NULL,
+            "(() => { const t = performance.now(); let s = 0; for (let i = 0; i < 1e7; i++) s += i % 7;"
+            " return 'js 1e7 loop: ' + Math.round(performance.now() - t) + ' ms (' + s + ')'; })()");
     shot("example", "https://example.com/", "1500", "180000");
-    shot("youtube", "https://www.youtube.com/", "15000", "150000");
+    /* how far YouTube's own rendering got: animation frames ticking, icons drawn */
+    shot_js("youtube", "https://www.youtube.com/", "15000", "150000",
+            "window.__raf = 0; window.__tick = 0; window.__t0 = performance.now();"
+            " (function f() { window.__raf++; requestAnimationFrame(f); })();"
+            " setInterval(() => window.__tick++, 10); 'counting frames and timer ticks'",
+            "'in ' + Math.round(performance.now() - window.__t0) + ' ms: raf=' + window.__raf"
+            " + ' timer10ms=' + window.__tick + ' yt-icon=' + document.querySelectorAll('yt-icon').length"
+            " + ' with-svg=' + document.querySelectorAll('yt-icon svg').length"
+            " + ' guide=' + !!document.querySelector('ytd-mini-guide-renderer')"
+            " + ' logo=' + document.querySelectorAll('#logo-icon svg').length");
     /* a video: Big Buck Bunny (Blender Foundation, CC BY), no DRM */
     shot_js("ytwatch", "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "30000", "300000",
             PLAY_JS, VIDEO_STATUS_JS);

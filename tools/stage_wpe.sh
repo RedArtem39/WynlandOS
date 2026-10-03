@@ -44,6 +44,35 @@ if [ ! -f "$OUT/wpeshot.elf" ] || [ tests/wpeshot.c -nt "$OUT/wpeshot.elf" ]; th
         -Wl,-rpath-link,"$LIB:$GSTLIB"
 fi
 
+# 2b. Web (apps/web): the browser, a Qt Quick app like Files (Qt from
+#     tools/stage_qt6.sh's cache, its QPA plugin compiled in) with WPE
+QTROOT=${QT6_CACHE:-$HOME/.cache/wynland-qt6}/root
+QTLIB=$QTROOT/usr/lib/x86_64-linux-gnu
+QTINC=$QTROOT/usr/include/x86_64-linux-gnu/qt6
+QTVER=$(ls "$QTINC/QtCore" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+QB=$OUT/qt6obj
+WEB_SRC="apps/web/main.cpp apps/web/webview.h apps/web/wynwpe.c apps/web/wynwpe.h"
+if [ ! -f "$OUT/web.elf" ] || [ -n "$(find $WEB_SRC qt_qpa -newer "$OUT/web.elf" 2>/dev/null)" ]; then
+    echo "  CXX(HOST)  apps/web (Qt Quick + WPE WebKit)"
+    QTFLAGS="-I$QTINC"
+    for m in QtCore QtGui QtQml QtQuick; do
+        QTFLAGS="$QTFLAGS -I$QTINC/$m -I$QTINC/$m/$QTVER -I$QTINC/$m/$QTVER/$m"
+    done
+    QTFLAGS="$QTFLAGS -I$QTINC/QtGui/$QTVER/QtGui/qpa -I$QB -Iqt_qpa"
+    WPEFLAGS="-I$INC -I$INC/wpe-platform -I$ROOT/usr/include/wpe-1.0 -I$DEV/usr/include/libsoup-3.0 $(pkg-config --cflags gio-2.0)"
+    MOCINC=$(for f in $QTFLAGS; do case $f in -I*) printf '%s ' "$f";; esac; done)
+    "$QTROOT/usr/lib/qt6/libexec/moc" $MOCINC -o "$QB/moc_webview.cpp" apps/web/webview.h
+    gcc -O2 -Wall -c -o "$QB/wynwpe.o" apps/web/wynwpe.c $WPEFLAGS
+    g++ -std=c++17 -O2 -fPIC -DQT_STATICPLUGIN -DQT_NO_DEBUG -DQT_NO_KEYWORDS $QTFLAGS $WPEFLAGS -Iapps/web \
+        -o "$OUT/web.elf" apps/web/main.cpp "$QB/moc_webview.cpp" "$QB/wynwpe.o" \
+        qt_qpa/qwynlandfbmain.cpp qt_qpa/qwynlandfb_zerpargs.cpp \
+        qt_qpa/qwynlandfbintegration.cpp qt_qpa/qwynlandfbscreen.cpp qt_qpa/qwynlandfbinput.cpp \
+        "$QB/moc_qwynlandfbinput.cpp" \
+        -L"$QTLIB" -L"$LIB" -Wl,-rpath-link,"$QTLIB:$LIB:$GSTLIB" -Wl,-rpath,/lib64 \
+        -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core -lWPEWebKit-2.0 \
+        $(pkg-config --libs gio-2.0 gobject-2.0 glib-2.0)
+fi
+
 # 3. what ships
 GIOMOD=$MULTI/gio/modules/libgiognutls.so      # HTTPS for libsoup (glib-networking)
 CA=/etc/ssl/certs/ca-certificates.crt          # where Ubuntu's GnuTLS looks
@@ -71,6 +100,18 @@ PROCS="WPEWebProcess WPENetworkProcess WPEGPUProcess"
     for f in mime.cache globs globs2 magic aliases subclasses types generic-icons icons treemagic XMLnamespaces version; do
         [ -f "/usr/share/mime/$f" ] && echo "F /usr/share/mime/$f /usr/share/mime/$f"
     done
+    # XKB data: WPE's keymap (keyboard input) compiles one at startup
+    XKB=$(readlink -f /usr/share/X11/xkb)
+    echo "D /usr/share/X11"
+    echo "D /usr/share/X11/xkb"
+    (cd "$XKB" && find -L . -mindepth 1 -type d | sort) | sed 's|^\.|D /usr/share/X11/xkb|'
+    (cd "$XKB" && find -L . -type f | sort) | while read -r f; do
+        echo "F /usr/share/X11/xkb/${f#./} $(readlink -f "$XKB/${f#./}")"
+    done
+    # the browser
+    echo "F /usr/bin/web $OUT/web.elf"
+    echo "D /usr/share/zerp/qml/web"
+    for q in "$REPO"/apps/web/qml/*.qml; do echo "F /usr/share/zerp/qml/web/$(basename "$q") $q"; done
     echo "F /usr/bin/wpeshot $OUT/wpeshot.elf"
     echo "F /etc/wynrc/services/wpetest $REPO/rootfs/etc/wynrc/services/wpetest"
     echo "F /usr/bin/wpetest $OUT/wpetest.elf"
@@ -84,10 +125,10 @@ PROCS="WPEWebProcess WPENetworkProcess WPEGPUProcess"
 #    manifests ship (a library WPE needs newer than theirs is an error)
 OTHER="ext2_manifest.txt"
 for m in "$OUT/qt6_manifest.txt" "$OUT/gst_manifest.txt"; do [ -f "$m" ] && OTHER="$OTHER $m"; done
-ELFS="$LIB/libWPEWebKit-2.0.so.1 $LIB/libwpe-1.0.so.1 $GIOMOD $OUT/wpeshot.elf $PKGLIB/injected-bundle/libWPEInjectedBundle.so"
+ELFS="$LIB/libWPEWebKit-2.0.so.1 $LIB/libwpe-1.0.so.1 $GIOMOD $OUT/wpeshot.elf $OUT/web.elf $PKGLIB/injected-bundle/libWPEInjectedBundle.so"
 for p in $PROCS; do ELFS="$ELFS $PKGLIB/$p"; done
 for f in $ELFS; do
-    LD_LIBRARY_PATH="$LIB:$GSTLIB" ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
+    LD_LIBRARY_PATH="$LIB:$GSTLIB:$QTLIB" ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
 done | sort -u | while read -r soname path; do
     case "$soname" in libWPEWebKit-2.0.so.1|libwpe-1.0.so.1) continue ;; esac
     if awk -v want="/lib64/$soname" '($1=="F"||$1=="Fo") && $2==want {found=1} END {exit !found}' $OTHER; then
@@ -102,6 +143,6 @@ done | sort -u | while read -r soname path; do
     echo "F /lib64/$soname $(readlink -f "$path")"
 done | sort -u >> "$MAN"
 
-missing=$(for f in $ELFS; do LD_LIBRARY_PATH="$LIB:$GSTLIB" ldd "$f" | grep 'not found' || true; done | sort -u)
+missing=$(for f in $ELFS; do LD_LIBRARY_PATH="$LIB:$GSTLIB:$QTLIB" ldd "$f" | grep 'not found' || true; done | sort -u)
 if [ -n "$missing" ]; then echo "  WPE        WARNING: unresolved:"; echo "$missing"; fi
 echo "  WPE        WPE WebKit $(ls "$CACHE"/debs/libwpewebkit-2.0-1_*.deb | sed 's/.*_\([0-9.]*\)-.*/\1/'): $(grep -c '^F' "$MAN") files in $MAN"

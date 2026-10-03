@@ -275,11 +275,18 @@ int main(int argc, char **argv)
     fprintf(stderr, "[zerp2] shell up\n");
 
     if (bootCfg().contains("snapshot")) {
-        // something to tile in the picture
-        QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/files")); });
-        if (!bootCfg().contains("noqml")) QTimer::singleShot(6000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/qmldemo")); });
-        // "snapfiles": the file manager full screen in the picture
-        if (bootCfg().contains("snapfiles")) QTimer::singleShot(5500, &server, [&server] { server.toggleFullscreen(); });
+        // "snapweb": the browser full screen in the picture (and nothing
+        // else); otherwise something to tile
+        const bool web = bootCfg().contains("snapweb");
+        if (web) {
+            QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/web")); });
+            QTimer::singleShot(6000, &server, [&server] { server.toggleFullscreen(); });
+        } else {
+            QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/files")); });
+            if (!bootCfg().contains("noqml")) QTimer::singleShot(6000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/qmldemo")); });
+            // "snapfiles": the file manager full screen in the picture
+            if (bootCfg().contains("snapfiles")) QTimer::singleShot(5500, &server, [&server] { server.toggleFullscreen(); });
+        }
 
         // measured load: frames per second while the pointer sweeps the dock
         // (magnification) and while workspaces switch (tiles slide)
@@ -317,8 +324,20 @@ int main(int argc, char **argv)
         QTimer::singleShot(80000, &server, [&server] { fprintf(stderr, "[zerp2] workspace 2\n"); server.setWorkspace(2); });
         QTimer::singleShot(82000, &server, [&server] { fprintf(stderr, "[zerp2] workspace 1\n"); server.setWorkspace(1); });
         QTimer::singleShot(86000, win, [fpsTick] { fpsTick->stop(); });
-        QTimer::singleShot(60000, win, [win] {
-            QImage img = win->grabWindow().scaledToWidth(960, Qt::SmoothTransformation);
+        // "snapat=N": the picture at N seconds (60 by default), also as
+        // /tmp/zerp2-snap.png at full size (the serial log can drop lines)
+        int snapAt = 60;
+        const QByteArray cfg = bootCfg();
+        const int at = cfg.indexOf("snapat=");
+        if (at >= 0) snapAt = qMax(5, cfg.mid(at + 7).split('\n').first().trimmed().toInt());
+        QTimer::singleShot(snapAt * 1000, win, [win] {
+            ::syscall(1000);   /* WynlandOS: every process's time and threads, on the log */
+            const QImage full = win->grabWindow();
+            if (full.save(QStringLiteral("/tmp/zerp2-snap.png"), "PNG")) {
+                ::sync();
+                fprintf(stderr, "[zerp2] snapshot saved: /tmp/zerp2-snap.png\n");
+            }
+            QImage img = full.scaledToWidth(960, Qt::SmoothTransformation);
             QBuffer buf; buf.open(QIODevice::WriteOnly);
             img.save(&buf, "PNG");
             const QByteArray b64 = buf.data().toBase64();

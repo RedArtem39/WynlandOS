@@ -11,8 +11,8 @@ Item {
         radius: 11 * icon.u
         antialiasing: true
         gradient: Gradient {
-            GradientStop { position: 0; color: icon.kind === "term" ? "#2b2f3a" : icon.kind === "files" ? "#4ea8ff" : icon.kind === "launcher" ? "#a066ff" : "#41cd52" }
-            GradientStop { position: 1; color: icon.kind === "term" ? "#14161c" : icon.kind === "files" ? "#2a6fd6" : icon.kind === "launcher" ? "#6a3fd1" : "#2a9a3a" }
+            GradientStop { position: 0; color: icon.kind === "term" ? "#2b2f3a" : icon.kind === "files" ? "#4ea8ff" : icon.kind === "launcher" ? "#a066ff" : icon.kind === "web" ? "#ff9a4d" : "#41cd52" }
+            GradientStop { position: 1; color: icon.kind === "term" ? "#14161c" : icon.kind === "files" ? "#2a6fd6" : icon.kind === "launcher" ? "#6a3fd1" : icon.kind === "web" ? "#e0592a" : "#2a9a3a" }
         }
         border.color: "#ffffff"; border.width: 1 * icon.u
         Rectangle { anchors.fill: parent; radius: parent.radius; color: "white"; opacity: 0.06 }
@@ -33,6 +33,15 @@ Item {
         width: 28 * icon.u; height: 21 * icon.u
         Rectangle { width: 12 * icon.u; height: 6 * icon.u; radius: 2 * icon.u; color: "#dff1ff" }
         Rectangle { y: 3 * icon.u; width: parent.width; height: parent.height - 3 * icon.u; radius: 3 * icon.u; color: "#eaf6ff" }
+    }
+    // web: a globe (outline, a meridian, the equator)
+    Item {
+        visible: icon.kind === "web"
+        anchors.centerIn: parent
+        width: 28 * icon.u; height: 28 * icon.u
+        Rectangle { anchors.fill: parent; radius: width / 2; color: "transparent"; border.color: "white"; border.width: 2.2 * icon.u; antialiasing: true }
+        Rectangle { anchors.centerIn: parent; width: parent.width * 0.44; height: parent.height; radius: width / 2; color: "transparent"; border.color: "white"; border.width: 2 * icon.u; antialiasing: true }
+        Rectangle { anchors.centerIn: parent; width: parent.width; height: 2 * icon.u; color: "white" }
     }
     // launcher: 3x3 grid
     Grid {
