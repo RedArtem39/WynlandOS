@@ -353,6 +353,7 @@ static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
     uint32_t need = size <= PIPE_BUF_SIZE ? size : 1;
     while (PIPE_BUF_SIZE - pipe->count < need) {
         if (pipe->is_pipe && pipe->readers == 0) return 0; /* caller: EPIPE */
+        if (sched_dying()) return 0;
         waitqueue_wait(&pipe->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
     }
     uint32_t written = 0;
@@ -373,6 +374,7 @@ static uint32_t pipe_read(KPipe *pipe, void *buf, uint32_t size) {
     uint8_t *dst = (uint8_t *)buf;
     while (pipe->count == 0) {
         if (pipe->is_pipe && pipe->writers == 0) return 0; /* EOF */
+        if (sched_dying()) return 0;
         waitqueue_wait(&pipe->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
     }
     uint32_t read_bytes = 0;
@@ -462,7 +464,7 @@ static int64_t do_wait(int64_t pid, bool nohang, bool consume, Process **found)
         if (!have_child) return -LNX_ECHILD;
         if (nohang) return 0;
         Thread *t = sched_current();
-        if (t->sig_pending & ~t->sig_mask) return -LNX_EINTR;
+        if ((t->sig_pending & ~t->sig_mask) || sched_dying()) return -LNX_EINTR;
         /* short slices: a wake can race the scan above */
         waitqueue_wait_ms(&caller->child_wq, timer_get_ms() + 50);
     }
@@ -940,6 +942,16 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                     single_wq = wq;
                 }
             }
+            else if (file->node.first_cluster == SOCK_FD_UDP) {
+                /* readable only with a datagram queued ("always readable"
+                   sent glibc's resolver into empty reads); always writable */
+                short ev = fds ? fds[i].events : 0;
+                short rev = (short)(ev & 0x0004);
+                if (udp_socket_readable((int)file->current_cluster)) rev |= (short)(ev & 0x0001);
+                if (fds) fds[i].revents |= rev;
+                if (rev) ready++;
+                else single_wq = udp_socket_wq((int)file->current_cluster);
+            }
             else if (file->node.first_cluster == SOCK_FD_TCP) {
                 /* Real readiness: "always readable" made a non-blocking
                    client (curl: poll(socket, eventfd) then read) fall into
@@ -991,6 +1003,7 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
            which every pipe/socket/timerfd state change also wakes, so
            those still wake us immediately; the ~50ms cap remains for
            sources that don't signal it yet (TCP, PTYs). */
+        if (sched_dying()) return -LNX_EINTR;
         if (single_wq && nfds == 1) {
             waitqueue_wait_ms(single_wq, sleep_until);
         } else {
@@ -1430,6 +1443,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         if (a3 < 8) return (uint64_t)-22;                 /* -EINVAL */
                         while (kp->evcount == 0) {
                             if (fd_oflags[a1] & LINUX_O_NONBLOCK) return (uint64_t)-11; /* -EAGAIN */
+                            if (sched_dying()) return (uint64_t)-LNX_EINTR;
                             waitqueue_wait(&kp->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                         }
                         uint64_t v = kp->ev_semaphore ? 1 : kp->evcount;
@@ -1458,6 +1472,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return (uint64_t)n;
             }
             if (fd_table[a1]->node.first_cluster == SOCK_FD_UDP) {
+                if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && !udp_socket_readable((int)fd_table[a1]->current_cluster))
+                    return (uint64_t)-11; /* -EAGAIN */
                 int n = udp_socket_recvfrom((int)fd_table[a1]->current_cluster, (void *)a2, (uint32_t)a3, NULL, NULL);
                 if (n < 0) return (uint64_t)-1;
                 return (uint64_t)n;
@@ -1469,6 +1485,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)-11; /* -EAGAIN */
                 }
                 while (pty->s2m_count == 0) {
+                    if (sched_dying()) return (uint64_t)-LNX_EINTR;
                     waitqueue_wait(&pty->s2m_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                 }
                 uint32_t n = pty_ring_read(pty->s2m_buf, &pty->s2m_head, &pty->s2m_tail, &pty->s2m_count, (void *)a2, (uint32_t)a3);
@@ -1486,6 +1503,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)-11; /* -EAGAIN */
                 }
                 while (pty->m2s_count == 0) {
+                    if (sched_dying()) return (uint64_t)-LNX_EINTR;
                     waitqueue_wait(&pty->m2s_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                 }
                 uint32_t n = pty_ring_read(pty->m2s_buf, &pty->m2s_head, &pty->m2s_tail, &pty->m2s_count, (void *)a2, (uint32_t)a3);
@@ -1544,6 +1562,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         if (v == 0xFFFFFFFFFFFFFFFFULL) return (uint64_t)-22;
                         while (EVENTFD_MAX - kp->evcount < v) {
                             if (fd_oflags[a1] & LINUX_O_NONBLOCK) return (uint64_t)-11; /* -EAGAIN */
+                            if (sched_dying()) return (uint64_t)-LNX_EINTR;
                             waitqueue_wait(&kp->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                         }
                         kp->evcount += v;
@@ -1589,6 +1608,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
                 while (pty->m2s_count >= PTY_BUF_SIZE) {
+                    if (sched_dying()) return (uint64_t)-LNX_EINTR;
                     waitqueue_wait(&pty->m2s_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                 }
                 uint32_t n = pty_ring_write(pty->m2s_buf, &pty->m2s_head, &pty->m2s_tail, &pty->m2s_count, (const void *)a2, (uint32_t)a3);
@@ -1599,6 +1619,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 Pty *pty = g_ptys[fd_table[a1]->current_cluster];
                 if (!pty) return (uint64_t)-9; // EBADF
                 while (pty->s2m_count >= PTY_BUF_SIZE) {
+                    if (sched_dying()) return (uint64_t)-LNX_EINTR;
                     waitqueue_wait(&pty->s2m_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
                 }
                 uint32_t n = pty_ring_write(pty->s2m_buf, &pty->s2m_head, &pty->s2m_tail, &pty->s2m_count, (const void *)a2, (uint32_t)a3);
@@ -3023,21 +3044,24 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 231: // SYS_exit_group (Linux standard) -- the whole process
             {
                 proc->exit_code = (int)a1;
-                /* Every other thread of the process dies too, now -- like a
-                   fatal signal (signal_kill_process()). Not running (one
-                   CPU), each is either in user code or asleep at a blocking
-                   point; the reaper unlinks it from any wait queue. It was
-                   "SIGKILL pending + wake": but many sleeps in here retry
-                   on a wake, so such a thread never died, the process was
-                   never torn down, its fds never closed -- WebKit's child
-                   processes never saw their parent go and kept running. */
+                /* Every other thread of the process dies too: SIGKILL
+                   pending + woken if asleep. A sleeping one leaves its
+                   wait through the syscall's own cleanup (sched_dying():
+                   every blocking wait gives up), dropping what it holds --
+                   killing it in its sleep leaked socket references and the
+                   peers never saw EOF; one in user code dies at the next
+                   timer tick (kernel/irq.c). It once ended only the caller,
+                   and later waits retried after the wake: WebKit's child
+                   processes then never saw their parent go. */
                 extern Thread *sched_get_thread_list(void);
                 Thread *start = sched_get_thread_list(), *it = start;
                 int guard = 0;
                 if (it) do {
                     if (it->proc == proc && it != sched_current() &&
-                        it->state != THREAD_STATE_TERMINATED)
-                        it->state = THREAD_STATE_TERMINATED;
+                        it->state != THREAD_STATE_TERMINATED) {
+                        it->sig_pending |= 1ULL << 9;
+                        if (it->state == THREAD_STATE_BLOCKED) sched_unblock(it, -LNX_EINTR);
+                    }
                     it = it->next;
                 } while (it != start && ++guard < 100000);
                 process_mark_exited(proc, ((int)a1 & 0xFF) << 8);
@@ -4661,6 +4685,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (file->node.first_cluster == SOCK_FD_UDP) {
                     uint32_t from_ip = 0;
                     uint16_t from_port = 0;
+                    if (((fd_oflags[fd] & LINUX_O_NONBLOCK) || (a4 & 0x40 /* MSG_DONTWAIT */)) &&
+                        !udp_socket_readable((int)file->current_cluster))
+                        return (uint64_t)-11; /* -EAGAIN */
                     int n = udp_socket_recvfrom((int)file->current_cluster, (void *)a2, (uint32_t)a3, &from_ip, &from_port);
                     if (n < 0) return (uint64_t)-1;
                     if (a5) {

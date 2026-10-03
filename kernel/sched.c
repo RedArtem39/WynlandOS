@@ -715,6 +715,13 @@ void sched_dump_user_threads(void)
     if (rflags & 0x200) __asm__ volatile("sti");
 }
 
+bool sched_dying(void)
+{
+    Thread *t = current_thread;
+    return t && t->proc && t->proc->pid != 0 &&
+           ((t->sig_pending & (1ULL << 9)) || t->proc->exited);
+}
+
 Thread *sched_get_thread_list(void) {
     return thread_list;
 }

@@ -329,6 +329,7 @@ int64_t usock_connect(int idx, const char *name, uint32_t len, bool nonblock) {
             break;
         }
         if (nonblock) { ret = -EAGAIN; break; }
+        if (sched_dying()) { ret = -4; break; }   /* -EINTR */
         l->refs++;
         waitqueue_wait_ms(&l->wq, SCHED_NO_DEADLINE);
         usock_unref(l->idx);
@@ -354,6 +355,7 @@ int64_t usock_accept(int idx, bool nonblock) {
             break;
         }
         if (nonblock) { ret = -EAGAIN; break; }
+        if (sched_dying()) { ret = -4; break; }   /* -EINTR */
         waitqueue_wait_ms(&s->wq, SCHED_NO_DEADLINE);
         if (!g_usock[idx]) { ret = -EINVAL; break; } /* can't happen: we hold a ref */
     }
@@ -495,6 +497,7 @@ int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint3
         /* Wait for the receiver to drain: it wakes its peer (us) on every
            consumption. A datagram target that isn't our peer wakes its own
            queue; wait there instead. */
+        if (sched_dying()) { ret = -4; break; }   /* -EINTR */
         USock *wq_owner = (r->peer == s) ? s : r;
         wq_owner->refs++;
         r->refs++;
@@ -552,6 +555,7 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
             }
         }
         if (nonblock) { ret = -EAGAIN; goto out; }
+        if (sched_dying()) { ret = -4; goto out; }   /* -EINTR */
         waitqueue_wait_ms(&s->wq, SCHED_NO_DEADLINE);
     }
 

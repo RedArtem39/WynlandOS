@@ -9,7 +9,9 @@ extern uint8_t __kernel_end[];
 extern void serial_write_string(const char *str);
 
 static uint8_t  *bitmap = NULL;
-static uint8_t  *refcount = NULL;  /* one byte per page frame; 0 = untracked/exclusive owner path via bitmap alone */
+static uint16_t *refcount = NULL;  /* per page frame; 0 = untracked/exclusive owner path via bitmap alone.
+                                     16 bits: a page-cache frame (libc's code) is mapped into every
+                                     process -- one byte wrapped at 256 sharers and freed a live frame */
 static uint64_t total_pages = 0;
 static uint64_t free_pages = 0;
 static uint64_t total_mem_size = 0;
@@ -56,7 +58,7 @@ void pmm_init(BootInfo *boot_info)
     /* 2. Find a free memory region large enough to store the bitmap */
     uint64_t bitmap_phys_addr = 0;
     for (uint32_t i = 0; i < region_count; i++) {
-        if (regions[i].type == MEMORY_USABLE && regions[i].size >= bitmap_size) {
+        if (regions[i].type == MEMORY_USABLE && regions[i].size >= bitmap_size + 2 * total_pages + 2 * PAGE_SIZE) {
             /* Keep it aligned above the kernel region to be safe */
             if (regions[i].base >= 0x100000) {
                 bitmap_phys_addr = regions[i].base;
@@ -68,7 +70,7 @@ void pmm_init(BootInfo *boot_info)
     /* Fallback if no safe high memory is found, try any usable region */
     if (bitmap_phys_addr == 0) {
         for (uint32_t i = 0; i < region_count; i++) {
-            if (regions[i].type == MEMORY_USABLE && regions[i].size >= bitmap_size) {
+            if (regions[i].type == MEMORY_USABLE && regions[i].size >= bitmap_size + 2 * total_pages + 2 * PAGE_SIZE) {
                 bitmap_phys_addr = regions[i].base;
                 break;
             }
@@ -140,10 +142,10 @@ void pmm_init(BootInfo *boot_info)
        the bitmap in the same region -- both are tiny (KB-scale) compared to
        any usable region large enough to hold the bitmap in the first place,
        so this avoids a second region search and its edge cases entirely. */
-    uint64_t refcount_size = total_pages;
+    uint64_t refcount_size = total_pages * sizeof(uint16_t);
     uint64_t refcount_phys_addr = (bitmap_phys_addr + bitmap_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-    refcount = (uint8_t *)(uintptr_t)refcount_phys_addr;
+    refcount = (uint16_t *)(uintptr_t)refcount_phys_addr;
     memset(refcount, 0, refcount_size);
 
     uint64_t refcount_start_page = refcount_phys_addr / PAGE_SIZE;
@@ -302,11 +304,14 @@ void pmm_page_incref(void *addr)
 
     uint64_t idx = (uint64_t)addr / PAGE_SIZE;
     if (idx < total_pages && bitmap_test(idx)) {
-        if (refcount[idx] == 255) {
+        if (refcount[idx] == 0xFFFF) {
+            /* saturated: never wrap (a wrap frees a frame still in use);
+               callers check pmm_page_refcount() first and copy instead */
             extern void serial_write_string(const char *);
-            serial_write_string("PMM: refcount overflow\r\n");
+            serial_write_string("PMM: refcount saturated\r\n");
+        } else {
+            refcount[idx]++;
         }
-        refcount[idx]++;
     }
 
     if (rflags & 0x200) {

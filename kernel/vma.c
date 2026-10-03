@@ -290,7 +290,7 @@ static void pcache_put(uint32_t inum, uint32_t index, void *frame)
         pcache_shrink(1024);
         if (g_pcache_pages == before) { skip = 4096; return; }
     }
-    if (pmm_page_refcount(frame) >= 250) return;               /* the byte-wide count */
+    if (pmm_page_refcount(frame) >= 60000) return;             /* near the 16-bit count's top */
     PCInode **slot = pcache_inode_slot(inum);
     if (!*slot) {
         PCInode *n = (PCInode *)kmalloc(sizeof(PCInode));
@@ -335,12 +335,30 @@ void pcache_drop_inode(uint32_t inum)
     if (rflags & 0x200) __asm__ volatile("sti");
 }
 
-/* a cached page into the process: shared, read-only, copy on write */
+/* PTE flags for a cached frame: never writable in place; copy on write
+   only where the mapping allows writes (a COW bit on a read-only mapping
+   made a write to it succeed with a private copy instead of faulting) */
+static uint64_t cached_pte_flags(const VMA *v)
+{
+    uint64_t f = pte_flags_for(v) & ~PAGE_WRITE;
+    if (v->prot & VMA_PROT_WRITE) f |= PAGE_COW;
+    return f;
+}
+
+/* a cached page into the process: shared, read-only (copy on write when
+   writable); a frame with too many sharers is copied instead */
 static void map_cached(Process *proc, VMA *v, uint64_t page, void *frame)
 {
-    uint64_t f = (pte_flags_for(v) & ~PAGE_WRITE) | PAGE_COW;
+    if (pmm_page_refcount(frame) >= 60000) {
+        void *own = pmm_alloc_page();
+        if (own) {
+            memcpy(own, frame, PAGE_SIZE);
+            vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)own, pte_flags_for(v));
+            return;
+        }
+    }
     pmm_page_incref(frame);
-    vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, f);
+    vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, cached_pte_flags(v));
 }
 
 /* file-backed: the faulting page and the following not-yet-present pages
@@ -434,8 +452,7 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
         if (cache_it) {
             pcache_put(inum, index, frame);
             if (pmm_page_refcount(frame) > 1) {      /* cached: share it */
-                vmm_map_page(proc->pml4, page + off, (uint64_t)(uintptr_t)frame,
-                             (pte_flags_for(v) & ~PAGE_WRITE) | PAGE_COW);
+                vmm_map_page(proc->pml4, page + off, (uint64_t)(uintptr_t)frame, cached_pte_flags(v));
                 continue;
             }
         }

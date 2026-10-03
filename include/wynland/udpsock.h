@@ -17,6 +17,7 @@
 
 #define UDP_MAX_SOCKETS      16
 #define UDP_RX_BUF_SIZE      2048
+#define UDP_RX_SLOTS         8        /* datagrams queued per socket */
 #define UDP_EPHEMERAL_BASE   50000
 #define UDP_RECV_TIMEOUT     3000000  /* poll iterations */
 
@@ -45,6 +46,11 @@ int  udp_socket_recvfrom(int idx, void *buf, uint32_t max_len,
 void udp_socket_close(int idx);
 
 uint16_t udp_socket_local_port(int idx);
+
+/* A datagram is waiting (poll(), non-blocking reads); the queue blocking
+   readers sleep on. */
+bool udp_socket_readable(int idx);
+struct WaitQueue *udp_socket_wq(int idx);
 
 /* The peer set by udp_socket_connect() (ip in network order, port in host
    order); false when not connected. */

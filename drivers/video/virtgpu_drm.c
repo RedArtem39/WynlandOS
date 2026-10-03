@@ -1287,6 +1287,7 @@ int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
         bool any = false;
         for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++) any |= c->events[i].used;
         if (nonblock || !any) return -EAGAIN;
+        if (sched_dying()) return -4;   /* -EINTR */
         waitqueue_wait_ms(&c->ev_wq, timer_get_ms() + 5);
     }
     uint64_t done = 0;

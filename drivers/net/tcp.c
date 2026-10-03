@@ -8,6 +8,7 @@
  */
 
 #include <wynland/random.h>
+#include <wynland/sched.h>
 #include <wynland/tcp.h>
 #include <wynland/unix_socket.h>
 #include <wynland/net.h>
@@ -459,6 +460,7 @@ int tcp_recv(TcpConnection *conn, void *buf, uint32_t max_len)
 
         if (conn->data_available && conn->rx_len > 0)
             break;
+        if (sched_dying()) return -1;
 
         waitqueue_wait(&conn->rx_wq, timer_get_ticks() + TCP_WAIT_RETRY_TICKS);
     }

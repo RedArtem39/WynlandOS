@@ -3,6 +3,7 @@
  * See include/wynland/udpsock.h for the design note.
  */
 #include <wynland/udpsock.h>
+#include <wynland/sched.h>
 #include <wynland/net.h>
 #include <wynland/waitqueue.h>
 
@@ -26,17 +27,21 @@ typedef struct {
     uint32_t remote_ip;
     uint16_t remote_port;
 
-    /* Single-datagram receive buffer -- last datagram delivered,
-       overwritten by the next one if the caller hasn't drained it yet.
-       Simple and sufficient for a request/response client like a DNS
-       resolver; not a real multi-datagram queue. */
-    uint8_t  rx_buf[UDP_RX_BUF_SIZE];
-    uint32_t rx_len;
-    uint32_t rx_from_ip;
-    uint16_t rx_from_port;
-    volatile bool data_available;
+    /* A queue of datagrams. It was one buffer, each datagram overwriting
+       the last: glibc's resolver sends the A and AAAA queries at once, the
+       second answer wiped the first, and every new host name waited out a
+       5-second resolver timeout. */
+    struct {
+        uint8_t  data[UDP_RX_BUF_SIZE];
+        uint32_t len;
+        uint32_t from_ip;
+        uint16_t from_port;
+    } rx[UDP_RX_SLOTS];
+    uint32_t rx_head, rx_count;
     WaitQueue rx_wq; /* Phase 22d: real blocking recvfrom() */
 } UdpSocket;
+
+extern WaitQueue g_poll_any_wq;   /* kernel/unix_socket.c: poll() on several fds */
 
 static UdpSocket sockets[UDP_MAX_SOCKETS];
 static uint16_t  ephemeral_counter;
@@ -95,21 +100,34 @@ int udp_socket_recvfrom(int idx, void *buf, uint32_t max_len,
     /* Real blocking recvfrom(): net_poll() is timer-tick-driven now (see
        kernel/irq.c), so this only needs to wait for udp_socket_deliver()
        to wake it -- no more busy-spinning net_poll() itself. */
-    while (!(s->data_available && s->rx_len > 0)) {
+    while (s->rx_count == 0) {
+        if (sched_dying()) return -1;
         waitqueue_wait(&s->rx_wq, timer_get_ticks() + UDP_WAIT_RETRY_TICKS);
     }
 
-    uint32_t copy_len = s->rx_len;
+    /* the oldest datagram; what doesn't fit is dropped, as on Linux */
+    uint32_t h = s->rx_head;
+    uint32_t copy_len = s->rx[h].len;
     if (copy_len > max_len)
         copy_len = max_len;
-    memcpy(buf, s->rx_buf, copy_len);
+    memcpy(buf, s->rx[h].data, copy_len);
 
-    if (from_ip)   *from_ip   = s->rx_from_ip;
-    if (from_port) *from_port = s->rx_from_port;
+    if (from_ip)   *from_ip   = s->rx[h].from_ip;
+    if (from_port) *from_port = s->rx[h].from_port;
 
-    s->rx_len         = 0;
-    s->data_available = false;
+    s->rx_head = (h + 1) % UDP_RX_SLOTS;
+    s->rx_count--;
     return (int)copy_len;
+}
+
+bool udp_socket_readable(int idx)
+{
+    return idx >= 0 && idx < UDP_MAX_SOCKETS && sockets[idx].in_use && sockets[idx].rx_count > 0;
+}
+
+WaitQueue *udp_socket_wq(int idx)
+{
+    return (idx >= 0 && idx < UDP_MAX_SOCKETS && sockets[idx].in_use) ? &sockets[idx].rx_wq : NULL;
 }
 
 void udp_socket_close(int idx)
@@ -140,15 +158,19 @@ bool udp_socket_deliver(uint32_t src_ip, uint16_t src_port,
 {
     for (int i = 0; i < UDP_MAX_SOCKETS; i++) {
         if (sockets[i].in_use && sockets[i].local_port == dst_port) {
+            UdpSocket *s = &sockets[i];
+            if (s->rx_count >= UDP_RX_SLOTS) return true;   /* full: dropped, as UDP may */
+            uint32_t t = (s->rx_head + s->rx_count) % UDP_RX_SLOTS;
             uint32_t copy_len = len;
             if (copy_len > UDP_RX_BUF_SIZE)
                 copy_len = UDP_RX_BUF_SIZE;
-            memcpy(sockets[i].rx_buf, data, copy_len);
-            sockets[i].rx_len         = copy_len;
-            sockets[i].rx_from_ip     = src_ip;
-            sockets[i].rx_from_port   = src_port;
-            sockets[i].data_available = true;
-            waitqueue_wake_all(&sockets[i].rx_wq);
+            memcpy(s->rx[t].data, data, copy_len);
+            s->rx[t].len       = copy_len;
+            s->rx[t].from_ip   = src_ip;
+            s->rx[t].from_port = src_port;
+            s->rx_count++;
+            waitqueue_wake_all(&s->rx_wq);
+            waitqueue_wake_all(&g_poll_any_wq);
             return true;
         }
     }

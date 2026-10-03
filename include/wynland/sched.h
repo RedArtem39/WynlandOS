@@ -129,6 +129,12 @@ void thread_fx_default(uint8_t *area);
 
 void sched_init(void);
 
+/* The current thread is to die (SIGKILL pending, or its process exited):
+   a blocking wait gives up -- the syscall returns -EINTR through its normal
+   cleanup (references it holds get dropped) and the thread dies on the
+   way out. exit_group() and fatal signals rely on it. */
+bool sched_dying(void);
+
 /* Debugging: every user thread on the serial log -- process, state, the
    syscall it is in, its user RIP and probable return addresses as
    "libfoo.so+0x1234" (what is a hung program doing?). Syscall 1000. */

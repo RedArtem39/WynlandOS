@@ -208,6 +208,12 @@ void irq_handler(InterruptRegisters *regs)
         extern void virtio_gpu_tick(void);
         virtio_gpu_tick();
 
+        /* the network every millisecond: on the 10 ms tick alone, every
+           exchange (a TLS handshake step, an ACK, a DNS answer) waited up
+           to 10 ms for its packet; an empty RX ring is one index compare */
+        extern void net_poll(void);
+        net_poll();
+
         if ((timer_ms % TIMER_MS_PER_TICK) != 0) {
             /* 1ms preemption: sched_schedule()'s deadline pass is also
                what wakes millisecond sleepers (sched_sleep_ms()). */
@@ -225,8 +231,6 @@ void irq_handler(InterruptRegisters *regs)
            sched_preempt_tick() so it fires on literally every tick
            unconditionally, not only on ticks where this particular thread
            happens to get rescheduled back after a preemption. */
-        extern void net_poll(void);
-        net_poll();
         extern void hda_tick(void);
         hda_tick();                  /* silence what the sound card just played */
         {   /* Latency report: timer ticks more than 100 ms apart mean the

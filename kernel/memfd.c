@@ -275,6 +275,7 @@ int64_t timerfd_read(int idx, uint64_t *count, bool nonblock) {
             break;
         }
         if (nonblock) { ret = -EAGAIN; break; }
+        if (sched_dying()) { ret = -4; break; }   /* -EINTR: dying */
         /* next_ms 0 == SCHED_NO_DEADLINE: sleep until a settime() wakes us */
         waitqueue_wait_ms(&t->wq, t->next_ms);
     }
