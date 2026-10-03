@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -76,6 +77,19 @@ static int run_capture(const char *path, const char *arg, const char *arg2, char
     return WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st);
 }
 
+/* many futex waiters at once, each on its own word */
+#define FUTEX_THREADS 120
+static int g_fwords[FUTEX_THREADS];
+static long g_fres[FUTEX_THREADS];
+static void *futex_waiter(void *arg)
+{
+    long i = (long)arg;
+    struct timespec ts = { 5, 0 };
+    long r = syscall(SYS_futex, &g_fwords[i], 128 /* FUTEX_WAIT_PRIVATE */, 0, &ts, NULL, 0);
+    g_fres[i] = r < 0 ? -errno : r;
+    return NULL;
+}
+
 static void *report_tid(void *out)
 {
     *(pid_t *)out = (pid_t)syscall(SYS_gettid);
@@ -92,6 +106,40 @@ int main(int argc, char **argv)
         pthread_join(th, NULL);
         check((pid_t)syscall(SYS_gettid) == getpid(), "main thread: gettid() == getpid()");
         check(other > 0 && other != getpid(), "second thread: its own tid");
+    }
+    {   /* eventfd is a counter: GLib wakes its loop with one write each and
+           drains it once -- as a pipe of records it filled up and the
+           writer blocked on itself */
+        int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        int all = efd >= 0;
+        uint64_t one = 1, got = 0;
+        for (int i = 0; all && i < 5000; i++)
+            if (write(efd, &one, 8) != 8) all = 0;
+        check(all, "eventfd: 5000 writes without blocking");
+        check(read(efd, &got, 8) == 8 && got == 5000, "eventfd: one read takes the sum");
+        check(read(efd, &got, 8) < 0 && errno == EAGAIN, "eventfd: then empty (EAGAIN)");
+        if (efd >= 0) close(efd);
+    }
+    {   /* 120 threads asleep on 120 futex words: the kernel had 64 queues
+           for the whole system and failed the rest with ENOMEM */
+        pthread_t th[FUTEX_THREADS];
+        int started = 0;
+        for (long i = 0; i < FUTEX_THREADS; i++)
+            if (pthread_create(&th[i], NULL, futex_waiter, (void *)i) == 0) started++;
+        struct timespec nap = { 0, 300000000 };
+        nanosleep(&nap, NULL);                      /* let them all park */
+        for (int i = 0; i < FUTEX_THREADS; i++) {
+            g_fwords[i] = 1;
+            syscall(SYS_futex, &g_fwords[i], 129 /* FUTEX_WAKE_PRIVATE */, 1, NULL, NULL, 0);
+        }
+        int bad = 0;
+        for (int i = 0; i < started; i++) {
+            pthread_join(th[i], NULL);
+            /* 0 = woken, -EAGAIN = the word changed before it slept: both fine */
+            if (g_fres[i] != 0 && g_fres[i] != -EAGAIN) bad++;
+        }
+        if (bad) fprintf(stderr, "[forktest] %d futex waits failed (first: %ld)\n", bad, g_fres[0]);
+        check(started == FUTEX_THREADS && bad == 0, "120 futex waiters at once");
     }
     /* re-exec'd by the posix_spawn test */
     if (argc > 1 && strcmp(argv[1], "child5") == 0) return 5;

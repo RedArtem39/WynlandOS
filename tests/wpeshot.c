@@ -1,14 +1,16 @@
 /*
  * WynlandOS - WPE WebKit headless check (glibc, host-built)
  * ============================================================
- * wpeshot <url> [name] [settle-ms] [timeout-ms]
+ * wpeshot <url> [name] [settle-ms] [timeout-ms] [action-js] [status-js]
  *
  * Loads <url> in a WPE WebKit view on WPEPlatform's headless display,
  * waits for the load to finish (plus settle-ms for scripts to draw),
  * takes a snapshot of the visible area and writes it as a PNG to the
  * file: $WPESHOT_DIR/<name>.png (default /tmp).
  * Progress, console messages and failures go to stderr as
- * "[wpeshot] ..." lines. Exit 0 when a snapshot was written.
+ * "[wpeshot] ..." lines. action-js runs once the load finished (e.g.
+ * start a video), status-js is evaluated and printed right before the
+ * snapshot. Exit 0 when a snapshot was written.
  *
  * Build: gcc -O2 $(pkg-config --cflags --libs wpe-webkit-2.0 wpe-platform-headless-2.0) -lz
  */
@@ -31,6 +33,8 @@ static guint g_settle_ms = 3000;
 static int g_rc = 1;
 static gint64 g_t0;
 static gboolean g_shot_started;
+static const char *g_action_js, *g_status_js;
+static gboolean g_status_failed;   /* status-js said "FAIL..." */
 
 static long ms(void) { return (long)((g_get_monotonic_time() - g_t0) / 1000); }
 
@@ -136,8 +140,41 @@ static void snapshot_done(GObject *obj, GAsyncResult *res, gpointer data)
     emit_png(png);
     g_byte_array_unref(png);
     g_object_unref(img);
-    g_rc = inked ? 0 : 2;
+    g_rc = !inked ? 2 : g_status_failed ? 3 : 0;
     g_main_loop_quit(g_loop);
+}
+
+static void start_snapshot(void)
+{
+    fprintf(stderr, "[wpeshot] %s: taking the snapshot (%ld ms)\n", g_name, ms());
+    webkit_web_view_get_snapshot(g_view, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
+                                 NULL, snapshot_done, NULL);
+}
+
+/* data: "action" or "status"; after the status script the snapshot */
+static void js_done(GObject *obj, GAsyncResult *res, gpointer data)
+{
+    const char *what = data;
+    gboolean status = strcmp(what, "status") == 0;
+    GError *err = NULL;
+    JSCValue *v = webkit_web_view_evaluate_javascript_finish(WEBKIT_WEB_VIEW(obj), res, &err);
+    if (!v) {
+        fprintf(stderr, "[wpeshot] %s: %s script failed: %s\n", g_name, what, err ? err->message : "?");
+        g_clear_error(&err);
+        if (status) { g_status_failed = TRUE; start_snapshot(); }
+        return;
+    }
+    char *s = jsc_value_to_string(v);
+    fprintf(stderr, "[wpeshot] %s: %s -> %s (%ld ms)\n", g_name, what, s ? s : "?", ms());
+    if (status && s && strncmp(s, "FAIL", 4) == 0) g_status_failed = TRUE;
+    g_free(s);
+    g_object_unref(v);
+    if (status) start_snapshot();
+}
+
+static void run_js(const char *js, const char *what)
+{
+    webkit_web_view_evaluate_javascript(g_view, js, -1, NULL, NULL, NULL, js_done, (gpointer)what);
 }
 
 static gboolean take_snapshot(gpointer data)
@@ -145,9 +182,8 @@ static gboolean take_snapshot(gpointer data)
     (void)data;
     if (g_shot_started) return G_SOURCE_REMOVE;
     g_shot_started = TRUE;
-    fprintf(stderr, "[wpeshot] %s: taking the snapshot (%ld ms)\n", g_name, ms());
-    webkit_web_view_get_snapshot(g_view, WEBKIT_SNAPSHOT_REGION_VISIBLE, WEBKIT_SNAPSHOT_OPTIONS_NONE,
-                                 NULL, snapshot_done, NULL);
+    if (g_status_js) run_js(g_status_js, "status");   /* then the snapshot */
+    else start_snapshot();
     return G_SOURCE_REMOVE;
 }
 
@@ -156,8 +192,10 @@ static void load_changed(WebKitWebView *v, WebKitLoadEvent ev, gpointer data)
     (void)data;
     static const char *names[] = { "started", "redirected", "committed", "finished" };
     fprintf(stderr, "[wpeshot] %s: load %s (%ld ms) %s\n", g_name, names[ev], ms(), webkit_web_view_get_uri(v));
-    if (ev == WEBKIT_LOAD_FINISHED)
+    if (ev == WEBKIT_LOAD_FINISHED) {
+        if (g_action_js) run_js(g_action_js, "action");
         g_timeout_add(g_settle_ms, take_snapshot, NULL);
+    }
 }
 
 static gboolean load_failed(WebKitWebView *v, WebKitLoadEvent ev, char *uri, GError *err, gpointer data)
@@ -208,6 +246,8 @@ int main(int argc, char **argv)
     if (argc > 2) g_name = argv[2];
     if (argc > 3) g_settle_ms = (guint)atoi(argv[3]);
     guint timeout_ms = argc > 4 ? (guint)atoi(argv[4]) : 120000;
+    if (argc > 5 && argv[5][0]) g_action_js = argv[5];   /* run once the load finished */
+    if (argc > 6 && argv[6][0]) g_status_js = argv[6];   /* printed right before the snapshot */
     g_t0 = g_get_monotonic_time();
 
     /* WebKit starts its processes in a bubblewrap sandbox: WynlandOS has

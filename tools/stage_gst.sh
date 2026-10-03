@@ -20,7 +20,7 @@ PLUG=$LIB/gstreamer-1.0
 OUT=$REPO/build
 MAN=$OUT/gst_manifest.txt
 
-TOP="libgstreamer1.0-0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav"
+TOP="libgstreamer1.0-0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav"
 # host side only, to make the H.264 test clip (x264enc); not shipped
 HOST_ONLY="gstreamer1.0-plugins-ugly"
 
@@ -85,7 +85,8 @@ PLUGINS="coreelements
  videoconvertscale videorate audiotestsrc videotestsrc rawparse pbtypes
  ogg vorbis opus
  ossaudio wavparse matroska isomp4 autodetect audioparsers id3demux
- libav"
+ libav vpx
+ videoparsersbad debugutilsbad subenc dav1d"
 SHIP=""
 for p in $PLUGINS; do
     f="$PLUG/libgst$p.so"

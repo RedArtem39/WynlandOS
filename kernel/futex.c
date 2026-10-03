@@ -34,7 +34,13 @@ extern void serial_write_string(const char *str);
 #define FUTEX_WAIT_BITSET    9u
 #define FUTEX_WAKE_BITSET   10u
 
-#define MAX_FUTEX_QUEUES 64
+/* One queue per (address space, futex word) that has waiters, made on the
+   first wait and freed when it empties, in a hash table. There used to be
+   a fixed table of 64 for the whole system: WebKit's thread pools plus
+   the desktop's own ran it out, FUTEX_WAIT failed with ENOMEM and glibc
+   aborted the process ("The futex facility returned an unexpected error
+   code"). */
+#define FUTEX_BUCKETS 1024
 
 /* (named FutexQueue, not WaitQueue: process.h brings in the scheduler's
    WaitQueue -- this file only compiled while the stale object was reused) */
@@ -42,16 +48,19 @@ typedef struct FutexQueue {
     uint64_t key_pml4;
     uint64_t key_uaddr;
     Thread  *head;      /* intrusive FIFO via Thread.wq_next */
-    bool     in_use;
+    struct FutexQueue *next;   /* bucket chain */
 } FutexQueue;
 
-static FutexQueue g_queues[MAX_FUTEX_QUEUES];
+static FutexQueue *g_buckets[FUTEX_BUCKETS];
 
 void futex_init(void) {
-    for (int i = 0; i < MAX_FUTEX_QUEUES; i++) {
-        g_queues[i].in_use = false;
-        g_queues[i].head = NULL;
-    }
+    for (int i = 0; i < FUTEX_BUCKETS; i++) g_buckets[i] = NULL;
+}
+
+static unsigned bucket_of(uint64_t key_pml4, uint64_t key_uaddr) {
+    uint64_t h = (key_uaddr >> 2) ^ ((key_pml4 >> 12) * 0x9E3779B97F4A7C15ULL);
+    h ^= h >> 29;
+    return (unsigned)(h & (FUTEX_BUCKETS - 1));
 }
 
 /* Prunes threads that stopped being BLOCKED out of the list while walking
@@ -72,25 +81,31 @@ static void queue_prune(FutexQueue *q) {
     }
 }
 
+/* Callers hold interrupts off (the table is only touched that way). */
 static FutexQueue *queue_lookup(uint64_t key_pml4, uint64_t key_uaddr, bool create) {
-    FutexQueue *free_slot = NULL;
-    for (int i = 0; i < MAX_FUTEX_QUEUES; i++) {
-        FutexQueue *q = &g_queues[i];
-        if (q->in_use && q->key_pml4 == key_pml4 && q->key_uaddr == key_uaddr) {
-            return q;
-        }
-        if (!q->in_use && !free_slot) free_slot = q;
-    }
-    if (!create || !free_slot) return NULL;
-    free_slot->in_use = true;
-    free_slot->key_pml4 = key_pml4;
-    free_slot->key_uaddr = key_uaddr;
-    free_slot->head = NULL;
-    return free_slot;
+    unsigned b = bucket_of(key_pml4, key_uaddr);
+    for (FutexQueue *q = g_buckets[b]; q; q = q->next)
+        if (q->key_pml4 == key_pml4 && q->key_uaddr == key_uaddr) return q;
+    if (!create) return NULL;
+    FutexQueue *q = (FutexQueue *)kmalloc(sizeof(FutexQueue));
+    if (!q) return NULL;
+    q->key_pml4 = key_pml4;
+    q->key_uaddr = key_uaddr;
+    q->head = NULL;
+    q->next = g_buckets[b];
+    g_buckets[b] = q;
+    return q;
 }
 
+/* An empty queue goes away. Nobody keeps a pointer to one across a sleep:
+   a waiter finds its queue through Thread.wq_head (it keeps the queue
+   non-empty while it is linked), see futex_unlink_self(). */
 static void queue_release_if_empty(FutexQueue *q) {
-    if (q->head == NULL) q->in_use = false;
+    if (q->head != NULL) return;
+    FutexQueue **pp = &g_buckets[bucket_of(q->key_pml4, q->key_uaddr)];
+    while (*pp && *pp != q) pp = &(*pp)->next;
+    if (*pp) *pp = q->next;
+    kfree(q);
 }
 
 static void queue_push(FutexQueue *q, Thread *t) {
@@ -105,12 +120,12 @@ static void queue_push(FutexQueue *q, Thread *t) {
     tail->wq_next = t;
 }
 
-/* Unlinks `t` (the current thread, just resumed) from its queue. Called by
-   the waiter itself after sched_block() returns -- covers both wake paths,
-   since wakers may have left the link in place when they found the thread
-   already unblocked via deadline. Self-service keeps every path correct
-   without the scheduler knowing queue internals. */
-static void self_unlink(FutexQueue *q, Thread *t) {
+/* Unlinks `t` (the current thread, just resumed) from the queue it is in
+   now, if any: wakers unlink (wq_head = NULL), a deadline pass leaves it
+   linked, a requeue may have moved it to another queue. */
+static void futex_unlink_self(Thread *t) {
+    if (!t->wq_head) return;
+    FutexQueue *q = (FutexQueue *)((uint8_t *)t->wq_head - __builtin_offsetof(FutexQueue, head));
     Thread **pp = &q->head;
     while (*pp) {
         if (*pp == t) {
@@ -208,9 +223,10 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         queue_push(q, self);
         int64_t r = sched_block((void *)q, deadline);
         /* Resumed: by a WAKE (already unlinked by it) or by the deadline
-           pass (still linked). Either way make sure we are off the list. */
+           pass (still linked, maybe requeued). Either way make sure we are
+           off the list. `q` may be gone by now -- not used again. */
         __asm__ volatile("cli");
-        self_unlink(q, self);
+        futex_unlink_self(self);
         if (rflags & 0x200) __asm__ volatile("sti");
         return r;
     }
@@ -333,7 +349,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         }
 
         uint32_t moved = 0;
-        if (nr_requeue > 0) {
+        if (nr_requeue > 0 && q->head && uaddr2_key_addr != uaddr) {
             FutexQueue *q2 = queue_lookup(key, uaddr2_key_addr, true);
             if (q2) {
                 /* splice up to nr_requeue remaining waiters over */
@@ -342,12 +358,13 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                     Thread *t = *src;
                     *src = t->wq_next;
                     queue_push(q2, t);
+                    t->wq = (void *)q2;   /* or q2's prune drops it as stale: a lost wakeup */
                     moved++;
                 }
-                queue_release_if_empty(q);
                 queue_release_if_empty(q2);
             }
         }
+        queue_release_if_empty(q);
 
         if (rflags & 0x200) __asm__ volatile("sti");
         return (int64_t)(woken + moved);

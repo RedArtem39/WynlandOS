@@ -24,9 +24,25 @@ static long now_ms(void)
     return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static void shot(const char *name, const char *url, const char *settle_ms, const char *timeout_ms)
+/* action/status: JavaScript run once the page loaded / printed before the
+   snapshot (a status starting with "FAIL" fails the page) */
+/* boot.cfg "wpeonly=a,b": only those pages (quicker debugging runs) */
+static char g_only[256];
+static int wanted(const char *name)
 {
-    char *argv[] = { "/usr/bin/wpeshot", (char *)url, (char *)name, (char *)settle_ms, (char *)timeout_ms, NULL };
+    if (!g_only[0]) return 1;
+    size_t n = strlen(name);
+    for (const char *p = g_only; (p = strstr(p, name)); p += n)
+        if ((p == g_only || p[-1] == ',') && (p[n] == 0 || p[n] == ',')) return 1;
+    return 0;
+}
+
+static void shot_js(const char *name, const char *url, const char *settle_ms, const char *timeout_ms,
+                    const char *action, const char *status)
+{
+    if (!wanted(name)) return;
+    char *argv[] = { "/usr/bin/wpeshot", (char *)url, (char *)name, (char *)settle_ms, (char *)timeout_ms,
+                     (char *)(action ? action : ""), (char *)(status ? status : ""), NULL };
     char *env[] = {
         "HOME=/tmp", "XDG_CACHE_HOME=/tmp/.cache", "XDG_DATA_HOME=/tmp/.local/share",
         "XDG_RUNTIME_DIR=/tmp", "LD_LIBRARY_PATH=/lib64",
@@ -48,11 +64,40 @@ static void shot(const char *name, const char *url, const char *settle_ms, const
     if (ok) g_pass++; else g_fail++;
 }
 
+static void shot(const char *name, const char *url, const char *settle_ms, const char *timeout_ms)
+{
+    shot_js(name, url, settle_ms, timeout_ms, NULL, NULL);
+}
+
+/* play the page's <video>; then: is it playing, and what did it decode? */
+static const char PLAY_JS[] =
+    "(() => { const v = document.querySelector('video'); if (!v) return 'no video';"
+    " const p = v.play(); if (p) p.catch(e => console.log('play(): ' + e)); return 'play() called'; })()";
+static const char VIDEO_STATUS_JS[] =
+    "(() => { const v = document.querySelector('video'); if (!v) return 'FAIL no <video>';"
+    " const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;"
+    " return (v.currentTime > 2 && !v.paused ? 'PLAYING' : 'FAIL')"
+    " + ' t=' + v.currentTime.toFixed(1) + ' paused=' + v.paused + ' ready=' + v.readyState"
+    " + ' err=' + (v.error ? v.error.code + ':' + v.error.message : 'none')"
+    " + ' frames=' + (q ? q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames : '?')"
+    " + ' ' + v.videoWidth + 'x' + v.videoHeight; })()";
+
 int main(void)
 {
+    FILE *cfg = fopen("/etc/wynland/boot.cfg", "r");
+    char line[256];
+    while (cfg && fgets(line, sizeof line, cfg))
+        if (strncmp(line, "wpeonly=", 8) == 0) {
+            strncpy(g_only, line + 8, sizeof g_only - 1);
+            g_only[strcspn(g_only, "\r\n")] = 0;
+        }
+    if (cfg) fclose(cfg);
     shot("local", "file:///usr/share/wynland/web/test.html", "1500", "120000");
     shot("example", "https://example.com/", "1500", "180000");
     shot("youtube", "https://www.youtube.com/", "15000", "150000");
+    /* a video: Big Buck Bunny (Blender Foundation, CC BY), no DRM */
+    shot_js("ytwatch", "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "30000", "300000",
+            PLAY_JS, VIDEO_STATUS_JS);
     fprintf(stderr, "[wpetest] DONE pass=%d fail=%d\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

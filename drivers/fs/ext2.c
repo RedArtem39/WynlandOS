@@ -2247,6 +2247,22 @@ bool vfs_chmod(const char *path, uint32_t mode) {
     return ext2_write_inode(inum, &inode);
 }
 
+/* fchmod(): the open file's inode, owner or root only. -1 not an ext2
+   file, 0 not allowed, 1 done. */
+int vfs_fchmod(VfsFile *file, uint32_t mode) {
+    if (!file) return -1;
+    uint32_t inum = file->node.first_cluster;
+    if (inum == 0 || inum >= 0xFFFFFF00u) return -1;    /* device/socket/pipe sentinels */
+    Ext2Inode inode;
+    if (!ext2_read_inode(inum, &inode)) return -1;
+    uint32_t uid = current_uid_or_root();
+    if (uid != 0 && inode.i_uid != uid) return 0;
+    inode.i_mode = (uint16_t)((inode.i_mode & ~07777u) | (mode & 07777u));
+    inode.i_ctime = (uint32_t)rtc_get_unix_time();
+    file->node.mode = (uint16_t)(inode.i_mode & 07777u);
+    return ext2_write_inode(inum, &inode) ? 1 : -1;
+}
+
 bool vfs_set_readonly(const char *path) {
     uint32_t inum;
     Ext2Inode inode;

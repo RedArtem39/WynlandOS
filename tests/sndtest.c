@@ -54,10 +54,18 @@ int main(void)
     {
         static short shortbuf[1024 * 2];   /* 4 KB of silence */
         int q = 0;
+        struct timespec t0, t1;
         ioctl(fd, SNDCTL_DSP_RESET, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         write(fd, shortbuf, sizeof shortbuf);
         ioctl(fd, SNDCTL_DSP_GETODELAY, &q);
-        check(q >= (int)sizeof shortbuf, "GETODELAY counts a fresh write");
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        /* minus what the card played meanwhile (48 kHz stereo 16-bit: 192
+           bytes a millisecond) -- other autotests run alongside and this
+           process can be preempted between the two calls */
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        int played = (int)(ms + 1) * 192;
+        check(q > 0 && q >= (int)sizeof shortbuf - played, "GETODELAY counts a fresh write");
         ioctl(fd, SNDCTL_DSP_SYNC, 0);
     }
     int space[4] = {0};

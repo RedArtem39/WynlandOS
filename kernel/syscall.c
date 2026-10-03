@@ -284,7 +284,16 @@ typedef struct {
     bool     is_pipe;
     uint32_t readers;
     uint32_t writers;
+    /* eventfd: a 64-bit counter, not bytes. It used to be a pipe of 8-byte
+       records: GLib's wakeups (one write each, drained once per loop pass)
+       filled it, and the writing thread -- WebKit's main thread -- slept
+       on itself. */
+    bool     is_eventfd;
+    bool     ev_semaphore;   /* EFD_SEMAPHORE: read takes 1, not all */
+    uint64_t evcount;
 } KPipe;
+
+#define EVENTFD_MAX 0xFFFFFFFFFFFFFFFEULL
 
 static KPipe *g_pipes[MAX_PIPES];
 
@@ -862,6 +871,14 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                 int p_idx = file->current_cluster;
                 if (p_idx >= 0 && p_idx < MAX_PIPES && g_pipes[p_idx] != NULL) {
                     KPipe *p = g_pipes[p_idx];
+                    if (p->is_eventfd) {
+                        bool r = p->evcount > 0, w = p->evcount < EVENTFD_MAX;
+                        if (fds && r && (fds[i].events & 0x0001)) { fds[i].revents |= 0x0001; ready++; }
+                        else if (fds && w && (fds[i].events & 0x0004)) { fds[i].revents |= 0x0004; ready++; }
+                        else single_wq = &p->read_wq;
+                        if (fds && r && w && (fds[i].events & 0x0004)) fds[i].revents |= 0x0004;
+                        continue;
+                    }
                     if (p->count == 0 && p->is_pipe && p->writers == 0) {
                         if (fds) fds[i].revents |= 0x0010 | (fds[i].events & 0x0001); // POLLHUP (+POLLIN: read gives EOF)
                         ready++;
@@ -1397,6 +1414,20 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        client's pipe each frame) depend on this -- without
                        it one quiet client parked the whole compositor. */
                     KPipe *kp = g_pipes[pipe_idx];
+                    if (kp->is_eventfd) {
+                        /* the counter (or 1 of it, EFD_SEMAPHORE), 8 bytes */
+                        if (a3 < 8) return (uint64_t)-22;                 /* -EINVAL */
+                        while (kp->evcount == 0) {
+                            if (fd_oflags[a1] & LINUX_O_NONBLOCK) return (uint64_t)-11; /* -EAGAIN */
+                            waitqueue_wait(&kp->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+                        }
+                        uint64_t v = kp->ev_semaphore ? 1 : kp->evcount;
+                        if (copy_to_user((void *)a2, &v, 8) != 0) return (uint64_t)-14;
+                        kp->evcount -= v;
+                        waitqueue_wake_all(&kp->write_wq);
+                        waitqueue_wake_all(&g_poll_any_wq);
+                        return 8;
+                    }
                     if (kp->count == 0 && kp->is_pipe && kp->writers == 0) return 0; /* EOF */
                     if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && kp->count == 0) {
                         return (uint64_t)-11; /* -EAGAIN */
@@ -1493,8 +1524,25 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                        Check and write can't be separated: syscalls run with
                        IF=0 (SFMASK) and pipe_write() only sleeps when it
                        can't proceed, which these checks rule out. */
-                    if (a3 == 0) return 0;
                     KPipe *kp = g_pipes[pipe_idx];
+                    if (kp->is_eventfd) {
+                        /* adds to the counter; blocks only at the very top */
+                        uint64_t v;
+                        if (a3 < 8) return (uint64_t)-22;                 /* -EINVAL */
+                        if (copy_from_user(&v, (const void *)a2, 8) != 0) return (uint64_t)-14;
+                        if (v == 0xFFFFFFFFFFFFFFFFULL) return (uint64_t)-22;
+                        while (EVENTFD_MAX - kp->evcount < v) {
+                            if (fd_oflags[a1] & LINUX_O_NONBLOCK) return (uint64_t)-11; /* -EAGAIN */
+                            waitqueue_wait(&kp->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+                        }
+                        kp->evcount += v;
+                        if (v) {
+                            waitqueue_wake_all(&kp->read_wq);
+                            waitqueue_wake_all(&g_poll_any_wq);
+                        }
+                        return 8;
+                    }
+                    if (a3 == 0) return 0;
                     if (kp->is_pipe && kp->readers == 0) {
                         signal_raise_current(13 /* SIGPIPE */);
                         return (uint64_t)-32; /* -EPIPE */
@@ -2289,10 +2337,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 KPipe *p = (KPipe *)kmalloc(sizeof(KPipe));
                 if (!p) return (uint64_t)-12; /* -ENOMEM */
                 memset(p, 0, sizeof(KPipe));
-                if (initval > 0) {
-                    uint64_t val = initval;
-                    pipe_write(p, &val, 8);
+                if ((uint32_t)a2 & ~(uint32_t)(1 | 04000 | 02000000)) {
+                    kfree(p);
+                    return (uint64_t)-22; /* -EINVAL: only SEMAPHORE, NONBLOCK, CLOEXEC */
                 }
+                p->is_eventfd = true;
+                p->ev_semaphore = (a2 & 1) != 0;          /* EFD_SEMAPHORE */
+                p->evcount = (uint32_t)initval;
 
                 int p_idx = -1;
                 for (int i = 0; i < MAX_PIPES; i++) {
@@ -2321,6 +2372,8 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 file->node.first_cluster = 0xFFFFFFFC; // Eventfd signature
                 file->current_cluster = p_idx;
                 fd_table[fd] = file;
+                fd_oflags[fd] = LINUX_O_RDWR | ((a2 & 04000) ? LINUX_O_NONBLOCK : 0);  /* EFD_NONBLOCK */
+                fd_flags[fd]  = (a2 & 02000000) ? FD_CLOEXEC : 0;                     /* EFD_CLOEXEC */
 
                 trace_str("  Success: created eventfd fd=");
                 char fdbuf[16];
@@ -2952,20 +3005,21 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
         case 231: // SYS_exit_group (Linux standard) -- the whole process
             {
                 proc->exit_code = (int)a1;
-                /* Every other thread of the process dies too: SIGKILL
-                   pending + woken if asleep; the syscall-return path or the
-                   timer (for one running user code) terminates it. It used
-                   to end only the calling thread, so glibc's exit() from a
-                   helper thread left the rest of the program running. */
+                /* Every other thread of the process dies too, now -- like a
+                   fatal signal (signal_kill_process()). Not running (one
+                   CPU), each is either in user code or asleep at a blocking
+                   point; the reaper unlinks it from any wait queue. It was
+                   "SIGKILL pending + wake": but many sleeps in here retry
+                   on a wake, so such a thread never died, the process was
+                   never torn down, its fds never closed -- WebKit's child
+                   processes never saw their parent go and kept running. */
                 extern Thread *sched_get_thread_list(void);
                 Thread *start = sched_get_thread_list(), *it = start;
                 int guard = 0;
                 if (it) do {
                     if (it->proc == proc && it != sched_current() &&
-                        it->state != THREAD_STATE_TERMINATED) {
-                        it->sig_pending |= 1ULL << 9;
-                        if (it->state == THREAD_STATE_BLOCKED) sched_unblock(it, -LNX_EINTR);
-                    }
+                        it->state != THREAD_STATE_TERMINATED)
+                        it->state = THREAD_STATE_TERMINATED;
                     it = it->next;
                 } while (it != start && ++guard < 100000);
                 process_mark_exited(proc, ((int)a1 & 0xFF) << 8);
@@ -3153,6 +3207,13 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
                 if (pr->uid != 0 && (uint32_t)a1 != pr->uid) return (uint64_t)-1; /* -EPERM */
                 pr->uid = (uint32_t)a1;
                 return 0;
+            }
+
+        case 91:  // SYS_fchmod(fd, mode): GLib's g_file_set_contents() sets the mode this way
+            {
+                if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;   /* -EBADF */
+                int r = vfs_fchmod(fd_table[a1], (uint32_t)a2);
+                return r > 0 ? 0 : r == 0 ? (uint64_t)-1 /* -EPERM */ : (uint64_t)-22; /* -EINVAL */
             }
 
         case 90:  // SYS_chmod(path, mode)

@@ -99,6 +99,7 @@ bool vfs_rename(const char *oldpath, const char *newpath);
 bool vfs_stat(const char *path, VfsStat *out);
 bool vfs_set_readonly(const char *path); /* clears all write bits in i_mode */
 bool vfs_chmod(const char *path, uint32_t mode); /* owner or root */
+int  vfs_fchmod(VfsFile *file, uint32_t mode);   /* same, an open file: -1 not ext2, 0 EPERM, 1 ok */
 bool vfs_may_access(const char *path, uint32_t want); /* 4 r, 2 w, 1 x; root always */
 
 /* ---- ext2 mount diagnostics (shell disk_dump etc.) ---- */
