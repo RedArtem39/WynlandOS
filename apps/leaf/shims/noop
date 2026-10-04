@@ -1,0 +1,6 @@
+#!/bin/sh
+# WynlandOS - leaf: a Debian maintainer-script helper that has nothing to do
+# here (no systemd, no SysV runlevels, no ld.so.cache, no dpkg triggers).
+# Installed as deb-systemd-helper, deb-systemd-invoke, systemctl,
+# invoke-rc.d, update-rc.d, ldconfig, dpkg-trigger, dpkg-maintscript-helper.
+exit 0

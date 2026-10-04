@@ -1,0 +1,5 @@
+# WynlandOS - where leaf gets packages: Ubuntu 26.04 (Resolute Raccoon), the
+# release WynlandOS's userland is staged from. "deb URL SUITE COMPONENT..."
+deb http://archive.ubuntu.com/ubuntu resolute main universe
+deb http://archive.ubuntu.com/ubuntu resolute-updates main universe
+deb http://security.ubuntu.com/ubuntu resolute-security main universe

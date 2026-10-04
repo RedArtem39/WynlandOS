@@ -1,0 +1,36 @@
+#!/usr/bin/python3
+# WynlandOS - leaf's stand-in for dpkg, for what maintainer scripts ask it:
+# --compare-versions, --print-architecture, --assert-*, -s/-l of a package.
+import json, os, sys
+sys.path.insert(0, "/usr/lib/leaf")
+a = sys.argv[1:]
+if not a:
+    sys.exit(0)
+if a[0] == "--print-architecture":
+    print("amd64"); sys.exit(0)
+if a[0] == "--print-foreign-architectures":
+    sys.exit(0)
+if a[0].startswith("--assert-"):
+    sys.exit(0)
+if a[0] == "--compare-versions" and len(a) == 4:
+    import importlib.machinery, importlib.util
+    loader = importlib.machinery.SourceFileLoader("leaf", "/usr/bin/leaf")
+    spec = importlib.util.spec_from_loader("leaf", loader)
+    leaf = importlib.util.module_from_spec(spec); loader.exec_module(leaf)
+    x, op, y = a[1], a[2], a[3]
+    ops = {"lt": "<<", "le": "<=", "eq": "=", "ne": "!=", "ge": ">=", "gt": ">>",
+           "lt-nl": "<<", "le-nl": "<=", "ge-nl": ">=", "gt-nl": ">>",
+           "<<": "<<", "<=": "<=", "=": "=", ">=": ">=", ">>": ">>", "<": "<=", ">": ">="}
+    o = ops.get(op)
+    if o is None:
+        sys.exit(2)
+    if not x or not y:      # an empty version is older than any (the -nl forms: newer)
+        empty_low = not op.endswith("-nl")
+        r = (0 if x == y else (-1 if (not x) == empty_low else 1))
+    else:
+        r = leaf.vcmp(x, y)
+    ok = {"<<": r < 0, "<=": r <= 0, "=": r == 0, "!=": r != 0, ">=": r >= 0, ">>": r > 0}[o]
+    sys.exit(0 if ok else 1)
+if a[0] in ("-s", "--status", "-l", "--list", "-L", "--listfiles", "-S", "--search", "--validate-version"):
+    sys.exit(0 if a[0] == "--validate-version" else 1)
+sys.exit(0)

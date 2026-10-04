@@ -1,0 +1,58 @@
+#!/usr/bin/python3
+# WynlandOS - leaf's update-alternatives: the highest-priority provider of a
+# generic name (editor, pager, x-www-browser...) is what its link points to.
+# State in /var/lib/leaf/alternatives.json.
+import json, os, sys
+DB = "/var/lib/leaf/alternatives.json"
+try:
+    db = json.load(open(DB))
+except Exception:
+    db = {}
+a = sys.argv[1:]
+while a and a[0] in ("--quiet", "--force", "--verbose"):
+    a = a[1:]
+
+def apply(name):
+    alt = db.get(name)
+    if not alt or not alt["choices"]:
+        if alt and os.path.islink(alt["link"]):
+            os.unlink(alt["link"])
+        db.pop(name, None)
+        return
+    best = max(alt["choices"], key=lambda p: alt["choices"][p]["prio"])
+    links = [(alt["link"], best)] + [(l, t) for l, t in alt["choices"][best].get("slaves", [])]
+    for link, target in links:
+        os.makedirs(os.path.dirname(link), exist_ok=True)
+        if os.path.lexists(link):
+            if not os.path.islink(link):
+                continue                     # a real file is there: leave it
+            os.unlink(link)
+        os.symlink(target, link)
+
+if a and a[0] == "--install" and len(a) >= 5:
+    link, name, path, prio = a[1], a[2], a[3], int(a[4])
+    slaves = []
+    rest = a[5:]
+    while len(rest) >= 4 and rest[0] == "--slave":
+        slaves.append((rest[1], rest[3]))
+        rest = rest[4:]
+    alt = db.setdefault(name, {"link": link, "choices": {}})
+    alt["choices"][path] = {"prio": prio, "slaves": slaves}
+    apply(name)
+elif a and a[0] == "--remove" and len(a) >= 3:
+    if a[1] in db:
+        db[a[1]]["choices"].pop(a[2], None)
+        apply(a[1])
+elif a and a[0] == "--remove-all" and len(a) >= 2:
+    if a[1] in db:
+        db[a[1]]["choices"] = {}
+        apply(a[1])
+elif a and a[0] in ("--query", "--display", "--list") and len(a) >= 2:
+    alt = db.get(a[1])
+    if not alt:
+        sys.exit(2)
+    for p in alt["choices"]:
+        print(p)
+    sys.exit(0)
+os.makedirs(os.path.dirname(DB), exist_ok=True)
+json.dump(db, open(DB, "w"), indent=1)

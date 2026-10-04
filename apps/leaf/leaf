@@ -1,0 +1,728 @@
+#!/usr/bin/python3
+# WynlandOS - leaf, the package manager.
+#
+# WynlandOS runs Ubuntu's binaries as they are, so leaf installs Ubuntu's
+# packages: it reads the archive's signed index (InRelease, checked with
+# gpgv against Ubuntu's keyring), resolves dependencies, downloads the
+# .debs, checks each one's SHA256 against the index, and unpacks them
+# itself. What it installed it can list, verify and remove again.
+#
+#   leaf update                  fetch the package lists
+#   leaf search WORD...          packages whose name or summary has WORD
+#   leaf show PKG                about a package
+#   leaf install PKG...          install, with what they depend on
+#   leaf remove PKG...           remove what leaf installed
+#   leaf upgrade                 newer versions of installed packages
+#   leaf list [--installed|--base]
+#   leaf files PKG               the files of an installed package
+#   leaf owner PATH              which installed package a file is from
+#
+# State: /etc/leaf/sources (where from), /var/lib/leaf/lists (the index),
+# /var/lib/leaf/installed.json (what leaf put where), /var/lib/leaf/base
+# (what came with the system image), /var/cache/leaf (downloaded .debs).
+#
+# Copyright (C) 2026 Red_Artem39. GPL-2.0-only.
+
+import hashlib
+import io
+import json
+import lzma
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+
+ROOT = os.environ.get("LEAF_ROOT", "/")
+ETC = os.path.join(ROOT, "etc/leaf")
+LIB = os.path.join(ROOT, "var/lib/leaf")
+CACHE = os.path.join(ROOT, "var/cache/leaf")
+LISTS = os.path.join(LIB, "lists")
+DB = os.path.join(LIB, "installed.json")
+BASE = os.path.join(LIB, "base")
+ARCH = "amd64"
+KEYRING = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+# what is not worth the disk: docs, man pages, translations
+SKIP_PREFIXES = ("./usr/share/doc/", "./usr/share/man/", "./usr/share/info/",
+                 "./usr/share/locale/", "./usr/share/lintian/")
+
+USE_COLOR = sys.stdout.isatty()
+
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+
+
+def say(msg):
+    print(c("1;34", "::") + " " + msg, flush=True)
+
+
+def warn(msg):
+    print(c("1;33", "warning:") + " " + msg, file=sys.stderr, flush=True)
+
+
+def die(msg):
+    print(c("1;31", "error:") + " " + msg, file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+# ------------------------------------------------------------------ versions
+
+def _order(ch):
+    if ch == "~":
+        return -1
+    if ch.isdigit():
+        return 0
+    if ch.isalpha():
+        return ord(ch)
+    return ord(ch) + 256 if ch else 0
+
+
+def _cmp_part(a, b):
+    """dpkg's comparison of upstream versions / revisions"""
+    i = j = 0
+    while i < len(a) or j < len(b):
+        first_diff = 0
+        while (i < len(a) and not a[i].isdigit()) or (j < len(b) and not b[j].isdigit()):
+            ac = _order(a[i]) if i < len(a) else 0
+            bc = _order(b[j]) if j < len(b) else 0
+            if ac != bc:
+                return ac - bc
+            i += 1
+            j += 1
+        while i < len(a) and a[i] == "0":
+            i += 1
+        while j < len(b) and b[j] == "0":
+            j += 1
+        while i < len(a) and a[i].isdigit() and j < len(b) and b[j].isdigit():
+            if not first_diff:
+                first_diff = ord(a[i]) - ord(b[j])
+            i += 1
+            j += 1
+        if i < len(a) and a[i].isdigit():
+            return 1
+        if j < len(b) and b[j].isdigit():
+            return -1
+        if first_diff:
+            return first_diff
+    return 0
+
+
+def _split_version(v):
+    epoch, _, rest = v.rpartition(":") if ":" in v else ("0", "", v)
+    if "-" in rest:
+        up, _, rev = rest.rpartition("-")
+    else:
+        up, rev = rest, ""
+    return int(epoch or 0), up, rev
+
+
+def vcmp(a, b):
+    ea, ua, ra = _split_version(a)
+    eb, ub, rb = _split_version(b)
+    if ea != eb:
+        return ea - eb
+    return _cmp_part(ua, ub) or _cmp_part(ra, rb)
+
+
+def satisfies(have, op, want):
+    r = vcmp(have, want)
+    return {"<<": r < 0, "<=": r <= 0, "=": r == 0, ">=": r >= 0, ">>": r > 0,
+            "<": r <= 0, ">": r >= 0}[op]
+
+
+def parse_rel(field):
+    """'a (>= 1) | b, c:any' -> [[('a','>=','1'), ('b',None,None)], [('c',None,None)]]"""
+    out = []
+    for group in field.split(","):
+        alts = []
+        for alt in group.split("|"):
+            alt = alt.strip()
+            if not alt:
+                continue
+            if "[" in alt:          # architecture restrictions: we are amd64
+                alt = alt[:alt.index("[")].strip()
+            if "<" in alt and alt.rstrip().endswith(">") and "(" not in alt[alt.index("<"):]:
+                alt = alt[:alt.index("<")].strip()    # build profiles
+            op = ver = None
+            if "(" in alt:
+                name, _, rest = alt.partition("(")
+                rest = rest.rstrip(") ").strip()
+                for o in ("<<", "<=", ">=", ">>", "=", "<", ">"):
+                    if rest.startswith(o):
+                        op, ver = o, rest[len(o):].strip()
+                        break
+                alt = name.strip()
+            name = alt.split(":")[0]
+            alts.append((name, op, ver))
+        if alts:
+            out.append(alts)
+    return out
+
+
+# ------------------------------------------------------------------ sources
+
+def read_sources():
+    """lines: deb URL SUITE COMPONENT..."""
+    path = os.path.join(ETC, "sources")
+    out = []
+    try:
+        for line in open(path):
+            f = line.split("#", 1)[0].split()
+            if len(f) >= 4 and f[0] == "deb":
+                out.append((f[1].rstrip("/"), f[2], f[3:]))
+    except FileNotFoundError:
+        die(f"no {path}")
+    return out
+
+
+def fetch(url, dest=None, quiet=False):
+    """download url (to dest, or into memory), with a progress line"""
+    req = urllib.request.Request(url, headers={"User-Agent": "leaf/1 (WynlandOS)"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        buf = io.BytesIO() if dest is None else open(dest + ".part", "wb")
+        got = 0
+        t0 = time.monotonic()
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            buf.write(chunk)
+            got += len(chunk)
+            if not quiet and USE_COLOR and total:
+                rate = got / max(time.monotonic() - t0, 0.001)
+                print(f"\r   {os.path.basename(url)[:48]:48} {got * 100 // total:3d}%  {rate / 1e6:5.1f} MB/s",
+                      end="", flush=True)
+        if not quiet and USE_COLOR and total:
+            print("\r" + " " * 78 + "\r", end="", flush=True)
+        if dest is None:
+            return buf.getvalue()
+        buf.close()
+        os.replace(dest + ".part", dest)
+        return None
+
+
+def list_name(url, suite, comp):
+    host = url.split("://", 1)[-1].replace("/", "_")
+    return f"{host}_{suite}_{comp}"
+
+
+def cmd_update(args):
+    need_root()
+    os.makedirs(LISTS, exist_ok=True)
+    have_gpgv = shutil.which("gpgv") and os.path.exists(KEYRING)
+    if not have_gpgv:
+        warn("gpgv or the Ubuntu keyring is missing: the index is NOT checked")
+    for url, suite, comps in read_sources():
+        say(f"{url} {suite}")
+        signed = fetch(f"{url}/dists/{suite}/InRelease", quiet=True)
+        if have_gpgv:
+            with tempfile.NamedTemporaryFile(delete=False) as t:
+                t.write(signed)
+            r = subprocess.run(["gpgv", "--keyring", KEYRING, t.name],
+                               capture_output=True, text=True)
+            os.unlink(t.name)
+            if r.returncode != 0:
+                die(f"bad signature on {suite}/InRelease:\n{r.stderr}")
+        text = signed.decode("utf-8", "replace")
+        # the SHA256 list of the files the release describes
+        sums = {}
+        in_sha = False
+        for line in text.splitlines():
+            if line.startswith("SHA256:"):
+                in_sha = True
+                continue
+            if in_sha:
+                if not line.startswith(" "):
+                    in_sha = False
+                    continue
+                h, size, name = line.split()
+                sums[name] = (h, int(size))
+        for comp in comps:
+            rel = f"{comp}/binary-{ARCH}/Packages.xz"
+            if rel not in sums:
+                warn(f"{suite}/{rel}: not in the release")
+                continue
+            data = fetch(f"{url}/dists/{suite}/{rel}")
+            if hashlib.sha256(data).hexdigest() != sums[rel][0]:
+                die(f"{suite}/{rel}: checksum mismatch")
+            packages = lzma.decompress(data)
+            index = parse_packages(packages, url)
+            with open(os.path.join(LISTS, list_name(url, suite, comp) + ".json"), "w") as f:
+                json.dump(index, f, separators=(",", ":"))
+            print(f"   {comp}: {len(index)} packages")
+    say("done")
+
+
+KEEP = ("Package", "Version", "Depends", "Pre-Depends", "Provides", "Filename",
+        "Size", "SHA256", "Description", "Installed-Size", "Section", "Conflicts",
+        "Breaks", "Replaces", "Architecture", "Essential", "Priority")
+
+
+def parse_packages(raw, url):
+    out = []
+    for para in raw.decode("utf-8", "replace").split("\n\n"):
+        rec = {}
+        for line in para.split("\n"):
+            if not line or line[0] in " \t":
+                continue
+            k, _, v = line.partition(":")
+            if k in KEEP:
+                rec[k] = v.strip()
+        if "Package" in rec and rec.get("Architecture") in (ARCH, "all"):
+            rec["_url"] = url
+            out.append(rec)
+    return out
+
+
+# ------------------------------------------------------------------ the index
+
+class Index:
+    def __init__(self):
+        self.pkgs = {}       # name -> newest record
+        self.provides = {}   # virtual -> [names]
+        if not os.path.isdir(LISTS) or not os.listdir(LISTS):
+            die("no package lists: run 'leaf update'")
+        for fn in sorted(os.listdir(LISTS)):
+            if not fn.endswith(".json"):
+                continue
+            for rec in json.load(open(os.path.join(LISTS, fn))):
+                name = rec["Package"]
+                old = self.pkgs.get(name)
+                if old is None or vcmp(rec["Version"], old["Version"]) > 0:
+                    self.pkgs[name] = rec
+        for name, rec in self.pkgs.items():
+            for alts in parse_rel(rec.get("Provides", "")):
+                for pname, _, _ in alts:
+                    self.provides.setdefault(pname, []).append(name)
+
+
+class State:
+    """what is installed: leaf's own (with files) and the image's base"""
+
+    def __init__(self):
+        try:
+            self.db = json.load(open(DB))
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.db = {}
+        self.base = {}
+        try:
+            for line in open(BASE):
+                f = line.split()
+                if len(f) >= 2:
+                    self.base[f[0]] = f[1]
+        except FileNotFoundError:
+            pass
+
+    def version(self, name):
+        if name in self.db:
+            return self.db[name]["version"]
+        return self.base.get(name)
+
+    def provided(self, name):
+        """installed packages that Provide name"""
+        out = []
+        for n, rec in self.db.items():
+            if name in rec.get("provides", []):
+                out.append(n)
+        return out
+
+    def save(self):
+        os.makedirs(LIB, exist_ok=True)
+        tmp = DB + ".new"
+        with open(tmp, "w") as f:
+            json.dump(self.db, f, indent=1)
+        os.replace(tmp, DB)
+
+
+def dep_met(state, plan, name, op, ver):
+    v = plan[name]["Version"] if name in plan else state.version(name)
+    if v is not None and (op is None or satisfies(v, op, ver)):
+        return True
+    if op is None and (state.provided(name) or any(
+            name in [a[0] for g in parse_rel(r.get("Provides", "")) for a in g] for r in plan.values())):
+        return True
+    return False
+
+
+def resolve(index, state, names, upgrade=False):
+    """the records to install for names, dependencies first"""
+    plan = {}
+    order = []
+    missing = []
+
+    def want(name, op=None, ver=None, why=None):
+        if dep_met(state, plan, name, op, ver) and not (upgrade and why is None):
+            return True
+        rec = index.pkgs.get(name)
+        if rec is None:
+            for prov in index.provides.get(name, []):
+                if op is None:
+                    rec = index.pkgs[prov]
+                    break
+        if rec is None or (op and rec["Package"] == name and not satisfies(rec["Version"], op, ver)):
+            return False
+        n = rec["Package"]
+        if n in plan:
+            return True
+        plan[n] = rec
+        for field in ("Pre-Depends", "Depends"):
+            for alts in parse_rel(rec.get(field, "")):
+                if any(dep_met(state, plan, a, o, v) for a, o, v in alts):
+                    continue
+                if not any(want(a, o, v, why=n) for a, o, v in alts):
+                    missing.append(f"{n} needs {' | '.join(a + (f' ({o} {v})' if o else '') for a, o, v in alts)}")
+        order.append(n)
+        return True
+
+    for name in names:
+        if name not in index.pkgs and name not in index.provides:
+            die(f"no package called '{name}'")
+        if not upgrade and state.version(name) is not None and name not in state.db:
+            say(f"{name} came with the system")
+            continue
+        if not upgrade and name in state.db:
+            say(f"{name} {state.db[name]['version']} is installed already")
+            continue
+        if not want(name):
+            die(f"cannot install {name}")
+    if missing:
+        die("unmet dependencies:\n  " + "\n  ".join(missing))
+    return [plan[n] for n in order]
+
+
+# ------------------------------------------------------------------ .deb
+
+def ar_members(path):
+    with open(path, "rb") as f:
+        if f.read(8) != b"!<arch>\n":
+            raise ValueError("not a .deb")
+        while True:
+            hdr = f.read(60)
+            if len(hdr) < 60:
+                return
+            name = hdr[:16].decode().strip().rstrip("/")
+            size = int(hdr[48:58].decode().strip())
+            data = f.read(size)
+            if size % 2:
+                f.read(1)
+            yield name, data
+
+
+def open_tar(name, data):
+    if name.endswith(".zst"):
+        import compression.zstd
+        data = compression.zstd.decompress(data)
+        return tarfile.open(fileobj=io.BytesIO(data), mode="r:")
+    return tarfile.open(fileobj=io.BytesIO(data), mode="r:*")
+
+
+def unpack(deb):
+    """(control dict, scripts dict, data tarfile)"""
+    control, scripts, data = {}, {}, None
+    for name, blob in ar_members(deb):
+        if name.startswith("control.tar"):
+            t = open_tar(name, blob)
+            for m in t.getmembers():
+                base = m.name.lstrip("./")
+                if not m.isfile():
+                    continue
+                content = t.extractfile(m).read()
+                if base == "control":
+                    for line in content.decode("utf-8", "replace").splitlines():
+                        if line and line[0] not in " \t" and ":" in line:
+                            k, _, v = line.partition(":")
+                            control[k] = v.strip()
+                elif base in ("preinst", "postinst", "prerm", "postrm", "conffiles"):
+                    scripts[base] = content
+        elif name.startswith("data.tar"):
+            data = open_tar(name, blob)
+    return control, scripts, data
+
+
+def run_script(pkg, which, scripts, *args):
+    body = scripts.get(which)
+    if not body:
+        return
+    with tempfile.NamedTemporaryFile(delete=False, suffix="." + which) as t:
+        t.write(body)
+    os.chmod(t.name, 0o755)
+    env = dict(os.environ, DPKG_MAINTSCRIPT_PACKAGE=pkg, DPKG_MAINTSCRIPT_NAME=which,
+               DPKG_MAINTSCRIPT_ARCH=ARCH, DEBIAN_FRONTEND="noninteractive", DPKG_ROOT="")
+    r = subprocess.run([t.name, *args], env=env, capture_output=True, text=True)
+    os.unlink(t.name)
+    if r.returncode != 0:
+        warn(f"{pkg}: {which} {' '.join(args)} failed ({r.returncode}); carrying on\n"
+             + (r.stderr.strip()[-600:] if r.stderr else ""))
+
+
+def install_deb(state, rec, path, conffiles_keep=True):
+    pkg = rec["Package"]
+    control, scripts, data = unpack(path)
+    if data is None:
+        raise ValueError(f"{pkg}: no data in the .deb")
+    old = state.db.get(pkg)
+    run_script(pkg, "preinst", scripts, "upgrade" if old else "install", *( [old["version"]] if old else []))
+    conffiles = set()
+    if "conffiles" in scripts:
+        conffiles = {l.strip() for l in scripts["conffiles"].decode().splitlines() if l.strip().startswith("/")}
+    files = []
+    dirs = []
+    for m in data.getmembers():
+        name = m.name if m.name.startswith("./") else "./" + m.name
+        if name == "./" or name.startswith(SKIP_PREFIXES):
+            continue
+        rel = os.path.normpath(name[2:])
+        if rel.startswith("..") or os.path.isabs(rel):
+            raise ValueError(f"{pkg}: path outside the root: {m.name}")
+        dest = os.path.join(ROOT, rel)
+        abspath = "/" + rel
+        if m.isdir():
+            os.makedirs(dest, exist_ok=True)
+            dirs.append(abspath)
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if abspath in conffiles and conffiles_keep and os.path.exists(dest) and old:
+            files.append(abspath)          # the user's config stays; the new one beside it
+            dest = dest + ".leaf-new"
+        tmp = dest + ".leaf-tmp"
+        if os.path.lexists(tmp):
+            os.unlink(tmp)
+        if m.issym():
+            os.symlink(m.linkname, tmp)
+        elif m.islnk():
+            target = os.path.join(ROOT, os.path.normpath(m.linkname.lstrip("./")))
+            shutil.copy2(target, tmp)
+        elif m.isfile():
+            with data.extractfile(m) as src, open(tmp, "wb") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+            os.chmod(tmp, m.mode & 0o7777)
+        else:
+            continue                        # devices, fifos: not in normal packages
+        if os.path.isdir(dest) and not os.path.islink(dest):
+            os.unlink(tmp)
+            warn(f"{pkg}: {abspath} is a directory here; skipped")
+            continue
+        os.replace(tmp, dest)
+        if not dest.endswith(".leaf-new"):
+            files.append(abspath)
+    provides = [a[0] for g in parse_rel(control.get("Provides", "")) for a in g]
+    if old:
+        for f in set(old.get("files", [])) - set(files):
+            p = os.path.join(ROOT, f.lstrip("/"))
+            if os.path.lexists(p) and not os.path.isdir(p):
+                os.unlink(p)
+    state.db[pkg] = {"version": control.get("Version", rec["Version"]), "files": files, "dirs": dirs,
+                     "provides": provides, "depends": control.get("Depends", ""),
+                     "summary": control.get("Description", "").split("\n")[0],
+                     "postrm": (scripts.get("postrm") or b"").decode("utf-8", "replace"),
+                     "prerm": (scripts.get("prerm") or b"").decode("utf-8", "replace"),
+                     "auto": state.db.get(pkg, {}).get("auto", True)}
+    state.save()
+    return scripts, old
+
+
+def download(recs):
+    os.makedirs(CACHE, exist_ok=True)
+    paths = {}
+    total = sum(int(r.get("Size", 0)) for r in recs)
+    say(f"downloading {len(recs)} package(s), {total / 1e6:.1f} MB")
+    for r in recs:
+        path = os.path.join(CACHE, os.path.basename(r["Filename"]))
+        ok = False
+        if os.path.exists(path):
+            ok = sha256_file(path) == r["SHA256"]
+        if not ok:
+            fetch(f"{r['_url']}/{r['Filename']}", path)
+            if sha256_file(path) != r["SHA256"]:
+                os.unlink(path)
+                die(f"{r['Package']}: checksum mismatch -- not installing")
+        paths[r["Package"]] = path
+    return paths
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def need_root():
+    if ROOT == "/" and os.geteuid() != 0:
+        die("this changes the system: run it as root (ary)")
+
+
+def do_install(index, state, recs, explicit):
+    if not recs:
+        return
+    size = sum(int(r.get("Installed-Size", 0)) for r in recs)
+    print("   " + " ".join(c("1", r["Package"]) + " " + c("2", r["Version"]) for r in recs))
+    print(f"   about {size / 1024:.1f} MB on disk")
+    paths = download(recs)
+    done = []
+    for r in recs:
+        print(f"   {c('32', 'unpacking')} {r['Package']}", flush=True)
+        try:
+            scripts, old = install_deb(state, r, paths[r["Package"]])
+        except Exception as e:
+            die(f"{r['Package']}: {e}")
+        done.append((r, scripts, old))
+    for r, scripts, old in done:
+        run_script(r["Package"], "postinst", scripts, "configure", *([old["version"]] if old else []))
+    for name in explicit:
+        if name in state.db:
+            state.db[name]["auto"] = False
+    state.save()
+    say(f"installed {len(recs)} package(s)")
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_install(args):
+    need_root()
+    index, state = Index(), State()
+    recs = resolve(index, state, args)
+    do_install(index, state, recs, args)
+
+
+def cmd_upgrade(args):
+    need_root()
+    index, state = Index(), State()
+    old = [n for n, r in state.db.items() if n in index.pkgs and vcmp(index.pkgs[n]["Version"], r["version"]) > 0]
+    if not old:
+        say("everything is up to date")
+        return
+    recs = resolve(index, state, old, upgrade=True)
+    recs = [r for r in recs if state.version(r["Package"]) != r["Version"]]
+    do_install(index, state, recs, [])
+
+
+def cmd_remove(args):
+    need_root()
+    state = State()
+    for name in args:
+        if name not in state.db:
+            if name in state.base:
+                die(f"{name} is part of the system image; leaf does not remove it")
+            die(f"{name} is not installed")
+    # who still depends on what goes
+    for name in args:
+        users = [n for n, r in state.db.items() if n not in args and
+                 any(a[0] == name for g in parse_rel(r.get("depends", "")) for a in g)]
+        if users:
+            die(f"{name} is needed by {', '.join(users)}")
+    for name in args:
+        rec = state.db[name]
+        scripts = {k: rec[k].encode() for k in ("prerm", "postrm") if rec.get(k)}
+        run_script(name, "prerm", scripts, "remove")
+        for f in rec["files"]:
+            p = os.path.join(ROOT, f.lstrip("/"))
+            if os.path.lexists(p) and not os.path.isdir(p):
+                os.unlink(p)
+        for d in sorted(rec.get("dirs", []), key=len, reverse=True):
+            try:
+                os.rmdir(os.path.join(ROOT, d.lstrip("/")))
+            except OSError:
+                pass                     # not empty: shared with others
+        run_script(name, "postrm", scripts, "remove")
+        del state.db[name]
+        state.save()
+        print(f"   {c('31', 'removed')} {name}")
+    # dependencies nothing needs any more
+    orphans = [n for n, r in state.db.items() if r.get("auto") and not any(
+        a[0] == n for o in state.db.values() for g in parse_rel(o.get("depends", "")) for a in g)]
+    if orphans:
+        print("   no longer needed: " + " ".join(orphans) + "  (leaf remove them to free the space)")
+
+
+def cmd_search(args):
+    index = Index()
+    words = [w.lower() for w in args]
+    hits = []
+    for name, r in index.pkgs.items():
+        summary = r.get("Description", "")
+        hay = (name + " " + summary).lower()
+        if all(w in hay for w in words):
+            hits.append((0 if any(w in name for w in words) else 1, name, r["Version"], summary))
+    state = State()
+    for _, name, ver, summary in sorted(hits)[:200]:
+        mark = c("32", " [installed]") if state.version(name) else ""
+        print(f"{c('1', name)} {c('2', ver)}{mark}\n    {summary}")
+    if len(hits) > 200:
+        print(f"... and {len(hits) - 200} more")
+
+
+def cmd_show(args):
+    index, state = Index(), State()
+    for name in args:
+        r = index.pkgs.get(name)
+        if not r:
+            die(f"no package called '{name}'")
+        print(f"{c('1', name)} {r['Version']}  ({r.get('Section', '?')})")
+        print(f"  {r.get('Description', '')}")
+        print(f"  installed:  {state.version(name) or 'no'}")
+        print(f"  download:   {int(r.get('Size', 0)) / 1e6:.2f} MB, on disk {int(r.get('Installed-Size', 0)) / 1024:.2f} MB")
+        for f in ("Depends", "Pre-Depends", "Provides"):
+            if r.get(f):
+                print(f"  {f.lower() + ':':11} {r[f]}")
+
+
+def cmd_list(args):
+    state = State()
+    if "--base" in args:
+        for n, v in sorted(state.base.items()):
+            print(f"{n} {c('2', v)}")
+        return
+    for n, r in sorted(state.db.items()):
+        auto = c("2", " (dependency)") if r.get("auto") else ""
+        print(f"{c('1', n)} {c('2', r['version'])}{auto}  {r.get('summary', '')}")
+    if not state.db:
+        print("leaf has installed nothing yet; 'leaf list --base' shows what came with the system")
+
+
+def cmd_files(args):
+    state = State()
+    for name in args:
+        if name not in state.db:
+            die(f"{name} is not installed by leaf")
+        print("\n".join(state.db[name]["files"]))
+
+
+def cmd_owner(args):
+    state = State()
+    for p in args:
+        p = os.path.abspath(p)
+        owners = [n for n, r in state.db.items() if p in r["files"]]
+        print(f"{p}: {', '.join(owners) if owners else 'not from a leaf package'}")
+
+
+COMMANDS = {"update": cmd_update, "install": cmd_install, "remove": cmd_remove,
+            "upgrade": cmd_upgrade, "search": cmd_search, "show": cmd_show,
+            "list": cmd_list, "files": cmd_files, "owner": cmd_owner}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__ if __doc__ else open(__file__).read().split("\n\n")[1])
+        print("usage: leaf update | search W.. | show P.. | install P.. | remove P.. | upgrade | list | files P | owner F")
+        return
+    cmd = COMMANDS.get(sys.argv[1])
+    if cmd is None:
+        die(f"unknown command '{sys.argv[1]}' (leaf help)")
+    try:
+        cmd(sys.argv[2:])
+    except KeyboardInterrupt:
+        die("interrupted")
+    except urllib.error.URLError as e:
+        die(f"network: {e.reason}")
+
+
+if __name__ == "__main__":
+    main()

@@ -150,6 +150,18 @@ static const struct sh_case CASES[] = {
       "[1, 4, 9]\n" },
     { "/usr/bin/python3", "python3: https (ssl, CA bundle)",
       "import urllib.request; print(urllib.request.urlopen('https://example.com', timeout=30).status)", "200\n" },
+    /* leaf, the package manager: Ubuntu's archive, signed index, real installs */
+    { "/bin/sh", "ary: superuser, root for one command",
+      "printf 'wyn\\nwyn\\n' | ary -S login >/dev/null; echo wrong | ary -S id -u 2>&1; echo wyn | ary -S id -u; id -u",
+      "ary: incorrect password\n0\n1000\n" },
+    { "/bin/sh", "leaf: update (InRelease checked by gpgv)",
+      "echo wyn | ary -S leaf update > /tmp/leaf-update.log 2>&1; echo $?; ls /var/lib/leaf/lists | wc -l", "0\n6\n" },
+    { "/bin/sh", "leaf: install tree + jq from Ubuntu",
+      "echo wyn | ary -S leaf install tree jq > /tmp/leaf-install.log 2>&1; echo $?; tree -d /etc/leaf | tail -1; echo '{\"a\":[1,2]}' | jq -c '.a|add'",
+      "0\n0 directories\n3\n" },
+    { "/bin/sh", "leaf: remove",
+      "echo wyn | ary -S leaf remove tree > /dev/null 2>&1; command -v tree || echo gone; leaf list | cut -d' ' -f1 | tr '\\n' ' '",
+      "gone\njq libjq1 libonig5 " },
     { "/bin/sh", "python3: venv, pip",
       "python3 -m venv --without-pip ve && ve/bin/python -c 'import sys; print(sys.prefix)' && python3 -m pip --version | cut -c1-4",
       "/tmp/shhome/ve\npip \n" },
@@ -162,7 +174,7 @@ static void run_cases(void)
         const struct sh_case *c = &CASES[i];
         char *argv[] = { (char *)c->shell, "-c", (char *)c->script, NULL };
         long t0 = now_ms();
-        int st = capture(argv, out, sizeof out, 30000);
+        int st = capture(argv, out, sizeof out, 300000);
         long ms = now_ms() - t0;
         int ok = st == 0 && strcmp(out, c->want) == 0;
         char what[160];

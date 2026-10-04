@@ -24,7 +24,8 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  python3 python3-minimal python3.14 python3.14-minimal libpython3.14-minimal libpython3.14
  libpython3.14-stdlib libpython3-stdlib python3-pip python3-wheel
  python3-packaging python3-setuptools python3-venv python3.14-venv
- python3-pip-whl python3-setuptools-whl tzdata netbase media-types"
+ python3-pip-whl python3-setuptools-whl tzdata netbase media-types
+ gpgv ubuntu-keyring"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)
@@ -90,6 +91,9 @@ done
 # python3.14 itself is not PIE (linked at 0x400000, where the kernel's
 # identity map is): a PIE main() over libpython3.14.so stands in for it
 gcc -O2 -fPIE -pie -o "$OUT/python3.14" tools/python_launcher.c     "$ROOT/usr/lib/x86_64-linux-gnu/libpython3.14.so.1.0" -Wl,-rpath-link,"$ROOT/usr/lib/x86_64-linux-gnu"
+
+# ary: becoming root from any shell (apps/ary)
+gcc -O2 -o "$OUT/ary" apps/ary/ary.c
 
 # the .pycs made above are in no package
 find $PYDIRS -type d -name __pycache__ | sed "s|^$ROOT||" >> "$dirs"
@@ -164,6 +168,28 @@ if [ -n "$missing" ]; then echo "  BASE       WARNING: unresolved:"; echo "$miss
 } >> "$MAN"
 grep -q '^D /etc/fish$' "$MAN" || echo "D /etc/fish" >> "$MAN"
 grep -q '^D /etc/fish/conf.d$' "$MAN" || echo "D /etc/fish/conf.d" >> "$MAN"
+
+# 4. leaf, the package manager (apps/leaf): the program, where it gets
+#    packages, what the image already has, and stand-ins for the dpkg and
+#    systemd helpers Debian's maintainer scripts call
+python3 tools/leaf_base.py "$OUT/leaf_base.txt" ext2_manifest.txt $OTHER "$MAN"
+L=$REPO/apps/leaf
+{
+    for d in /root /etc/leaf /var/lib /var/lib/leaf /var/cache/leaf; do
+        grep -q "^D $d\$" "$MAN" $OTHER || echo "D $d"
+    done
+    echo "P /root 0 40700"
+    echo "F /usr/bin/ary $OUT/ary"
+    echo "F /usr/bin/leaf $L/leaf"
+    echo "F /etc/leaf/sources $L/shims/sources"
+    echo "F /var/lib/leaf/base $OUT/leaf_base.txt"
+    echo "F /usr/bin/dpkg $L/shims/dpkg"
+    echo "F /usr/bin/update-alternatives $L/shims/update-alternatives"
+    for n in deb-systemd-helper deb-systemd-invoke systemctl invoke-rc.d update-rc.d dpkg-trigger dpkg-maintscript-helper; do
+        echo "F /usr/bin/$n $L/shims/noop"
+    done
+    echo "F /usr/sbin/ldconfig $L/shims/noop"
+} >> "$MAN"
 
 rm -f "$dirs" "$files" "$links"
 echo "  BASE       $(grep -c '^F' "$MAN") files, $(grep -c '^S' "$MAN") links in $MAN"

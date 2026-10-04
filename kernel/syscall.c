@@ -878,6 +878,20 @@ static int64_t open_tty_path(const char *path, int linux_flags, VfsFile **fd_tab
     return 1;
 }
 
+/* Why creating `path` failed: its directory is missing (-ENOENT), not a
+   directory (-ENOTDIR) or not writable for the caller (-EACCES). */
+static int64_t create_errno(const char *path) {
+    char dir[MAX_PATH];
+    int n = 0, last = 0;
+    while (path[n] && n < MAX_PATH - 1) { dir[n] = path[n]; if (path[n] == '/') last = n; n++; }
+    dir[last ? last : 1] = 0;
+    VfsStat st;
+    if (!vfs_stat(dir, &st)) return -2;
+    if (!st.is_dir) return -20;
+    if (!vfs_may_access(dir, 2 | 1)) return -13;
+    return -5;   /* -EIO: the filesystem said no (full?) */
+}
+
 /* What vfs_open_flags() does not know about, checked before it: O_EXCL,
    O_DIRECTORY, and directories are not opened for writing. 0 or -errno. */
 static int64_t open_precheck(const char *path, int linux_flags) {
@@ -1860,7 +1874,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                                ((vfs_flags & 0x1A) ? 2u : 0u)))
                     return (uint64_t)-13; /* -EACCES */
                 VfsFile *file = vfs_open_flags(path_kbuf, vfs_flags);
-                if (!file) return (uint64_t)-2;
+                if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path_kbuf) : -2);
 
                 /* Real permission enforcement backed by the ext2 inode's
                    own owner + mode bits (replaces the old FAT32
@@ -2487,7 +2501,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (pe < 0) return (uint64_t)pe;
                 VfsStat mst;
                 if (vfs_lstat(path, &mst)) return (uint64_t)-17;         /* -EEXIST */
-                return vfs_mkdir(path) ? 0 : (uint64_t)-2;               /* parent missing (or -EACCES) */
+                return vfs_mkdir(path) ? 0 : (uint64_t)create_errno(path);
             }
 
         case 83: // SYS_mkdir
@@ -4253,7 +4267,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (!vfs_may_access(path, want)) return (uint64_t)-13; /* -EACCES */
                 }
                 VfsFile *file = vfs_open_flags(path, vfs_flags);
-                if (!file) return (uint64_t)-2; /* -ENOENT */
+                if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path) : -2);
                 fd_table[fd] = file;
                 fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
                 return fd;
@@ -5824,6 +5838,21 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 73: // SYS_flock: one machine, and fish's history lock is all that asks
             if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
             return 0;
+
+        case 98: // SYS_getrusage(who, struct rusage *): the CPU time we count
+            {
+                struct { int64_t us, ss, uu, su; int64_t rest[14]; } ru;
+                _Static_assert(sizeof(ru) == 144, "struct rusage layout");
+                memset(&ru, 0, sizeof(ru));
+                if ((int64_t)a1 == 0 || (int64_t)a1 == 1) {   /* RUSAGE_SELF / _THREAD */
+                    ru.us = (int64_t)(proc->st_user_ticks / 1000);
+                    ru.uu = (int64_t)(proc->st_user_ticks % 1000) * 1000;
+                    ru.ss = (int64_t)(proc->st_kernel_ticks / 1000);
+                    ru.su = (int64_t)(proc->st_kernel_ticks % 1000) * 1000;
+                }
+                if (copy_to_user((void *)a2, &ru, sizeof(ru)) != 0) return (uint64_t)-14;
+                return 0;
+            }
 
         case 122: // SYS_setfsuid / 123 SYS_setfsgid: the filesystem id is the uid
         case 123:

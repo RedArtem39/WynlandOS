@@ -476,7 +476,7 @@ endif
 WITH_BASE ?= 1
 ifeq ($(WITH_BASE),1)
 BASE_MANIFEST = $(BUILD)/base_manifest.txt
-$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
+$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
 	@bash tools/stage_base.sh
 else
 BASE_MANIFEST =
