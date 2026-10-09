@@ -34,7 +34,9 @@ PKGS="qt6-base-dev qt6-base-private-dev qt6-base-dev-tools qt6-declarative-dev
 # fontconfig's stock configuration + DejaVu: a hand-written minimal
 # fonts.conf has no substitution rules, every font match came back empty
 # and Qt crashed in QFontconfigDatabase::setupFontEngine
-PKGS="$PKGS fontconfig-config fonts-dejavu-core"
+PKGS="$PKGS fontconfig-config fonts-dejavu-core fonts-jetbrains-mono"
+# the terminal (apps/term): libvterm parses what programs print
+PKGS="$PKGS libvterm0 libvterm-dev"
 # eglfs links the input stacks even with input disabled (Zerp 2.0 feeds
 # input itself); they only have to load
 PKGS="$PKGS libmtdev1t64 libinput10 libts0t64 libevdev2 libwacom9 libgudev-1.0-0"
@@ -82,6 +84,14 @@ g++ $CXXFLAGS -Iapps/files -o "$OUT/files.elf" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/files.elf"
 
+# Terminal (apps/term): libvterm in a QRasterWindow, the same QPA plugin
+g++ $CXXFLAGS -I"$ROOT/usr/include" -o "$OUT/term.elf" \
+    apps/term/main.cpp qt_qpa/qwynlandfbmain.cpp qt_qpa/qwynlandfb_zerpargs.cpp \
+    qt_qpa/qwynlandfbintegration.cpp qt_qpa/qwynlandfbscreen.cpp qt_qpa/qwynlandfbinput.cpp \
+    "$B/moc_qwynlandfbinput.cpp" \
+    -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Gui -lQt6Core -lvterm
+echo "  QT6        built build/term.elf"
+
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
 Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
@@ -109,6 +119,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     echo "D /usr/share/zerp/qml/files"
     for q in apps/files/qml/*.qml; do echo "F /usr/share/zerp/qml/files/$(basename "$q") $q"; done
     echo "F /usr/bin/files build/files.elf"
+    echo "F /usr/bin/term build/term.elf"
     # fontconfig configuration and fonts, from the packages (symlinks in
     # conf.d are stored as copies of their targets)
     echo "D /var"
@@ -138,7 +149,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
 
 # libraries: everything the app and the QML plugins load, by soname into
 # /lib64 -- skipping what the base manifest already ships there
-{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; echo "$OUT/files.elf"; find "$QMLSRC" -name "*.so";
+{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; echo "$OUT/files.elf"; echo "$OUT/term.elf"; find "$QMLSRC" -name "*.so";
   echo "$LIB/qt6/plugins/platforms/libqeglfs.so"; echo "$LIB/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so"; } | while read f; do
     ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
 done | sort -u | while read soname path; do

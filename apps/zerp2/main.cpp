@@ -138,7 +138,7 @@ private:
             return true;
         }
         switch (code) {
-        case 0x1C: m_srv->spawn(QStringLiteral("/zerp_term.elf")); return true;   // Enter
+        case 0x1C: m_srv->spawn(QStringLiteral("/usr/bin/term")); return true;     // Enter: the terminal (fish)
         case 0x10: m_srv->closeFocused(); return true;                            // Q
         case 0x20: m_srv->spawn(QStringLiteral("/zerp_rofi.elf")); return true;   // D
         case 0x21: m_srv->toggleFullscreen(); return true;                        // F
@@ -300,7 +300,7 @@ int main(int argc, char **argv)
             }
         }
     }
-    if (!greeterMode) server.spawn(QStringLiteral("/zerp_term.elf"));   // a terminal to start with
+    if (!greeterMode) server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
     QObject::connect(win, &QQuickWindow::frameSwapped, win, [] {
         static int frames = 0;
         if (++frames == 1 || frames % 600 == 0) fprintf(stderr, "[zerp2] frame %d\n", frames);

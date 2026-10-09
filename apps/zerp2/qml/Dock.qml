@@ -15,7 +15,7 @@ Item {
     property real mouseX: -1000
 
     readonly property var apps: [
-        { name: "Terminal", path: "/zerp_term.elf", appId: "zerp_term", kind: "term" },
+        { name: "Terminal", path: "/usr/bin/term", appId: "term", kind: "term" },
         { name: "Files", path: "/usr/bin/files", appId: "files", kind: "files" },
         { name: "Web", path: "/usr/bin/web", appId: "web", kind: "web" },
         { name: "Launcher", path: "/zerp_rofi.elf", appId: "zerp_rofi", kind: "launcher" },
