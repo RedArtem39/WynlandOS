@@ -10,7 +10,7 @@
  * account is locked). ary is setuid root: it checks the password against
  * /etc/shadow, then makes itself root for real and execs the command.
  *
- * Copyright (C) 2026 Red_Artem39. GPL-2.0-only.
+ * Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
  * Build: gcc -O2 -o build/ary apps/ary/ary.c apps/accounts/accounts.c -lcrypt
  */
 #define _GNU_SOURCE

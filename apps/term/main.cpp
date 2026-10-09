@@ -10,7 +10,7 @@
 //
 // Keys: Ctrl+Shift+= / - font size; the wheel scrolls back (2000 lines).
 //
-// Copyright (C) 2026 Red_Artem39. GPL-2.0-only.
+// Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
 
 #include <QtCore/QSocketNotifier>
 #include <QtCore/QTimer>

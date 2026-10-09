@@ -10,7 +10,7 @@
  * passwd is setuid root (a user changes its own after giving the current
  * one); useradd and userdel are root's.
  *
- * Copyright (C) 2026 Red_Artem39. GPL-2.0-only.
+ * Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
  */
 #define _GNU_SOURCE
 #include "accounts.h"

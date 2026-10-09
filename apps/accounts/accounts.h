@@ -10,7 +10,7 @@
  * Used by ary, useradd, userdel, passwd and the login daemon (wynlogin).
  * The changing calls need root.
  *
- * Copyright (C) 2026 Red_Artem39. GPL-2.0-only.
+ * Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
  */
 #pragma once
 #include <stdbool.h>

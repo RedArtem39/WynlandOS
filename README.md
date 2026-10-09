@@ -115,9 +115,13 @@ manager, a login screen, and real hardware: USB, NVMe, Realtek 2.5GbE.
 Copyright (C) 2026 Red_Artem39
 
 WynlandOS is free software: you can redistribute it and/or modify it under the
-terms of the GNU General Public License, version 2 only, as published by the
-Free Software Foundation. It is distributed WITHOUT ANY WARRANTY; see
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 2 of the License, or (at your option) any later
+version (GPL-2.0-or-later). It is distributed WITHOUT ANY WARRANTY; see
 [LICENSE](LICENSE) for the full text.
+
+Code taken from other projects keeps its own license, kept beside it and in
+[.licenses](.licenses).
 
 Third-party software staged into the disk image (Qt, WebKit, GStreamer,
 Python, fish, GNU coreutils and the rest) is not part of this repository and

@@ -16,7 +16,7 @@
  *   -> CREATE <user> <full name> <password>   (first boot only)
  * boot.cfg "autologin=NAME" skips the screen (screenshots, tests).
  *
- * Copyright (C) 2026 Red_Artem39. GPL-2.0-only.
+ * Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
  */
 #define _GNU_SOURCE
 #include "accounts.h"
