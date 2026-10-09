@@ -3,3 +3,4 @@ type=daemon
 exec=/zerp.elf
 provide=display
 restart=always
+user=1000

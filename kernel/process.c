@@ -58,6 +58,14 @@ void process_init(void) {
     serial_write_string("Process: kernel Process 0 initialized.\r\n");
 }
 
+bool process_in_group(const Process *p, uint32_t gid) {
+    if (!p) return false;
+    if (p->gid == gid) return true;
+    for (uint32_t i = 0; i < p->ngroups && i < 32; i++)
+        if (p->groups[i] == gid) return true;
+    return false;
+}
+
 Process *process_list_head(void) {
     return g_process_list;
 }
@@ -118,6 +126,10 @@ static void process_unlink_and_free(Process *p) {
 }
 
 Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
+    return process_spawn_env(path, argv, NULL, uid, uid);
+}
+
+Process *process_spawn_env(const char *path, const char **argv, const char **envp, uint32_t uid, uint32_t gid) {
     PageTable *new_pml4 = vmm_new_process_pml4();
     if (!new_pml4) {
         serial_write_string("process_spawn: failed to allocate PML4\r\n");
@@ -134,7 +146,18 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        the safe window, not after the fact" fix as thread_create_ex()'s
        Thread.proc (see kernel/sched.c) for the exact class of race this
        avoids. */
-    p->uid = (uid == PROC_UID_INHERIT) ? sched_current()->proc->uid : uid;
+    if (uid == PROC_UID_INHERIT) {
+        Process *me = sched_current()->proc;
+        p->uid = me->uid; p->ruid = me->ruid; p->suid = me->suid;
+        p->gid = me->gid; p->rgid = me->rgid; p->sgid = me->sgid;
+        p->ngroups = me->ngroups;
+        for (uint32_t g = 0; g < me->ngroups && g < 32; g++) p->groups[g] = me->groups[g];
+    } else {
+        /* a fresh identity: a uid and its primary group */
+        p->uid = p->ruid = p->suid = uid;
+        p->gid = p->rgid = p->sgid = (gid == PROC_UID_INHERIT) ? uid : gid;
+        p->ngroups = 0;
+    }
     p->ppid = sched_current()->proc->pid;
     if (sched_current()->proc->pid != 0) {
         p->pgid = sched_current()->proc->pgid;
@@ -216,7 +239,7 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
        *caller's* userspace memory would fault exactly like the path
        argument already did before Phase 1's SYS_spawn fix (see that
        writeup). SYS_spawn's argv handling below mirrors that same fix. */
-    bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, argv, NULL, p);
+    bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, argv, envp, p);
 
     self->proc = caller_proc;
     __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)caller_proc->pml4) : "memory");

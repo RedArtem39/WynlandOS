@@ -45,6 +45,7 @@ typedef struct {
     bool readonly;          /* true iff no write bit at all in the ext2 mode */
     uint16_t mode;          /* ext2 i_mode & 07777 -- real permission bits */
     uint32_t uid;           /* ext2 i_uid -- real ownership */
+    uint32_t gid;           /* ext2 i_gid */
     uint32_t mtime;         /* ext2 i_mtime (unix seconds) */
 } VfsNode;
 
@@ -72,6 +73,7 @@ typedef struct {
     uint8_t  attr;          /* low byte of the ext2 mode */
     uint16_t mode;          /* ext2 i_mode & 07777 */
     uint32_t uid;           /* ext2 i_uid */
+    uint32_t gid;           /* ext2 i_gid */
     uint32_t mtime, atime, ctime; /* unix seconds */
     bool     is_link;       /* vfs_lstat(): the path names a symlink */
     bool     is_sock;       /* an AF_UNIX socket's name */
@@ -108,6 +110,11 @@ bool vfs_symlink(const char *target, const char *linkpath);
 bool vfs_mksock(const char *path);
 /* a hard link: 0, or -errno */
 int  vfs_link(const char *oldpath, const char *newpath);
+/* chown: uid/gid (uint32_t)-1 = unchanged; 0 or -errno */
+int  vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow);
+int  vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid);
+/* the owner/group/other permission bits of an inode as the caller sees them */
+uint32_t vfs_perm_for(uint32_t i_uid, uint32_t i_gid, uint32_t i_mode);
 void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *files, uint64_t *ffree);
 int  vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow);
 int  vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime);

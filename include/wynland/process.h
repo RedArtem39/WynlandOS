@@ -61,7 +61,12 @@ typedef struct Process {
     uint32_t   fd_flags[MAX_OPEN_FILES];   /* Per-fd flags (FD_CLOEXEC etc.) */
     uint32_t   fd_oflags[MAX_OPEN_FILES];  /* Per-fd open status flags */
     int        thread_count;
-    uint32_t   uid;              /* Phase 5: real per-process UID. 0 = root. */
+    uint32_t   uid;              /* the EFFECTIVE uid: what permission checks use. 0 = root. */
+    uint32_t   ruid, suid;       /* real and saved uid (setresuid) */
+    uint32_t   gid;              /* the effective gid; new files get it */
+    uint32_t   rgid, sgid;       /* real and saved gid */
+    uint32_t   groups[32];       /* supplementary groups (setgroups) */
+    uint32_t   ngroups;
     struct Thread  *main_thread; /* entry thread -- lets callers poll for exit */
     bool       exited;           /* Phase 18: set by thread_exit() itself (see
                                      sched.c) rather than read via main_thread,
@@ -143,10 +148,13 @@ void      process_init(void);          /* Creates Process 0 (kernel), uid = 0 */
    parent's wait4()/waitid() and sends it SIGCHLD. */
 void      process_mark_exited(Process *p, int wait_status);
 Process  *process_list_head(void);      /* walk with ->next */
+/* is gid p's effective group or one of its supplementary ones? */
+bool      process_in_group(const Process *p, uint32_t gid);
 Process  *process_create(PageTable *pml4);
 Process  *process_kernel(void);         /* Process 0 -- pml4 = boot snapshot */
 uint64_t  process_alloc_pid(void); /* a fresh number for a pid or a user thread's tid */
 Process  *process_find_by_pid(uint64_t pid); /* Phase 18: NULL if never existed. Never freed once created (see g_process_list), so safe to hold across calls -- check ->exited, don't assume liveness from non-NULL alone. */
+Process  *process_spawn_env(const char *path, const char **argv, const char **envp, uint32_t uid, uint32_t gid); /* the same, with an environment (NULL: the default one) and a group */
 Process  *process_spawn(const char *path, const char **argv, uint32_t uid); /* Loads path into a fresh address space, spawns its entry thread. argv may be NULL (historical default args) or a NULL-terminated array of kernel-owned strings. uid: PROC_UID_INHERIT to keep the caller's current uid, or a specific value (e.g. boot launches demoting to 1000). */
 
 /* Releases everything real about a process: every open fd (type-specific

@@ -1,6 +1,0 @@
-description=Zerp 2.0 (Qt Quick on the GPU)
-type=daemon
-exec=/usr/bin/zerp2
-provide=display
-when=zerp=2 virgl=1 autotest=0
-restart=always

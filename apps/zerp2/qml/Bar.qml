@@ -79,6 +79,38 @@ Item {
                 c.beginPath(); c.arc(9, 13, 1.4, 0, Math.PI * 2); c.fill();
             }
         }
+        // the user; a click logs out (wynlogin shows the login screen)
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            height: 22
+            width: who.implicitWidth + 30
+            radius: 11
+            color: logoutArea.containsMouse ? "#3b4261" : "transparent"
+            Behavior on color { ColorAnimation { duration: 150 } }
+            Rectangle {
+                anchors { left: parent.left; leftMargin: 4; verticalCenter: parent.verticalCenter }
+                width: 16; height: 16; radius: 8
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: "#7cc4ff" }
+                    GradientStop { position: 1.0; color: "#3d8bff" }
+                }
+                Text {
+                    anchors.centerIn: parent
+                    color: "white"
+                    font.pixelSize: 9
+                    font.bold: true
+                    text: userName.length ? userName[0].toUpperCase() : "?"
+                }
+            }
+            Text {
+                id: who
+                anchors { left: parent.left; leftMargin: 25; verticalCenter: parent.verticalCenter }
+                color: "#e6e8ef"
+                font.pixelSize: 13
+                text: logoutArea.containsMouse ? "Log out " + userName : userName
+            }
+            MouseArea { id: logoutArea; anchors.fill: parent; hoverEnabled: true; onClicked: zerp.logout() }
+        }
         Text {
             id: clock
             color: "#e6e8ef"

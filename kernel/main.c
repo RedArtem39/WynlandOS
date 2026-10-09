@@ -2731,7 +2731,7 @@ void kernel_main(BootInfo *boot_info)
 
     /* Hyprland (/hyprland.wyn) is no longer started at boot: the port is
        abandoned (it crashed in its dynamic loader before drawing); Zerp
-       is the desktop, Zerp 2.0 goes Qt Quick. uid=1000 below is the
+       is the desktop, Zerp 2.0 goes Qt Quick. Without /sbin/init, uid=1000 below is the
        demotion point -- the kernel (uid 0) hands off to a normal-user
        session, like an init spawning a login shell. */
 
@@ -2749,7 +2749,7 @@ void kernel_main(BootInfo *boot_info)
                runlevels live in /etc/wynrc; it decides what starts. */
             vfs_close(initf);
             console_print_string(boot_info, "Starting wynrc (/sbin/init)...\n", 0x0000FF00, term_bg_color);
-            process_spawn("/sbin/init", NULL, 1000);
+            process_spawn("/sbin/init", NULL, 0);   /* init is root; services choose their user */
         } else {
     /* /etc/wynland/boot.cfg (written by `make`, see ZERP/AUTOTEST there):
            zerp=2 -> Zerp 2.0 (Qt Quick on the GPU) when virgl is up and it is

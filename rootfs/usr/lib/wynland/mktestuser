@@ -1,0 +1,6 @@
+#!/bin/sh
+# WynlandOS - the account the boot-time tests run as: "tester", an
+# administrator with the password "wyn" (AUTOTEST images only).
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin
+id tester >/dev/null 2>&1 && exit 0
+printf 'wyn\n' | useradd -a -c "Test account" --password-stdin tester

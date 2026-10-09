@@ -2,4 +2,6 @@ description=sound card check (HDA, /dev/dsp)
 type=oneshot
 exec=/sndtest.elf
 when=autotest=1
-after=display
+after=display testuser
+user=tester
+need=testuser

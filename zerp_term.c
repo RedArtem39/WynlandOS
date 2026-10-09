@@ -55,7 +55,19 @@ static int  g_line_count = 0; /* total ever added; ring-indexed mod MAX_LINES */
 
 static char g_input[MAX_LINE_LEN];
 static int  g_input_len = 0;
-static char g_path[256] = "/home/user";
+static char g_path[256] = "/";     /* $HOME at start (zerp_main) */
+static char g_user[64] = "user";    /* $USER */
+extern char **zerp_envp;
+
+/* a variable of our environment, or NULL */
+static const char *zenv(const char *name) {
+    for (char **e = zerp_envp; e && *e; e++) {
+        const char *a = *e, *b = name;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b && *a == '=') return a + 1;
+    }
+    return 0;
+}
 
 typedef enum { MODE_NORMAL, MODE_PASSWORD, MODE_PTY } Mode;
 static Mode g_mode = MODE_NORMAL;
@@ -230,9 +242,9 @@ static void redraw(ZerpClient *zc) {
         } else {
             /* "user /home/user $ " or "root /etc # " */
             const int root = zgetuid() == 0;
-            const char *who = root ? "root " : "user ";
             p = 0;
-            for (const char *q = who; *q; q++) line[p++] = *q;
+            for (const char *q = root ? "root" : g_user; *q && p < 60; q++) line[p++] = *q;
+            line[p++] = ' ';
             for (const char *q = g_path; *q && p < 120; q++) line[p++] = *q;
             line[p++] = ' '; line[p++] = root ? '#' : '$'; line[p++] = ' ';
             for (int i = 0; i < g_input_len && p < MAX_LINE_LEN + 14; i++) line[p++] = g_input[i];
@@ -316,7 +328,7 @@ static void cmd_cd(const char *arg) {
 
 static void cmd_whoami(void) {
     long uid = zgetuid();
-    add_line(uid == 0 ? "0 (root)" : "1000", TEXT_COLOR);
+    add_line(uid == 0 ? "root" : g_user, TEXT_COLOR);
 }
 
 static void cmd_write(const char *args) {
@@ -477,12 +489,16 @@ static void cmd_pty_exec(const char *app, const char *args) {
         zclose(slave);
         /* the static curl port looks for its CA bundle under /usr/etc/ssl
            and never finds it there; point it at the system one */
-        const char *envp2[5];
-        envp2[0] = "TERM=vt100";
-        envp2[1] = "CURL_CA_BUNDLE=/etc/ssl/cert.pem";
-        envp2[2] = "SSL_CERT_FILE=/etc/ssl/cert.pem";
-        envp2[3] = "HOME=/";
-        envp2[4] = 0;
+        /* ours (the session's: HOME, USER, PATH...) plus the terminal's */
+        const char *envp2[48];
+        int ne = 0;
+        envp2[ne++] = "TERM=vt100";
+        envp2[ne++] = "CURL_CA_BUNDLE=/etc/ssl/cert.pem";
+        envp2[ne++] = "SSL_CERT_FILE=/etc/ssl/cert.pem";
+        for (char **e = zerp_envp; e && *e && ne < 47; e++)
+            if (!((*e)[0] == 'T' && (*e)[1] == 'E' && (*e)[2] == 'R' && (*e)[3] == 'M' && (*e)[4] == '='))
+                envp2[ne++] = *e;
+        envp2[ne] = 0;
         zexecve(path, argv2, envp2);
         zexit(127);
     }
@@ -598,7 +614,7 @@ static void run_command(const char *line) {
     else if (str_eq(cmd, "write")) cmd_write(args);
     else if (str_eq(cmd, "nano")) cmd_nano(args);
     else if (str_eq(cmd, "clear")) { g_line_count = 0; g_png_pending = 0; }
-    else if (str_eq(cmd, "ary")) cmd_ary(args);
+    else if (str_eq(cmd, "ary")) cmd_pty_exec("ary", args);   /* the real one (setuid, your password) */
     else if (str_eq(cmd, "exit") && g_root_session) {
         zsetuid(USER_UID);
         g_root_session = 0;
@@ -704,9 +720,12 @@ int zerp_main(int argc, char **argv) {
     if (zerp_wait_for_tile(&zc, 100000) != 0) return 1;
     g_zc = &zc;
 
+    /* who we are: the session's HOME and USER (wynlogin) */
+    const char *home = zenv("HOME"), *user = zenv("USER");
+    if (home && home[0] == '/') path_set_absolute(home);
+    if (user) str_copy_n(g_user, user, (int)sizeof(g_user));
     add_line("Zerp terminal -- type 'help' for commands", TEXT_COLOR);
-    if (zary_status() != 1)
-        add_line("no superuser yet -- 'ary login' creates one", TEXT_COLOR);
+    (void)cmd_ary;   /* the old built-in (kernel root password): /usr/bin/ary now */
     redraw(&zc);
 
     for (;;) {

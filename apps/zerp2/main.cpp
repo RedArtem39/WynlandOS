@@ -30,8 +30,11 @@
 #include <QtQml/qqml.h>
 
 #include "zerp2.h"
+#include "greeter.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -64,7 +67,8 @@ static const char kUpper[59] = {
 class InputPump : public QObject
 {
 public:
-    InputPump(QQuickWindow *w, ZServer *srv) : m_win(w), m_srv(srv)
+    // greeter: the login screen -- no WM bindings (they start programs)
+    InputPump(QQuickWindow *w, ZServer *srv, bool greeter = false) : m_win(w), m_srv(srv), m_greeter(greeter)
     {
         m_kbd = ::open("/dev/input/kbd", O_RDONLY);
         connect(&m_timer, &QTimer::timeout, this, &InputPump::poll);
@@ -162,7 +166,7 @@ private:
         if (!e0 && (code == 0x2A || code == 0x36)) m_shift = !release;
         const int kid = code + (e0 ? 128 : 0);
         if (release && m_swallow[kid]) { m_swallow[kid] = false; return; }
-        if (!release && (m_alt || m_altR || m_super) && binding(e0, code)) {
+        if (!m_greeter && !release && (m_alt || m_altR || m_super) && binding(e0, code)) {
             m_swallow[kid] = true;   // its release must not reach the client either
             return;
         }
@@ -214,6 +218,7 @@ private:
 
     QQuickWindow *m_win;
     ZServer *m_srv;
+    bool m_greeter = false;
     bool m_alt = false, m_altR = false, m_super = false, m_shift = false;
     bool m_swallow[256] = {};
     QTimer m_timer;
@@ -246,6 +251,12 @@ int main(int argc, char **argv)
     if (!qEnvironmentVariableIsSet("HOME")) qputenv("HOME", "/tmp");
     if (!qEnvironmentVariableIsSet("XDG_RUNTIME_DIR")) qputenv("XDG_RUNTIME_DIR", "/tmp");
 
+    // zerp2 --greeter REQ_FD REP_FD [--first]: the login screen (wynlogin)
+    const bool greeterMode = argc >= 4 && !strcmp(argv[1], "--greeter");
+    const int greeterReq = greeterMode ? atoi(argv[2]) : -1;
+    const int greeterRep = greeterMode ? atoi(argv[3]) : -1;
+    const bool firstBoot = greeterMode && argc >= 5 && !strcmp(argv[4], "--first");
+
     QGuiApplication app(argc, argv);
     qmlRegisterType<ZSurface>("Zerp", 1, 0, "ZSurface");
     qmlRegisterUncreatableType<ZClient>("Zerp", 1, 0, "ZClient", QStringLiteral("made by the server"));
@@ -259,26 +270,51 @@ int main(int argc, char **argv)
     });
     engine.rootContext()->setContextProperty(QStringLiteral("wallpaperUrl"),
         QFile::exists(QStringLiteral("/wall.png")) ? QStringLiteral("file:///wall.png") : QString());
-    engine.load(QUrl::fromLocalFile(QStringLiteral("/usr/share/zerp2/qml/Shell.qml")));
+    Greeter *greeter = greeterMode ? new Greeter(greeterReq, greeterRep, firstBoot, &app) : nullptr;
+    engine.rootContext()->setContextProperty(QStringLiteral("greeter"), greeter);
+    engine.rootContext()->setContextProperty(QStringLiteral("userName"),
+        qEnvironmentVariableIsSet("USER") ? qEnvironmentVariable("USER") : QStringLiteral("user"));
+    const QString qml = greeterMode ? QStringLiteral("Greeter.qml") : QStringLiteral("Shell.qml");
+    engine.load(QUrl::fromLocalFile(QStringLiteral("/usr/share/zerp2/qml/") + qml));
     if (engine.rootObjects().isEmpty()) {
-        fprintf(stderr, "[zerp2] FAIL: Shell.qml did not load\n");
+        fprintf(stderr, "[zerp2] FAIL: %s did not load\n", qPrintable(qml));
         return 1;
     }
     auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!win) { fprintf(stderr, "[zerp2] FAIL: root is not a Window\n"); return 1; }
-    InputPump pump(win, &server);
-    server.spawn(QStringLiteral("/zerp_term.elf"));   // a terminal to start with
+    InputPump pump(win, &server, greeterMode);
+    // debugging: boot.cfg "greeterdemo=NAME:PASSWORD" -- the login screen
+    // fills itself in after a while (creates the account on a first boot),
+    // so the whole way to a session can be watched without a keyboard
+    if (greeter) {
+        const QByteArray cfg = bootCfg();
+        const int at = cfg.indexOf("greeterdemo=");
+        if (at >= 0) {
+            const QList<QByteArray> np = cfg.mid(at + 12).split('\n').first().trimmed().split(':');
+            if (np.size() == 2) {
+                const int when = cfg.contains("snapat=") ? 30000 : 8000;   // after the screen's own picture
+                QTimer::singleShot(when, greeter, [greeter, np] {
+                    if (greeter->firstBoot()) greeter->createAccount(QString::fromUtf8(np[0]), QString(), QString::fromUtf8(np[1]));
+                    else greeter->login(QString::fromUtf8(np[0]), QString::fromUtf8(np[1]));
+                });
+            }
+        }
+    }
+    if (!greeterMode) server.spawn(QStringLiteral("/zerp_term.elf"));   // a terminal to start with
     QObject::connect(win, &QQuickWindow::frameSwapped, win, [] {
         static int frames = 0;
         if (++frames == 1 || frames % 600 == 0) fprintf(stderr, "[zerp2] frame %d\n", frames);
     });
-    fprintf(stderr, "[zerp2] shell up\n");
+    fprintf(stderr, greeterMode ? "[zerp2] login screen up%s\n" : "[zerp2] shell up%s\n",
+            firstBoot ? " (first boot)" : "");
 
     if (bootCfg().contains("snapshot")) {
         // "snapweb": the browser full screen in the picture (and nothing
         // else); otherwise something to tile
         const bool web = bootCfg().contains("snapweb");
-        if (web) {
+        if (greeterMode) {
+            // the login screen alone in the picture
+        } else if (web) {
             QTimer::singleShot(3000, &server, [&server] { server.spawn(QStringLiteral("/usr/bin/web")); });
             QTimer::singleShot(6000, &server, [&server] { server.toggleFullscreen(); });
         } else {
@@ -330,12 +366,14 @@ int main(int argc, char **argv)
         const QByteArray cfg = bootCfg();
         const int at = cfg.indexOf("snapat=");
         if (at >= 0) snapAt = qMax(5, cfg.mid(at + 7).split('\n').first().trimmed().toInt());
-        QTimer::singleShot(snapAt * 1000, win, [win] {
+        QTimer::singleShot(snapAt * 1000, win, [win, greeterMode] {
             ::syscall(1000);   /* WynlandOS: every process's time and threads, on the log */
             const QImage full = win->grabWindow();
-            if (full.save(QStringLiteral("/tmp/zerp2-snap.png"), "PNG")) {
+            // the login screen (another account) keeps its own file
+            const QString snap = greeterMode ? QStringLiteral("/tmp/greeter-snap.png") : QStringLiteral("/tmp/zerp2-snap.png");
+            if (full.save(snap, "PNG")) {
                 ::sync();
-                fprintf(stderr, "[zerp2] snapshot saved: /tmp/zerp2-snap.png\n");
+                fprintf(stderr, "[zerp2] snapshot saved: %s\n", qPrintable(snap));
             }
             QImage img = full.scaledToWidth(960, Qt::SmoothTransformation);
             QBuffer buf; buf.open(QIODevice::WriteOnly);

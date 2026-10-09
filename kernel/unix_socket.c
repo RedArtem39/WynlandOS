@@ -115,7 +115,7 @@ static struct UCred current_cred(void) {
     struct UCred c;
     c.pid = (int32_t)p->pid;
     c.uid = p->uid;
-    c.gid = p->uid; /* no separate gids in this kernel */
+    c.gid = p->gid;
     return c;
 }
 

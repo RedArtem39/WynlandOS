@@ -92,8 +92,11 @@ done
 # identity map is): a PIE main() over libpython3.14.so stands in for it
 gcc -O2 -fPIE -pie -o "$OUT/python3.14" tools/python_launcher.c     "$ROOT/usr/lib/x86_64-linux-gnu/libpython3.14.so.1.0" -Wl,-rpath-link,"$ROOT/usr/lib/x86_64-linux-gnu"
 
-# ary: becoming root from any shell (apps/ary)
-gcc -O2 -o "$OUT/ary" apps/ary/ary.c
+# accounts (apps/accounts): ary, useradd/userdel/passwd, the login
+# manager -- yescrypt passwords through libcrypt, as Ubuntu
+gcc -O2 -Wall -o "$OUT/ary" apps/ary/ary.c apps/accounts/accounts.c -lcrypt
+gcc -O2 -Wall -o "$OUT/acct-tools" apps/accounts/tools.c apps/accounts/accounts.c -lcrypt
+gcc -O2 -Wall -o "$OUT/wynlogin" apps/accounts/wynlogin.c apps/accounts/accounts.c -lcrypt
 
 # the .pycs made above are in no package
 find $PYDIRS -type d -name __pycache__ | sed "s|^$ROOT||" >> "$dirs"
@@ -179,7 +182,23 @@ L=$REPO/apps/leaf
         grep -q "^D $d\$" "$MAN" $OTHER || echo "D $d"
     done
     echo "P /root 0 40700"
+    # accounts: the files (shadow root's only), the programs (ary and
+    # passwd setuid root), the login manager, the greeter's home
+    for f in passwd group shells; do echo "F /etc/$f $REPO/rootfs/etc/$f"; done
+    echo "F /etc/shadow $REPO/rootfs/etc/shadow"
+    echo "P /etc/shadow 0 100600"
     echo "F /usr/bin/ary $OUT/ary"
+    echo "P /usr/bin/ary 0 104755"
+    echo "F /usr/bin/passwd $OUT/acct-tools"
+    echo "P /usr/bin/passwd 0 104755"
+    echo "F /usr/sbin/useradd $OUT/acct-tools"
+    echo "F /usr/sbin/userdel $OUT/acct-tools"
+    echo "F /usr/sbin/wynlogin $OUT/wynlogin"
+    echo "D /usr/lib/wynland"
+    echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"
+    for s in wynlogin testuser; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    echo "D /var/lib/greeter"
+    echo "P /var/lib/greeter 990 40755"
     echo "F /usr/bin/leaf $L/leaf"
     echo "F /etc/leaf/sources $L/shims/sources"
     echo "F /var/lib/leaf/base $OUT/leaf_base.txt"

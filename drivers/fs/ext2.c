@@ -294,13 +294,32 @@ static uint32_t current_uid_or_root(void) {
     return 0;
 }
 
+static uint32_t current_gid_or_root(void) {
+    Thread *t = sched_current();
+    if (g_vfs_root_override && g_vfs_root_override == (void *)t) return 0;
+    if (t && t->proc) return t->proc->gid;
+    return 0;
+}
+
+/* The rwx bits that apply to the caller: the owner's, the group's (its
+   effective group or a supplementary one), or everyone else's. Root: all. */
+uint32_t vfs_perm_for(uint32_t i_uid, uint32_t i_gid, uint32_t i_mode) {
+    uint32_t uid = current_uid_or_root();
+    if (uid == 0) return 7;
+    if (i_uid == uid) return (i_mode >> 6) & 7;
+    Thread *t = sched_current();
+    bool root_override = g_vfs_root_override && g_vfs_root_override == (void *)t;
+    if (!root_override && t && t->proc && process_in_group(t->proc, i_gid)) return (i_mode >> 3) & 7;
+    return i_mode & 7;
+}
+
 /* Adding or removing a name in a directory needs write permission on the
    directory (root: always). There was no check at all: any user could
    create or delete files anywhere. */
 static bool may_write_dir(const Ext2Inode *dir) {
     uint32_t uid = current_uid_or_root();
     if (uid == 0) return true;
-    bool ok = (dir->i_uid == uid) ? (dir->i_mode & 0200) != 0 : (dir->i_mode & 0002) != 0;
+    bool ok = (vfs_perm_for(dir->i_uid, dir->i_gid, dir->i_mode) & 3) == 3;   /* write + search */
     if (!ok) serial_write_string("perm: denied a directory write\r\n");
     return ok;
 }
@@ -1393,6 +1412,7 @@ bool ext2_mkdir(uint32_t parent_inum, Ext2Inode *parent, const char *name) {
     nd.i_mode = EXT2_S_IFDIR | 0755;
     nd.i_links_count = 2; /* parent's entry + its own "." */
     nd.i_uid = (uint16_t)current_uid_or_root();
+    nd.i_gid = (uint16_t)current_gid_or_root();
     uint32_t now = (uint32_t)rtc_get_unix_time();
     nd.i_atime = now;
     nd.i_ctime = now;
@@ -1655,6 +1675,7 @@ bool ext2_create_symlink(uint32_t dir_inum, Ext2Inode *dir, const char *name, co
     link.i_mode = EXT2_S_IFLNK | 0777;
     link.i_links_count = 1;
     link.i_uid = (uint16_t)current_uid_or_root();
+    link.i_gid = (uint16_t)current_gid_or_root();
     uint32_t now = (uint32_t)rtc_get_unix_time();
     link.i_atime = now;
     link.i_ctime = now;
@@ -1854,6 +1875,7 @@ static void fill_node_from_inode(VfsNode *node, uint32_t inum,
     node->readonly = (inode->i_mode & 0222) == 0;
     node->mode = inode->i_mode & 07777;
     node->uid = inode->i_uid;
+    node->gid = inode->i_gid;
     node->mtime = inode->i_mtime;
 }
 
@@ -2301,6 +2323,7 @@ static bool create_node(const char *path, uint16_t mode, uint8_t ft) {
        calls before the scheduler exists fall back to root -- correct,
        those really are root-owned bootstrap files. */
     newf.i_uid = (uint16_t)current_uid_or_root();
+    newf.i_gid = (uint16_t)current_gid_or_root();
     uint32_t now = (uint32_t)rtc_get_unix_time();
     newf.i_atime = now;
     newf.i_ctime = now;
@@ -2324,8 +2347,8 @@ static bool create_node(const char *path, uint16_t mode, uint8_t ft) {
    owner-vs-other enforcement. Replaces the old FAT32 single-attribute-
    bit hack with actual permission semantics. */
 /* May the caller read (4) / write (2) / execute (1) an existing path?
-   Owner bits for the owner, "other" bits for everyone else (no groups),
-   root always. A path that doesn't exist answers true: creating it is
+   Owner bits for the owner, group bits for its groups, "other" bits for
+   everyone else, root always. A path that doesn't exist answers true: creating it is
    the directory's business (may_write_dir). */
 bool vfs_may_access(const char *path, uint32_t want) {
     uint32_t uid = current_uid_or_root();
@@ -2333,12 +2356,50 @@ bool vfs_may_access(const char *path, uint32_t want) {
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return true;
-    uint32_t have = (inode.i_uid == uid) ? ((inode.i_mode >> 6) & 7) : (inode.i_mode & 7);
+    uint32_t have = vfs_perm_for(inode.i_uid, inode.i_gid, inode.i_mode);
     if ((have & want) == want) return true;
     serial_write_string("perm: denied ");
     serial_write_string(path);
     serial_write_string("\r\n");
     return false;
+}
+
+/* chown: root may give a file to anyone; its owner may only move it to
+   one of its own groups. A change by anyone clears setuid/setgid, as on
+   Linux. */
+static int chown_inode(uint32_t inum, Ext2Inode *inode, uint32_t uid, uint32_t gid) {
+    uint32_t me = current_uid_or_root();
+    if (me != 0) {
+        if (inode->i_uid != me) return -1;                              /* -EPERM */
+        if (uid != (uint32_t)-1 && uid != inode->i_uid) return -1;
+        Thread *t = sched_current();
+        if (gid != (uint32_t)-1 && !(t && t->proc && process_in_group(t->proc, gid))) return -1;
+    }
+    if (uid != (uint32_t)-1) inode->i_uid = (uint16_t)uid;
+    if (gid != (uint32_t)-1) inode->i_gid = (uint16_t)gid;
+    if ((inode->i_mode & EXT2_S_IFMT) == EXT2_S_IFREG && (uid != (uint32_t)-1 || gid != (uint32_t)-1))
+        inode->i_mode &= (uint16_t)~06000u;
+    inode->i_ctime = (uint32_t)rtc_get_unix_time();
+    return ext2_write_inode(inum, inode) ? 0 : -5;
+}
+
+int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
+    uint32_t inum;
+    Ext2Inode inode;
+    bool ok = nofollow ? ext2_lookup_nofollow(path, &inum, &inode, NULL) : ext2_lookup_path(path, &inum, &inode);
+    if (!ok) return -2;
+    return chown_inode(inum, &inode, uid, gid);
+}
+
+int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
+    if (!file) return -9;
+    uint32_t inum = file->node.first_cluster;
+    if (inum == 0 || inum >= 0xFFFFFF00u) return 0;    /* devices, pipes: nothing kept */
+    Ext2Inode inode;
+    if (!ext2_read_inode(inum, &inode)) return -9;
+    int r = chown_inode(inum, &inode, uid, gid);
+    if (r == 0) { file->node.uid = inode.i_uid; file->node.gid = inode.i_gid; file->node.mode = inode.i_mode & 07777; }
+    return r;
 }
 
 /* chmod: the owner or root; only the permission bits change */
@@ -2679,6 +2740,7 @@ static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2I
     out->attr = (uint8_t)(inode.i_mode & 0xFF); /* low mode byte for callers that peek */
     out->mode = (uint16_t)(inode.i_mode & 07777);
     out->uid = inode.i_uid;
+    out->gid = inode.i_gid;
     out->mtime = inode.i_mtime;
     out->atime = inode.i_atime;
     out->ctime = inode.i_ctime;

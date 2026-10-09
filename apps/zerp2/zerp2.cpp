@@ -22,7 +22,9 @@
 
 // WynlandOS syscalls (kernel/syscall.c)
 static long sys_shm_create(long size) { return syscall(407, size, 0, 0); }
-static long sys_spawn_argv(const char *path, const char **argv) { return syscall(408, path, argv, 0); }
+// a client gets the session's environment (HOME, USER, ... of who logged in)
+extern char **environ;
+static long sys_spawn_argv(const char *path, const char **argv) { return syscall(408, path, argv, environ); }
 static long sys_process_alive(long pid) { return syscall(411, pid, 0, 0); }
 
 static const int kOutboxMax = 128;

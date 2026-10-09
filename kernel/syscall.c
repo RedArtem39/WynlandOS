@@ -592,6 +592,7 @@ static int copy_argv_array_from_user(const char *const *uarray, char **kbufs, co
 /* owner and times of a path's inode */
 static void stat_fill_owner(struct linux_stat *st, const VfsStat *vst) {
     st->st_uid = vst->uid;
+    st->st_gid = vst->gid;
     st->st_atime_sec = vst->atime;
     st->st_mtime_sec = vst->mtime;
     st->st_ctime_sec = vst->ctime;
@@ -619,6 +620,7 @@ static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
     }
     if (perm) {
         st->st_uid = file->node.uid;
+        st->st_gid = file->node.gid;
         st->st_mtime_sec = st->st_ctime_sec = st->st_atime_sec = file->node.mtime;
     }
     st->st_blocks = (st->st_size + 511) / 512;
@@ -890,6 +892,11 @@ static int64_t create_errno(const char *path) {
     if (!st.is_dir) return -20;
     if (!vfs_may_access(dir, 2 | 1)) return -13;
     return -5;   /* -EIO: the filesystem said no (full?) */
+}
+
+/* the umask in force (022 until umask() is called) */
+static uint32_t proc_umask(const Process *p) {
+    return p->umask_set ? p->umask : 022;
 }
 
 /* What vfs_open_flags() does not know about, checked before it: O_EXCL,
@@ -1873,27 +1880,29 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!vfs_may_access(path_kbuf, ((vfs_flags & 0x01) ? 4u : 0u) |
                                                ((vfs_flags & 0x1A) ? 2u : 0u)))
                     return (uint64_t)-13; /* -EACCES */
+                VfsStat pre;
+                bool existed = (vfs_flags & 0x04) && vfs_stat(path_kbuf, &pre);
                 VfsFile *file = vfs_open_flags(path_kbuf, vfs_flags);
+                if (file && (vfs_flags & 0x04) && !existed) {
+                    uint32_t m = ((uint32_t)a3 & 07777) & ~proc_umask(proc);
+                    vfs_fchmod(file, m);
+                }
                 if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path_kbuf) : -2);
 
                 /* Real permission enforcement backed by the ext2 inode's
-                   own owner + mode bits (replaces the old FAT32
-                   readonly-attribute hack). Owner-vs-other model: the
-                   Process struct has no gid, so there is honestly no
-                   group dimension to check against -- documented as
-                   such rather than overclaimed. Root bypasses. */
+                   own owner + mode bits: owner, group (the process's
+                   groups), other. Root bypasses. */
                 if ((vfs_flags & (0x01 /* VFS_O_READ */ |
                                   0x02 /* VFS_O_WRITE */ |
                                   0x10 /* VFS_O_TRUNC */ |
                                   0x08 /* VFS_O_APPEND */))) {
                     uint32_t puid = sched_current()->proc->uid;
-                    if (puid != 0) {
+                    /* a file this very call created may be written whatever its mode */
+                    if (puid != 0 && !((vfs_flags & 0x04) && !existed)) {
                         uint32_t want = 0;
                         if (vfs_flags & 0x01) want |= 04;
                         if (vfs_flags & (0x02 | 0x10 | 0x08)) want |= 02;
-                        uint32_t have = (puid == file->node.uid)
-                            ? ((file->node.mode >> 6) & 7)
-                            : (file->node.mode & 7);
+                        uint32_t have = vfs_perm_for(file->node.uid, file->node.gid, file->node.mode);
                         if ((have & want) != want) {
                             kfree(file);
                             return (uint64_t)-13; /* -EACCES */
@@ -2501,7 +2510,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (pe < 0) return (uint64_t)pe;
                 VfsStat mst;
                 if (vfs_lstat(path, &mst)) return (uint64_t)-17;         /* -EEXIST */
-                return vfs_mkdir(path) ? 0 : (uint64_t)create_errno(path);
+                if (!vfs_mkdir(path)) return (uint64_t)create_errno(path);
+                vfs_chmod(path, ((uint32_t)a3 & 07777) & ~proc_umask(proc));   /* the mode asked, less the umask */
+                return 0;
             }
 
         case 83: // SYS_mkdir
@@ -2932,7 +2943,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (!share_mm) vmm_destroy_process_pml4(child_pml4);
                     return (uint64_t)-12; /* -ENOMEM */
                 }
-                child->uid = parent->uid;
+                child->uid = parent->uid; child->ruid = parent->ruid; child->suid = parent->suid;
+                child->gid = parent->gid; child->rgid = parent->rgid; child->sgid = parent->sgid;
+                child->ngroups = parent->ngroups;
+                memcpy(child->groups, parent->groups, sizeof(child->groups));
                 child->ppid = parent->pid;
                 child->pgid = parent->pgid;
                 child->sid = parent->sid;
@@ -3206,6 +3220,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 regs->rsp = stack_top;
                 
                 str_copy(exec_proc->exe_path, kernel_path);
+                /* a setuid/setgid program runs as its file's owner/group */
+                {
+                    VfsStat xst;
+                    if (vfs_stat(kernel_path, &xst) && !xst.is_dir) {
+                        if (xst.mode & 04000) exec_proc->uid = exec_proc->suid = xst.uid;
+                        if (xst.mode & 02000) exec_proc->gid = exec_proc->sgid = xst.gid;
+                    }
+                }
                 signal_exec_reset(sched_current(), exec_proc);
                 serial_write_string("SYS_execve: Successfully loaded ELF. Entry = ");
                 char buf[32];
@@ -3389,6 +3411,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
+        case 415: // SYS_spawn_as(path, argv, envp, uid, gid): root's spawn of another user
         case 408: // SYS_spawn_argv(path_ptr, argv_ptr) -- like SYS_spawn
                    // (405) but also hands the child a real argv array: a2
                    // is a NULL-terminated array of user-space char*
@@ -3400,6 +3423,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    // garbage as a real argv pointer and dereferencing it.
             {
                 if (!a1) return (uint64_t)-1;
+                if (num == 415 && proc->uid != 0) return (uint64_t)-1;   /* -EPERM */
 
                 char *path_buf = (char *)kmalloc(MAX_PATH);
                 if (!path_buf) return (uint64_t)-1;
@@ -3413,11 +3437,40 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int argc = copy_argv_array_from_user((const char *const *)a2, argv_bufs, kargv, MAX_SPAWN_ARGV);
                 if (argc < 0) { argc = 0; kargv[0] = NULL; }
 
-                extern Process *process_spawn(const char *path, const char **argv, uint32_t uid);
-                Process *child = process_spawn(path_buf, argc > 0 ? kargv : NULL, PROC_UID_INHERIT);
+                /* a3: the environment (NULL: the kernel's default one).
+                   415 (SYS_spawn_as) adds a4/a5: the uid and gid of the new
+                   process -- root only. What init (services) and the login
+                   daemon (sessions) use. 408's callers pass garbage there. */
+                char *envp_bufs[128] = {0};
+                const char *kenvp[129];
+                int envc = a3 ? copy_argv_array_from_user((const char *const *)a3, envp_bufs, kenvp, 128) : -1;
+                uint32_t nuid = PROC_UID_INHERIT, ngid = PROC_UID_INHERIT;
+                if (num == 415) {
+                    nuid = (uint32_t)a4;
+                    ngid = (uint32_t)a5;
+                }
+                /* 415's 6th argument: its supplementary groups,
+                   { uint32_t n; uint32_t gid[n <= 32] } (NULL: none) */
+                uint32_t sgroups[33] = {0};
+                if (num == 415 && regs->r9) {
+                    if (copy_from_user(sgroups, (const void *)regs->r9, 4) != 0 || sgroups[0] > 32 ||
+                        (sgroups[0] && copy_from_user(sgroups + 1, (const void *)(regs->r9 + 4), sgroups[0] * 4) != 0)) {
+                        kfree(path_buf);
+                        for (int k = 0; k < argc; k++) kfree(argv_bufs[k]);
+                        for (int k = 0; k < envc; k++) kfree(envp_bufs[k]);
+                        return (uint64_t)-14;
+                    }
+                }
+                Process *child = process_spawn_env(path_buf, argc > 0 ? kargv : NULL,
+                                                   envc >= 0 ? kenvp : NULL, nuid, ngid);
+                if (child && num == 415) {   /* set before it first runs: syscalls run with interrupts off */
+                    child->ngroups = sgroups[0];
+                    memcpy(child->groups, sgroups + 1, sgroups[0] * 4);
+                }
 
                 kfree(path_buf);
                 for (int k = 0; k < argc; k++) kfree(argv_bufs[k]);
+                for (int k = 0; k < envc; k++) kfree(envp_bufs[k]);
 
                 if (!child) return (uint64_t)-1;
                 return child->pid;
@@ -3445,7 +3498,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (!auth_root_password_set()) return (uint64_t)-2;
                 if (auth_check_root(given)) {
-                    sched_current()->proc->uid = 0;
+                    Process *ep = sched_current()->proc;
+                    ep->uid = ep->ruid = ep->suid = 0;
+                    ep->gid = ep->rgid = ep->sgid = 0;
                     return 0;
                 }
                 /* like sudo: a wrong password costs a couple of seconds,
@@ -3471,10 +3526,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 414: // SYS_ary_status: 1 when a root password is set, else 0
             return auth_root_password_set() ? 1 : 0;
 
-        case 105: // SYS_setuid(uid): root may become anyone; others only themselves
+        case 105: // SYS_setuid(uid): root sets all three; others only the effective one, to an id they have
             {
                 Process *pr = sched_current()->proc;
-                if (pr->uid != 0 && (uint32_t)a1 != pr->uid) return (uint64_t)-1; /* -EPERM */
+                if (pr->uid == 0) { pr->uid = pr->ruid = pr->suid = (uint32_t)a1; return 0; }
+                if ((uint32_t)a1 != pr->ruid && (uint32_t)a1 != pr->suid) return (uint64_t)-1; /* -EPERM */
                 pr->uid = (uint32_t)a1;
                 return 0;
             }
@@ -3959,14 +4015,81 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
-        case 102: // SYS_getuid
-        case 104: // SYS_getgid
-        case 107: // SYS_geteuid
-        case 108: // SYS_getegid
-            /* Phase 5: real per-process uid (Process.uid, kernel/process.c).
-               No separate GID model -- gid mirrors uid, matching the
-               convention that root (uid 0) is also "group 0". */
-            return sched_current()->proc->uid;
+        case 102: return proc->ruid;   // SYS_getuid
+        case 107: return proc->uid;    // SYS_geteuid
+        case 104: return proc->rgid;   // SYS_getgid
+        case 108: return proc->gid;    // SYS_getegid
+
+        case 117: // SYS_setresuid(r, e, s) / 119 SYS_setresgid: -1 keeps one
+        case 119:
+            {
+                bool g = num == 119;
+                uint32_t *r = g ? &proc->rgid : &proc->ruid, *e = g ? &proc->gid : &proc->uid,
+                         *sv = g ? &proc->sgid : &proc->suid;
+                uint32_t nr = (uint32_t)a1, ne = (uint32_t)a2, ns = (uint32_t)a3;
+                if (proc->uid != 0) {
+                    /* unprivileged: only to ids it already has */
+                    uint32_t ok[3] = { *r, *e, *sv };
+                    uint32_t want[3] = { nr, ne, ns };
+                    for (int k = 0; k < 3; k++)
+                        if (want[k] != (uint32_t)-1 && want[k] != ok[0] && want[k] != ok[1] && want[k] != ok[2])
+                            return (uint64_t)-1;   /* -EPERM */
+                }
+                if (nr != (uint32_t)-1) *r = nr;
+                if (ne != (uint32_t)-1) *e = ne;
+                if (ns != (uint32_t)-1) *sv = ns;
+                return 0;
+            }
+
+        case 118: // SYS_getresuid(r*, e*, s*) / 120 SYS_getresgid
+        case 120:
+            {
+                bool g = num == 120;
+                uint32_t v[3] = { g ? proc->rgid : proc->ruid, g ? proc->gid : proc->uid, g ? proc->sgid : proc->suid };
+                uint64_t up[3] = { a1, a2, a3 };
+                for (int k = 0; k < 3; k++)
+                    if (up[k] && copy_to_user((void *)up[k], &v[k], 4) != 0) return (uint64_t)-14;
+                return 0;
+            }
+
+        case 113: // SYS_setreuid(r, e) / 114 SYS_setregid: setres*() without the saved one
+        case 114:
+            {
+                bool g = num == 114;
+                uint32_t nr = (uint32_t)a1, ne = (uint32_t)a2;
+                uint32_t old_r = g ? proc->rgid : proc->ruid;
+                /* the saved id follows the effective one when the real one is set
+                   or the effective one becomes something other than the real */
+                uint32_t ns = (nr != (uint32_t)-1 || (ne != (uint32_t)-1 && ne != old_r))
+                              ? (ne != (uint32_t)-1 ? ne : (g ? proc->gid : proc->uid)) : (uint32_t)-1;
+                return syscall_dispatcher(g ? 119 : 117, nr, ne, ns, 0, 0, regs);
+            }
+
+        case 106: // SYS_setgid(gid): root sets all three, others only the effective one
+            if (proc->uid == 0) { proc->gid = proc->rgid = proc->sgid = (uint32_t)a1; return 0; }
+            if ((uint32_t)a1 != proc->rgid && (uint32_t)a1 != proc->sgid) return (uint64_t)-1;
+            proc->gid = (uint32_t)a1;
+            return 0;
+
+        case 115: // SYS_getgroups(size, list)
+            {
+                if ((int64_t)a1 < 0) return (uint64_t)-22;
+                if (a1 == 0) return proc->ngroups;
+                if (a1 < proc->ngroups) return (uint64_t)-22;
+                if (proc->ngroups && copy_to_user((void *)a2, proc->groups, proc->ngroups * 4) != 0) return (uint64_t)-14;
+                return proc->ngroups;
+            }
+
+        case 116: // SYS_setgroups(size, list): root only
+            {
+                if (proc->uid != 0) return (uint64_t)-1;
+                if (a1 > 32) return (uint64_t)-22;
+                uint32_t g[32];
+                if (a1 && copy_from_user(g, (const void *)a2, a1 * 4) != 0) return (uint64_t)-14;
+                memcpy(proc->groups, g, a1 * 4);
+                proc->ngroups = (uint32_t)a1;
+                return 0;
+            }
 
         case 61: // SYS_wait4(pid, int *wstatus, options, struct rusage *)
             {
@@ -4266,7 +4389,13 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (vfs_flags & (0x02 | 0x10 | 0x08)) want |= 2;
                     if (!vfs_may_access(path, want)) return (uint64_t)-13; /* -EACCES */
                 }
+                VfsStat pre;
+                bool existed = (vfs_flags & 0x04) && vfs_stat(path, &pre);
                 VfsFile *file = vfs_open_flags(path, vfs_flags);
+                if (file && (vfs_flags & 0x04) && !existed) {
+                    uint32_t m = ((uint32_t)a4 & 07777) & ~proc_umask(proc);
+                    vfs_fchmod(file, m);
+                }
                 if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path) : -2);
                 fd_table[fd] = file;
                 fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
@@ -5743,7 +5872,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return vfs_symlink(target, lp) ? 0 : (uint64_t)-2;
             }
 
-        case 95: // SYS_umask(mask): kept, though files are made 0644 and directories 0755 anyway
+        case 95: // SYS_umask(mask): what open(O_CREAT)/mkdir take off the mode
             {
                 uint64_t old = proc->umask_set ? proc->umask : 022;
                 proc->umask = (uint32_t)a1 & 0777;
@@ -5821,8 +5950,28 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 93:  // SYS_fchown(fd, uid, gid)
         case 94:  // SYS_lchown(path, uid, gid)
         case 260: // SYS_fchownat(dirfd, path, uid, gid, flags)
-            /* one user and no groups that matter: root may, others may not */
-            return proc->uid == 0 ? 0 : (uint64_t)-1;
+            {
+                if (num == 93) {
+                    if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
+                    return (uint64_t)(int64_t)vfs_fchown(fd_table[a1], (uint32_t)a2, (uint32_t)a3);
+                }
+                char path[MAX_PATH];
+                int dirfd = num == 260 ? (int)a1 : AT_FDCWD_;
+                uint64_t up = num == 260 ? a2 : a1;
+                uint32_t nu = (uint32_t)(num == 260 ? a3 : a2), ng = (uint32_t)(num == 260 ? a4 : a3);
+                if (num == 260 && (a5 & 0x1000)) {         /* AT_EMPTY_PATH: the fd itself */
+                    char first = 0;
+                    if (up && copy_from_user(&first, (const void *)up, 1) != 0) return (uint64_t)-14;
+                    if (!first) {
+                        if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
+                        return (uint64_t)(int64_t)vfs_fchown(fd_table[a1], nu, ng);
+                    }
+                }
+                int64_t pe = user_path_at(dirfd, up, path);
+                if (pe < 0) return (uint64_t)pe;
+                bool nofollow = num == 94 || (num == 260 && (a5 & 0x100));
+                return (uint64_t)(int64_t)vfs_chown(path, nu, ng, nofollow);
+            }
 
         case 221: // SYS_fadvise64: advice only
             return 0;
@@ -5854,9 +6003,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
-        case 122: // SYS_setfsuid / 123 SYS_setfsgid: the filesystem id is the uid
+        case 122: // SYS_setfsuid / 123 SYS_setfsgid: the filesystem id is the effective id
         case 123:
-            return num == 122 ? proc->uid : 0;   /* the previous value; nothing changes */
+            return num == 122 ? proc->uid : proc->gid;   /* the previous value; nothing changes */
+
+        case 188: case 189: case 190:   // set/lset/fsetxattr
+        case 191: case 192: case 193:   // get/lget/fgetxattr
+        case 194: case 195: case 196:   // list/llist/flistxattr
+        case 197: case 198: case 199:   // remove/lremove/fremovexattr
+            return (uint64_t)-95;       /* -EOPNOTSUPP: ext2 here keeps no extended attributes */
 
         case 294: // SYS_inotify_init1
         case 326: // SYS_copy_file_range: cp falls back to read/write

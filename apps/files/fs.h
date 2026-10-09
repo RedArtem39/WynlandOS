@@ -15,7 +15,7 @@ class Fs : public QObject
 public:
     using QObject::QObject;
 
-    QString home() const { return QStringLiteral("/home/user"); }
+    QString home() const { return qEnvironmentVariableIsSet("HOME") ? qEnvironmentVariable("HOME") : QStringLiteral("/"); }
     int uid() const;
     QString lastError() const { return m_error; }
 

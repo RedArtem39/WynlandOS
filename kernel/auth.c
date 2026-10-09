@@ -1,7 +1,8 @@
 /*
  * WynlandOS - the root password (`ary`).
  *
- * /etc/shadow, root-only (0600), one line:  root:<salt hex>:<hash hex>
+ * /etc/wynland/rootpw, root-only (0600), one line:  root:<salt hex>:<hash hex>
+ * (Zerp 1's built-in ary only; accounts are /etc/passwd + /etc/shadow now)
  * hash = SHA-256 iterated AUTH_ROUNDS times over salt+password (salted,
  * deliberately slow). No file / no root line = no password set yet: the
  * first `ary login` creates it. The kernel reads and writes the file
@@ -15,7 +16,7 @@
 #include <wynland/vfs.h>
 #include <wynland/sched.h>
 
-#define AUTH_FILE   "/etc/shadow"
+#define AUTH_FILE   "/etc/wynland/rootpw"   /* not /etc/shadow: that is the standard file now (apps/accounts) */
 #define AUTH_ROUNDS 20000
 
 extern void *g_vfs_root_override;   /* drivers/fs/ext2.c: thread acting as root */

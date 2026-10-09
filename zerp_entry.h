@@ -12,7 +12,11 @@
 
 int zerp_main(int argc, char **argv);
 
+/* the environment: after argv's NULL on the initial stack */
+char **zerp_envp;
+
 void real_start(long argc, char **argv) {
+    zerp_envp = argv + argc + 1;
     int code = zerp_main((int)argc, argv);
     zexit(code);
 }

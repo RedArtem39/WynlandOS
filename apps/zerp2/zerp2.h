@@ -10,6 +10,7 @@
 #pragma once
 
 #include <QtCore/QAbstractListModel>
+#include <QtCore/QCoreApplication>
 #include <QtCore/QObject>
 #include <QtCore/QRect>
 #include <QtCore/QTimer>
@@ -138,6 +139,7 @@ public:
     void setWorkspace(int w);
 
     Q_INVOKABLE int spawn(const QString &path);
+    Q_INVOKABLE void logout() { QCoreApplication::quit(); }   // the session ends: wynlogin shows the login screen
     Q_INVOKABLE void focus(QObject *client);
     Q_INVOKABLE void closeFocused();
     Q_INVOKABLE void moveFocusedTo(int workspace);

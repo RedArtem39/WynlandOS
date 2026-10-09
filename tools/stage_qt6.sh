@@ -85,8 +85,9 @@ echo "  QT6        built build/files.elf"
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
 Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
+"$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
-    apps/zerp2/main.cpp apps/zerp2/zerp2.cpp "$B/moc_zerp2.cpp" \
+    apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/zerp2.elf"
 

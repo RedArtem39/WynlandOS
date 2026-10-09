@@ -1,0 +1,6 @@
+description=the login screen and the user's session (Zerp 2.0)
+type=daemon
+exec=/usr/sbin/wynlogin
+provide=display
+when=zerp=2 virgl=1 autotest=0
+restart=always

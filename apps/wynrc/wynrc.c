@@ -19,6 +19,8 @@
 //                 /etc/wynland/boot.cfg (make's choices) and
 //                 /etc/wynland/hw (what the kernel found)
 //   restart=      always | on-failure | no      (daemons; default on-failure)
+//   user=         the account it runs as (a name from /etc/passwd, or a
+//                 uid); default root -- wynrc itself is root
 //
 // Control: an AF_UNIX socket (abstract "wynrc"), one line per request:
 // "status", "start NAME", "stop NAME", "restart NAME".
@@ -26,6 +28,9 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <pwd.h>
+#include <stdint.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -59,6 +64,7 @@ typedef struct {
     char after[MAX_LIST][32]; int n_after;
     char provide[32];
     char when[256];
+    char user[32];            /* user=: "" = root */
     int restart;              /* 0 no, 1 on-failure, 2 always */
     int state;
     char info[96];
@@ -207,6 +213,7 @@ static int load_service(const char *name)
         else if (!strcmp(k, "provide")) snprintf(s->provide, sizeof s->provide, "%s", v);
         else if (!strcmp(k, "when")) snprintf(s->when, sizeof s->when, "%s", v);
         else if (!strcmp(k, "restart")) s->restart = !strcmp(v, "always") ? 2 : !strcmp(v, "no") ? 0 : 1;
+        else if (!strcmp(k, "user")) snprintf(s->user, sizeof s->user, "%s", v);
     }
     fclose(f);
     return 0;
@@ -296,7 +303,47 @@ static void start(Svc *s)
        and Zerp use): a fresh image, this process as its parent. A
        fork()+execv() here sometimes left zerp2's dynamic loader crashing
        in its first dlopen(); fork+exec stays the fallback. */
-    pid_t pid = (pid_t)syscall(408, argv[0], argv, 0);
+    pid_t pid;
+    if (s->user[0] && strcmp(s->user, "root")) {
+        /* another account: the kernel's spawn with its uid/gid
+           (SYS_spawn_as, root's only) and its environment */
+        struct passwd *pw = getpwnam(s->user);
+        char *end;
+        long num = strtol(s->user, &end, 10);
+        uid_t uid = pw ? pw->pw_uid : (*end ? (uid_t)-1 : (uid_t)num);
+        gid_t gid = pw ? pw->pw_gid : uid;
+        if (uid == (uid_t)-1) {
+            s->state = S_FAILED;
+            snprintf(s->info, sizeof s->info, "no user %s", s->user);
+            logf_("%s: no user %s", s->name, s->user);
+            return;
+        }
+        extern char **environ;
+        static char envbuf[6][256];
+        char *envp[64];
+        int n = 0;
+        for (char **e = environ; *e && n < 56; e++)
+            if (strncmp(*e, "HOME=", 5) && strncmp(*e, "USER=", 5) && strncmp(*e, "LOGNAME=", 8) &&
+                strncmp(*e, "SHELL=", 6) && strncmp(*e, "PATH=", 5))
+                envp[n++] = *e;
+        snprintf(envbuf[0], sizeof envbuf[0], "HOME=%s", pw ? pw->pw_dir : "/tmp");
+        snprintf(envbuf[1], sizeof envbuf[1], "USER=%s", pw ? pw->pw_name : s->user);
+        snprintf(envbuf[2], sizeof envbuf[2], "LOGNAME=%s", pw ? pw->pw_name : s->user);
+        snprintf(envbuf[3], sizeof envbuf[3], "SHELL=%s", pw ? pw->pw_shell : "/bin/sh");
+        snprintf(envbuf[4], sizeof envbuf[4], "PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin");
+        for (int k = 0; k < 5; k++) envp[n++] = envbuf[k];
+        envp[n] = NULL;
+        struct { uint32_t n; uint32_t g[32]; } groups = { 0, {0} };
+        gid_t list[32];
+        int ng = 32;
+        if (pw && getgrouplist(pw->pw_name, gid, list, &ng) >= 0)
+            for (int k = 0; k < ng && groups.n < 32; k++) groups.g[groups.n++] = list[k];
+        pid = (pid_t)syscall(415, argv[0], argv, envp, (long)uid, (long)gid, &groups);
+        if (pid <= 0) { s->state = S_FAILED; snprintf(s->info, sizeof s->info, "spawn as %s failed", s->user); return; }
+    } else {
+        extern char **environ;
+        pid = (pid_t)syscall(408, argv[0], argv, environ);   /* ours: PATH, TZ, the library paths */
+    }
     if (pid <= 0) {
         pid = fork();
         if (pid == 0) {
@@ -419,7 +466,7 @@ static void handle_request(int fd, char *req)
 int main(void)
 {
     g_t0 = now_ms();
-    if (!getenv("PATH")) setenv("PATH", "/usr/bin:/bin:/sbin", 1);
+    if (!getenv("PATH")) setenv("PATH", "/usr/local/bin:/usr/bin:/usr/sbin:/sbin", 1);
     if (!getenv("HOME")) setenv("HOME", "/tmp", 1);
     signal(SIGPIPE, SIG_IGN);
 

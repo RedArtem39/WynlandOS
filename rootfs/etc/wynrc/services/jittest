@@ -2,4 +2,6 @@ description=JIT memory policy check (W^X, WYNLAND_ALLOW_JIT)
 type=oneshot
 exec=/jittest.elf
 when=autotest=1
-after=display
+after=display testuser
+user=tester
+need=testuser

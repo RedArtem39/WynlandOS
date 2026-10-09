@@ -2,4 +2,6 @@ description=Shell check (fish, dash, GNU coreutils, grep, sed, tar ...)
 type=oneshot
 exec=/shtest.elf
 when=autotest=1|sh
-after=display
+after=display testuser
+user=tester
+need=testuser

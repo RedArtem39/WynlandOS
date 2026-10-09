@@ -151,9 +151,23 @@ static const struct sh_case CASES[] = {
     { "/usr/bin/python3", "python3: https (ssl, CA bundle)",
       "import urllib.request; print(urllib.request.urlopen('https://example.com', timeout=30).status)", "200\n" },
     /* leaf, the package manager: Ubuntu's archive, signed index, real installs */
-    { "/bin/sh", "ary: superuser, root for one command",
-      "printf 'wyn\\nwyn\\n' | ary -S login >/dev/null; echo wrong | ary -S id -u 2>&1; echo wyn | ary -S id -u; id -u",
+    /* accounts: the test account (rootfs/usr/lib/wynland/mktestuser) */
+    { "/bin/sh", "accounts: who we are (passwd, group, HOME)",
+      "id -un; id -u; id -Gn; echo ~tester; ls -ld ~tester | cut -d' ' -f1,3,4; ls ~tester/README.txt",
+      "tester\n1000\ntester wheel\n/home/tester\ndrwx------ tester tester\n/home/tester/README.txt\n" },
+    { "/bin/sh", "ary: root with your own password (wheel)",
+      "echo wrong | ary -S id -u 2>&1; echo wyn | ary -S id -u; id -u",
       "ary: incorrect password\n0\n1000\n" },
+    { "/bin/sh", "accounts: useradd, passwd, group permissions, userdel",
+      "echo wyn | ary -S sh -c 'printf \"pw1\\n\" | useradd -c Bob --password-stdin bob' >/dev/null;"
+      " id -un bob; ls -ld /home/bob | cut -d' ' -f1,3,4;"
+      " echo secret > /tmp/wheelonly; echo wyn | ary -S sh -c 'chown root:wheel /tmp/wheelonly && chmod 640 /tmp/wheelonly';"
+      " cat /tmp/wheelonly; ls -l /tmp/wheelonly | cut -d' ' -f1,3,4;"
+      " echo wyn | ary -S sh -c 'echo pw2 | passwd --stdin bob' | tail -1;"
+      " groups bob | cut -d: -f2; echo pw2 | ary -S id -u 2>&1 | head -1;"
+      " echo wyn | ary -S userdel -r bob; id bob >/dev/null 2>&1 || echo bob-gone; ls /home",
+      "bob\ndrwx------ bob bob\nsecret\n-rw-r----- root wheel\npasswd: the password of bob is changed\n bob\n"
+      "ary: incorrect password\nbob-gone\ntester\n" },
     { "/bin/sh", "leaf: update (InRelease checked by gpgv)",
       "echo wyn | ary -S leaf update > /tmp/leaf-update.log 2>&1; echo $?; ls /var/lib/leaf/lists | wc -l", "0\n6\n" },
     { "/bin/sh", "leaf: install tree + jq from Ubuntu",
@@ -260,7 +274,7 @@ static void run_pty(void)
     size_t len = 0;
     buf[0] = 0;
     long t0 = now_ms();
-    int up = pty_read_until(m, buf, sizeof buf, &len, "# ", 30000);   /* root@wynland ~# */
+    int up = pty_read_until(m, buf, sizeof buf, &len, "> ", 30000);   /* tester@wynland ~> */
     char what[96];
     snprintf(what, sizeof what, "fish -i: prompt on a PTY (%ld ms)", now_ms() - t0);
     check(up, what);

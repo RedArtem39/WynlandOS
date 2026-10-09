@@ -2,4 +2,6 @@ description=WPE WebKit check (local page, HTTPS, YouTube; snapshots to the log)
 type=oneshot
 exec=/usr/bin/wpetest
 when=autotest=1
-after=display gsttest
+after=display testuser gsttest
+user=tester
+need=testuser

@@ -1,5 +1,6 @@
-# wynrc default runlevel (order matters for providers: zerp2 before zerp)
-zerp2
+# wynrc default runlevel (order matters for providers: wynlogin before zerp)
+wynlogin
+testuser
 zerp
 gltest
 forktest
