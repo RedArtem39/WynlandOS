@@ -4,8 +4,10 @@ vignette, and the WynlandOS spiral (rootfs/usr/share/wynland/logo.png)
 dimmed in the lower right corner. The palette is the logo's blue on
 black -- nothing else.
 
-Plain Python (the build host has no imaging modules): the logo PNG is
-decoded here, the result written as a PNG.
+Rendered at half resolution, as the old one: the scene scales it up, and
+Zerp blurs it for its glass -- a full-size picture made that four times
+the work. Plain Python (the build host has no imaging modules): the logo
+PNG is decoded here, the result written as a PNG.
 usage: gen_wallpaper.py out.png [width height]
 """
 import os
@@ -15,8 +17,8 @@ import sys
 import zlib
 
 out = sys.argv[1]
-W = int(sys.argv[2]) if len(sys.argv) > 2 else 1920
-H = int(sys.argv[3]) if len(sys.argv) > 3 else 1080
+W = int(sys.argv[2]) if len(sys.argv) > 2 else 960
+H = int(sys.argv[3]) if len(sys.argv) > 3 else 540
 LOGO = os.path.join(os.path.dirname(__file__), "..", "rootfs", "usr", "share", "wynland", "logo.png")
 
 

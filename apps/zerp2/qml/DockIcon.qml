@@ -11,11 +11,10 @@ Item {
         radius: 11 * icon.u
         antialiasing: true
         gradient: Gradient {
-            // graphite tiles; the logo's blue for the one that is blue by nature (files)
-            GradientStop { position: 0; color: icon.kind === "files" ? "#4b8dff" : "#232831" }
-            GradientStop { position: 1; color: icon.kind === "files" ? "#2c63d8" : "#14171c" }
+            GradientStop { position: 0; color: icon.kind === "term" ? "#2b2f3a" : icon.kind === "files" ? "#4ea8ff" : icon.kind === "launcher" ? "#a066ff" : icon.kind === "web" ? "#ff9a4d" : "#41cd52" }
+            GradientStop { position: 1; color: icon.kind === "term" ? "#14161c" : icon.kind === "files" ? "#2a6fd6" : icon.kind === "launcher" ? "#6a3fd1" : icon.kind === "web" ? "#e0592a" : "#2a9a3a" }
         }
-        border.color: "#2e343e"; border.width: 1 * icon.u
+        border.color: "#ffffff"; border.width: 1 * icon.u
         Rectangle { anchors.fill: parent; radius: parent.radius; color: "white"; opacity: 0.06 }
     }
 
@@ -24,7 +23,7 @@ Item {
         visible: icon.kind === "term"
         anchors { left: parent.left; leftMargin: 9 * icon.u; verticalCenter: parent.verticalCenter }
         text: ">_"
-        color: "#6fb3ff"
+        color: "#7ee787"
         font { family: "DejaVu Sans Mono"; pixelSize: 18 * icon.u; bold: true }
     }
     // files: folder

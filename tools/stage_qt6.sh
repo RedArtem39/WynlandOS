@@ -34,7 +34,7 @@ PKGS="qt6-base-dev qt6-base-private-dev qt6-base-dev-tools qt6-declarative-dev
 # fontconfig's stock configuration + DejaVu: a hand-written minimal
 # fonts.conf has no substitution rules, every font match came back empty
 # and Qt crashed in QFontconfigDatabase::setupFontEngine
-PKGS="$PKGS fontconfig-config fonts-dejavu-core fonts-jetbrains-mono"
+PKGS="$PKGS fontconfig-config fonts-dejavu-core fonts-jetbrains-mono fonts-adwaita-sans"
 # the terminal (apps/term): libvterm parses what programs print
 PKGS="$PKGS libvterm0 libvterm-dev"
 # eglfs links the input stacks even with input disabled (Zerp 2.0 feeds
@@ -56,6 +56,15 @@ if [ $NEW = 1 ] || [ ! -f "$CACHE/.unpacked" ]; then
 fi
 QTVER=$(ls "$INC/QtCore" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 echo "  QT6        Qt $QTVER from $CACHE"
+
+# Adwaita Mono (the login screen's face; OFL): Ubuntu packages only the
+# sans, so the mono comes from GNOME's release
+AFONT=$ROOT/usr/share/fonts/truetype/adwaita-mono
+if [ ! -f "$AFONT/AdwaitaMono-Regular.ttf" ]; then
+    mkdir -p "$AFONT"
+    curl -sSfL https://download.gnome.org/sources/adwaita-fonts/49/adwaita-fonts-49.0.tar.xz \
+        | tar xJ -C "$AFONT" --strip-components=2 adwaita-fonts-49.0/mono/
+fi
 
 # 2. qmldemo.elf
 export LD_LIBRARY_PATH=$LIB

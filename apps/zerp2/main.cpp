@@ -283,6 +283,16 @@ int main(int argc, char **argv)
     auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!win) { fprintf(stderr, "[zerp2] FAIL: root is not a Window\n"); return 1; }
     InputPump pump(win, &server, greeterMode);
+    // debugging: boot.cfg "logoutat=N" -- the session logs out after N s
+    // (the login screen with an account, for its picture)
+    if (!greeterMode) {
+        const QByteArray cfg = bootCfg();
+        const int at = cfg.indexOf("logoutat=");
+        if (at >= 0) {
+            const int secs = cfg.mid(at + 9).split('\n').first().trimmed().toInt();
+            if (secs > 0) QTimer::singleShot(secs * 1000, &app, [] { QCoreApplication::quit(); });
+        }
+    }
     // debugging: boot.cfg "greeterdemo=NAME:PASSWORD" -- the login screen
     // fills itself in after a while (creates the account on a first boot),
     // so the whole way to a session can be watched without a keyboard
@@ -366,11 +376,11 @@ int main(int argc, char **argv)
         const QByteArray cfg = bootCfg();
         const int at = cfg.indexOf("snapat=");
         if (at >= 0) snapAt = qMax(5, cfg.mid(at + 7).split('\n').first().trimmed().toInt());
-        QTimer::singleShot(snapAt * 1000, win, [win, greeterMode] {
+        QTimer::singleShot(snapAt * 1000, win, [win, greeterMode, firstBoot] {
             ::syscall(1000);   /* WynlandOS: every process's time and threads, on the log */
             const QImage full = win->grabWindow();
             // the login screen (another account) keeps its own file
-            const QString snap = greeterMode ? QStringLiteral("/tmp/greeter-snap.png") : QStringLiteral("/tmp/zerp2-snap.png");
+            const QString snap = greeterMode ? (firstBoot ? QStringLiteral("/tmp/greeter-first.png") : QStringLiteral("/tmp/greeter-snap.png")) : QStringLiteral("/tmp/zerp2-snap.png");
             if (full.save(snap, "PNG")) {
                 ::sync();
                 fprintf(stderr, "[zerp2] snapshot saved: %s\n", qPrintable(snap));
