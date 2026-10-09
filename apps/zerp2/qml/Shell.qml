@@ -11,7 +11,7 @@ Window {
     id: shell
     visible: true
     visibility: Window.FullScreen
-    color: "#0b0d12"
+    color: "#07090c"
     title: "Zerp"
 
     // ---- look
@@ -109,8 +109,8 @@ Window {
             anchors.fill: parent
             visible: wallpaperUrl === ""
             gradient: Gradient {
-                GradientStop { position: 0.0; color: "#1b1f3a" }
-                GradientStop { position: 1.0; color: "#0b1a2a" }
+                GradientStop { position: 0.0; color: "#0d1015" }
+                GradientStop { position: 1.0; color: "#07090c" }
             }
         }
         Image {

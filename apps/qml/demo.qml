@@ -97,8 +97,8 @@ Window {
                     anchors.centerIn: parent
                     radius: 10
                     gradient: Gradient {
-                        GradientStop { position: 0.0; color: "#7aa2f7" }
-                        GradientStop { position: 1.0; color: "#bb9af7" }
+                        GradientStop { position: 0.0; color: "#6fb3ff" }
+                        GradientStop { position: 1.0; color: "#2c63d8" }
                     }
                     Behavior on rotation { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
                     RotationAnimation on rotation {

@@ -47,8 +47,8 @@ extern "C" {
 Q_IMPORT_PLUGIN(QWynlandFbIntegrationPlugin)
 
 // the look: a dark, slightly see-through background and a 16-colour
-// palette in the same spirit (Catppuccin Mocha)
-static const QColor kBg(17, 17, 27, 222);
+// palette (Catppuccin Mocha's colours on WynlandOS black)
+static const QColor kBg(10, 12, 16, 224);
 static const QColor kFg(205, 214, 244);
 static const QColor kCursor(245, 224, 220);
 static const uint8_t kPalette[16][3] = {

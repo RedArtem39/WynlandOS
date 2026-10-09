@@ -52,7 +52,7 @@ Item {
             maskSpreadAtMin: 1.0
         }
         Glass { anchors.fill: parent; gx: dock.x; gy: dock.y }
-        Rectangle { anchors.fill: parent; color: "#10131a"; opacity: 0.5 }
+        Rectangle { anchors.fill: parent; color: "#0a0c10"; opacity: 0.7 }
     }
     Item {
         id: shelfMask
@@ -88,7 +88,7 @@ Item {
             DockIcon { anchors.fill: parent; kind: slot.modelData.kind }
             Rectangle {   // running dot
                 width: 4; height: 4; radius: 2
-                color: "#e6e8ef"
+                color: "#d6dbe4"
                 x: (slot.width - width) / 2
                 y: slot.height + 3
                 visible: dock.running(slot.modelData.appId)
@@ -98,8 +98,8 @@ Item {
                 x: (slot.width - width) / 2
                 y: -height - 10
                 width: tip.implicitWidth + 16; height: 24; radius: 7
-                color: "#1d2130"; border.color: "#3b4261"
-                Text { id: tip; anchors.centerIn: parent; text: slot.modelData.name; color: "#e6e8ef"; font.pixelSize: 12 }
+                color: "#12151b"; border.color: "#262b34"
+                Text { id: tip; anchors.centerIn: parent; text: slot.modelData.name; color: "#d6dbe4"; font.pixelSize: 12 }
             }
             MouseArea { anchors.fill: parent; onClicked: dock.activate(slot.modelData) }
         }

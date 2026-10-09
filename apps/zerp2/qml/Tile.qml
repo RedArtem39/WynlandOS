@@ -13,8 +13,8 @@ Item {
     property int cornerRadius: 12
 
     readonly property bool active: client && client.focused
-    readonly property color edgeLeft: active ? "#33ccff" : "#3a3f4b"
-    readonly property color edgeRight: active ? "#a066ff" : "#3a3f4b"
+    readonly property color edgeLeft: active ? "#6fb3ff" : "#22262e"
+    readonly property color edgeRight: active ? "#3d7eff" : "#22262e"
 
     x: target.x + wsOffset
     y: target.y

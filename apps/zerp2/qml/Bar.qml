@@ -9,7 +9,7 @@ Item {
 
     // frosted: our slice of the live blurred wallpaper
     Glass { anchors.fill: parent; gx: bar.x; gy: bar.y }
-    Rectangle { anchors.fill: parent; color: "#10131a"; opacity: 0.55 }
+    Rectangle { anchors.fill: parent; color: "#0a0c10"; opacity: 0.7 }
     Rectangle { anchors { left: parent.left; right: parent.right; bottom: parent.bottom } height: 1; color: "white"; opacity: 0.07 }
 
     // ---- workspaces
@@ -27,13 +27,13 @@ Item {
                 height: 18
                 width: current ? 34 : 18
                 radius: 9
-                color: current ? "#7aa2f7" : occupied ? "#3b4261" : "#262a36"
+                color: current ? "#3d7eff" : occupied ? "#2a303b" : "#171a20"
                 Behavior on width { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
                 Behavior on color { ColorAnimation { duration: 200 } }
                 Text {
                     anchors.centerIn: parent
                     text: parent.ws
-                    color: parent.current ? "#0f1117" : "#a9b1d6"
+                    color: parent.current ? "#0a0c10" : "#8a93a3"
                     font.pixelSize: 11
                     font.bold: true
                 }
@@ -46,7 +46,7 @@ Item {
     Text {
         anchors.centerIn: parent
         text: zerp.focusedClient ? zerp.focusedClient.title : "WynlandOS"
-        color: "#e6e8ef"
+        color: "#d6dbe4"
         font.pixelSize: 13
         font.bold: true
         elide: Text.ElideRight
@@ -71,11 +71,11 @@ Item {
             onPaint: {
                 var c = getContext("2d");
                 c.reset();
-                c.strokeStyle = "#e6e8ef"; c.lineWidth = 1.8; c.lineCap = "round";
+                c.strokeStyle = "#d6dbe4"; c.lineWidth = 1.8; c.lineCap = "round";
                 for (var r = 4; r <= 12; r += 4) {
                     c.beginPath(); c.arc(9, 13, r, Math.PI * 1.25, Math.PI * 1.75); c.stroke();
                 }
-                c.fillStyle = "#e6e8ef";
+                c.fillStyle = "#d6dbe4";
                 c.beginPath(); c.arc(9, 13, 1.4, 0, Math.PI * 2); c.fill();
             }
         }
@@ -85,15 +85,12 @@ Item {
             height: 22
             width: who.implicitWidth + 30
             radius: 11
-            color: logoutArea.containsMouse ? "#3b4261" : "transparent"
+            color: logoutArea.containsMouse ? "#1b1f27" : "transparent"
             Behavior on color { ColorAnimation { duration: 150 } }
             Rectangle {
                 anchors { left: parent.left; leftMargin: 4; verticalCenter: parent.verticalCenter }
                 width: 16; height: 16; radius: 8
-                gradient: Gradient {
-                    GradientStop { position: 0.0; color: "#7cc4ff" }
-                    GradientStop { position: 1.0; color: "#3d8bff" }
-                }
+                color: "#3d7eff"
                 Text {
                     anchors.centerIn: parent
                     color: "white"
@@ -105,7 +102,7 @@ Item {
             Text {
                 id: who
                 anchors { left: parent.left; leftMargin: 25; verticalCenter: parent.verticalCenter }
-                color: "#e6e8ef"
+                color: "#d6dbe4"
                 font.pixelSize: 13
                 text: logoutArea.containsMouse ? "Log out " + userName : userName
             }
@@ -113,7 +110,7 @@ Item {
         }
         Text {
             id: clock
-            color: "#e6e8ef"
+            color: "#d6dbe4"
             font.pixelSize: 13
             anchors.verticalCenter: parent.verticalCenter
             function refresh() { text = Qt.formatDateTime(new Date(), "ddd d MMM   HH:mm") }

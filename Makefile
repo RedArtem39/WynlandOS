@@ -656,6 +656,6 @@ check-tools:
 -include $(shell find $(BUILD) -name "*.d" 2>/dev/null)
 
 # Default wallpaper (/wall.png), generated
-$(BUILD)/wall.png: tools/gen_wallpaper.py
+$(BUILD)/wall.png: tools/gen_wallpaper.py rootfs/usr/share/wynland/logo.png
 	@mkdir -p $(BUILD)
 	@python3 tools/gen_wallpaper.py $@
