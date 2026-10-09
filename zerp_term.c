@@ -57,6 +57,7 @@ static char g_input[MAX_LINE_LEN];
 static int  g_input_len = 0;
 static char g_path[256] = "/";     /* $HOME at start (zerp_main) */
 static char g_user[64] = "user";    /* $USER */
+static char g_home[256] = "";       /* $HOME: shown as ~ in the prompt */
 extern char **zerp_envp;
 
 /* a variable of our environment, or NULL */
@@ -240,13 +241,20 @@ static void redraw(ZerpClient *zc) {
             for (p = 0; pr[p]; p++) line[p] = pr[p];
             for (int i = 0; i < g_password_len && p < MAX_LINE_LEN + 14; i++) line[p++] = '*';
         } else {
-            /* "user /home/user $ " or "root /etc # " */
+            /* "red39:~$ ", "red39:~/Projects$ ", "root:/etc# " -- the home
+               folder is "~", as in bash */
             const int root = zgetuid() == 0;
             p = 0;
             for (const char *q = root ? "root" : g_user; *q && p < 60; q++) line[p++] = *q;
-            line[p++] = ' ';
-            for (const char *q = g_path; *q && p < 120; q++) line[p++] = *q;
-            line[p++] = ' '; line[p++] = root ? '#' : '$'; line[p++] = ' ';
+            line[p++] = ':';
+            const char *shown = g_path;
+            int hl = 0;
+            while (g_home[hl]) hl++;
+            int under = hl > 1;
+            for (int k = 0; under && k < hl; k++) if (g_path[k] != g_home[k]) under = 0;
+            if (under && (g_path[hl] == '\0' || g_path[hl] == '/')) { line[p++] = '~'; shown = g_path + hl; }
+            for (const char *q = shown; *q && p < 120; q++) line[p++] = *q;
+            line[p++] = root ? '#' : '$'; line[p++] = ' ';
             for (int i = 0; i < g_input_len && p < MAX_LINE_LEN + 14; i++) line[p++] = g_input[i];
         }
         line[p] = '\0';
@@ -630,7 +638,7 @@ static void run_command(const char *line) {
         add_line("launching the QML demo...", TEXT_COLOR);
     } else if (str_eq(cmd, "help")) {
         add_line("built-ins: ls cd pwd cat whoami write nano ary rofi qml clear help", TEXT_COLOR);
-        add_line("ary login | ary su | ary passwd | ary <command>   (root; 'exit' leaves ary su)", TEXT_COLOR);
+        add_line("ary <command>: one command as root, with your own password (administrators)", TEXT_COLOR);
         add_line("/usr/bin: curl cmake nano pkgconf rc-status rc-service rc-update (e.g. 'rc-status')", TEXT_COLOR);
     } else {
         /* not a built-in: try /usr/bin/<cmd> on a PTY (curl, cmake, ...) */
@@ -722,7 +730,7 @@ int zerp_main(int argc, char **argv) {
 
     /* who we are: the session's HOME and USER (wynlogin) */
     const char *home = zenv("HOME"), *user = zenv("USER");
-    if (home && home[0] == '/') path_set_absolute(home);
+    if (home && home[0] == '/') { path_set_absolute(home); str_copy_n(g_home, home, (int)sizeof(g_home)); }
     if (user) str_copy_n(g_user, user, (int)sizeof(g_user));
     add_line("Zerp terminal -- type 'help' for commands", TEXT_COLOR);
     (void)cmd_ary;   /* the old built-in (kernel root password): /usr/bin/ary now */
