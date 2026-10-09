@@ -1,0 +1,7 @@
+description=sandboxing check (seccomp, namespaces, chroot)
+type=oneshot
+exec=/sandboxtest.elf
+when=autotest=1|sandbox
+after=display testuser
+user=tester
+need=testuser

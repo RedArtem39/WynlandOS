@@ -1,4 +1,4 @@
 description=the test account (tester, an administrator)
 type=oneshot
 exec=/usr/lib/wynland/mktestuser
-when=autotest=1|sh
+when=autotest=1|sh|sandbox

@@ -22,6 +22,7 @@
 #include <wynland/kfile.h>
 #include <wynland/unix_socket.h>
 #include <wynland/tty.h>
+#include <wynland/sandbox.h>
 
 extern uint64_t timer_get_ticks(void);
 
@@ -371,6 +372,9 @@ extern void kfree(void *ptr);
    vfork (CLONE_VM|CLONE_VFORK); consumed there. Syscalls run with
    interrupts off on one CPU, so nothing can observe it in between. */
 static bool g_fork_share_mm = false;
+/* the process the last fork made (clone() looks at it: its pid as the
+   caller sees it can be another number) */
+static Process *g_last_fork_child;
 
 #define LNX_ECHILD 10
 #define LNX_EINTR  4
@@ -926,6 +930,25 @@ static int pty_new_fd(VfsFile **fd_table, uint32_t *fd_flags, uint32_t *fd_oflag
 /* /dev/ptmx (a new PTY's master), /dev/pts/N (its slave), /dev/tty (the
    caller's terminal, when that is a PTY): an fd, or -errno; 1 when the
    path is none of these */
+/* /proc/self/{uid_map,gid_map,setgroups} (kernel/sandbox.c): an fd, or 1
+   when the path is none of them */
+static int64_t open_sandbox_proc(const char *path, int linux_flags, VfsFile **fd_table, uint32_t *fd_flags, uint32_t *fd_oflags) {
+    int kind = sandbox_proc_file(path);
+    if (!kind) return 1;
+    int fd = get_free_fd(fd_table);
+    if (fd < 0) return -24;                      /* -EMFILE */
+    VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+    if (!f) return -12;
+    memset(f, 0, sizeof(VfsFile));
+    str_copy(f->node.name, kind == 1 ? "uid_map" : kind == 2 ? "gid_map" : "setgroups");
+    f->node.first_cluster = PROCNS_FD;
+    f->node.mode = 0644;
+    f->current_cluster = (uint32_t)kind;
+    fd_table[fd] = f;
+    fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
+    return fd;
+}
+
 static int64_t open_tty_path(const char *path, int linux_flags, VfsFile **fd_table, uint32_t *fd_flags, uint32_t *fd_oflags) {
     if (str_compare(path, "/dev/ptmx") == 0 || str_compare(path, "/dev/pts/ptmx") == 0) {
         int idx = pty_alloc();
@@ -994,8 +1017,11 @@ static uint64_t readlink_fallback(const char *path, uint64_t ubuf, uint64_t bufs
         Process *pr = sched_current()->proc;
         int fd = 0;
         const char *q = path + pl;
-        while (*q >= '0' && *q <= '9') fd = fd * 10 + (*q++ - '0');
-        if (*q || fd >= MAX_OPEN_FILES || !pr->fd_table[fd]) return (uint64_t)-2;
+        while (*q >= '0' && *q <= '9') {
+            fd = fd * 10 + (*q++ - '0');
+            if (fd >= MAX_OPEN_FILES) return (uint64_t)-2;   /* it overflowed into a negative index */
+        }
+        if (*q || !pr->fd_table[fd]) return (uint64_t)-2;
         VfsFile *f = pr->fd_table[fd];
         char t[MAX_PATH];
         uint32_t fc = f->node.first_cluster;
@@ -1013,6 +1039,17 @@ static uint64_t readlink_fallback(const char *path, uint64_t ubuf, uint64_t bufs
         } else {
             return (uint64_t)-2;   /* names of other fds are not kept */
         }
+        uint64_t len = 0;
+        while (t[len]) len++;
+        if (len > bufsiz) len = bufsiz;
+        if (copy_to_user((void *)ubuf, t, len) != 0) return (uint64_t)-14;
+        return len;
+    }
+    if (path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c' &&
+        path[5] == '/' && path[6] == 's' && path[7] == 'e' && path[8] == 'l' && path[9] == 'f' &&
+        path[10] == '/' && path[11] == 'n' && path[12] == 's' && path[13] == '/') {
+        char t[64];
+        if (!sandbox_ns_link(path + 14, t, sizeof(t))) return (uint64_t)-2;
         uint64_t len = 0;
         while (t[len]) len++;
         if (len > bufsiz) len = bufsiz;
@@ -1512,6 +1549,7 @@ struct linux_cmsghdr { uint64_t cmsg_len; int32_t cmsg_level; int32_t cmsg_type;
 
 void process_teardown(Process *proc) {
     if (!proc || proc->pid == 0) return; /* never tear down the kernel process */
+    sandbox_teardown(proc);
 
     for (int i = 0; i < MAX_OPEN_FILES; i++) {
         VfsFile *f = proc->fd_table[i];
@@ -1595,12 +1633,27 @@ static void strace_line(uint64_t pid, uint64_t num, uint64_t a1, uint64_t a2, ui
 /* syscall_entry calls this: the dispatch, counted (Process.st_*) */
 uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
     uint64_t t0 = __builtin_ia32_rdtsc();
+    /* seccomp: the process's filters decide first (kernel/sandbox.c) --
+       on the way in from user space only: the kernel's own nested calls
+       (clone runs fork, vfork runs clone, setreuid runs setresuid) are
+       parts of the call that was allowed */
+    Thread *gate = sched_current();
+    if (!gate->in_syscall) {
+        Process *sp = gate->proc;
+        if (sp && sp->seccomp_mode) {
+            const uint64_t sa[6] = { a1, a2, a3, a4, a5, regs->r9 };
+            uint64_t sr;
+            if (seccomp_filter_syscall(num, sa, regs->rip, &sr)) return sr;
+        }
+    }
     if (!g_strace_state) strace_config();
     bool tr = g_strace_state == 2 && strace_wants(sched_current()->proc);
     uint64_t tpid = tr ? sched_current()->proc->pid : 0;
     if (tr && (num == 0 || num == 7 || num == 23 || num == 270 || num == 271 || num == 61 || num == 202 || num == 232 || num == 281))
         strace_line(tpid, num, a1, a2, a3, (uint64_t)-1000);   /* blocking calls: also on entry */
+    gate->in_syscall++;
     uint64_t r = syscall_dispatch(num, a1, a2, a3, a4, a5, regs);
+    gate->in_syscall--;
     if (tr) strace_line(tpid, num, a1, a2, a3, r);
     Process *p = sched_current()->proc;   /* after execve: the new image's */
     if (p) { p->st_syscalls++; p->st_sys_tsc += __builtin_ia32_rdtsc() - t0; }
@@ -1649,6 +1702,18 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                "return 0". */
             if (a3 != 0 && !user_prepare_write(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
+            }
+            if (a1 < MAX_OPEN_FILES && fd_table[a1] && fd_table[a1]->node.first_cluster == PROCNS_FD) {
+                char kb[64];
+                int64_t n = sandbox_proc_read((int)fd_table[a1]->current_cluster, kb, sizeof(kb));
+                VfsFile *pf = fd_table[a1];
+                if (n < 0) return (uint64_t)n;
+                if (pf->offset >= (uint64_t)n) return 0;
+                uint64_t c = (uint64_t)n - pf->offset;
+                if (c > a3) c = a3;
+                if (copy_to_user((void *)a2, kb + pf->offset, c) != 0) return (uint64_t)-14;
+                pf->offset += (uint32_t)c;
+                return c;
             }
             if (a1 < MAX_OPEN_FILES && fd_table[a1] && IS_DRM_DEV(fd_table[a1]->node.first_cluster)) {
                 return (uint64_t)drm_read(fd_table[a1]->current_cluster, a2, a3,
@@ -1804,6 +1869,13 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (is_kobj_fd(fd_table[a1])) {
                 UIoVecR v = { (const uint8_t *)a2, a3 };
                 return (uint64_t)kobj_writev(fd_table[a1], fd_oflags[a1], &v, 1);
+            }
+            if (fd_table[a1]->node.first_cluster == PROCNS_FD) {
+                if ((fd_oflags[a1] & 3) == LINUX_O_RDONLY) return (uint64_t)-9;
+                char kb[64];
+                if (a3 >= sizeof(kb)) return (uint64_t)-22;
+                if (copy_from_user(kb, (const void *)a2, a3) != 0) return (uint64_t)-14;
+                return (uint64_t)sandbox_proc_write((int)fd_table[a1]->current_cluster, kb, (uint32_t)a3);
             }
             if (fd_table[a1]->node.first_cluster == 0xFFFFFFFB || fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
                 uint32_t pipe_idx = fd_table[a1]->current_cluster;
@@ -1964,6 +2036,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int fd = get_free_fd(fd_table);
                 if (fd == -1) return (uint64_t)-24; /* -EMFILE */
                 if ((pe = open_tty_path(path_kbuf, linux_flags, fd_table, fd_flags, fd_oflags)) != 1) return (uint64_t)pe;
+                if ((pe = open_sandbox_proc(path_kbuf, linux_flags, fd_table, fd_flags, fd_oflags)) != 1) return (uint64_t)pe;
                 if ((pe = open_precheck(path_kbuf, linux_flags)) < 0) return (uint64_t)pe;
                 /* before opening: O_TRUNC acts inside vfs_open_flags */
                 if (!vfs_may_access(path_kbuf, ((vfs_flags & 0x01) ? 4u : 0u) |
@@ -2906,8 +2979,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             sched_dump_user_threads();
             return 0;
 
-        case 39: // SYS_getpid (Linux standard)
-            return sched_current()->proc->pid;
+        case 39: // SYS_getpid: as its pid namespace sees it
+            return pid_to_ns(sched_current()->proc->pid, sched_current()->proc);
 
         case 56: // SYS_clone (Linux standard)
             if (!(a1 & 0x00010000)) { /* no CLONE_THREAD: a new PROCESS */
@@ -2930,20 +3003,25 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    and we sleep until it execve()s or exits. Plain CLONE_VM
                    without VFORK stays a copy. */
                 bool vfork_mode = (a1 & 0x00000100) && (a1 & 0x00004000);
+                /* CLONE_NEWUSER/NEWPID/NEWNET... (kernel/sandbox.c) */
+                int64_t nsr = sandbox_clone_check(a1);
+                if (nsr) return (uint64_t)nsr;
                 uint64_t saved_rsp = regs->rsp;
                 if (a2) regs->rsp = a2;           /* child runs on the given stack */
                 g_fork_share_mm = vfork_mode;
+                g_last_fork_child = NULL;
                 uint64_t cpid = syscall_dispatcher(57, 0, 0, 0, 0, 0, regs);
                 g_fork_share_mm = false;
                 regs->rsp = saved_rsp;
-                if ((int64_t)cpid < 0) return cpid;
-                Process *cp = process_find_by_pid(cpid);
+                if ((int64_t)cpid < 0) { sandbox_clone_abort(); return cpid; }
+                Process *cp = g_last_fork_child;
+                if (cp) sandbox_clone_apply(cp, a1);
                 Thread *ct = cp ? cp->main_thread : NULL;
                 if (ct) {
-                    uint32_t ctidv = (uint32_t)ct->id;
+                    uint32_t ctidv = (uint32_t)pid_to_ns(ct->id, cp);   /* its own tid, as it sees it */
                     if ((a1 & 0x01000000) && a4) poke_user_u32(cp->pml4, a4, ctidv); /* CLONE_CHILD_SETTID */
                     if (a1 & 0x00200000) ct->clear_tid = (uint32_t *)a4;             /* CLONE_CHILD_CLEARTID */
-                    if ((a1 & 0x00100000) && a3) *(int *)(uintptr_t)a3 = (int)ctidv; /* CLONE_PARENT_SETTID */
+                    if ((a1 & 0x00100000) && a3) *(int *)(uintptr_t)a3 = (int)cpid;  /* CLONE_PARENT_SETTID: ours */
                 }
                 if (vfork_mode && cp) {
                     extern uint64_t timer_get_ms(void);
@@ -2966,6 +3044,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)-14; /* -EFAULT */
                 }
 
+                {
+                    int64_t tr = sandbox_thread_check(sched_current()->proc);
+                    if (tr) return (uint64_t)tr;
+                }
                 CloneArg *ca = (CloneArg *)kmalloc(sizeof(CloneArg));
                 ca->regs = *regs;
                 ca->regs.rsp = a2; // Child stack pointer
@@ -2975,6 +3057,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* a user thread's tid: from the pid space (it runs only
                    after this syscall returns: IF=0 here) */
                 t->id = process_alloc_pid();
+                pidns_register(t->id, sched_current()->proc);
+                uint64_t vtid = pid_to_ns(t->id, sched_current()->proc);   /* as the process sees it */
                 /* CLONE_SETTLS (0x80000): tls = a5, user half only (see
                    arch_prctl). Without the flag the child keeps ours. */
                 if (a1 & 0x80000) t->tls_base = (a5 < 0x0000800000000000ULL) ? a5 : 0;
@@ -2988,10 +3072,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 sched_current()->proc->thread_count++;
 
                 if (want_parent_tid && a3) {
-                    *(int *)(uintptr_t)a3 = (int)t->id;
+                    *(int *)(uintptr_t)a3 = (int)vtid;
                 }
                 if (want_child_tid && a4) {
-                    *(int *)(uintptr_t)a4 = (int)t->id;
+                    *(int *)(uintptr_t)a4 = (int)vtid;
                 }
                 if (a1 & 0x00200000) { // CLONE_CHILD_CLEARTID (0x80000 is CLONE_SETTLS)
                     /* Phase 22a: on this thread's death the kernel must zero
@@ -3006,7 +3090,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     t->clear_tid = (uint32_t *)a4;
                 }
 
-                return t->id;
+                return vtid;
             }
 
         case 57: // SYS_fork (Linux standard) -- real process duplication
@@ -3022,6 +3106,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    instead of paying a full eager memcpy of the parent's
                    entire address space at every fork() call. */
                 Process *parent = sched_current()->proc;
+                {
+                    int64_t fr = sandbox_fork_check(parent);   /* its pid namespace takes it */
+                    if (fr) { g_fork_share_mm = false; return (uint64_t)fr; }
+                }
 
                 /* vfork: the child borrows the parent's address space as-is
                    (no copy, no COW) -- see Process.vfork_shared. */
@@ -3064,6 +3152,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->vfork_released = !share_mm;
                 /* signal dispositions are inherited across fork() */
                 memcpy(child->sig_acts, parent->sig_acts, sizeof(parent->sig_acts));
+                /* seccomp, capabilities, chroot, namespaces (kernel/sandbox.c) */
+                sandbox_fork(child, parent);
+                g_last_fork_child = child;
                 /* Heap pages themselves were already deep-copied/COW-shared
                    by vmm_cow_clone_user_pages() above (they're ordinary
                    PAGE_USER leaves in that range, same as any other); this
@@ -3117,7 +3208,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 child->thread_count = 1;
 
 
-                return child->pid; /* parent's own return value: the child's real pid */
+                return pid_to_ns(child->pid, parent); /* the child's pid as the parent sees it */
             }
 
         case 59: // SYS_execve (Linux standard)
@@ -3329,10 +3420,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 {
                     VfsStat xst;
                     if (vfs_stat(kernel_path, &xst) && !xst.is_dir) {
-                        if (xst.mode & 04000) exec_proc->uid = exec_proc->suid = xst.uid;
-                        if (xst.mode & 02000) exec_proc->gid = exec_proc->sgid = xst.gid;
+                        /* not with no_new_privs, nor inside a user namespace
+                           (a chroot of its own could hold any setuid file) */
+                        if (!sandbox_exec_ignores_setid(exec_proc)) {
+                            if (xst.mode & 04000) exec_proc->uid = exec_proc->suid = xst.uid;
+                            if (xst.mode & 02000) exec_proc->gid = exec_proc->sgid = xst.gid;
+                        }
                     }
                 }
+                sandbox_exec(exec_proc);
                 signal_exec_reset(sched_current(), exec_proc);
                 serial_write_string("SYS_execve: Successfully loaded ELF. Entry = ");
                 char buf[32];
@@ -3423,7 +3519,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                because nothing compared it. musl calls this at pthread start
                as a belt-and-suspenders alternative to clone's ctid. */
             sched_current()->clear_tid = (uint32_t *)a1;
-            return (uint64_t)sched_current()->id;
+            return pid_to_ns(sched_current()->id, proc);
 
         case 229: // SYS_clock_getres(clock, struct timespec *): it returned the tid
             {
@@ -3634,9 +3730,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 105: // SYS_setuid(uid): root sets all three; others only the effective one, to an id they have
             {
                 Process *pr = sched_current()->proc;
-                if (pr->uid == 0) { pr->uid = pr->ruid = pr->suid = (uint32_t)a1; return 0; }
-                if ((uint32_t)a1 != pr->ruid && (uint32_t)a1 != pr->suid) return (uint64_t)-1; /* -EPERM */
-                pr->uid = (uint32_t)a1;
+                uint32_t nu = uid_from_ns(pr, (uint32_t)a1);   /* an id of its user namespace */
+                if (nu == (uint32_t)-1) return (uint64_t)-22;   /* -EINVAL: not mapped */
+                if (pr->uid == 0) { pr->uid = pr->ruid = pr->suid = nu; return 0; }
+                if (nu != pr->ruid && nu != pr->suid) return (uint64_t)-1; /* -EPERM */
+                pr->uid = nu;
                 return 0;
             }
 
@@ -4120,10 +4218,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
-        case 102: return proc->ruid;   // SYS_getuid
-        case 107: return proc->uid;    // SYS_geteuid
-        case 104: return proc->rgid;   // SYS_getgid
-        case 108: return proc->gid;    // SYS_getegid
+        /* ids as the process's user namespace sees them (kernel/sandbox.c) */
+        case 102: return uid_to_ns(proc, proc->ruid);   // SYS_getuid
+        case 107: return uid_to_ns(proc, proc->uid);    // SYS_geteuid
+        case 104: return gid_to_ns(proc, proc->rgid);   // SYS_getgid
+        case 108: return gid_to_ns(proc, proc->gid);    // SYS_getegid
 
         case 117: // SYS_setresuid(r, e, s) / 119 SYS_setresgid: -1 keeps one
         case 119:
@@ -4132,6 +4231,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint32_t *r = g ? &proc->rgid : &proc->ruid, *e = g ? &proc->gid : &proc->uid,
                          *sv = g ? &proc->sgid : &proc->suid;
                 uint32_t nr = (uint32_t)a1, ne = (uint32_t)a2, ns = (uint32_t)a3;
+                /* ids of our user namespace -> real ones; unmapped: EINVAL */
+                {
+                    uint32_t *w[3] = { &nr, &ne, &ns };
+                    for (int k = 0; k < 3; k++) {
+                        if (*w[k] == (uint32_t)-1) continue;
+                        *w[k] = g ? gid_from_ns(proc, *w[k]) : uid_from_ns(proc, *w[k]);
+                        if (*w[k] == (uint32_t)-1) return (uint64_t)-LNX_EINVAL;
+                    }
+                }
                 if (proc->uid != 0) {
                     /* unprivileged: only to ids it already has */
                     uint32_t ok[3] = { *r, *e, *sv };
@@ -4151,6 +4259,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 bool g = num == 120;
                 uint32_t v[3] = { g ? proc->rgid : proc->ruid, g ? proc->gid : proc->uid, g ? proc->sgid : proc->suid };
+                for (int k = 0; k < 3; k++) v[k] = g ? gid_to_ns(proc, v[k]) : uid_to_ns(proc, v[k]);
                 uint64_t up[3] = { a1, a2, a3 };
                 for (int k = 0; k < 3; k++)
                     if (up[k] && copy_to_user((void *)up[k], &v[k], 4) != 0) return (uint64_t)-14;
@@ -4162,32 +4271,38 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 bool g = num == 114;
                 uint32_t nr = (uint32_t)a1, ne = (uint32_t)a2;
-                uint32_t old_r = g ? proc->rgid : proc->ruid;
+                uint32_t old_r = g ? gid_to_ns(proc, proc->rgid) : uid_to_ns(proc, proc->ruid);
                 /* the saved id follows the effective one when the real one is set
                    or the effective one becomes something other than the real */
                 uint32_t ns = (nr != (uint32_t)-1 || (ne != (uint32_t)-1 && ne != old_r))
-                              ? (ne != (uint32_t)-1 ? ne : (g ? proc->gid : proc->uid)) : (uint32_t)-1;
+                              ? (ne != (uint32_t)-1 ? ne : (g ? gid_to_ns(proc, proc->gid) : uid_to_ns(proc, proc->uid))) : (uint32_t)-1;
                 return syscall_dispatcher(g ? 119 : 117, nr, ne, ns, 0, 0, regs);
             }
 
         case 106: // SYS_setgid(gid): root sets all three, others only the effective one
-            if (proc->uid == 0) { proc->gid = proc->rgid = proc->sgid = (uint32_t)a1; return 0; }
-            if ((uint32_t)a1 != proc->rgid && (uint32_t)a1 != proc->sgid) return (uint64_t)-1;
-            proc->gid = (uint32_t)a1;
-            return 0;
+            {
+                uint32_t ng = gid_from_ns(proc, (uint32_t)a1);
+                if (ng == (uint32_t)-1) return (uint64_t)-LNX_EINVAL;
+                if (proc->uid == 0) { proc->gid = proc->rgid = proc->sgid = ng; return 0; }
+                if (ng != proc->rgid && ng != proc->sgid) return (uint64_t)-1;
+                proc->gid = ng;
+                return 0;
+            }
 
         case 115: // SYS_getgroups(size, list)
             {
                 if ((int64_t)a1 < 0) return (uint64_t)-22;
                 if (a1 == 0) return proc->ngroups;
                 if (a1 < proc->ngroups) return (uint64_t)-22;
-                if (proc->ngroups && copy_to_user((void *)a2, proc->groups, proc->ngroups * 4) != 0) return (uint64_t)-14;
+                uint32_t vg[32];
+                for (uint32_t k = 0; k < proc->ngroups; k++) vg[k] = gid_to_ns(proc, proc->groups[k]);
+                if (proc->ngroups && copy_to_user((void *)a2, vg, proc->ngroups * 4) != 0) return (uint64_t)-14;
                 return proc->ngroups;
             }
 
         case 116: // SYS_setgroups(size, list): root only
             {
-                if (proc->uid != 0) return (uint64_t)-1;
+                if (proc->uid != 0 || sandbox_setgroups_denied(proc)) return (uint64_t)-1;
                 if (a1 > 32) return (uint64_t)-22;
                 uint32_t g[32];
                 if (a1 && copy_from_user(g, (const void *)a2, a1 * 4) != 0) return (uint64_t)-14;
@@ -4204,10 +4319,17 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (a2 && !user_prepare_write(a2, sizeof(int))) return (uint64_t)-14;
                 if (a4 && !user_prepare_write(a4, 144)) return (uint64_t)-14;
                 Process *c = NULL;
-                int64_t r = do_wait((int64_t)a1, (options & 1) /* WNOHANG */, true, &c);
+                int64_t wp = (int64_t)a1;
+                if (wp > 0 || wp < -1) {          /* a pid / a group of our namespace */
+                    uint64_t g = pid_from_ns((uint64_t)(wp > 0 ? wp : -wp), proc);
+                    if (!g) return (uint64_t)-10;  /* -ECHILD */
+                    wp = wp > 0 ? (int64_t)g : -(int64_t)g;
+                }
+                int64_t r = do_wait(wp, (options & 1) /* WNOHANG */, true, &c);
                 if (r > 0) {
                     if (a2) *(int *)(uintptr_t)a2 = c->wait_status;
                     if (a4) memset((void *)(uintptr_t)a4, 0, 144); /* no resource accounting */
+                    r = (int64_t)pid_to_ns((uint64_t)r, proc);
                 }
                 return (uint64_t)r;
             }
@@ -4218,8 +4340,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!(options & (4 | 2 | 8))) return (uint64_t)-LNX_EINVAL; /* WEXITED|WSTOPPED|WCONTINUED */
                 int64_t pid;
                 if (a1 == 0)      pid = -1;                                   /* P_ALL */
-                else if (a1 == 1) { if ((int64_t)a2 <= 0) return (uint64_t)-LNX_EINVAL; pid = (int64_t)a2; } /* P_PID */
-                else if (a1 == 2) pid = a2 ? -(int64_t)a2 : 0;              /* P_PGID */
+                else if (a1 == 1) {                                          /* P_PID */
+                    if ((int64_t)a2 <= 0) return (uint64_t)-LNX_EINVAL;
+                    pid = (int64_t)pid_from_ns(a2, proc);
+                    if (!pid) return (uint64_t)-10;                          /* -ECHILD */
+                }
+                else if (a1 == 2) {                                          /* P_PGID */
+                    pid = a2 ? -(int64_t)pid_from_ns(a2, proc) : 0;
+                    if (a2 && !pid) return (uint64_t)-10;
+                }
                 else return (uint64_t)-LNX_EINVAL;                            /* P_PIDFD: not supported */
                 if (a3 && !user_prepare_write(a3, 128)) return (uint64_t)-14;
                 if (a5 && !user_prepare_write(a5, 144)) return (uint64_t)-14;
@@ -4242,8 +4371,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         bool killed = (c->wait_status & 0x7F) != 0;
                         si[0] = 17;                                   /* si_signo = SIGCHLD */
                         si[2] = killed ? 2 : 1;                       /* si_code: CLD_KILLED / CLD_EXITED */
-                        si[4] = (int32_t)c->pid;                      /* si_pid */
-                        si[5] = (int32_t)c->uid;                      /* si_uid */
+                        si[4] = (int32_t)pid_to_ns(c->pid, proc);    /* si_pid */
+                        si[5] = (int32_t)uid_to_ns(proc, c->uid);     /* si_uid */
                         si[6] = killed ? (c->wait_status & 0x7F)      /* si_status */
                                        : ((c->wait_status >> 8) & 0xFF);
                     }
@@ -4258,18 +4387,21 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int sig = (int)a2;
                 if (sig < 0 || sig > 64) return (uint64_t)-LNX_EINVAL;
                 if (pid > 0) {
-                    Process *p = process_find_by_pid((uint64_t)pid);
+                    uint64_t gp = pid_from_ns((uint64_t)pid, proc);
+                    Process *p = gp ? process_find_by_pid(gp) : NULL;
                     if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
                     return (uint64_t)signal_process(p, sig);
                 }
                 /* groups (0: ours, < -1: -pid) and -1 (everyone we may
-                   signal except init-ish pid 0/1 and ourselves) */
-                uint64_t grp = pid == 0 ? proc->pgid : (uint64_t)(-pid);
+                   signal except init-ish pid 0/1 and ourselves) -- of what
+                   our pid namespace holds */
+                uint64_t grp = pid == 0 ? proc->pgid : pid_from_ns((uint64_t)(-pid), proc);
                 bool any = false, perm = false;
                 for (Process *p = process_list_head(); p; p = p->next) {
                     if (p->pid == 0 || p->reaped) continue;
+                    if (!pid_to_ns(p->pid, proc)) continue;
                     if (pid == -1) {
-                        if (p->pid == 1 || p == proc) continue;
+                        if (pid_to_ns(p->pid, proc) == 1 || p == proc) continue;
                     } else if (p->pgid != grp) {
                         continue;
                     }
@@ -4282,49 +4414,51 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
         case 109: // SYS_setpgid(pid, pgid)
             {
-                Process *p = a1 ? process_find_by_pid(a1) : proc;
-                if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
+                Process *p = a1 ? process_find_by_pid(pid_from_ns(a1, proc)) : proc;
+                if (!p || p->reaped || (a1 && !pid_from_ns(a1, proc))) return (uint64_t)-LNX_ESRCH;
                 if (p != proc && p->ppid != proc->pid) return (uint64_t)-LNX_ESRCH; /* self or a child */
                 if ((int64_t)a2 < 0) return (uint64_t)-LNX_EINVAL;
                 if (p->sid != proc->sid) return (uint64_t)-LNX_EPERM;
                 if (p->pid == p->sid) return (uint64_t)-LNX_EPERM;                 /* session leader */
-                p->pgid = a2 ? a2 : p->pid;
+                uint64_t gp = a2 ? pid_from_ns(a2, proc) : p->pid;
+                if (!gp) return (uint64_t)-LNX_EPERM;
+                p->pgid = gp;
                 return 0;
             }
 
         case 121: // SYS_getpgid(pid)
             {
-                Process *p = a1 ? process_find_by_pid(a1) : proc;
-                if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
-                return p->pgid;
+                Process *p = a1 ? process_find_by_pid(pid_from_ns(a1, proc)) : proc;
+                if (!p || p->reaped || (a1 && !pid_from_ns(a1, proc))) return (uint64_t)-LNX_ESRCH;
+                return pid_to_ns(p->pgid, proc);
             }
 
         case 111: // SYS_getpgrp
-            return proc->pgid;
+            return pid_to_ns(proc->pgid, proc);
 
         case 112: // SYS_setsid
             if (proc->pgid == proc->pid) return (uint64_t)-LNX_EPERM; /* already a group leader */
             proc->sid = proc->pgid = proc->pid;
             pty_detach(proc);   /* a new session starts without a terminal */
-            return proc->sid;
+            return pid_to_ns(proc->sid, proc);
 
         case 124: // SYS_getsid(pid)
             {
-                Process *p = a1 ? process_find_by_pid(a1) : proc;
-                if (!p || p->reaped) return (uint64_t)-LNX_ESRCH;
-                return p->sid;
+                Process *p = a1 ? process_find_by_pid(pid_from_ns(a1, proc)) : proc;
+                if (!p || p->reaped || (a1 && !pid_from_ns(a1, proc))) return (uint64_t)-LNX_ESRCH;
+                return pid_to_ns(p->sid, proc);
             }
 
         case 58: // SYS_vfork: clone(CLONE_VM | CLONE_VFORK | SIGCHLD)
             return syscall_dispatcher(56, 0x00000100 | 0x00004000 | 17, 0, 0, 0, 0, regs);
 
-        case 110: // SYS_getppid
-            return sched_current()->proc->ppid;
+        case 110: // SYS_getppid (0: the parent is outside our pid namespace)
+            return pid_to_ns(sched_current()->proc->ppid, proc);
 
         case 186: // SYS_gettid
             {
                 Thread *curr = sched_current();
-                return curr ? curr->id : 1;
+                return curr ? pid_to_ns(curr->id, proc) : 1;
             }
 
         case 228: // SYS_clock_gettime
@@ -4487,6 +4621,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 
                 if ((pe = open_tty_path(path, linux_flags, fd_table, fd_flags, fd_oflags)) != 1) return (uint64_t)pe;
+                if ((pe = open_sandbox_proc(path, linux_flags, fd_table, fd_flags, fd_oflags)) != 1) return (uint64_t)pe;
                 if ((pe = open_precheck(path, linux_flags)) < 0) return (uint64_t)pe;
                 {
                     uint32_t want = 0;
@@ -4622,6 +4757,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 } else {
                     tgid = a1; tid = a2; sig = (int)a3;
                 }
+                /* the ids of our pid namespace; outside it: no such thread */
+                tid = pid_from_ns(tid, proc);
+                if (tgid) tgid = pid_from_ns(tgid, proc);
+                if (!tid || (num == 234 && !tgid)) return (uint64_t)-3; /* -ESRCH */
                 if (!signal_raise_thread(tid, tgid, sig)) {
                     return (uint64_t)-3; /* -ESRCH */
                 }
@@ -4860,8 +4999,31 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 273: // SYS_set_robust_list (Linux standard)
             return 0;
 
-        case 157: // SYS_prctl (Linux standard)
-            return 0;
+        case 157: // SYS_prctl: no_new_privs, seccomp, names... (kernel/sandbox.c)
+            return (uint64_t)sandbox_prctl((int)a1, a2, a3, a4, a5);
+
+        case 317: // SYS_seccomp(op, flags, args)
+            return (uint64_t)sandbox_seccomp((uint32_t)a1, (uint32_t)a2, a3);
+
+        case 125: // SYS_capget(hdr, data)
+            return (uint64_t)sandbox_capget(a1, a2);
+
+        case 126: // SYS_capset(hdr, data)
+            return (uint64_t)sandbox_capset(a1, a2);
+
+        case 272: // SYS_unshare(flags): user, pid, net namespaces
+            return (uint64_t)sandbox_unshare(a1);
+
+        case 161: // SYS_chroot(path)
+            {
+                char cpath[MAX_PATH];
+                int64_t pe = user_path_at(AT_FDCWD_, a1, cpath);
+                if (pe < 0) return (uint64_t)pe;
+                return (uint64_t)sandbox_chroot(cpath);
+            }
+
+        case 308: // SYS_setns: joining another process's namespaces -- not supported
+            return (uint64_t)-22;   /* -EINVAL */
 
         case 7:   // SYS_poll (Linux standard) -- shares ppoll's implementation.
                    // a3 here is a plain int timeout_ms (poll()'s real third
@@ -5073,6 +5235,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
 
                 VfsFile *file = fd_table[fd];
+                /* an isolated network namespace has no IP network */
+                if (proc->netns && (file->node.first_cluster == SOCK_FD_TCP || file->node.first_cluster == SOCK_FD_UDP))
+                    return (uint64_t)-101;   /* -ENETUNREACH */
                 if (file->node.first_cluster == USOCK_FD) {
                     char name[108]; uint32_t nlen;
                     int64_t r = sun_from_user(a2, a3, name, &nlen);
@@ -5116,6 +5281,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
                 if (a3 != 0 && !user_check_read(a2, a3)) return -14; // EFAULT
                 VfsFile *file = fd_table[fd];
+                if (proc->netns && (file->node.first_cluster == SOCK_FD_TCP || file->node.first_cluster == SOCK_FD_UDP))
+                    return (uint64_t)-101;   /* -ENETUNREACH: an isolated network namespace */
 
                 if (file->node.first_cluster == USOCK_FD) {
                     char name[108]; uint32_t nlen = 0;
@@ -5221,6 +5388,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (mh.msg_iovlen > IOV_MAX_LOCAL) return (uint64_t)-22; // EINVAL
 
                 if (!fd_is_usock(fd_table, (uint64_t)fd)) {
+                    if (proc->netns && (fd_table[fd]->node.first_cluster == SOCK_FD_TCP ||
+                                        fd_table[fd]->node.first_cluster == SOCK_FD_UDP))
+                        return (uint64_t)-101;   /* -ENETUNREACH */
                     /* TCP/pipes etc.: no ancillary data here -- gather write */
                     return syscall_dispatcher(20, a1, mh.msg_iov, mh.msg_iovlen, 0, 0, regs);
                 }

@@ -8,6 +8,7 @@
  * first `ary login` creates it. The kernel reads and writes the file
  * itself (callers are unprivileged), via the root override of the VFS.
  */
+#include <wynland/sandbox.h>
 #include <wynland/auth.h>
 #include <wynland/sha256.h>
 #include <wynland/random.h>
@@ -56,7 +57,11 @@ static void derive(const uint8_t salt[8], const char *pw, uint8_t out[32])
 /* salt[8], hash[32] from the root line; false when there is none */
 static bool read_root(uint8_t salt[8], uint8_t hash[32])
 {
+    /* the system's file, whatever root the caller has: a chroot holding a
+       made-up rootpw must not decide who becomes root */
+    sandbox_real_root(true);
     VfsFile *f = vfs_open(AUTH_FILE);
+    sandbox_real_root(false);
     if (!f) return false;
     char line[128] = {0};
     int n = vfs_read(f, line, sizeof(line) - 1);
@@ -110,6 +115,7 @@ bool auth_set_root(const char *pw)
     line[87] = 0;
 
     g_vfs_root_override = (void *)sched_current();   /* this thread writes it, as root */
+    sandbox_real_root(true);                          /* to the system's file (chroot) */
     VfsStat st;
     if (!vfs_stat(AUTH_FILE, &st)) vfs_create(AUTH_FILE);
     /* root-only BEFORE the hash goes in: it used to be chmod'ed after the
@@ -118,6 +124,7 @@ bool auth_set_root(const char *pw)
     VfsFile *f = ok ? vfs_open_flags(AUTH_FILE, VFS_O_WRITE | VFS_O_TRUNC) : NULL;
     ok = false;
     if (f) { ok = vfs_write(f, line, 87) == 87; vfs_close(f); }
+    sandbox_real_root(false);
     g_vfs_root_override = NULL;
     return ok;
 }

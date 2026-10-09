@@ -73,6 +73,7 @@ Fo /dlsymtest.elf       build/dlsymtest.elf
 Fo /forktest.elf        build/forktest.elf
 Fo /sndtest.elf         build/sndtest.elf
 Fo /jittest.elf         build/jittest.elf
+Fo /sandboxtest.elf     build/sandboxtest.elf
 
 # wynrc: init, rc tools, services, runlevels
 D /sbin
@@ -86,6 +87,7 @@ D /etc/wynrc/runlevels
 F  /etc/wynrc/services/forktest rootfs/etc/wynrc/services/forktest
 F  /etc/wynrc/services/sndtest rootfs/etc/wynrc/services/sndtest
 F  /etc/wynrc/services/jittest rootfs/etc/wynrc/services/jittest
+F  /etc/wynrc/services/sandboxtest rootfs/etc/wynrc/services/sandboxtest
 F  /etc/wynrc/services/gltest rootfs/etc/wynrc/services/gltest
 F  /etc/wynrc/services/kmstest rootfs/etc/wynrc/services/kmstest
 F  /etc/wynrc/services/zerp rootfs/etc/wynrc/services/zerp

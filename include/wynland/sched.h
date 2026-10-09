@@ -86,6 +86,15 @@ typedef struct Thread {
          code was doing with the registers when it got preempted.
        Last fields on purpose: nothing before them moves. */
     uint64_t last_syscall;    /* the syscall this thread last entered (sched_dump_user_threads) */
+    /* seccomp SECCOMP_RET_TRAP: what the SIGSYS being delivered reports */
+    bool     sys_trap;
+    int32_t  sys_trap_nr;
+    uint32_t sys_trap_data;
+    uint64_t sys_trap_ip;
+    bool     fs_real_root;    /* path lookups ignore the process's chroot (kernel files) */
+    uint32_t in_syscall;      /* syscall_dispatcher() depth: >0 inside one (its own
+                                 nested calls -- clone's fork -- are not filtered again) */
+    char     comm[16];        /* prctl(PR_SET_NAME) */
     uint8_t fx_raw[FPU_AREA_MAX + 64];
     uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;

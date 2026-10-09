@@ -28,6 +28,9 @@ typedef struct SignalFrame {
                      rt_sigreturn so the code after the handler sees it */
     uint64_t mask;    /* the blocked set to go back to (rt_sigreturn) */
     struct SignalFrame *prev;   /* the frame of a handler this one interrupted */
+    uint64_t uc;                /* SA_SIGINFO: the ucontext on the user stack; rt_sigreturn
+                                   takes the registers back from it (a handler may change
+                                   them -- seccomp trap handlers set RAX, the result) */
     uint8_t fx[FPU_AREA_MAX]; /* the interrupted code's FPU state: the handler may
                         use those registers; rt_sigreturn puts it back */
 } SignalFrame;
@@ -235,14 +238,31 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
         while (1) __asm__ volatile("cli; hlt");
     }
     *(uint64_t *)(uintptr_t)sp = restorer; /* handler's RET target */
+    kf->uc = uc;
     if (si) {
         memset((void *)(uintptr_t)si, 0, (size_t)(uc + 1024 - si));
         int32_t *sif = (int32_t *)(uintptr_t)si;
         sif[0] = sig;                                   /* si_signo; si_code 0 = SI_USER */
+        if (sig == 31 && t->sys_trap) {                 /* SIGSYS from a seccomp filter */
+            sif[1] = (int32_t)t->sys_trap_data;         /* si_errno: SECCOMP_RET_DATA */
+            sif[2] = 1;                                 /* si_code: SYS_SECCOMP */
+            *(uint64_t *)(uintptr_t)(si + 16) = t->sys_trap_ip;   /* si_call_addr */
+            sif[6] = t->sys_trap_nr;                    /* si_syscall */
+            sif[7] = (int32_t)0xC000003E;               /* si_arch: AUDIT_ARCH_X86_64 */
+            t->sys_trap = false;
+        }
+        /* uc_mcontext.gregs[]: R8..R15, RDI, RSI, RBP, RBX, RDX, RAX,
+           RCX, RSP, RIP, EFL (RCX/R11 as sysret leaves them) */
+        uint64_t *g = (uint64_t *)(uintptr_t)uc + 5;
+        g[0] = kf->r8;  g[1] = kf->r9;  g[2] = kf->r10; g[3] = kf->r11;
+        g[4] = kf->r12; g[5] = kf->r13; g[6] = kf->r14; g[7] = kf->r15;
+        g[8] = kf->rdi; g[9] = kf->rsi; g[10] = kf->rbp; g[11] = kf->rbx;
+        g[12] = kf->rdx; g[13] = kf->rax; g[14] = kf->rip;
+        g[15] = kf->rsp; g[16] = kf->rip; g[17] = kf->rflags;
         uint64_t *ucq = (uint64_t *)(uintptr_t)uc;
-        ucq[5 + 15] = kf->rsp;                          /* uc_mcontext.gregs[REG_RSP] */
-        ucq[5 + 16] = kf->rip;                          /* gregs[REG_RIP] */
         ucq[37] = kf->mask >> 1;                        /* uc_sigmask (offset 296) */
+    } else {
+        t->sys_trap = false;
     }
 
     regs->rip = handler;
@@ -355,6 +375,27 @@ uint64_t signal_rt_return(void *regs_v) {
     memcpy(regs, &f->r15, 16 * 8);
     t->sig_frame = f->prev;
     t->sig_mask = f->mask & ~SIG_UNBLOCKABLE;
+    if (f->uc) {
+        /* what the handler left in its ucontext, as on Linux: the general
+           registers, RIP/RSP (user addresses only), the signal mask */
+        uint64_t g[18], umask;
+        if (copy_from_user(g, (const void *)(uintptr_t)(f->uc + 40), sizeof(g)) != 0 ||
+            copy_from_user(&umask, (const void *)(uintptr_t)(f->uc + 296), sizeof(umask)) != 0 ||
+            g[16] >= SIG_USER_LIMIT || g[15] >= SIG_USER_LIMIT) {
+            kfree(f);
+            process_mark_exited(t->proc, 11);
+            t->state = THREAD_STATE_TERMINATED;
+            serial_write_string("[signal] rt_sigreturn: bad ucontext\r\n");
+            sched_schedule();
+            while (1) __asm__ volatile("cli; hlt");
+        }
+        regs->r8 = g[0];  regs->r9 = g[1];  regs->r10 = g[2]; regs->r11 = g[3];
+        regs->r12 = g[4]; regs->r13 = g[5]; regs->r14 = g[6]; regs->r15 = g[7];
+        regs->rdi = g[8]; regs->rsi = g[9]; regs->rbp = g[10]; regs->rbx = g[11];
+        regs->rdx = g[12]; f->rax = g[13];
+        regs->rsp = g[15]; regs->rip = g[16];
+        t->sig_mask = (umask << 1) & ~SIG_UNBLOCKABLE;
+    }
     /* rax is not part of SyscallRegs (it travels in the dispatcher's return
        register): the syscall the handler interrupted had its result saved
        in the frame at delivery -- returning it here puts it back in RAX.

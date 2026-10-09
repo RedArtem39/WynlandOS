@@ -32,6 +32,7 @@
  * packing mistake fail the build instead of silently misreading disk.
  */
 
+#include <wynland/sandbox.h>
 #include <wynland/virtio_gpu.h>
 #include <wynland/virtgpu_drm.h>
 #include <wynland/vfs.h>
@@ -226,7 +227,9 @@ static uint32_t str_len_local(const char *s) {
 }
 
 /* Splits "/a/b/c" -> parent="/a/b", name="c"; "/f" -> "/", "f";
-   "f" -> "/", "f". Same semantics as the previous driver's helper. */
+   "f" -> "/", "f". Same semantics as the previous driver's helper.
+   `name` holds MAX_FILENAME bytes: a longer last component fails (it was
+   copied in whole, past the end of the caller's buffer). */
 static bool split_path(const char *path, char *parent, char *name) {
     int last_slash = -1;
     int len = 0;
@@ -235,7 +238,8 @@ static bool split_path(const char *path, char *parent, char *name) {
         len++;
     }
 
-    if (len == 0) return false;
+    if (len == 0 || len >= MAX_PATH) return false;
+    if (len - (last_slash + 1) >= MAX_FILENAME) return false;
 
     if (last_slash < 0) {
         str_copy(parent, "/");
@@ -255,6 +259,12 @@ static bool split_path(const char *path, char *parent, char *name) {
     parent[last_slash] = '\0';
     str_copy(name, path + last_slash + 1);
     return true;
+}
+
+/* ".", ".." and "" are not names to create, remove, rename or link:
+   ".." in a chroot's root is the real parent's entry */
+static bool dot_name(const char *b) {
+    return !b[0] || (b[0] == '.' && (!b[1] || (b[1] == '.' && !b[2])));
 }
 
 /* Helper: check if path ends with suffix */
@@ -1254,13 +1264,18 @@ static bool ext2_dir_name_of(const Ext2Inode *dir, uint32_t inum, char *name, ui
 
 /* The absolute path of directory inode `inum`, found the way getcwd()
    did on old Unixes: up through "..", looking each name up in the
-   parent. What getcwd() and the *at() calls' dirfds are resolved by. */
+   parent. What getcwd() and the *at() calls' dirfds are resolved by.
+   Relative to the calling process's root (chroot): a directory outside it
+   has no path (false) -- a descriptor kept from before a chroot() leads
+   nowhere. */
 bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap) {
     if (!g_group_desc || cap < 2) return false;
     char tmp[MAX_PATH];
     uint32_t pos = MAX_PATH - 1;      /* built backwards from the end */
     tmp[pos] = 0;
-    for (int depth = 0; inum != EXT2_ROOT_INO; depth++) {
+    const uint32_t root = sandbox_lookup_root();
+    for (int depth = 0; inum != root; depth++) {
+        if (inum == EXT2_ROOT_INO) return false;    /* reached the real root: outside */
         Ext2Inode dir, parent;
         uint32_t pinum;
         char name[MAX_FILENAME];
@@ -1771,9 +1786,11 @@ uint32_t ext2_read_symlink(const Ext2Inode *link, char *buf, uint32_t bufsize) {
 static bool ext2_lookup_from(uint32_t start_inum, const char *path,
                              uint32_t *out_inum, Ext2Inode *out_inode, int link_depth);
 
+/* Absolute paths start at the calling process's root (chroot()); ".."
+   there stays there, and absolute symlink targets start there too. */
 static bool ext2_lookup_path(const char *path, uint32_t *out_inum, Ext2Inode *out_inode) {
     if (!path || path[0] != '/') return false;
-    return ext2_lookup_from(EXT2_ROOT_INO, path, out_inum, out_inode, 0);
+    return ext2_lookup_from(sandbox_lookup_root(), path, out_inum, out_inode, 0);
 }
 
 static bool ext2_lookup_from(uint32_t start_inum, const char *path,
@@ -1803,6 +1820,19 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
 
         uint32_t next_inum;
         uint8_t  next_type;
+        /* only a directory has entries: a regular file's bytes were read as
+           ones -- a file holding a made-up entry for the real root led out
+           of any chroot */
+        if ((cur.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
+        /* ".." at the process's root: the root itself */
+        if (comp[0] == '.' && comp[1] == '.' && !comp[2] && cur_inum == sandbox_lookup_root()) {
+            if (last) {
+                *out_inum = cur_inum;
+                if (out_inode) *out_inode = cur;
+                return true;
+            }
+            continue;
+        }
         if (!ext2_dir_lookup(&cur, comp, &next_inum, &next_type)) return false;
 
         Ext2Inode next;
@@ -1826,7 +1856,7 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
             for (uint32_t i = 0; i < rl; i++) combined[tl + i] = rest[i];
             combined[tl + rl] = '\0';
 
-            uint32_t base = (target[0] == '/') ? EXT2_ROOT_INO : cur_inum;
+            uint32_t base = (target[0] == '/') ? sandbox_lookup_root() : cur_inum;
             return ext2_lookup_from(base, combined, out_inum, out_inode,
                                     link_depth + 1);
         }
@@ -2320,6 +2350,7 @@ bool vfs_mksock(const char *path) {
 static bool create_node(const char *path, uint16_t mode, uint8_t ft) {
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
+    if (dot_name(basename)) return false;
 
     uint32_t dir_inum;
     Ext2Inode dir;
@@ -2553,6 +2584,7 @@ bool vfs_set_readonly(const char *path) {
 bool vfs_mkdir(const char *path) {
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
+    if (dot_name(basename)) return false;
 
     uint32_t dir_inum;
     Ext2Inode dir;
@@ -2608,6 +2640,7 @@ bool vfs_delete(const char *path) {
        inode itself once its link count hits zero). */
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
+    if (dot_name(basename)) return false;
     uint32_t parent_inum;
     Ext2Inode parent;
     if (!ext2_lookup_path(dirname, &parent_inum, &parent)) return false;
@@ -2710,6 +2743,7 @@ int vfs_readlink(const char *path, char *buf, uint32_t cap) {
 bool vfs_symlink(const char *target, const char *linkpath) {
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     if (!split_path(linkpath, dirname, basename) || !basename[0]) return false;
+    if (dot_name(basename)) return false;
     uint32_t dinum, x;
     Ext2Inode dir;
     if (!ext2_lookup_path(dirname, &dinum, &dir)) return false;
@@ -2725,6 +2759,7 @@ int vfs_link(const char *oldpath, const char *newpath) {
     if (!ext2_lookup_nofollow(oldpath, &inum, &inode, NULL)) return -2;           /* -ENOENT */
     if ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) return -1;                    /* -EPERM */
     if (!split_path(newpath, dirname, basename) || !basename[0]) return -2;
+    if (dot_name(basename)) return -2;
     if (!ext2_lookup_path(dirname, &dinum, &dir)) return -2;
     if ((dir.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return -20;                     /* -ENOTDIR */
     if (ext2_dir_lookup(&dir, basename, &x, NULL)) return -17;                      /* -EEXIST */
@@ -2833,6 +2868,7 @@ bool vfs_rename(const char *oldpath, const char *newpath) {
     char new_dir[MAX_PATH], new_base[MAX_FILENAME];
     split_path(oldpath, old_dir, old_base);
     split_path(newpath, new_dir, new_base);
+    if (dot_name(old_base) || dot_name(new_base)) return false;
 
     uint32_t old_dir_inum, new_dir_inum, old_inum;
     Ext2Inode old_dir_inode, new_dir_inode, old_inode;

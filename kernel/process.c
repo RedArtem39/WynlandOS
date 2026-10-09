@@ -6,6 +6,7 @@
  * by pointer, see vmm_new_process_pml4()) and its own fd table.
  */
 #include <wynland/process.h>
+#include <wynland/sandbox.h>
 #include <wynland/signal.h>
 #include <wynland/sched.h>
 #include <wynland/vmm.h>
@@ -73,6 +74,7 @@ Process *process_list_head(void) {
 void process_mark_exited(Process *p, int wait_status) {
     if (!p || p->exited) return;
     p->wait_status = wait_status;
+    sandbox_on_exit(p);   /* a pid namespace's init: the rest of it dies too */
     p->exited = true;
 
     /* a vfork parent sleeping until we exec or die */
@@ -130,6 +132,8 @@ Process *process_spawn(const char *path, const char **argv, uint32_t uid) {
 }
 
 Process *process_spawn_env(const char *path, const char **argv, const char **envp, uint32_t uid, uint32_t gid) {
+    /* the caller's pid namespace takes one more (kernel/sandbox.c) */
+    if (sandbox_fork_check(sched_current()->proc) != 0) return NULL;
     PageTable *new_pml4 = vmm_new_process_pml4();
     if (!new_pml4) {
         serial_write_string("process_spawn: failed to allocate PML4\r\n");
@@ -164,6 +168,11 @@ Process *process_spawn_env(const char *path, const char **argv, const char **env
         p->sid  = sched_current()->proc->sid;
     }
     p->vfork_released = true; /* not a vfork child */
+    /* like fork + execve: the caller's seccomp filters, chroot and
+       namespaces carry over (kernel/sandbox.c); room for its pid was made
+       before it was created */
+    sandbox_fork(p, sched_current()->proc);
+    sandbox_exec(p);
 
     /* fd inheritance -- mirrors real execve() semantics: everything the
        caller has open carries over to the new process at the same fd

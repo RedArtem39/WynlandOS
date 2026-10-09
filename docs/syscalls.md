@@ -68,14 +68,14 @@ missing; anything not listed here is `-ENOSYS`.
 
 | # | call | notes |
 |---|------|-------|
-| 39, 110, 186 | `getpid`, `getppid`, `gettid` | |
+| 39, 110, 186 | `getpid`, `getppid`, `gettid` | as the caller's pid namespace sees them (`getppid` 0 when the parent is outside it); `kill`, `wait4`, `waitid`, `tgkill` and the group calls take and give these numbers too |
 | 56, 57, 58 | `clone`, `fork`, `vfork` | copy-on-write `fork`; threads via `CLONE_VM\|CLONE_THREAD` |
 | 59 | `execve` | ELF (static, dynamic, PIE) and `#!` scripts; setuid/setgid bits |
 | 60, 231 | `exit`, `exit_group` | |
 | 61, 247 | `wait4`, `waitid` | |
 | 98 | `getrusage` | CPU time |
 | 109, 111, 112, 121, 124 | `setpgid`, `getpgrp`, `setsid`, `getpgid`, `getsid` | |
-| 157 | `prctl` | accepted |
+| 157 | `prctl` | `PR_SET/GET_NO_NEW_PRIVS`, `PR_SET/GET_SECCOMP`, `PR_SET/GET_NAME`, `PR_SET/GET_DUMPABLE`, `PR_SET/GET_PDEATHSIG` (kept, not sent), `PR_CAPBSET_READ/DROP`; others accepted |
 | 158 | `arch_prctl` | `ARCH_SET_FS`/`GET_FS` |
 | 202 | `futex` | wait/wake queues, bitsets, requeue |
 | 218, 273, 334 | `set_tid_address`, `set_robust_list`, `rseq` | |
@@ -87,12 +87,30 @@ missing; anything not listed here is `-ENOSYS`.
 
 | # | call | notes |
 |---|------|-------|
-| 102, 104, 107, 108 | `getuid`, `getgid`, `geteuid`, `getegid` | |
+| 102, 104, 107, 108 | `getuid`, `getgid`, `geteuid`, `getegid` | as the caller's user namespace maps them (65534 when not mapped) |
 | 105, 106 | `setuid`, `setgid` | root sets all three ids, others the effective one |
 | 113, 114 | `setreuid`, `setregid` | |
 | 117–120 | `setresuid`, `setresgid`, `getresuid`, `getresgid` | |
 | 115, 116 | `getgroups`, `setgroups` | `setgroups` is root's |
 | 122, 123 | `setfsuid`, `setfsgid` | the effective id is the filesystem id |
+
+### Sandboxing
+
+`kernel/sandbox.c`; what differs from Linux is listed in
+`include/wynland/sandbox.h`.
+
+| # | call | notes |
+|---|------|-------|
+| 317 | `seccomp` | `SET_MODE_STRICT`, `SET_MODE_FILTER` (classic BPF, up to 4096 instructions, stacked; flags TSYNC/LOG/SPEC_ALLOW), `GET_ACTION_AVAIL`. Actions: KILL_PROCESS, KILL_THREAD (both kill the process with SIGSYS), TRAP (SIGSYS with `si_syscall`, `si_call_addr`, `si_arch`; the handler's `REG_RAX` is the result), ERRNO, LOG, ALLOW; TRACE and USER_NOTIF give `-ENOSYS`. Filters are per process (every thread), inherited by fork, spawn and execve; installing one needs no_new_privs or CAP_SYS_ADMIN |
+| 125, 126 | `capget`, `capset` | root has every capability, a user none; the creator of a user namespace has all of them inside it; `capset` only drops |
+| 161 | `chroot` | needs CAP_SYS_CHROOT (root, or inside a user namespace); moves the working directory to the new root; `..` stays at it, absolute symlinks start at it, directory fds from outside lead nowhere |
+| 272 | `unshare` | `CLONE_NEWUSER` (anyone; one-range uid/gid maps through `/proc/self/uid_map`, `gid_map`, `setgroups`), `CLONE_NEWPID` (children only; the first is pid 1, its death kills the rest), `CLONE_NEWNET` (no IP; abstract Unix sockets of its own); UTS/IPC/CGROUP/TIME accepted, isolating nothing; `CLONE_NEWNS` `-EINVAL` |
+| 56 | `clone` | the same `CLONE_NEW*` flags for the child |
+| 308 | `setns` | `-EINVAL` |
+
+`readlink("/proc/self/ns/user")` and the other namespaces give
+`user:[NNN]`, different for each namespace. With no_new_privs, or inside
+a user namespace, setuid and setgid bits do nothing at execve.
 
 ### Signals
 
@@ -144,7 +162,7 @@ missing; anything not listed here is `-ENOSYS`.
 | 97, 302 | `getrlimit`, `prlimit64` | fixed limits; setting is accepted |
 | 99 | `sysinfo` | |
 | 318 | `getrandom` | |
-| 444–446 | `landlock_*` | `-ENOSYS` |
+| 444–446 | `landlock_*` | `-ENOSYS` (callers fall back to the sandboxing above) |
 
 ## WynlandOS calls (400 and up)
 

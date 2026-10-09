@@ -63,6 +63,8 @@ libav, VP8/9, AV1); sound through an Intel HD Audio driver (`/dev/dsp`).
   permissions, a working directory and the `*at()` calls.
 - Pseudo-terminals with a real line discipline (`/dev/ptmx`, `/dev/pts/N`,
   canonical mode, ^C to the foreground group, `SIGWINCH`).
+- Sandboxing, as browsers build theirs: seccomp-bpf, no_new_privs,
+  capabilities, chroot, and user, pid and network namespaces.
 - Networking: virtio-net, ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS; Unix domain
   sockets with fd passing; `poll`, `select`, `epoll`, `eventfd`, `timerfd`,
   `memfd`.
@@ -93,7 +95,8 @@ leave parts out.
 (`tests/`): process lifecycle (`forktest`), OpenGL on the GPU (`gltest`), KMS
 page flips (`kmstest`), sound, the JIT memory policy, GStreamer playback,
 WebKit pages including YouTube (`wpetest`), and the shell, coreutils and
-Python (`shtest`). `AUTOTEST=sh` runs just the last one.
+Python (`shtest`), and the sandboxing (`sandboxtest`). `AUTOTEST=sh` and
+`AUTOTEST=sandbox` run just one of those.
 
 ## Layout
 

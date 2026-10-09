@@ -3,6 +3,7 @@
  * (include/wynland/tty.h)
  */
 
+#include <wynland/sandbox.h>
 #include <wynland/tty.h>
 #include <wynland/types.h>
 #include <wynland/heap.h>
@@ -443,7 +444,7 @@ int64_t pty_ioctl(int idx, bool master, uint64_t req, uint64_t argp) {
         return 0;
     }
     case 0x540F: { /* TIOCGPGRP */
-        int32_t g = (int32_t)p->fg_pgrp;
+        int32_t g = (int32_t)pid_to_ns(p->fg_pgrp, me);
         if (!master && pty_ctty(me) != idx) return -25;
         if (copy_to_user((void *)argp, &g, 4) != 0) return -14;
         return 0;
@@ -453,11 +454,19 @@ int64_t pty_ioctl(int idx, bool master, uint64_t req, uint64_t argp) {
         if (copy_from_user(&g, (const void *)argp, 4) != 0) return -14;
         if (g <= 0) return -22;
         if (!master && pty_ctty(me) != idx) return -25;
-        p->fg_pgrp = (uint64_t)g;
+        /* a group of the caller's pid namespace, in this terminal's session
+           (it let a sandboxed process aim ^C at any group of the system) */
+        uint64_t gg = pid_from_ns((uint64_t)g, me);
+        if (!gg) return -1;                                   /* -EPERM */
+        bool found = false;
+        for (Process *q = process_list_head(); q && !found; q = q->next)
+            if (!q->exited && q->pgid == gg && (!p->session || q->sid == p->session)) found = true;
+        if (!found) return -1;
+        p->fg_pgrp = gg;
         return 0;
     }
     case 0x5429: { /* TIOCGSID */
-        int32_t s = (int32_t)p->session;
+        int32_t s = (int32_t)pid_to_ns(p->session, me);
         if (!s) return -25;
         if (copy_to_user((void *)argp, &s, 4) != 0) return -14;
         return 0;

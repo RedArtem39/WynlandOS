@@ -35,6 +35,7 @@
 #include <wynland/signal.h>
 #include <wynland/kfile.h>
 #include <wynland/unix_socket.h>
+#include <wynland/sandbox.h>
 
 extern uint64_t timer_get_ms(void);
 
@@ -98,6 +99,7 @@ typedef struct USock {
     int      npend;
     bool     bound;
     uint16_t name_len;
+    uint32_t scope;                /* whose name it is: name_scope() */
     char     name[USOCK_NAME_MAX];
     struct UCred cred;       /* creator's */
     struct UCred peer_cred;  /* peer's, captured at connect/socketpair time */
@@ -249,9 +251,18 @@ static bool name_eq(const USock *s, const char *name, uint32_t len) {
     return true;
 }
 
+/* Whose names: a filesystem name belongs to the root it was bound under
+   (a chroot's "/tmp/x" is not the host's), an abstract one to the network
+   namespace (as on Linux). */
+static uint32_t name_scope(const char *name, uint32_t len) {
+    if (len && name[0] == '\0') return 0x80000000u | sandbox_netns(sched_current()->proc);
+    return sandbox_lookup_root();
+}
+
 static USock *find_bound(const char *name, uint32_t len) {
+    uint32_t scope = name_scope(name, len);
     for (int i = 0; i < USOCK_SLOTS; i++) {
-        if (g_usock[i] && name_eq(g_usock[i], name, len)) return g_usock[i];
+        if (g_usock[i] && g_usock[i]->scope == scope && name_eq(g_usock[i], name, len)) return g_usock[i];
     }
     return NULL;
 }
@@ -274,6 +285,7 @@ int64_t usock_bind(int idx, const char *name, uint32_t len) {
     if (find_bound(name, len)) return -EADDRINUSE;
     kmemcpy(s->name, name, len);
     s->name_len = (uint16_t)len;
+    s->scope = name_scope(name, len);
     s->bound = true;
     return 0;
 }
@@ -321,6 +333,7 @@ int64_t usock_connect(int idx, const char *name, uint32_t len, bool nonblock) {
             srv->cred = l->cred;           /* server end belongs to the listener's owner */
             kmemcpy(srv->name, l->name, l->name_len);
             srv->name_len = l->name_len;   /* getsockname() on the accepted fd */
+            srv->scope = l->scope;
             link_pair(s, srv);
             srv->refs = 0;                 /* owned by the listener until accept() */
             l->pend[l->npend++] = srv;

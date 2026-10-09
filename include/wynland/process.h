@@ -133,6 +133,21 @@ typedef struct Process {
     uint64_t   st_user_ticks, st_kernel_ticks;
     uint64_t   st_faults, st_fault_tsc;
     uint64_t   st_syscalls, st_sys_tsc;
+    /* ---- sandbox (kernel/sandbox.c, include/wynland/sandbox.h); all
+       zero for an ordinary process, inherited by fork() and spawn ---- */
+    struct SeccompFilter *seccomp;   /* the newest filter; ->prev the older ones */
+    uint8_t    seccomp_mode;         /* 0 off, 1 strict, 2 filter */
+    bool       no_new_privs;         /* prctl(PR_SET_NO_NEW_PRIVS): setuid bits do nothing */
+    bool       caps_set;             /* capabilities given/changed: cap_* hold them;
+                                        else root (outside any user namespace) has all */
+    uint64_t   cap_eff, cap_prm, cap_inh;
+    uint32_t   root_inum;            /* chroot(): lookups start there; 0 = the real root */
+    struct UserNs *userns;           /* NULL: the initial user namespace */
+    struct PidNs  *pidns;            /* where it is (NULL: the initial one) */
+    struct PidNs  *pidns_child;      /* where its children go (unshare(CLONE_NEWPID)) */
+    uint32_t   netns;                /* 0: the host's network; else isolated (no IP) */
+    bool       nondumpable;          /* prctl(PR_SET_DUMPABLE, 0) */
+    int        pdeathsig;            /* prctl(PR_SET_PDEATHSIG): kept, not sent */
     struct Process *next;
 } Process;
 
