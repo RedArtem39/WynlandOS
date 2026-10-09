@@ -1,0 +1,17 @@
+WynlandOS wallpapers
+
+The photos are from Unsplash (https://unsplash.com), under the Unsplash
+License (https://unsplash.com/license): free to use, copy, modify and
+distribute. Cropped to 16:9 and scaled to 1920x1080.
+
+  peaks.png    Daniel Leone     https://unsplash.com/photos/v7daTKlZzaw
+               (the default)
+  fuji.png     Clay Banks       https://unsplash.com/photos/u27Rrbs9Dwc
+  summit.png   Tyler Lastovich  https://unsplash.com/photos/ddLiNMqWAOM
+
+spiral.png is generated at build time from the WynlandOS logo
+(tools/gen_wallpaper.py) and is part of WynlandOS (GPL-2.0-or-later).
+
+Found through ilyamiro's wallpaper collection
+(https://github.com/ilyamiro/shell-wallpapers); only the photos whose
+source and license are known were taken.

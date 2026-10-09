@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WynlandOS default wallpaper: near black, a little film grain, a soft
+"""WynlandOS logo wallpaper (spiral.png beside the photos): near black, a little film grain, a soft
 vignette, and the WynlandOS spiral (rootfs/usr/share/wynland/logo.png)
 dimmed in the lower right corner. The palette is the logo's blue on
 black -- nothing else.

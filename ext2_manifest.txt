@@ -27,6 +27,8 @@ D /etc/skel/Documents
 D /etc/skel/Downloads
 D /etc/skel/Pictures
 D /etc/skel/Projects
+D /etc/skel/.config
+D /etc/skel/.config/foot
 D /etc/hypr
 D /lib64
 D /lib64/dri
@@ -38,6 +40,8 @@ D /etc/glvnd/egl_vendor.d
 D /usr
 D /usr/bin
 D /usr/share
+D /usr/share/wynland
+D /usr/share/wynland/wallpapers
 D /usr/share/glvnd
 D /usr/share/glvnd/egl_vendor.d
 D /usr/lib
@@ -91,6 +95,12 @@ Fo /kmstest.elf         build/kmstest.elf
 Fo /zerp_files.elf      build/zerp_files.elf
 Fo /zerp_term.elf       build/zerp_term.elf
 Fo /wall.png            build/wall.png
+# the wallpapers (photos from Unsplash: see wallpapers/CREDITS)
+F  /usr/share/wynland/wallpapers/peaks.png   rootfs/usr/share/wynland/wallpapers/peaks.png
+F  /usr/share/wynland/wallpapers/fuji.png    rootfs/usr/share/wynland/wallpapers/fuji.png
+F  /usr/share/wynland/wallpapers/summit.png  rootfs/usr/share/wynland/wallpapers/summit.png
+F  /usr/share/wynland/wallpapers/CREDITS     rootfs/usr/share/wynland/wallpapers/CREDITS
+F  /usr/share/wynland/wallpapers/spiral.png  build/wall-spiral.png
 
 # ---- staged application regression binaries ----
 # Real musl-static programs exercising distinct syscall mixes; the
@@ -1498,6 +1508,7 @@ Fo /test_blockio.elf build/test_blockio.elf
 # the home skeleton: /etc/skel, copied into every new home (useradd)
 F  /etc/skel/README.txt            rootfs/etc/skel/README.txt
 F  /etc/skel/Pictures/wallpaper.png build/wall.png
+F  /etc/skel/.config/foot/foot.ini rootfs/etc/skel/.config/foot/foot.ini
 
 # permissions beyond the defaults (root, 0755 dirs/programs, 0644 files)
 P /tmp 0 41777

@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -417,6 +418,56 @@ int main(int argc, char **argv)
                 check(intact, "unlinked mapped file still reads its own data");
                 if (m != MAP_FAILED) munmap(m, 64 * 4096);
                 unlink("/tmp/forktest-other");
+
+                /* an open file outlives its name too: created, unlinked, then
+                   sized, written, mapped and read through its fd (mkstemp +
+                   unlink, as Qt makes the Wayland keymap) -- and a dup of
+                   the fd keeps it after the first is closed */
+                char tmpl[] = "/tmp/forktest-anonXXXXXX";
+                int af = mkstemp(tmpl);
+                unlink(tmpl);
+                int okf = af >= 0 && ftruncate(af, 8192) == 0 && pwrite(af, "keymap", 7, 4096) == 7;
+                int af2 = okf ? dup(af) : -1;
+                if (af >= 0) close(af);
+                unsigned char *am = af2 >= 0 ? mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, af2, 0) : MAP_FAILED;
+                okf = okf && am != MAP_FAILED && !memcmp(am + 4096, "keymap", 7);
+                if (am != MAP_FAILED) munmap(am, 8192);
+                if (af2 >= 0) close(af2);
+                check(okf, "unlinked open file still usable through its fds");
+
+                /* MAP_SHARED of a file is shared: code written through one
+                   mapping shows in another (GStreamer's orc JIT maps its
+                   file RW and RX), in a forked child, and in the file after
+                   msync() */
+                char shp[] = "/tmp/forktest-sharedXXXXXX";
+                int sf = mkstemp(shp);
+                unlink(shp);
+                int oks = sf >= 0 && ftruncate(sf, 8192) == 0;
+                unsigned char *rw = oks ? mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, sf, 0) : MAP_FAILED;
+                unsigned char *ro = oks ? mmap(NULL, 8192, PROT_READ, MAP_SHARED, sf, 0) : MAP_FAILED;
+                oks = oks && rw != MAP_FAILED && ro != MAP_FAILED;
+                if (oks) {
+                    memcpy(rw + 100, "jit code", 9);
+                    check(!memcmp(ro + 100, "jit code", 9), "MAP_SHARED: two mappings of a file see each other");
+                    pid_t sc = fork();
+                    if (sc == 0) { memcpy(rw + 4096, "from child", 11); _exit(0); }
+                    int sst;
+                    waitpid(sc, &sst, 0);
+                    check(!memcmp(ro + 4096, "from child", 11), "MAP_SHARED: a child's writes reach the parent");
+                    char fb[16] = {0};
+                    check(msync(rw, 8192, MS_SYNC) == 0 && pread(sf, fb, 9, 100) == 9 && !strcmp(fb, "jit code"),
+                          "MAP_SHARED: msync() writes the file");
+                } else {
+                    check(0, "MAP_SHARED: two mappings of a file see each other");
+                }
+                if (rw != MAP_FAILED) munmap(rw, 8192);
+                if (ro != MAP_FAILED) munmap(ro, 8192);
+                if (sf >= 0) close(sf);
+                int rof = open("/etc/hosts", O_RDONLY);
+                void *bad = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, rof, 0);
+                check(bad == MAP_FAILED && errno == EACCES, "MAP_SHARED writable needs a writable fd");
+                if (bad != MAP_FAILED) munmap(bad, 4096);
+                close(rof);
             }
             /* normal anonymous mappings still work */
             char *a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -426,18 +477,23 @@ int main(int argc, char **argv)
                 check(munmap(a, 1 << 20) == 0, "munmap of own mapping works");
             }
         }
-        /* permissions: a user (uid 1000) can't write /etc, can write /tmp
-           and its home, can't read /etc/shadow, can't setuid(0) */
+        /* permissions: a user (the test account, tester) can't write /etc,
+           can write /tmp and its home, can't read /etc/shadow, can't
+           setuid(0) */
         if (getuid() != 0) {
+            const struct passwd *me = getpwuid(getuid());
+            char home[256], probe[300];
+            snprintf(home, sizeof home, "%s", me ? me->pw_dir : "/nonexistent");
+            snprintf(probe, sizeof probe, "%s/.forktest-perm", home);
             FILE *f = fopen("/etc/forktest-perm", "w");
             check(f == NULL, "user cannot create files in /etc");
             if (f) { fclose(f); unlink("/etc/forktest-perm"); }
             f = fopen("/tmp/forktest-perm", "w");
             check(f != NULL, "user can create files in /tmp");
             if (f) { fclose(f); check(unlink("/tmp/forktest-perm") == 0, "user can delete its file in /tmp"); }
-            f = fopen("/home/user/.forktest-perm", "w");
-            check(f != NULL, "user can create files in /home/user");
-            if (f) { fclose(f); unlink("/home/user/.forktest-perm"); }
+            f = fopen(probe, "w");
+            check(f != NULL, "user can create files in its home");
+            if (f) { fclose(f); unlink(probe); }
             check(unlink("/etc/hosts") != 0 && access("/etc/hosts", F_OK) == 0, "user cannot delete /etc files");
             check(mkdir("/tmp/forktest-d", 0755) == 0, "mkdir in /tmp");
             f = fopen("/tmp/forktest-d/a", "w");
@@ -448,7 +504,7 @@ int main(int argc, char **argv)
             unlink("/tmp/forktest-d/b");
             check(rmdir("/tmp/forktest-d") == 0, "rmdir");
             struct stat hs, es;
-            check(stat("/home/user", &hs) == 0 && hs.st_uid == 1000 && (hs.st_mode & 0777) == 0755 &&
+            check(stat(home, &hs) == 0 && hs.st_uid == getuid() && (hs.st_mode & 0777) == 0700 &&
                   hs.st_mtime > 1600000000, "stat: real owner, mode and mtime");
             check(stat("/etc/hosts", &es) == 0 && es.st_uid == 0 && (es.st_mode & 0777) == 0644, "stat: /etc/hosts root 0644");
             check(stat("/tmp", &es) == 0 && (es.st_mode & 07777) == 01777, "stat: /tmp is 1777");
@@ -464,16 +520,9 @@ int main(int argc, char **argv)
         if (strstr(cfg, "authtest=1") && getuid() != 0) {
             check(syscall(414) == 0, "ary: no superuser on a fresh disk");
             check(syscall(409, "x") == -1 && errno == ENOENT, "ary su without a superuser -> ENOENT");
-            check(syscall(413, "s3cret", 0) == 0, "ary login creates the superuser");
-            check(syscall(414) == 1, "ary: superuser exists now");
-            check(syscall(413, "evil", 0) != 0, "a user cannot overwrite it");
+            check(syscall(413, "evil", 0) != 0 && syscall(414) == 0, "a user cannot set the first root password");
             check(access("/etc/shadow", R_OK) != 0, "/etc/shadow unreadable for users");
-            check(syscall(409, "wrong") != 0 && getuid() != 0, "wrong password refused");
-            check(syscall(409, "s3cret") == 0 && getuid() == 0, "ary su -> root");
-            FILE *f = fopen("/etc/forktest-root", "w");
-            check(f != NULL, "root can write /etc");
-            if (f) { fclose(f); unlink("/etc/forktest-root"); }
-            check(setuid(1000) == 0 && getuid() == 1000, "exit -> back to user");
+            check(syscall(409, "evil") != 0 && getuid() != 0, "and so cannot elevate");
         }
         /* real network: DNS (musl resolver -> /etc/resolv.conf), TCP, TLS */
         rc = run_capture("/usr/bin/curl", "-sI", "https://example.com/", out, sizeof(out));

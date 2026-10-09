@@ -446,7 +446,7 @@ PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf 
 WITH_QT6 ?= 1
 ifeq ($(WITH_QT6),1)
 QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
-$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
 	@bash tools/stage_qt6.sh
 else
 QT6_MANIFEST =
@@ -519,7 +519,7 @@ $(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MA
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
-$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf
+$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 
@@ -655,7 +655,13 @@ check-tools:
 # every object that was not edited compiled against the old layout.
 -include $(shell find $(BUILD) -name "*.d" 2>/dev/null)
 
-# Default wallpaper (/wall.png), generated
-$(BUILD)/wall.png: tools/gen_wallpaper.py rootfs/usr/share/wynland/logo.png
+# Default wallpaper (/wall.png): one of the photos in
+# rootfs/usr/share/wynland/wallpapers (WALLPAPER=fuji, summit, ...); the
+# generated logo one (spiral) is installed beside them
+WALLPAPER ?= peaks
+$(BUILD)/wall.png: rootfs/usr/share/wynland/wallpapers/$(WALLPAPER).png
+	@mkdir -p $(BUILD)
+	@cp $< $@
+$(BUILD)/wall-spiral.png: tools/gen_wallpaper.py rootfs/usr/share/wynland/logo.png
 	@mkdir -p $(BUILD)
 	@python3 tools/gen_wallpaper.py $@

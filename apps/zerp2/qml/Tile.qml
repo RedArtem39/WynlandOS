@@ -1,7 +1,9 @@
-// One Zerp client as a tile: its pixels, rounded by corner caps in the
+// One window as a tile: a Zerp client's pixels (ZSurface) or a Wayland
+// client's surface (ShellSurfaceItem), rounded by corner caps in the
 // border colour, a gradient border when focused, animated into place (and
 // sideways on workspace switches). No layers: animating stays cheap.
 import QtQuick
+import QtWayland.Compositor
 import Zerp
 
 Item {
@@ -63,16 +65,45 @@ Item {
         gy: tile.y + surface.y
     }
 
-    ZSurface {
+    Loader {
         id: surface
         anchors { fill: parent; margins: tile.cornerRadius > 0 ? tile.borderWidth : 0 }
-        client: tile.client
-        onPressed: zerp.focus(tile.client)
+        sourceComponent: tile.client && tile.client.wayland ? waylandSurface : zerpSurface
+    }
 
-        // rounded corners: caps in the border colour over the content
-        Corner { visible: tile.cornerRadius > 0; width: tile.cornerRadius; height: width; corner: 0; fill: tile.edgeLeft; x: 0; y: 0 }
-        Corner { visible: tile.cornerRadius > 0; width: tile.cornerRadius; height: width; corner: 1; fill: tile.edgeRight; x: parent.width - width; y: 0 }
-        Corner { visible: tile.cornerRadius > 0; width: tile.cornerRadius; height: width; corner: 2; fill: tile.edgeRight; x: parent.width - width; y: parent.height - height }
-        Corner { visible: tile.cornerRadius > 0; width: tile.cornerRadius; height: width; corner: 3; fill: tile.edgeLeft; x: 0; y: parent.height - height }
+    Component {
+        id: zerpSurface
+        ZSurface {
+            client: tile.client
+            onPressed: zerp.focus(tile.client)
+        }
+    }
+
+    Component {
+        id: waylandSurface
+        Item {
+            clip: true
+            Rectangle { anchors.fill: parent; color: "#0b0d11" }   // until the first frame
+            ShellSurfaceItem {
+                shellSurface: tile.client.shellSurface
+                autoCreatePopupItems: true    // menus, tooltips
+                moveItem: pinned              // an interactive move request moves nothing
+                TapHandler {
+                    acceptedButtons: Qt.AllButtons
+                    onPressedChanged: if (pressed) zerp.focus(tile.client)
+                }
+            }
+            Item { id: pinned }
+        }
+    }
+
+    // rounded corners: caps in the border colour over the content
+    Item {
+        anchors.fill: surface
+        visible: tile.cornerRadius > 0
+        Corner { width: tile.cornerRadius; height: width; corner: 0; fill: tile.edgeLeft; x: 0; y: 0 }
+        Corner { width: tile.cornerRadius; height: width; corner: 1; fill: tile.edgeRight; x: parent.width - width; y: 0 }
+        Corner { width: tile.cornerRadius; height: width; corner: 2; fill: tile.edgeRight; x: parent.width - width; y: parent.height - height }
+        Corner { width: tile.cornerRadius; height: width; corner: 3; fill: tile.edgeLeft; x: 0; y: parent.height - height }
     }
 }

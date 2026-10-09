@@ -1,22 +1,29 @@
-// WynlandOS - Zerp 2.0: client hosting (Zerp protocol) for the Qt Quick WM.
+// WynlandOS - Zerp 2.0: client hosting for the Qt Quick WM.
 //
-// A client is an ordinary Zerp client process (zerp_term, zerp_files, the
-// Qt apps through the qwynlandfb plugin): spawned with a c2s pipe, an s2c
-// pipe and a shared-memory pixel buffer (argv[1..3]), it renders into the
-// buffer at the size of its TILE_RECT and reports DAMAGE. Here every
-// client is a QML item (ZSurface) showing that buffer as a texture; QML
-// owns the layout (tiling, workspaces, animations) and tells each client
-// its size.
+// Two kinds of clients, tiled alike:
+//  - Zerp clients (zerp_term, the Qt apps through the qwynlandfb plugin):
+//    spawned with a c2s pipe, an s2c pipe and a shared-memory pixel buffer
+//    (argv[1..3]), they render into the buffer at the size of their
+//    TILE_RECT and report DAMAGE; a ZSurface item shows the buffer.
+//  - Wayland clients (any program speaking xdg-shell; Shell.qml runs the
+//    compositor): a ShellSurfaceItem shows the surface, the size goes out
+//    as an xdg_toplevel configure.
+// QML owns the layout (tiling, workspaces, animations) and tells each
+// client its size.
 #pragma once
 
 #include <QtCore/QAbstractListModel>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QObject>
+#include <QtCore/QPointer>
 #include <QtCore/QRect>
+#include <QtCore/QSize>
 #include <QtCore/QTimer>
 #include <QtCore/QVector>
 #include <QtQuick/QQuickItem>
 #include <cstdint>
+
+class QWaylandXdgToplevel;
 
 extern "C" {
 #include "../../zerp_protocol.h"
@@ -26,8 +33,11 @@ class ZClient : public QObject
 {
     Q_OBJECT
     Q_PROPERTY(int id READ id CONSTANT)
-    Q_PROPERTY(QString title READ title CONSTANT)
-    Q_PROPERTY(QString appId READ appId CONSTANT)
+    Q_PROPERTY(QString title READ title NOTIFY titleChanged)
+    Q_PROPERTY(QString appId READ appId NOTIFY titleChanged)
+    /* a Wayland client: shellSurface is its QWaylandXdgSurface */
+    Q_PROPERTY(bool wayland READ wayland CONSTANT)
+    Q_PROPERTY(QObject *shellSurface READ shellSurface CONSTANT)
     Q_PROPERTY(int workspace READ workspace WRITE setWorkspace NOTIFY workspaceChanged)
     Q_PROPERTY(bool focused READ focused NOTIFY focusedChanged)
     Q_PROPERTY(bool fullscreen READ fullscreen WRITE setFullscreen NOTIFY fullscreenChanged)
@@ -35,6 +45,7 @@ class ZClient : public QObject
     Q_PROPERTY(bool alpha READ alpha NOTIFY alphaChanged)
 public:
     ZClient(int id, const QString &path, QObject *parent);
+    ZClient(int id, QObject *xdgSurface, QObject *parent);   // a Wayland toplevel
     ~ZClient() override;
 
     bool start(uint32_t shmBytes);
@@ -44,10 +55,12 @@ public:
     int workspace() const { return m_workspace; }
     void setWorkspace(int w) { if (w != m_workspace) { m_workspace = w; emit workspaceChanged(); } }
     bool focused() const { return m_focused; }
-    void setFocused(bool f) { if (f != m_focused) { m_focused = f; emit focusedChanged(); } }
+    void setFocused(bool f);
     bool fullscreen() const { return m_fullscreen; }
     bool alpha() const { return m_alpha; }
-    void setFullscreen(bool f) { if (f != m_fullscreen) { m_fullscreen = f; emit fullscreenChanged(); } }
+    void setFullscreen(bool f);
+    bool wayland() const { return m_wayland; }
+    QObject *shellSurface() const { return m_xdg; }
 
     // QML: the size the client should render at (the layout's target,
     // not the animated in-between sizes)
@@ -55,7 +68,10 @@ public:
     Q_INVOKABLE void close();
 
     void sendMouse(int x, int y, uint32_t buttons, bool motion);
-    void sendKey(bool e0, uint8_t scancode);
+    void wlKeyboardFocus(bool on);
+    // a raw scancode (release bit 7); mods: the modifiers held, for
+    // Wayland clients (their xkb state follows them)
+    void sendKey(bool e0, uint8_t scancode, Qt::KeyboardModifiers mods = Qt::NoModifier);
     // drains c2s; returns false once the client is gone
     bool pump(QVector<QString> *spawnRequests);
     bool alive() const;
@@ -71,11 +87,13 @@ public:
     QRect takeDamage() { QRect r = m_damage; m_damage = QRect(); return r; }
 
 signals:
+    void titleChanged();
     void workspaceChanged();
     void focusedChanged();
     void fullscreenChanged();
     void alphaChanged();
     void damaged();
+    void fullscreenRequested(ZClient *self, bool on);   // a Wayland client asked
 
 private:
     void send(const ZerpMsg &m, bool motion = false);
@@ -97,6 +115,13 @@ private:
     void adoptPending();
     bool m_dirty = false;
     QRect m_damage;
+    // Wayland
+    bool m_wayland = false;
+    QPointer<QObject> m_xdg;         // QWaylandXdgSurface; gone with the client
+    QPointer<QObject> m_top;         // its QWaylandXdgToplevel: a client may destroy it first
+    QWaylandXdgToplevel *toplevel() const;
+    QSize m_wlSize;
+    void wlConfigure();
     QByteArray m_rx;
     QVector<ZerpMsg> m_out;          // waiting for room in the s2c pipe
     bool m_outTailMotion = false;
@@ -139,6 +164,11 @@ public:
     void setWorkspace(int w);
 
     Q_INVOKABLE int spawn(const QString &path);
+    // Shell.qml's xdg-shell: a new toplevel becomes a window
+    Q_INVOKABLE void addWayland(QObject *xdgSurface);
+    // start a program that is not a Zerp client (a Wayland one): a shell
+    // command line, the session's environment
+    Q_INVOKABLE bool run(const QString &command);
     Q_INVOKABLE void logout() { QCoreApplication::quit(); }   // the session ends: wynlogin shows the login screen
     Q_INVOKABLE void focus(QObject *client);
     Q_INVOKABLE void closeFocused();
@@ -161,6 +191,7 @@ private:
     void pumpAll();
     void reap();
     void refocus();
+    void remove(const QVector<ZClient *> &gone, const char *why);
 
     uint32_t m_shmBytes;
     int m_nextId = 1;

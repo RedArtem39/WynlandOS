@@ -23,6 +23,7 @@
 #define USOCK_FD    0xFFFFFFE0  /* AF_UNIX socket; current_cluster = socket slot */
 #define MEMFD_FD    0xFFFFFFE1  /* memfd_create(); current_cluster = memfd slot */
 #define TIMERFD_FD  0xFFFFFFE2  /* timerfd_create(); current_cluster = timer slot */
+#define EPOLL_FD    0xFFFFFFE3  /* epoll_create(); current_cluster = instance slot */
 
 void     kfile_get(VfsFile *f);
 VfsFile *kfile_dup(const VfsFile *f);   /* kmalloc'd copy + kfile_get(); NULL on OOM */

@@ -19,6 +19,10 @@
                            touching it is always fatal, never lazily faulted in */
 #define VMA_LAZY  0x4  /* demand-zero: a page gets a frame on first touch */
 #define VMA_FILE  0x8  /* with VMA_LAZY: the page is read from `file` on first touch */
+#define VMA_SHARED 0x10 /* with VMA_FILE: MAP_SHARED -- every shared mapping of the
+                           file's page is one frame, written back to the file */
+#define VMA_MAYWRITE 0x20 /* with VMA_SHARED: the file was open for writing, so
+                             mprotect() may make the mapping writable */
 
 /* A file behind lazy mappings: a private copy of the open file (the fd
    may be closed right after mmap()), shared by the VMAs split from one
@@ -64,6 +68,12 @@ void vma_clone_list(struct Process *to, struct Process *from);
 /* Free one VMA (dropping its file reference) / a whole list. */
 void vma_free(VMA *v);
 void vma_free_list(struct Process *proc);
+
+/* MAP_SHARED file pages (kernel/vma.c): written back to their files --
+   the ones nothing maps any more (then dropped) by the flusher thread,
+   every one in [start,end) of proc by msync(). */
+void shmap_flush_unmapped(void);
+void shmap_sync_range(struct Process *proc, uint64_t start, uint64_t end);
 
 /* The page cache behind file mappings (kernel/vma.c): a file's contents
    changed -- forget its cached pages. */

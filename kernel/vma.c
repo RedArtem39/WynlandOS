@@ -361,17 +361,188 @@ static void map_cached(Process *proc, VMA *v, uint64_t page, void *frame)
     vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, cached_pte_flags(v));
 }
 
+/* ---- MAP_SHARED file pages ----
+   A page of a file mapped MAP_SHARED is one frame for every shared
+   mapping of it, in every process, mapped writable where the mapping
+   allows (PAGE_SHARED_MAP | PAGE_SHARED_REF: fork shares it, munmap and
+   exit drop their reference). Private mappings of the file map it copy on
+   write, so they see what was written. The table keeps a reference on the
+   frame and on the file (which keeps the inode, even an unlinked one).
+   Written back to the file: by msync(), and by the flusher thread once no
+   mapping is left -- then the entry goes. (Each mapping used to get a
+   private copy: a JIT writing code through one mapping of a file and
+   running it through another -- GStreamer's orc -- ran zeros, and a
+   Wayland keymap written by the compositor reached no client.) read()
+   and write() go to the disk, not to these frames: a file being changed
+   through a shared mapping shows the change to read() after the writeback. */
+typedef struct ShEntry {
+    uint32_t inum, index;          /* page `index` of inode `inum` */
+    void *frame;
+    VmaFile *file;                 /* for the writeback; holds the inode */
+    bool writable;                 /* mapped writable once: may differ from the disk */
+    struct ShEntry *next;
+} ShEntry;
+#define SHMAP_BUCKETS 256
+static ShEntry *g_shmap[SHMAP_BUCKETS];
+
+static ShEntry **sh_slot(uint32_t inum, uint32_t index)
+{
+    ShEntry **pp = &g_shmap[(inum * 2654435761u ^ index * 40503u) & (SHMAP_BUCKETS - 1)];
+    while (*pp && ((*pp)->inum != inum || (*pp)->index != index)) pp = &(*pp)->next;
+    return pp;
+}
+
+extern int64_t ext2_inode_size(uint32_t inum);
+
+static uint64_t irq_off(void)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    return rflags;
+}
+static void irq_restore(uint64_t rflags) { if (rflags & 0x200) __asm__ volatile("sti" ::: "memory"); }
+
+/* the shared frame of a page with a new reference on it, or NULL; atomic
+   against the flusher, which frees entries nothing maps */
+static void *sh_get(uint32_t inum, uint32_t index, bool writable)
+{
+    uint64_t f = irq_off();
+    ShEntry *e = *sh_slot(inum, index);
+    void *frame = NULL;
+    if (e) {
+        pmm_page_incref(e->frame);
+        if (writable) e->writable = true;
+        frame = e->frame;
+    }
+    irq_restore(f);
+    return frame;
+}
+
+/* the frame's bytes to the file (up to the file's current end: a page
+   past it is not written, the file does not grow). Disk I/O. */
+static void sh_writeback(ShEntry *e)
+{
+    int64_t size = ext2_inode_size(e->inum);
+    uint64_t off = (uint64_t)e->index * PAGE_SIZE;
+    if (size < 0 || off >= (uint64_t)size) return;
+    uint64_t n = (uint64_t)size - off;
+    if (n > PAGE_SIZE) n = PAGE_SIZE;
+    /* a copy of the file: its own offset (faults seek the shared one);
+       written only if the descriptor was open for writing (mmap() and
+       mprotect() let no other mapping write) */
+    VfsFile w;
+    memcpy(&w, e->file->vf, sizeof w);
+    if (!(w.flags & VFS_O_WRITE)) return;
+    if (vfs_seek(&w, (int32_t)off, 0) >= 0) vfs_write(&w, e->frame, (uint32_t)n);
+}
+
+/* a shared page into the process: the one frame, created from the file
+   on the first touch of any mapping */
+static bool fault_in_shared(Process *proc, VMA *v, uint64_t page)
+{
+    VfsFile *cf = (VfsFile *)v->file->vf;
+    uint32_t inum = cf->node.first_cluster;
+    uint64_t in_vma = page - v->start;
+    uint32_t index = (uint32_t)((v->file_off + in_vma) / PAGE_SIZE);
+    const bool writable = (v->prot & VMA_PROT_WRITE) != 0;
+    void *frame = sh_get(inum, index, writable);
+    if (!frame) {
+        void *fresh = zeroed_frame();
+        if (!fresh) return false;
+        VfsFile r;                                   /* its own offset */
+        memcpy(&r, cf, sizeof r);
+        if (vfs_seek(&r, (int32_t)(v->file_off + in_vma), 0) >= 0) vfs_read(&r, fresh, PAGE_SIZE);
+        ShEntry *e = (ShEntry *)kmalloc(sizeof(ShEntry));
+        if (!e) { pmm_free_page(fresh); return false; }
+        e->inum = inum;
+        e->index = index;
+        e->frame = fresh;              /* the table's reference */
+        e->file = v->file;
+        e->writable = writable;
+        e->next = NULL;
+        uint64_t f = irq_off();        /* the read may have slept: someone else's may be there now */
+        ShEntry **slot = sh_slot(inum, index);
+        if (*slot) {
+            frame = (*slot)->frame;
+            pmm_page_incref(frame);
+            if (writable) (*slot)->writable = true;
+        } else {
+            *slot = e;
+            file_ref(v->file);
+            pmm_page_incref(fresh);    /* the mapping's reference */
+            frame = fresh;
+            e = NULL;
+        }
+        irq_restore(f);
+        if (e) { pmm_free_page(fresh); kfree(e); }
+    }
+    vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame,
+                 pte_flags_for(v) | PAGE_SHARED_MAP | PAGE_SHARED_REF);
+    return true;
+}
+
+void shmap_flush_unmapped(void)
+{
+    for (unsigned b = 0; b < SHMAP_BUCKETS; b++) {
+        for (ShEntry **pp = &g_shmap[b]; *pp; ) {
+            ShEntry *e = *pp;
+            if (pmm_page_refcount(e->frame) > 1) { pp = &e->next; continue; }   /* still mapped */
+            if (e->writable) {
+                e->writable = false;
+                sh_writeback(e);       /* may sleep: then look again */
+                if (pmm_page_refcount(e->frame) > 1 || e->writable) { pp = &g_shmap[b]; continue; }
+            }
+            uint64_t rflags = irq_off();
+            /* unlink exactly e (the bucket may have changed while writing) */
+            ShEntry **q = &g_shmap[b];
+            while (*q && *q != e) q = &(*q)->next;
+            bool gone = *q == e && pmm_page_refcount(e->frame) <= 1 && !e->writable;
+            if (gone) *q = e->next;
+            irq_restore(rflags);
+            if (gone) {
+                pmm_free_page(e->frame);
+                file_unref(e->file);
+                kfree(e);
+            }
+            pp = &g_shmap[b];          /* the bucket again, from its start */
+        }
+    }
+}
+
+void shmap_sync_range(Process *proc, uint64_t start, uint64_t end)
+{
+    for (VMA *v = proc->vma_list; v; v = v->next) {
+        if (!(v->flags & VMA_SHARED) || !v->file || v->end <= start || v->start >= end) continue;
+        uint32_t inum = ((VfsFile *)v->file->vf)->node.first_cluster;
+        uint64_t a = v->start > start ? v->start : start;
+        uint64_t z = v->end < end ? v->end : end;
+        for (uint64_t page = a & ~(uint64_t)(PAGE_SIZE - 1); page < z; page += PAGE_SIZE) {
+            ShEntry *e = *sh_slot(inum, (uint32_t)((v->file_off + (page - v->start)) / PAGE_SIZE));
+            if (e && e->writable) sh_writeback(e);
+        }
+    }
+}
+
 /* file-backed: the faulting page and the following not-yet-present pages
    of the same VMA, read in one go (up to the mapped length; past it, and
    past the end of the file, pages stay zero) */
 static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
 {
+    if (v->flags & VMA_SHARED) return fault_in_shared(proc, v, page);
     /* whole pages of an ext2 file go through the page cache */
     VfsFile *cf = (VfsFile *)v->file->vf;
     uint32_t inum = cf->node.first_cluster;
     uint64_t in_vma0 = page - v->start;
     bool cacheable = inum != 0 && inum < 0xFFFFFF00u && !(v->file_off & (PAGE_SIZE - 1)) &&
                      in_vma0 + PAGE_SIZE <= v->file_len;
+    /* a page some mapping shares: this private one sees it, copy on write */
+    if (!(v->file_off & (PAGE_SIZE - 1))) {
+        void *sf = sh_get(inum, (uint32_t)((v->file_off + in_vma0) / PAGE_SIZE), false);
+        if (sf) {
+            vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)sf, cached_pte_flags(v));
+            return true;
+        }
+    }
     if (cacheable) {
         void *hit = pcache_get(inum, (uint32_t)((v->file_off + in_vma0) / PAGE_SIZE));
         if (hit) {

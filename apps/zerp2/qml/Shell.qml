@@ -1,10 +1,13 @@
-// Zerp 2.0: a tiling WM. Wallpaper, a bar on top, a dock at the bottom,
-// and Zerp clients tiled dwindle-style per workspace in between.
+// Zerp 2.0: a tiling WM and Wayland compositor. Wallpaper, a bar on top,
+// a dock at the bottom, and windows -- Zerp clients and Wayland clients --
+// tiled dwindle-style per workspace in between.
 // Keys (mod = Alt or Super): Enter terminal, Q close, D launcher,
 // F fullscreen, 1..9 workspace, Shift+1..9 move window, arrows/HJKL focus.
 import QtQuick
 import QtQuick.Window
 import QtQuick.Effects
+import QtWayland.Compositor
+import QtWayland.Compositor.XdgShell
 import Zerp
 
 Window {
@@ -32,6 +35,25 @@ Window {
     readonly property bool fullscreenOn: {
         const f = zerp.focusedClient
         return !!f && f.fullscreen && f.workspace === zerp.workspace
+    }
+
+    // ---- Wayland: the socket is $XDG_RUNTIME_DIR/wayland-0; every
+    // xdg-shell toplevel becomes a window (ZServer::addWayland), drawn by
+    // Tile.qml. Clients are asked to leave the decorations to us.
+    WaylandCompositor {
+        id: wayland
+        socketName: "wayland-0"
+        WaylandOutput {
+            sizeFollowsWindow: true
+            window: shell
+        }
+        XdgShell {
+            onToplevelCreated: (toplevel, xdgSurface) => zerp.addWayland(xdgSurface)
+        }
+        XdgDecorationManagerV1 {
+            preferredMode: XdgToplevel.ServerSideDecoration
+        }
+        Component.onCompleted: console.log("wayland compositor up on " + socketName)
     }
 
     // id -> target rect, recomputed whenever clients/workspace change

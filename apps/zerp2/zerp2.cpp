@@ -4,11 +4,17 @@
 #include <QtCore/QFileInfo>
 #include <QtCore/QDateTime>
 #include <QtGui/QImage>
+#include <QtGui/QKeyEvent>
 #include <QtGui/QScreen>
 #include <QtGui/QWheelEvent>
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
 #include <QtQuick/QSGTexture>
+#include <QtWaylandCompositor/QWaylandCompositor>
+#include <QtWaylandCompositor/QWaylandSeat>
+#include <QtWaylandCompositor/QWaylandSurface>
+#include <QtWaylandCompositor/QWaylandXdgSurface>
+#include <QtWaylandCompositor/QWaylandXdgToplevel>
 #include <rhi/qrhi.h>
 
 #include <cerrno>
@@ -42,6 +48,30 @@ ZClient::ZClient(int id, const QString &path, QObject *parent)
     else if (base == QLatin1String("qmldemo")) m_title = QStringLiteral("Qt Quick demo");
     else if (base == QLatin1String("web")) m_title = QStringLiteral("Web");
     else m_title = base;
+}
+
+// A Wayland toplevel: no process of ours, no pipes; the surface is the
+// client. It goes when the surface does.
+ZClient::ZClient(int id, QObject *xdgSurface, QObject *parent)
+    : QObject(parent), m_id(id), m_wayland(true), m_xdg(xdgSurface)
+{
+    auto *xdg = qobject_cast<QWaylandXdgSurface *>(xdgSurface);
+    QWaylandXdgToplevel *top = xdg ? xdg->toplevel() : nullptr;
+    m_top = top;
+    auto names = [this, top] {
+        m_appId = top ? top->appId() : QString();
+        m_title = top && !top->title().isEmpty() ? top->title()
+                : !m_appId.isEmpty() ? m_appId : QStringLiteral("Wayland");
+        emit titleChanged();
+    };
+    names();
+    if (top) {
+        connect(top, &QWaylandXdgToplevel::titleChanged, this, names);
+        connect(top, &QWaylandXdgToplevel::appIdChanged, this, names);
+        // the client asks: full screen or back (F11 in a browser, a video)
+        connect(top, &QWaylandXdgToplevel::setFullscreen, this, [this] { emit fullscreenRequested(this, true); });
+        connect(top, &QWaylandXdgToplevel::unsetFullscreen, this, [this] { emit fullscreenRequested(this, false); });
+    }
 }
 
 ZClient::~ZClient()
@@ -88,8 +118,62 @@ bool ZClient::start(uint32_t shmBytes)
     return m_shm != nullptr;
 }
 
+void ZClient::setFocused(bool f)
+{
+    if (f == m_focused) return;
+    m_focused = f;
+    if (m_wayland) wlConfigure();   // "activated" is part of the state
+    emit focusedChanged();
+}
+
+void ZClient::setFullscreen(bool f)
+{
+    if (f == m_fullscreen) return;
+    m_fullscreen = f;
+    if (m_wayland) wlConfigure();
+    emit fullscreenChanged();
+}
+
+// the size and the state, as xdg_toplevel.configure: a tile is
+// "maximized" (no shadows, no rounded corners of its own, its size is not
+// a suggestion), the focused one "activated"
+// the toplevel, while both it and its surface live (the surface's own
+// pointer to it is left dangling when the client destroys the toplevel)
+QWaylandXdgToplevel *ZClient::toplevel() const
+{
+    return m_xdg && m_top ? qobject_cast<QWaylandXdgToplevel *>(m_top.data()) : nullptr;
+}
+
+void ZClient::wlConfigure()
+{
+    QWaylandXdgToplevel *top = toplevel();
+    if (!top || m_wlSize.isEmpty()) return;
+    QList<QWaylandXdgToplevel::State> st;
+    st << (m_fullscreen ? QWaylandXdgToplevel::FullscreenState : QWaylandXdgToplevel::MaximizedState);
+    if (m_focused) st << QWaylandXdgToplevel::ActivatedState;
+    top->sendConfigure(m_wlSize, st);
+}
+
+// the focused Wayland client gets the keyboard
+void ZClient::wlKeyboardFocus(bool on)
+{
+    auto *xdg = qobject_cast<QWaylandXdgSurface *>(m_xdg.data());
+    QWaylandSurface *surf = xdg ? xdg->surface() : nullptr;
+    if (!surf || !surf->compositor()) return;
+    if (QWaylandSeat *seat = surf->compositor()->defaultSeat())
+        seat->setKeyboardFocus(on ? surf : nullptr);
+}
+
 void ZClient::configure(int x, int y, int w, int h)
 {
+    if (m_wayland) {
+        Q_UNUSED(x); Q_UNUSED(y);
+        const QSize sz(qMax(w, 8), qMax(h, 8));
+        if (sz == m_wlSize) return;
+        m_wlSize = sz;
+        wlConfigure();
+        return;
+    }
     if (w < 8) w = 8;
     if (h < 8) h = 8;
     if ((uint64_t)w * (uint64_t)h * 4 > m_shmBytes) return;   // can't exceed the buffer
@@ -127,11 +211,16 @@ void ZClient::adoptPending()
 
 void ZClient::close()
 {
+    if (m_wayland) {
+        if (QWaylandXdgToplevel *top = toplevel()) top->sendClose();
+        return;
+    }
     if (m_pid > 0) ::kill((pid_t)m_pid, SIGTERM);
 }
 
 bool ZClient::alive() const
 {
+    if (m_wayland) return toplevel() != nullptr;
     return m_pid > 0 && sys_process_alive(m_pid) == 1;
 }
 
@@ -144,8 +233,53 @@ void ZClient::sendMouse(int x, int y, uint32_t buttons, bool motion)
     send(m, motion);
 }
 
-void ZClient::sendKey(bool e0, uint8_t scancode)
+// PC scancode set 1 -> Linux input key code (what Wayland's keymaps use).
+// Without the E0 prefix they are the same numbers.
+static int evdevKey(bool e0, int code)
 {
+    if (!e0) return code;
+    switch (code) {
+    case 0x1C: return 96;    // keypad Enter
+    case 0x1D: return 97;    // right Ctrl
+    case 0x35: return 98;    // keypad /
+    case 0x37: return 99;    // Print Screen
+    case 0x38: return 100;   // right Alt
+    case 0x47: return 102;   // Home
+    case 0x48: return 103;   // Up
+    case 0x49: return 104;   // Page Up
+    case 0x4B: return 105;   // Left
+    case 0x4D: return 106;   // Right
+    case 0x4F: return 107;   // End
+    case 0x50: return 108;   // Down
+    case 0x51: return 109;   // Page Down
+    case 0x52: return 110;   // Insert
+    case 0x53: return 111;   // Delete
+    case 0x5B: return 125;   // left Super
+    case 0x5C: return 126;   // right Super
+    case 0x5D: return 127;   // Menu
+    }
+    return 0;
+}
+
+void ZClient::sendKey(bool e0, uint8_t scancode, Qt::KeyboardModifiers mods)
+{
+    if (m_wayland) {
+        auto *xdg = qobject_cast<QWaylandXdgSurface *>(m_xdg.data());
+        QWaylandSurface *surf = xdg ? xdg->surface() : nullptr;
+        const int key = evdevKey(e0, scancode & 0x7F);
+        if (!surf || !surf->compositor() || !key) return;
+        QWaylandSeat *seat = surf->compositor()->defaultSeat();
+        if (!seat) return;
+        if (seat->keyboardFocus() != surf) seat->setKeyboardFocus(surf);
+        // xkb key codes are the Linux ones + 8. As a full key event: Qt
+        // then brings the client's modifier state in line with `mods`
+        // (wl_keyboard.modifiers) before the key -- sent bare, Shift+A
+        // arrived as a and Ctrl+C as c
+        QKeyEvent ke((scancode & 0x80) ? QEvent::KeyRelease : QEvent::KeyPress, Qt::Key_unknown, mods,
+                     quint32(key + 8), 0, 0);
+        seat->sendFullKeyEvent(&ke);
+        return;
+    }
     if (e0) { ZerpMsg p = { ZERP_MSG_INPUT_KEY, 0xE0, 0, 0, 0 }; m_out.append(p); }
     ZerpMsg k = { ZERP_MSG_INPUT_KEY, scancode, 0, 0, 0 };
     m_out.append(k);
@@ -183,6 +317,7 @@ void ZClient::flush()
 
 bool ZClient::pump(QVector<QString> *spawnRequests)
 {
+    if (m_wayland) return toplevel() != nullptr;
     if (m_c2s < 0) return false;
     flush();
     char buf[4096];
@@ -288,13 +423,52 @@ int ZServer::spawn(const QString &path)
     return c->id();
 }
 
+void ZServer::addWayland(QObject *xdgSurface)
+{
+    auto *xdg = qobject_cast<QWaylandXdgSurface *>(xdgSurface);
+    if (!xdg) return;
+    auto *c = new ZClient(m_nextId++, xdgSurface, this);
+    c->setWorkspace(m_workspace);
+    connect(c, &ZClient::fullscreenRequested, this, [this](ZClient *w, bool on) {
+        if (w->fullscreen() == on) return;
+        w->setFullscreen(on);
+        emit layoutChanged();
+    });
+    // the window goes with its surface (the client closed it, or exited)
+    connect(xdg, &QObject::destroyed, this, &ZServer::reap, Qt::QueuedConnection);
+    if (xdg->toplevel()) connect(xdg->toplevel(), &QObject::destroyed, this, &ZServer::reap, Qt::QueuedConnection);
+    fprintf(stderr, "[zerp2] wayland window %d: %s\n", c->id(), qPrintable(c->title()));
+    m_clients.append(c);
+    m_model.add(c);
+    emit clientsChanged();
+    focus(c);
+}
+
+bool ZServer::run(const QString &command)
+{
+    // through the shell: PATH, arguments, and scripts (xrun) -- the
+    // kernel's spawn starts ELF programs only
+    const QByteArray cmd = command.toLocal8Bit();
+    if (cmd.trimmed().isEmpty()) return false;
+    const char *argv[] = { "/bin/sh", "-c", cmd.constData(), nullptr };
+    const long pid = sys_spawn_argv("/bin/sh", argv);
+    fprintf(stderr, "[zerp2] run %s: pid %ld\n", cmd.constData(), pid);
+    return pid > 0;
+}
+
 void ZServer::focus(QObject *o)
 {
     auto *c = qobject_cast<ZClient *>(o);
     if (c == m_focused) return;
-    if (m_focused) m_focused->setFocused(false);
+    if (m_focused) {
+        m_focused->setFocused(false);
+        if (m_focused->wayland()) m_focused->wlKeyboardFocus(false);
+    }
     m_focused = c;
-    if (c) c->setFocused(true);
+    if (c) {
+        c->setFocused(true);
+        if (c->wayland()) c->wlKeyboardFocus(true);
+    }
     emit focusChanged();
 }
 
@@ -346,30 +520,11 @@ int ZServer::countOn(int w) const
     return n;
 }
 
-void ZServer::pumpAll()
+void ZServer::remove(const QVector<ZClient *> &gone, const char *why)
 {
-    QVector<QString> spawns;
-    QVector<ZClient *> gone;
-    for (ZClient *c : m_clients)
-        if (!c->pump(&spawns)) gone.append(c);
+    if (gone.isEmpty()) return;
     for (ZClient *c : gone) {
-        fprintf(stderr, "[zerp2] client %d closed\n", c->id());
-        m_clients.removeOne(c);
-        m_model.remove(c);
-        if (c == m_focused) m_focused = nullptr;
-        c->deleteLater();
-    }
-    if (!gone.isEmpty()) { emit clientsChanged(); if (!m_focused) refocus(); }
-    for (const QString &p : spawns) spawn(p);
-}
-
-void ZServer::reap()
-{
-    QVector<ZClient *> dead;
-    for (ZClient *c : m_clients) if (!c->alive()) dead.append(c);
-    if (dead.isEmpty()) return;
-    for (ZClient *c : dead) {
-        fprintf(stderr, "[zerp2] client %d exited\n", c->id());
+        fprintf(stderr, "[zerp2] client %d %s\n", c->id(), why);
         m_clients.removeOne(c);
         m_model.remove(c);
         if (c == m_focused) m_focused = nullptr;
@@ -377,6 +532,23 @@ void ZServer::reap()
     }
     emit clientsChanged();
     if (!m_focused) refocus();
+}
+
+void ZServer::pumpAll()
+{
+    QVector<QString> spawns;
+    QVector<ZClient *> gone;
+    for (ZClient *c : m_clients)
+        if (!c->pump(&spawns)) gone.append(c);
+    remove(gone, "closed");
+    for (const QString &p : spawns) spawn(p);
+}
+
+void ZServer::reap()
+{
+    QVector<ZClient *> dead;
+    for (ZClient *c : m_clients) if (!c->alive()) dead.append(c);
+    remove(dead, "exited");
 }
 
 // ---------------------------------------------------------------- ZTexture

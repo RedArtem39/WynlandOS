@@ -696,8 +696,23 @@ void clone_child_entry(void *arg) {
     thread_enter_user_mode_clone(&ca->regs);
 }
 
-#define MAX_EPOLL_INSTANCES 16
+/* Bound on how many struct wl_pollfd entries SYS_poll/SYS_ppoll will copy
+   into a kernel-side array in one call. */
+#define POLL_MAX_LOCAL 256
+
+struct wl_pollfd { int fd; short events; short revents; };
+
+/* epoll: an instance belongs to its file (EPOLL_FD, current_cluster =
+   slot), counted like the other kernel objects (kfile_get/kfile_close):
+   dup'd and inherited fds share it, the last close frees it. (Instances
+   were looked up by fd NUMBER in one global table -- two processes with
+   an epoll on the same fd number shared one -- and never freed.) The
+   watched fds are numbers in the fd table of whoever waits, as on Linux
+   for a single process. */
+#define MAX_EPOLL_INSTANCES 128
 #define MAX_EPOLL_EVENTS 64
+#define EPOLLONESHOT_ (1u << 30)
+#define EPOLLET_      (1u << 31)
 
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
@@ -709,30 +724,85 @@ struct epoll_event {
 } __attribute__((packed));
 
 typedef struct {
-    int active;
-    int fd;
+    int refs;                       /* 0: the slot is free */
     struct {
         int target_fd;
         struct epoll_event ev;
+        bool armed;                 /* EPOLLONESHOT: false once reported, until MOD */
+        bool out_reported;          /* EPOLLET: EPOLLOUT already said, until it drops */
     } watches[MAX_EPOLL_EVENTS];
     int num_watches;
 } EpollInstance;
 
-static EpollInstance epoll_instances[MAX_EPOLL_INSTANCES] = {0};
+static EpollInstance epoll_instances[MAX_EPOLL_INSTANCES];
 
-static EpollInstance* get_epoll_instance(int fd) {
-    for (int i = 0; i < MAX_EPOLL_INSTANCES; i++) {
-        if (epoll_instances[i].active && epoll_instances[i].fd == fd)
-            return &epoll_instances[i];
-    }
-    return NULL;
+static EpollInstance *epoll_of(VfsFile *f) {
+    if (!f || f->node.first_cluster != EPOLL_FD || f->current_cluster >= MAX_EPOLL_INSTANCES) return NULL;
+    EpollInstance *e = &epoll_instances[f->current_cluster];
+    return e->refs > 0 ? e : NULL;
 }
 
-/* Bound on how many struct wl_pollfd entries SYS_poll/SYS_ppoll will copy
-   into a kernel-side array in one call. */
-#define POLL_MAX_LOCAL 256
+static EpollInstance *get_epoll_instance(VfsFile **fd_table, int fd) {
+    if (fd < 0 || fd >= MAX_OPEN_FILES) return NULL;
+    return epoll_of(fd_table[fd]);
+}
 
-struct wl_pollfd { int fd; short events; short revents; };
+static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ms);
+
+/* One pass over an instance's watches, never sleeping (syscalls run with
+   interrupts off: it is atomic). Fills events (up to max) and returns how
+   many are ready; with events NULL it only says whether any is, changing
+   nothing. The set is read afresh each time, so a waiter sees watches
+   added or changed while it slept.
+   - EPOLLERR/EPOLLHUP are reported whatever the mask asks, as on Linux.
+   - EPOLLONESHOT: a reported watch is disarmed until EPOLL_CTL_MOD.
+   - EPOLLET reports EPOLLOUT once per rise (a socket is nearly always
+     writable: level-triggered it woke the waiter in a loop); EPOLLIN stays
+     level-triggered -- a spurious wakeup costs an EAGAIN, a missed one
+     hangs the program.
+   - Watched fds are numbers in the waiter's fd table; one that is not
+     open there is skipped (a forked child that closed its copy must not
+     take the parent's watch away). */
+static int epoll_depth;
+static int epoll_collect(EpollInstance *inst, VfsFile **fd_table, struct epoll_event *events, int max) {
+    if (epoll_depth >= 5) return 0;            /* nested epolls, as deep as Linux allows */
+    epoll_depth++;
+    int count = 0;
+    for (int i = 0; i < inst->num_watches; i++) {
+        if (!inst->watches[i].armed) continue;
+        int t = inst->watches[i].target_fd;
+        if (t < 0 || t >= MAX_OPEN_FILES || !fd_table[t]) continue;
+        uint32_t want = inst->watches[i].ev.events;
+        struct wl_pollfd one = { t, 0, 0 };
+        if (want & EPOLLIN) one.events |= 0x0001;
+        if (want & EPOLLOUT) one.events |= 0x0004;
+        if (do_poll(fd_table, &one, 1, 0) < 0) continue;
+        if (!(one.revents & 0x0004)) inst->watches[i].out_reported = false;   /* it dropped: the next rise counts */
+        uint32_t ev = 0;
+        if (one.revents & 0x0001) ev |= EPOLLIN;
+        if ((one.revents & 0x0004) && !((want & EPOLLET_) && inst->watches[i].out_reported)) ev |= EPOLLOUT;
+        if (one.revents & (0x0008 | 0x0020)) ev |= EPOLLERR;
+        if (one.revents & 0x0010) ev |= EPOLLHUP;
+        if (!ev) continue;
+        if (!events) { count = 1; break; }
+        if (count >= max) break;
+        events[count].events = ev;
+        events[count].data = inst->watches[i].ev.data;
+        count++;
+        if (ev & EPOLLOUT) inst->watches[i].out_reported = true;
+        if (want & EPOLLONESHOT_) inst->watches[i].armed = false;
+    }
+    epoll_depth--;
+    return count;
+}
+
+/* poll() on an epoll fd: readable when one of its watches is ready (the
+   Wayland server's event loop is an epoll the toolkit polls) */
+static bool epoll_file_ready(VfsFile *f, VfsFile **fd_table) {
+    EpollInstance *inst = epoll_of(f);
+    return inst && epoll_collect(inst, fd_table, NULL, 0) > 0;
+}
+
 extern uint64_t timer_get_ms(void);
 
 /* Poll `nfds` KERNEL-owned wl_pollfd entries for readiness, genuinely
@@ -983,6 +1053,7 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
 
         for (uint64_t i = 0; i < nfds; i++) {
             int fd = fds[i].fd;
+            if (fd < 0 && fds) continue;   /* poll(): a negative fd is ignored */
             if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) {
                 if (fds) fds[i].revents = 0x0020; // POLLNVAL
                 ready++;
@@ -1100,6 +1171,13 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                     single_wq = &conn->rx_wq;
                 }
             }
+            else if (file->node.first_cluster == EPOLL_FD) {
+                /* readable while one of its watches is; nothing wakes us
+                   for it directly: the g_poll_any_wq nap below */
+                if (epoll_file_ready(file, fd_table)) {
+                    if (fds && (fds[i].events & 0x0001)) { fds[i].revents |= 0x0001; ready++; }
+                }
+            }
             else {
                 // Regular files/devices/sockets are always readable/writable
                 // (real socket readiness lands in Phase 22d's net_poll wiring).
@@ -1155,6 +1233,12 @@ void kfile_get(VfsFile *f) {
     if (fc == USOCK_FD) usock_ref((int)f->current_cluster);
     else if (fc == MEMFD_FD) memfd_ref((int)f->current_cluster);
     else if (fc == TIMERFD_FD) timerfd_ref((int)f->current_cluster);
+    else if (fc == EPOLL_FD && f->current_cluster < MAX_EPOLL_INSTANCES) epoll_instances[f->current_cluster].refs++;
+    else if ((f->flags & VFS_F_PINNED) && fc < 0xFFFFFF00u) {   /* an ext2 file: one more holder */
+        /* the inode already has a slot (the original's): this only counts */
+        extern bool ext2_pin_inode(uint32_t inum);
+        if (!ext2_pin_inode(fc)) f->flags &= ~VFS_F_PINNED;
+    }
     else if (fc == DRM_PRIME_FD) drm_prime_get(f->current_cluster);
     else if (IS_DRM_DEV(fc)) drm_client_ref(f->current_cluster);
     else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
@@ -1205,6 +1289,11 @@ void kfile_close(VfsFile *f) {
         kfree(f);
     } else if (fc == TIMERFD_FD) {
         timerfd_unref((int)f->current_cluster);
+        kfree(f);
+    } else if (fc == EPOLL_FD) {
+        if (f->current_cluster < MAX_EPOLL_INSTANCES && epoll_instances[f->current_cluster].refs > 0 &&
+            --epoll_instances[f->current_cluster].refs == 0)
+            epoll_instances[f->current_cluster].num_watches = 0;
         kfree(f);
     } else if (fc == DRM_PRIME_FD) {
         drm_prime_put(f->current_cluster); /* never sleeps: BO freed later */
@@ -1904,7 +1993,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         if (vfs_flags & (0x02 | 0x10 | 0x08)) want |= 02;
                         uint32_t have = vfs_perm_for(file->node.uid, file->node.gid, file->node.mode);
                         if ((have & want) != want) {
-                            kfree(file);
+                            vfs_close(file);
                             return (uint64_t)-13; /* -EACCES */
                         }
                     }
@@ -2290,11 +2379,20 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
                     !fd_table[fd]->node.is_dir &&
                     fd_table[fd]->node.first_cluster < 0xFFFFFF00u) {
+                    /* MAP_SHARED: one frame per page for every shared
+                       mapping, written back (kernel/vma.c); writable only
+                       through a descriptor open for writing, as on Linux */
+                    const bool shared = (flags & 0x01) != 0;
+                    if (shared && (offset & (PAGE_SIZE - 1))) return (uint64_t)-22;                  /* -EINVAL */
+                    if (shared && (prot & 0x2) && (fd_oflags[fd] & 3) != 2) return (uint64_t)-13; /* -EACCES */
                     VmaFile *vf = vma_file_new(fd_table[fd]);
                     if (vf) {   /* else: read it all below, as before */
                         uint32_t fprot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
                         if (!vma_insert_file(sched_current()->proc, virt_addr, virt_addr + size_aligned,
-                                             fprot, VMA_LAZY | VMA_FILE, vf, offset, len)) {
+                                             fprot, VMA_LAZY | VMA_FILE |
+                                             (shared ? VMA_SHARED : 0) |
+                                             (shared && (fd_oflags[fd] & 3) == 2 ? VMA_MAYWRITE : 0),
+                                             vf, offset, len)) {
                             vf->refs = 1;   /* drop it the regular way (unpins) */
                             extern void vma_file_put(VmaFile *f);
                             vma_file_put(vf);
@@ -2622,6 +2720,13 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
 
                 Process *proc = sched_current()->proc;
+                /* a shared file mapping becomes writable only if the file
+                   was opened for writing (its pages go back to the file) */
+                if (prot & 0x2)
+                    for (VMA *sv = proc->vma_list; sv; sv = sv->next)
+                        if (sv->start < end && sv->end > addr &&
+                            (sv->flags & VMA_SHARED) && !(sv->flags & VMA_MAYWRITE))
+                            return (uint64_t)-13; /* -EACCES */
                 uint32_t new_prot = (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC);
                 if (!vma_protect_range(proc, addr, end, new_prot)) {
                     return (uint64_t)-12; /* -ENOMEM: part of the range isn't mapped */
@@ -3353,11 +3458,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             comp_mark_dirty();
             return 0;
 
-        case 404: // SYS_kfree
-            if (a1) {
-                kfree((void *)a1);
-            }
-            return 0;
+        case 404: // SYS_kfree: was kfree() of any pointer a program passed in --
+                  // a way to corrupt the kernel heap from user space. Gone.
+            return (uint64_t)-38; /* -ENOSYS */
 
         case 405: // SYS_spawn -- launch a1 (const char *path) as a new,
                    // isolated process (kernel/process.c: process_spawn()).
@@ -3510,15 +3613,17 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
         case 413: // SYS_ary_passwd(new_password, old_password): set the root
-                  // password. Allowed when none is set yet (first boot,
-                  // `ary login`), for root, or with the current password.
+                  // password. Allowed for root, or with the current password.
+                  // (It also let anyone set the first one, which with user
+                  // accounts -- where none is usually set -- was a way to
+                  // root through 409. Setting the first one is root's now.)
             {
                 char npw[128], opw[128] = {0};
                 if (!a1 || strncpy_from_user(npw, (const void *)a1, sizeof(npw)) < 0) return (uint64_t)-14;
                 if (a2 && strncpy_from_user(opw, (const void *)a2, sizeof(opw)) < 0) return (uint64_t)-14;
                 if (!npw[0]) return (uint64_t)-22; /* -EINVAL: empty */
-                bool allowed = !auth_root_password_set() || sched_current()->proc->uid == 0 ||
-                               (a2 && auth_check_root(opw));
+                bool allowed = sched_current()->proc->uid == 0 ||
+                               (a2 && auth_root_password_set() && auth_check_root(opw));
                 if (!allowed) { sched_sleep_ms(2000); return (uint64_t)-13; } /* -EACCES */
                 return auth_set_root(npw) ? 0 : (uint64_t)-5; /* -EIO */
             }
@@ -5430,113 +5535,114 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
         case 213: // SYS_epoll_create
-        case 291: // SYS_epoll_create1
+        case 291: // SYS_epoll_create1(flags): EPOLL_CLOEXEC = O_CLOEXEC
             {
+                int slot = -1;
+                for (int i = 0; i < MAX_EPOLL_INSTANCES; i++)
+                    if (epoll_instances[i].refs == 0) { slot = i; break; }
+                if (slot < 0) return (uint64_t)-23;        /* -ENFILE */
                 int fd = get_free_fd(fd_table);
-                if (fd < 0) return -24; // EMFILE
-                
+                if (fd < 0) return (uint64_t)-24;          /* -EMFILE */
                 VfsFile *efile = kmalloc(sizeof(VfsFile));
+                if (!efile) return (uint64_t)-12;
                 memset(efile, 0, sizeof(VfsFile));
-                efile->node.first_cluster = 0xFFFFFFF9; // Magic for epoll
+                str_copy(efile->node.name, "[eventpoll]");
+                efile->node.first_cluster = EPOLL_FD;
+                efile->current_cluster = (uint32_t)slot;
+                epoll_instances[slot].refs = 1;
+                epoll_instances[slot].num_watches = 0;
                 fd_table[fd] = efile;
-                
-                for (int i = 0; i < MAX_EPOLL_INSTANCES; i++) {
-                    if (!epoll_instances[i].active) {
-                        epoll_instances[i].active = 1;
-                        epoll_instances[i].fd = fd;
-                        epoll_instances[i].num_watches = 0;
-                        break;
-                    }
-                }
+                fd_set_open_flags(fd_flags, fd_oflags, fd, (num == 291 && (a1 & 02000000)) ? 02000000 : 0);
                 return fd;
             }
 
-        case 233: // SYS_epoll_ctl
+        case 233: // SYS_epoll_ctl(epfd, op, fd, struct epoll_event *)
             {
                 int epfd = (int)a1;
                 int op = (int)a2;
                 int fd = (int)a3;
 
-                EpollInstance *inst = get_epoll_instance(epfd);
-                if (!inst) return -9; // EBADF
+                EpollInstance *inst = get_epoll_instance(fd_table, epfd);
+                if (!inst) return (uint64_t)-9;            /* -EBADF (or -EINVAL: not an epoll) */
+                if (fd < 0 || fd >= MAX_OPEN_FILES || !fd_table[fd]) return (uint64_t)-9;
+                if (fd == epfd) return (uint64_t)-22;
 
                 struct epoll_event event;
                 if (op != EPOLL_CTL_DEL) { // real epoll_ctl allows event==NULL only for DEL
-                    if (copy_from_user(&event, (const void *)a4, sizeof(event)) != 0) return -14; // EFAULT
+                    if (copy_from_user(&event, (const void *)a4, sizeof(event)) != 0) return (uint64_t)-14;
                 }
+                int at = -1;
+                for (int i = 0; i < inst->num_watches; i++)
+                    if (inst->watches[i].target_fd == fd) { at = i; break; }
 
                 if (op == EPOLL_CTL_ADD) {
-                    if (inst->num_watches >= MAX_EPOLL_EVENTS) return -12; // ENOMEM
+                    if (at >= 0) return (uint64_t)-17;     /* -EEXIST */
+                    if (inst->num_watches >= MAX_EPOLL_EVENTS) return (uint64_t)-28; /* -ENOSPC */
                     inst->watches[inst->num_watches].target_fd = fd;
                     inst->watches[inst->num_watches].ev = event;
+                    inst->watches[inst->num_watches].armed = true;
+                    inst->watches[inst->num_watches].out_reported = false;
                     inst->num_watches++;
                 } else if (op == EPOLL_CTL_DEL) {
-                    for (int i = 0; i < inst->num_watches; i++) {
-                        if (inst->watches[i].target_fd == fd) {
-                            inst->watches[i] = inst->watches[inst->num_watches - 1];
-                            inst->num_watches--;
-                            break;
-                        }
-                    }
+                    if (at < 0) return (uint64_t)-2;       /* -ENOENT */
+                    inst->watches[at] = inst->watches[inst->num_watches - 1];
+                    inst->num_watches--;
                 } else if (op == EPOLL_CTL_MOD) {
-                    for (int i = 0; i < inst->num_watches; i++) {
-                        if (inst->watches[i].target_fd == fd) {
-                            inst->watches[i].ev = event;
-                            break;
-                        }
-                    }
+                    if (at < 0) return (uint64_t)-2;
+                    inst->watches[at].ev = event;
+                    inst->watches[at].armed = true;
+                    inst->watches[at].out_reported = false;
+                } else {
+                    return (uint64_t)-22;
                 }
+                waitqueue_wake_all(&g_poll_any_wq);        /* a waiter re-evaluates its set */
                 return 0;
             }
 
-        case 232: // SYS_epoll_wait
-        case 281: // SYS_epoll_pwait
+        case 232: // SYS_epoll_wait(epfd, events, maxevents, timeout ms)
+        case 281: // SYS_epoll_pwait(..., sigmask, sigsetsize)
             {
                 int epfd = (int)a1;
-                struct epoll_event *events = (struct epoll_event *)a2;
                 int maxevents = (int)a3;
-                if (maxevents > 0 && !user_prepare_write(a2, (uint64_t)maxevents * sizeof(struct epoll_event))) {
+                if (maxevents <= 0) return (uint64_t)-22;
+                if (maxevents > MAX_EPOLL_EVENTS) maxevents = MAX_EPOLL_EVENTS;
+                if (!user_prepare_write(a2, (uint64_t)maxevents * sizeof(struct epoll_event)))
                     return (uint64_t)-14; /* -EFAULT */
-                }
-                /* epoll_wait(epfd, events, maxevents, timeout) -- timeout
-                   is a4, milliseconds, same convention as poll()'s third
-                   arg. Previously dropped entirely (the inner dispatch
-                   always passed 0), so epoll_wait never actually honored
-                   its own caller's timeout even before Phase 22d. */
                 int timeout_ms = (int)(int32_t)a4;
-
-                EpollInstance *inst = get_epoll_instance(epfd);
-                if (!inst) return -9; // EBADF
-
-                struct wl_pollfd pfds[MAX_EPOLL_EVENTS];
-                for (int i = 0; i < inst->num_watches; i++) {
-                    pfds[i].fd = inst->watches[i].target_fd;
-                    pfds[i].events = 0;
-                    if (inst->watches[i].ev.events & EPOLLIN) pfds[i].events |= 0x0001; // POLLIN
-                    if (inst->watches[i].ev.events & EPOLLOUT) pfds[i].events |= 0x0004; // POLLOUT
-                    pfds[i].revents = 0;
+                EpollInstance *inst = get_epoll_instance(fd_table, epfd);
+                if (!inst) return (uint64_t)-9;
+                int64_t me = (num == 281 && a5) ? wait_mask_begin(a5, regs->r9) : 0;
+                if (me < 0) return (uint64_t)me;
+                /* hold the instance while waiting: a close of its last fd
+                   meanwhile must not hand the slot to a new epoll */
+                inst->refs++;
+                uint64_t deadline = timeout_ms < 0 ? SCHED_NO_DEADLINE : timer_get_ms() + (uint64_t)timeout_ms;
+                struct epoll_event out[MAX_EPOLL_EVENTS];
+                int64_t got;
+                for (;;) {
+                    got = epoll_collect(inst, fd_table, out, maxevents);
+                    if (got > 0 || timeout_ms == 0) break;
+                    uint64_t now = timer_get_ms();
+                    if (deadline != SCHED_NO_DEADLINE && now >= deadline) { got = 0; break; }
+                    if (sched_dying() || sleep_interrupted()) { got = -LNX_EINTR; break; }
+                    /* every pipe/socket/timerfd change and every epoll_ctl
+                       wakes this queue; the nap bounds the rest (TCP, PTYs) */
+                    uint64_t nap = now + 50;
+                    if (deadline != SCHED_NO_DEADLINE && nap > deadline) nap = deadline;
+                    waitqueue_wait_ms(&g_poll_any_wq, nap);
                 }
+                if (--inst->refs == 0) inst->num_watches = 0;
+                if (me) wait_mask_end(got);
+                if (got > 0 && copy_to_user((void *)a2, out, (uint64_t)got * sizeof(struct epoll_event)) != 0)
+                    return (uint64_t)-14;
+                return (uint64_t)got;
+            }
 
-                // Call do_poll() directly -- pfds is a kernel stack buffer,
-                // never user memory, so this must NOT go back through
-                // syscall_dispatcher(7, ...), which now validates its a1 as
-                // a genuine user pointer.
-                int ready = do_poll(fd_table, pfds, inst->num_watches, timeout_ms < 0 ? -1 : (int64_t)timeout_ms);
-
-                if (ready > 0) {
-                    int ev_count = 0;
-                    for (int i = 0; i < inst->num_watches; i++) {
-                        if (pfds[i].revents && ev_count < maxevents) {
-                            events[ev_count].data = inst->watches[i].ev.data;
-                            events[ev_count].events = 0;
-                            if (pfds[i].revents & 0x0001) events[ev_count].events |= EPOLLIN;
-                            if (pfds[i].revents & 0x0004) events[ev_count].events |= EPOLLOUT;
-                            if (pfds[i].revents & 0x0020) events[ev_count].events |= EPOLLERR;
-                            ev_count++;
-                        }
-                    }
-                    return ev_count;
-                }
+        case 26: // SYS_msync(addr, len, flags): shared file pages to their files
+            {
+                if (a1 & (PAGE_SIZE - 1)) return (uint64_t)-22;   /* -EINVAL */
+                if (a3 & 0x4 /* MS_SYNC */ || a3 & 0x1 /* MS_ASYNC */ || !a3)
+                    shmap_sync_range(sched_current()->proc, a1, a1 + a2);
                 return 0;
             }
 

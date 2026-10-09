@@ -20,6 +20,10 @@
 #define VFS_O_CREATE  0x04
 #define VFS_O_APPEND  0x08
 #define VFS_O_TRUNC   0x10
+/* set by vfs_open_flags(): the file's inode is pinned while this VfsFile
+   (and every copy kfile_get() made of it) is open, so an unlinked file
+   stays readable and writable through its fds, as on Linux */
+#define VFS_F_PINNED  0x80000000u
 
 /* Seek whence */
 #define VFS_SEEK_SET  0

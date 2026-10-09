@@ -1,0 +1,38 @@
+#!/bin/sh
+# WynlandOS - run an X11 program: xrun PROGRAM [ARGS...]
+#
+# X11 programs get an X server of their own, Xwayland, drawn as one
+# window in Zerp 2.0 (rootful: the X screen is that window). The first
+# xrun starts it on display :1, later ones reuse it.
+#   xrun xterm
+#   XRUN_SIZE=1600x900 xrun xterm
+#
+# Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
+
+if [ $# -eq 0 ]; then
+    echo "usage: xrun PROGRAM [ARGS...]" >&2
+    exit 2
+fi
+if [ -z "$WAYLAND_DISPLAY" ]; then
+    echo "xrun: no Wayland display (run it in the Zerp 2.0 session)" >&2
+    exit 1
+fi
+
+D=1
+if [ ! -S /tmp/.X11-unix/X$D ]; then
+    mkdir -p /tmp/.X11-unix 2>/dev/null
+    # software rendering into shared memory: no GL buffer sharing with the
+    # compositor yet
+    XWAYLAND_NO_GLAMOR=1 Xwayland :$D -geometry "${XRUN_SIZE:-1280x720}" -noreset \
+        -nolisten tcp >/tmp/xwayland-$(id -u).log 2>&1 &
+    i=0
+    while [ ! -S /tmp/.X11-unix/X$D ] && [ $i -lt 100 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    if [ ! -S /tmp/.X11-unix/X$D ]; then
+        echo "xrun: Xwayland did not start (see /tmp/xwayland-$(id -u).log)" >&2
+        exit 1
+    fi
+fi
+DISPLAY=:$D exec "$@"

@@ -40,6 +40,11 @@ PKGS="$PKGS libvterm0 libvterm-dev"
 # eglfs links the input stacks even with input disabled (Zerp 2.0 feeds
 # input itself); they only have to load
 PKGS="$PKGS libmtdev1t64 libinput10 libts0t64 libevdev2 libwacom9 libgudev-1.0-0"
+# Wayland: Zerp 2.0 is a compositor (QtWaylandCompositor, xdg-shell), and
+# Qt programs can be its clients (the wayland platform plugin)
+PKGS="$PKGS qt6-wayland-dev libqt6waylandcompositor6 libqt6waylandcompositorxdgshell6
+ qml6-module-qtwayland-compositor qt6-wayland libqt6waylandclient6 libqt6wlshellintegration6
+ libwayland-server0 libwayland-client0 libwayland-cursor0 libwayland-egl1 libxkbcommon0"
 
 # 1. fetch + unpack (cached; only packages not downloaded yet are fetched)
 mkdir -p "$CACHE/debs" "$ROOT"
@@ -102,15 +107,23 @@ g++ $CXXFLAGS -I"$ROOT/usr/include" -o "$OUT/term.elf" \
 echo "  QT6        built build/term.elf"
 
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
-Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
+Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick QtWaylandCompositor; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
+gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
+# wlcompat's two libwayland-server functions must win over the library's
+# own, for every library that calls them
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
     apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" \
-    -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
+    "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
+    -Wl,--export-dynamic-symbol=mkstemp -Wl,--export-dynamic-symbol=wl_resource_create \
+    "$LIB/libwayland-server.so.0" \
+    -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6WaylandCompositorXdgShell -lQt6WaylandCompositor \
+    -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/zerp2.elf"
 
 # 3. manifest: QML modules + ldd closure of the app and every QML plugin
+WLPLUG="wayland-shell-integration wayland-decoration-client wayland-graphics-integration-client wayland-graphics-integration-server"
 QMLSRC=$LIB/qt6/qml
 QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
 {
@@ -153,13 +166,21 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     echo "D /usr/lib/x86_64-linux-gnu/qt6/plugins/egldeviceintegrations"
     echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqeglfs.so $PL/platforms/libqeglfs.so"
     echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so $PL/egldeviceintegrations/libqeglfs-kms-integration.so"
+    # Wayland: the client platform plugin (Qt programs on Zerp's
+    # compositor) and the plugins both sides load
+    echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/platforms/libqwayland.so $PL/platforms/libqwayland.so"
+    for d in $WLPLUG; do
+        echo "D /usr/lib/x86_64-linux-gnu/qt6/plugins/$d"
+        for f in "$PL/$d"/*.so; do echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/$d/$(basename "$f") $f"; done
+    done
     echo "F /usr/bin/qt.conf rootfs/usr/bin/qt.conf"
 } > "$MAN"
 
 # libraries: everything the app and the QML plugins load, by soname into
 # /lib64 -- skipping what the base manifest already ships there
 { echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; echo "$OUT/files.elf"; echo "$OUT/term.elf"; find "$QMLSRC" -name "*.so";
-  echo "$LIB/qt6/plugins/platforms/libqeglfs.so"; echo "$LIB/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so"; } | while read f; do
+  echo "$LIB/qt6/plugins/platforms/libqeglfs.so"; echo "$LIB/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so";
+  echo "$LIB/qt6/plugins/platforms/libqwayland.so"; for d in $WLPLUG; do ls "$LIB/qt6/plugins/$d"/*.so; done; } | while read f; do
     ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
 done | sort -u | while read soname path; do
     if grep -qE "^F +/lib64/$soname( |$)" ext2_manifest.txt; then continue; fi

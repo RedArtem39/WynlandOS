@@ -507,8 +507,10 @@ static void ext2_reap_orphans(void);
 
 void ext2_flusher_thread(void *arg) {
     (void)arg;
+    extern void shmap_flush_unmapped(void);
     for (;;) {
         sched_sleep_ms(1000);
+        shmap_flush_unmapped();        /* before the orphans: it may let one go */
         ext2_reap_orphans();
         if (ext2_has_dirty()) ext2_flush();
     }
@@ -679,6 +681,12 @@ bool ext2_read_inode(uint32_t inum, Ext2Inode *out) {
     }
     kfree(buf);
     return ok;
+}
+
+/* an inode's size now (-1: no such inode) -- MAP_SHARED writeback */
+int64_t ext2_inode_size(uint32_t inum) {
+    Ext2Inode inode;
+    return ext2_read_inode(inum, &inode) ? (int64_t)inode.i_size : -1;
 }
 
 bool ext2_write_inode(uint32_t inum, const Ext2Inode *in) {
@@ -1509,13 +1517,16 @@ static void ext2_free_all_blocks(const Ext2Inode *inode) {
     }
 }
 
-/* Inodes held by lazy file mappings (kernel/vma.c VmaFile). Unlinking
-   such a file removes its name only; the inode and its blocks stay until
-   the last mapping goes, then the flusher thread frees them (the last
-   unpin can happen in the scheduler's reaper, no place for disk I/O).
-   Without this, a mapped file's inode was freed at unlink and could be
-   reused: untouched pages of the old mapping then read another file. */
-#define PIN_SLOTS 512
+/* Inodes held by lazy file mappings (kernel/vma.c VmaFile) and by open
+   files (VFS_F_PINNED). Unlinking such a file removes its name only; the
+   inode and its blocks stay until the last mapping or fd goes, then the
+   flusher thread frees them (the last unpin can happen in the scheduler's
+   reaper, no place for disk I/O). Without this, a mapped file's inode was
+   freed at unlink and could be reused: untouched pages of the old mapping
+   then read another file; and a file created, unlinked and then sized
+   through its fd (mkstemp + unlink, Qt's Wayland keymap) was already
+   gone. */
+#define PIN_SLOTS 4096
 static struct { uint32_t inum; uint32_t refs; bool orphan; } g_pins[PIN_SLOTS];
 
 static int pin_find(uint32_t inum) {
@@ -2024,6 +2035,12 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     file->dir_entry_sector = 0;
     file->dir_entry_offset = 0;
     file->dirty = false;
+    if (!is_dir) {
+        /* no pin, no open: unpinned, an unlink would free the inode under
+           the fd and a new file could take it */
+        if (!ext2_pin_inode(inum)) { kfree(file); return NULL; }
+        file->flags |= VFS_F_PINNED;
+    }
 
     if (flags & VFS_O_TRUNC) {
         pcache_drop_inode(inum);
@@ -2052,6 +2069,8 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
 
 void vfs_close(VfsFile *file) {
     if (!file) return;
+    if ((file->flags & VFS_F_PINNED) && file->node.first_cluster < 0xFFFFFF00u)
+        ext2_unpin_inode(file->node.first_cluster);
     kfree(file);
 }
 

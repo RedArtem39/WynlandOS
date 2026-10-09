@@ -144,6 +144,32 @@ static uint64_t current_key_pml4(void) {
     return (t && t->proc) ? (uint64_t)(uintptr_t)t->proc->pml4 : 0;
 }
 
+/* The queue key of a futex word: (address space, address), unless the
+   word is in memory shared between processes (PAGE_SHARED_MAP: a
+   MAP_SHARED file or memfd page, SysV-style SHM) and the caller did not
+   say FUTEX_PRIVATE_FLAG -- then its physical address, the same in every
+   process that maps it (key_pml4 1, never a page table's address). A
+   process-shared semaphore (Python's multiprocessing: sem_open() in
+   /dev/shm) waited on in one process and posted in another met in no
+   queue before. */
+#define FUTEX_KEY_SHARED 1
+static void futex_key(uint64_t uaddr, bool priv, uint64_t *kp, uint64_t *ka) {
+    *kp = current_key_pml4();
+    *ka = uaddr;
+    Thread *t = sched_current();
+    if (priv || !t || !t->proc || !t->proc->pml4) return;
+    uint64_t pte = vmm_get_pte(t->proc->pml4, uaddr & ~0xFFFULL);
+    if (!(pte & PAGE_PRESENT)) {                 /* not touched yet: fault it in */
+        uint32_t probe;                          /* a bad address just stays unkeyed */
+        if (copy_from_user(&probe, (const void *)uaddr, sizeof probe) != 0) return;
+        pte = vmm_get_pte(t->proc->pml4, uaddr & ~0xFFFULL);
+    }
+    if ((pte & PAGE_PRESENT) && (pte & PAGE_SHARED_MAP)) {
+        *kp = FUTEX_KEY_SHARED;
+        *ka = (pte & 0x000FFFFFFFFFF000ULL) | (uaddr & 0xFFFULL);
+    }
+}
+
 /* Absolute-deadline conversion for FUTEX_WAIT_BITSET timeouts (Linux ABI:
    `timeout_arg` points to a struct timespec holding an ABSOLUTE time --
    CLOCK_REALTIME if the flag is set, CLOCK_MONOTONIC otherwise). Our timer
@@ -181,7 +207,9 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                       uint64_t timeout_arg, uint64_t uaddr2, uint32_t val3) {
     uint32_t op = op_raw & ~FUTEX_OP_MASK;
     bool realtime = (op_raw & 256u) != 0;
-    uint64_t key = current_key_pml4();
+    const bool priv = (op_raw & 128u) != 0;
+    uint64_t key, kaddr;
+    futex_key(uaddr, priv, &key, &kaddr);
 
     switch (op) {
     case FUTEX_WAIT:
@@ -213,7 +241,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             return -11; /* -EAGAIN: value changed before we could sleep */
         }
 
-        FutexQueue *q = queue_lookup(key, uaddr, true);
+        FutexQueue *q = queue_lookup(key, kaddr, true);
         if (!q) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return -12; /* -ENOMEM: queue table exhausted */
@@ -238,7 +266,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
            wakes yet, documented v1 simplification. */
         uint64_t rflags;
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-        FutexQueue *q = queue_lookup(key, uaddr, false);
+        FutexQueue *q = queue_lookup(key, kaddr, false);
         uint32_t woken = 0;
         if (q) {
             queue_prune(q);
@@ -295,9 +323,11 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         default: cond = false; break;
         }
         uint32_t woken = 0;
+        uint64_t key2, kaddr2;
+        futex_key(uaddr2, priv, &key2, &kaddr2);
         for (int pass = 0; pass < 2; pass++) {
             if (pass == 1 && !cond) break;
-            FutexQueue *q = queue_lookup(key, pass ? uaddr2 : uaddr, false);
+            FutexQueue *q = pass ? queue_lookup(key2, kaddr2, false) : queue_lookup(key, kaddr, false);
             uint32_t limit = pass ? val2 : val, n = 0;
             if (!q) continue;
             queue_prune(q);
@@ -320,7 +350,8 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
     case FUTEX_CMP_REQUEUE: {
         volatile uint32_t *addr = (volatile uint32_t *)uaddr;
         uint32_t nr_requeue = (uint32_t)timeout_arg; /* arg4 = val2 */
-        uint64_t uaddr2_key_addr = uaddr2;
+        uint64_t key2, uaddr2_key_addr;
+        futex_key(uaddr2, priv, &key2, &uaddr2_key_addr);
 
         uint64_t rflags;
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
@@ -331,7 +362,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             return -11; /* -EAGAIN */
         }
 
-        FutexQueue *q = queue_lookup(key, uaddr, false);
+        FutexQueue *q = queue_lookup(key, kaddr, false);
         if (!q) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return 0;
@@ -349,8 +380,8 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         }
 
         uint32_t moved = 0;
-        if (nr_requeue > 0 && q->head && uaddr2_key_addr != uaddr) {
-            FutexQueue *q2 = queue_lookup(key, uaddr2_key_addr, true);
+        if (nr_requeue > 0 && q->head && (key2 != key || uaddr2_key_addr != kaddr)) {
+            FutexQueue *q2 = queue_lookup(key2, uaddr2_key_addr, true);
             if (q2) {
                 /* splice up to nr_requeue remaining waiters over */
                 Thread **src = &q->head;
@@ -383,10 +414,11 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
    DYING thread's context -- its CR3 and Process are still valid, which is
    exactly what the keying needs. Interrupt state handled internally. */
 void futex_wake_user(uint64_t uaddr, uint32_t n) {
-    uint64_t key = current_key_pml4();
+    uint64_t key, kaddr;
+    futex_key(uaddr, false, &key, &kaddr);   /* as Linux: a shared key where the memory is shared */
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-    FutexQueue *q = queue_lookup(key, uaddr, false);
+    FutexQueue *q = queue_lookup(key, kaddr, false);
     uint32_t woken = 0;
     if (q) {
         queue_prune(q);

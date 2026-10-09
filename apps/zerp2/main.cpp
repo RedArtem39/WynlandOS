@@ -28,6 +28,7 @@
 #include <QtQuick/QQuickWindow>
 #include <QtGui/QScreen>
 #include <QtQml/qqml.h>
+#include <sys/stat.h>
 
 #include "zerp2.h"
 #include "greeter.h"
@@ -171,7 +172,17 @@ private:
             return;
         }
         // everything else: raw scancodes to the focused client
-        if (ZClient *c = m_srv->focused()) { c->sendKey(e0, sc); return; }
+        if (ZClient *c = m_srv->focused()) {
+            // the modifiers held, for Wayland clients
+            Qt::KeyboardModifier m = Qt::NoModifier;
+            if (code == 0x2A || code == 0x36) m = e0 ? Qt::NoModifier : Qt::ShiftModifier;
+            else if (code == 0x1D) m = Qt::ControlModifier;
+            else if (code == 0x38) m = Qt::AltModifier;
+            else if (e0 && (code == 0x5B || code == 0x5C)) m = Qt::MetaModifier;
+            if (m != Qt::NoModifier) { if (release) m_mods &= ~m; else m_mods |= m; }
+            c->sendKey(e0, sc, m_mods);
+            return;
+        }
 
         int qk = 0;
         QString text;
@@ -249,7 +260,14 @@ int main(int argc, char **argv)
        console */
     if (bootCfg().contains("qsginfo")) qputenv("QSG_INFO", "1");
     if (!qEnvironmentVariableIsSet("HOME")) qputenv("HOME", "/tmp");
-    if (!qEnvironmentVariableIsSet("XDG_RUNTIME_DIR")) qputenv("XDG_RUNTIME_DIR", "/tmp");
+    // the session's own runtime directory: the Wayland socket lives there,
+    // and /tmp/wayland-0 left by another user's session could not be
+    // replaced (sticky /tmp)
+    if (!qEnvironmentVariableIsSet("XDG_RUNTIME_DIR") || qgetenv("XDG_RUNTIME_DIR") == "/tmp") {
+        const QByteArray rt = "/tmp/xdg-" + QByteArray::number(uint(getuid()));
+        ::mkdir(rt.constData(), 0700);
+        qputenv("XDG_RUNTIME_DIR", rt);
+    }
 
     // zerp2 --greeter REQ_FD REP_FD [--first]: the login screen (wynlogin)
     const bool greeterMode = argc >= 4 && !strcmp(argv[1], "--greeter");
@@ -310,7 +328,27 @@ int main(int argc, char **argv)
             }
         }
     }
-    if (!greeterMode) server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
+    if (!greeterMode) {
+        // what the session starts inherits these: Wayland programs find
+        // the compositor (Shell.qml), Qt ones take its platform plugin
+        // (ours, the Zerp clients, pick their own)
+        qputenv("WAYLAND_DISPLAY", "wayland-0");
+        qputenv("QT_QPA_PLATFORM", "wayland");
+        server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
+        // debugging: boot.cfg "wlrun=CMD[;CMD...]" -- programs started a few
+        // seconds in (Wayland clients, for the picture and the tests)
+        const QByteArray cfg = bootCfg();
+        const int at = cfg.indexOf("wlrun=");
+        if (at >= 0) {
+            const QList<QByteArray> cmds = cfg.mid(at + 6).split('\n').first().trimmed().split(';');
+            int when = 4000;
+            for (const QByteArray &c : cmds) {
+                const QString cmd = QString::fromUtf8(c).replace(QLatin1Char('+'), QLatin1Char(' '));
+                QTimer::singleShot(when, &server, [&server, cmd] { server.run(cmd); });
+                when += 2500;
+            }
+        }
+    }
     QObject::connect(win, &QQuickWindow::frameSwapped, win, [] {
         static int frames = 0;
         if (++frames == 1 || frames % 600 == 0) fprintf(stderr, "[zerp2] frame %d\n", frames);

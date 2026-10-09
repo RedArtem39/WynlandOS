@@ -25,7 +25,10 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  libpython3.14-stdlib libpython3-stdlib python3-pip python3-wheel
  python3-packaging python3-setuptools python3-venv python3.14-venv
  python3-pip-whl python3-setuptools-whl tzdata netbase media-types
- gpgv ubuntu-keyring"
+ gpgv ubuntu-keyring
+ foot libfcft4t64 libutf8proc3 xkb-data ncurses-term libc-bin
+ xwayland xserver-common x11-xkb-utils xterm xbitmaps libxfont2 libfontenc1 libxcvt0
+ libxkbfile1 libxaw7 libxmu6 libxft2 libxpm4 libutempter0 libei1 liboeffis1"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)
@@ -59,6 +62,7 @@ skip() {
         /usr/share/fish/man/*|/usr/share/fish/tools/*|/usr/share/applications/*) return 0 ;;
         /usr/share/pixmaps/*|/usr/share/icons/*|/etc/init.d/*|/etc/cron*|/usr/lib/systemd/*) return 0 ;;
         /usr/lib/x86_64-linux-gnu/*.so*) return 0 ;;   # libraries go by soname below
+        /usr/sbin/ldconfig) return 0 ;;                  # leaf's shim instead (libc-bin's would rebuild ld.so.cache)
         /lib/systemd/*|/usr/share/bash-completion/*|/usr/share/zsh/*) return 0 ;;
         # Debian's "use apt, not pip" marker: there is no apt here
         /usr/lib/python3*/EXTERNALLY-MANAGED) return 0 ;;
@@ -80,6 +84,8 @@ for d in "$CACHE"/debs/*.deb; do
         [ -z "$path" ] || [ "$path" = / ] && continue
         path=${path%/}
         skip "$path" && continue
+        # ncurses-term: only foot's own entries (TERM=foot), not 3000 others
+        case "$d" in */ncurses-term_*) case "$path" in /usr/share/terminfo|/usr/share/terminfo/f|/usr/share/terminfo/f/foot*) ;; *) continue ;; esac ;; esac
         case "$mode" in
             d*) echo "$path" >> "$dirs" ;;
             l*) echo "$(plain "$path") ${rest#-> }" >> "$links" ;;
@@ -208,6 +214,10 @@ L=$REPO/apps/leaf
         echo "F /usr/bin/$n $L/shims/noop"
     done
     echo "F /usr/sbin/ldconfig $L/shims/noop"
+    # X11 programs through Xwayland (rootfs/usr/bin/xrun)
+    echo "F /usr/bin/xrun $REPO/rootfs/usr/bin/xrun"
+    echo "D /tmp/.X11-unix"
+    echo "P /tmp/.X11-unix 0 41777"
 } >> "$MAN"
 
 rm -f "$dirs" "$files" "$links"
