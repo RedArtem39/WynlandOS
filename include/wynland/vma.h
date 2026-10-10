@@ -28,7 +28,7 @@
    may be closed right after mmap()), shared by the VMAs split from one
    mapping and by fork() copies. */
 typedef struct VmaFile {
-    uint8_t  vf[512];        /* a VfsFile, by value (vma.c checks the size) */
+    uint8_t  vf[1024];       /* a VfsFile, by value (vma.c checks the size) */
     uint32_t refs;
 } VmaFile;
 

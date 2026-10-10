@@ -75,7 +75,7 @@ missing; anything not listed here is `-ENOSYS`.
 | 61, 247 | `wait4`, `waitid` | |
 | 98 | `getrusage` | CPU time |
 | 109, 111, 112, 121, 124 | `setpgid`, `getpgrp`, `setsid`, `getpgid`, `getsid` | |
-| 157 | `prctl` | `PR_SET/GET_NO_NEW_PRIVS`, `PR_SET/GET_SECCOMP`, `PR_SET/GET_NAME`, `PR_SET/GET_DUMPABLE`, `PR_SET/GET_PDEATHSIG` (kept, not sent), `PR_CAPBSET_READ/DROP`; others accepted |
+| 157 | `prctl` | `PR_SET/GET_NO_NEW_PRIVS`, `PR_SET/GET_SECCOMP`, `PR_SET/GET_NAME`, `PR_SET/GET_DUMPABLE`, `PR_SET/GET_PDEATHSIG`, `PR_CAPBSET_READ/DROP`; others accepted |
 | 158 | `arch_prctl` | `ARCH_SET_FS`/`GET_FS` |
 | 202 | `futex` | wait/wake queues, bitsets, requeue |
 | 218, 273, 334 | `set_tid_address`, `set_robust_list`, `rseq` | |
@@ -104,13 +104,20 @@ missing; anything not listed here is `-ENOSYS`.
 | 317 | `seccomp` | `SET_MODE_STRICT`, `SET_MODE_FILTER` (classic BPF, up to 4096 instructions, stacked; flags TSYNC/LOG/SPEC_ALLOW), `GET_ACTION_AVAIL`. Actions: KILL_PROCESS, KILL_THREAD (both kill the process with SIGSYS), TRAP (SIGSYS with `si_syscall`, `si_call_addr`, `si_arch`; the handler's `REG_RAX` is the result), ERRNO, LOG, ALLOW; TRACE and USER_NOTIF give `-ENOSYS`. Filters are per process (every thread), inherited by fork, spawn and execve; installing one needs no_new_privs or CAP_SYS_ADMIN |
 | 125, 126 | `capget`, `capset` | root has every capability, a user none; the creator of a user namespace has all of them inside it; `capset` only drops |
 | 161 | `chroot` | needs CAP_SYS_CHROOT (root, or inside a user namespace); moves the working directory to the new root; `..` stays at it, absolute symlinks start at it, directory fds from outside lead nowhere |
-| 272 | `unshare` | `CLONE_NEWUSER` (anyone; one-range uid/gid maps through `/proc/self/uid_map`, `gid_map`, `setgroups`), `CLONE_NEWPID` (children only; the first is pid 1, its death kills the rest), `CLONE_NEWNET` (no IP; abstract Unix sockets of its own); UTS/IPC/CGROUP/TIME accepted, isolating nothing; `CLONE_NEWNS` `-EINVAL` |
+| 272 | `unshare` | `CLONE_NEWUSER` (anyone; one-range uid/gid maps through `/proc/{self,PID}/uid_map`, `gid_map`, `setgroups`), `CLONE_NEWPID` (children only; the first is pid 1, its death kills the rest), `CLONE_NEWNET` (no IP; abstract Unix sockets of its own; `lo` and rtnetlink there so it can be "configured"), `CLONE_NEWNS` (a copy of the mounts; copied into a less privileged namespace they are locked); UTS/IPC/CGROUP/TIME accepted, isolating nothing |
+| 165, 166, 155 | `mount`, `umount2`, `pivot_root` | bind mounts (files or directories, read-only by remount), tmpfs; proc, sysfs, devpts, mqueue, cgroup accepted as no-ops (those files exist by name); propagation flags accepted, nothing propagates; `MS_MOVE` `-EINVAL`. Needs CAP_SYS_ADMIN in the user namespace owning the mount namespace. `/proc/self/mountinfo` and `/proc/self/mounts` list them |
+| 282, 289 | `signalfd`, `signalfd4` | the signals pending for the reading thread (they must be blocked) |
 | 56 | `clone` | the same `CLONE_NEW*` flags for the child |
 | 308 | `setns` | `-EINVAL` |
 
 `readlink("/proc/self/ns/user")` and the other namespaces give
 `user:[NNN]`, different for each namespace. With no_new_privs, or inside
-a user namespace, setuid and setgid bits do nothing at execve.
+a user namespace, setuid and setgid bits do nothing at execve. Ubuntu's
+bubblewrap runs (`tests/sandboxtest.c`).
+
+Not there: `setns`, `MS_MOVE`, mount propagation, a read-only remount
+refusing files already open for writing (writes through them go on), and
+the `/proc/PID` directories beyond the namespace files.
 
 ### Signals
 

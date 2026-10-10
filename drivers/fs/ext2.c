@@ -267,15 +267,6 @@ static bool dot_name(const char *b) {
     return !b[0] || (b[0] == '.' && (!b[1] || (b[1] == '.' && !b[2])));
 }
 
-/* Helper: check if path ends with suffix */
-static bool path_ends_with(const char *path, const char *suffix) {
-    uint32_t plen = str_len_local(path);
-    uint32_t slen = str_len_local(suffix);
-    if (plen < slen) return false;
-    const char *p = path + (plen - slen);
-    return str_compare(p, suffix) == 0;
-}
-
 static void print_u32(uint32_t v) {
     char buf[16];
     uint_to_str(v, buf);
@@ -521,6 +512,7 @@ void ext2_flusher_thread(void *arg) {
     for (;;) {
         sched_sleep_ms(1000);
         shmap_flush_unmapped();        /* before the orphans: it may let one go */
+        sandbox_mnt_reap();            /* tmpfs directories nothing mounts any more */
         ext2_reap_orphans();
         if (ext2_has_dirty()) ext2_flush();
     }
@@ -1262,6 +1254,23 @@ static bool ext2_dir_name_of(const Ext2Inode *dir, uint32_t inum, char *name, ui
     return found;
 }
 
+bool at_root(uint32_t ino);   /* below: the process's root, or what is mounted over it */
+
+/* a device node's number (major << 8 | minor): ext2 keeps the old encoding
+   in i_block[0], or the new one in i_block[1] */
+static uint32_t ext2_rdev(const Ext2Inode *ip) {
+    if (ip->i_block[0]) return ip->i_block[0] & 0xFFFF;
+    uint32_t n = ip->i_block[1];
+    return ((n >> 8) & 0xFFF) << 8 | ((n & 0xFF) | ((n >> 12) & 0xFFF00));
+}
+
+/* the name of inode `child` in directory `dir_inum` (mountinfo) */
+bool vfs_name_in_dir(uint32_t dir_inum, uint32_t child, char *name, uint32_t cap) {
+    Ext2Inode d;
+    if (!ext2_read_inode(dir_inum, &d) || (d.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
+    return ext2_dir_name_of(&d, child, name, cap);
+}
+
 /* The absolute path of directory inode `inum`, found the way getcwd()
    did on old Unixes: up through "..", looking each name up in the
    parent. What getcwd() and the *at() calls' dirfds are resolved by.
@@ -1273,8 +1282,14 @@ bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap) {
     char tmp[MAX_PATH];
     uint32_t pos = MAX_PATH - 1;      /* built backwards from the end */
     tmp[pos] = 0;
-    const uint32_t root = sandbox_lookup_root();
-    for (int depth = 0; inum != root; depth++) {
+    for (int depth = 0; !at_root(inum); depth++) {
+        /* a mount's root is named by where it is mounted */
+        uint32_t mp = mnt_up(inum);
+        if (mp != inum) {
+            if (depth > 64) return false;
+            inum = mp;
+            continue;
+        }
         if (inum == EXT2_ROOT_INO) return false;    /* reached the real root: outside */
         Ext2Inode dir, parent;
         uint32_t pinum;
@@ -1784,17 +1799,46 @@ uint32_t ext2_read_symlink(const Ext2Inode *link, char *buf, uint32_t bufsize) {
    requirement applies only to the public entry point below; symlink
    expansion reuses this directly with relative targets. */
 static bool ext2_lookup_from(uint32_t start_inum, const char *path,
-                             uint32_t *out_inum, Ext2Inode *out_inode, int link_depth);
+                             uint32_t *out_inum, Ext2Inode *out_inode, int link_depth, const void *ctx);
 
 /* Absolute paths start at the calling process's root (chroot()); ".."
-   there stays there, and absolute symlink targets start there too. */
+   there stays there, and absolute symlink targets start there too.
+   Mounts (kernel/sandbox.c): a mountpoint is stepped through to what is
+   mounted there, ".." at a mount's root leads to the mountpoint's
+   directory; the mount the lookup ends in is left in the thread
+   (lookup_mnt, lookup_ro: read-only). */
 static bool ext2_lookup_path(const char *path, uint32_t *out_inum, Ext2Inode *out_inode) {
     if (!path || path[0] != '/') return false;
-    return ext2_lookup_from(sandbox_lookup_root(), path, out_inum, out_inode, 0);
+    const void *ctx = NULL;
+    uint32_t start = mnt_enter(sandbox_lookup_root(), &ctx);
+    if (!start) return false;
+    return ext2_lookup_from(start, path, out_inum, out_inode, 0, ctx);
+}
+
+/* the process's root as lookups start at it: the root inode, or what is
+   mounted over it -- ".." at either stays there */
+bool at_root(uint32_t ino) {
+    uint32_t r = sandbox_lookup_root();
+    if (ino == r) return true;
+    const void *c = NULL;
+    return mnt_enter(r, &c) == ino;
+}
+
+/* may the caller look names up in this directory (search permission)?
+   The kernel's own file work (the root password, tmpfs bookkeeping) may */
+static bool may_search(const Ext2Inode *dir) {
+    Thread *t = sched_current();
+    if (!t || !t->proc || t->fs_real_root) return true;
+    return (vfs_perm_for(dir->i_uid, dir->i_gid, dir->i_mode) & 1) != 0;
+}
+
+static void lookup_done(const void *ctx) {
+    Thread *t = sched_current();
+    if (t) { t->lookup_mnt = ctx; t->lookup_ro = mnt_ro(ctx); }
 }
 
 static bool ext2_lookup_from(uint32_t start_inum, const char *path,
-                             uint32_t *out_inum, Ext2Inode *out_inode, int link_depth) {
+                             uint32_t *out_inum, Ext2Inode *out_inode, int link_depth, const void *ctx) {
     if (!path || !out_inum || link_depth > EXT2_LOOKUP_MAX_LINKS) return false;
 
     uint32_t cur_inum = start_inum;
@@ -1824,16 +1868,36 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
            ones -- a file holding a made-up entry for the real root led out
            of any chroot */
         if ((cur.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
-        /* ".." at the process's root: the root itself */
-        if (comp[0] == '.' && comp[1] == '.' && !comp[2] && cur_inum == sandbox_lookup_root()) {
+        /* search permission on every directory walked through (there was
+           none: a 0700 home was open to anyone who knew a name in it) */
+        if (!may_search(&cur)) return false;
+        /* ".." at the process's root (or what is mounted over it): the root */
+        if (comp[0] == '.' && comp[1] == '.' && !comp[2] && at_root(cur_inum)) {
             if (last) {
                 *out_inum = cur_inum;
                 if (out_inode) *out_inode = cur;
+                lookup_done(ctx);
+                return true;
+            }
+            continue;
+        }
+        /* ".." at a mount's root: the directory holding its mountpoint
+           (the real parent of what is mounted could be anywhere) */
+        uint32_t up;
+        if (comp[0] == '.' && comp[1] == '.' && !comp[2] && mnt_leave(cur_inum, &ctx, &up)) {
+            cur_inum = up;
+            if (!ext2_read_inode(cur_inum, &cur)) return false;
+            if (last) {
+                *out_inum = cur_inum;
+                if (out_inode) *out_inode = cur;
+                lookup_done(ctx);
                 return true;
             }
             continue;
         }
         if (!ext2_dir_lookup(&cur, comp, &next_inum, &next_type)) return false;
+        next_inum = mnt_enter(next_inum, &ctx);       /* a mountpoint: what is mounted */
+        if (!next_inum) return false;                 /* too many mounts stacked there */
 
         Ext2Inode next;
         if (!ext2_read_inode(next_inum, &next)) return false;
@@ -1856,9 +1920,13 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
             for (uint32_t i = 0; i < rl; i++) combined[tl + i] = rest[i];
             combined[tl + rl] = '\0';
 
-            uint32_t base = (target[0] == '/') ? sandbox_lookup_root() : cur_inum;
-            return ext2_lookup_from(base, combined, out_inum, out_inode,
-                                    link_depth + 1);
+            if (target[0] == '/') {
+                const void *rctx = NULL;
+                uint32_t base = mnt_enter(sandbox_lookup_root(), &rctx);
+                if (!base) return false;
+                return ext2_lookup_from(base, combined, out_inum, out_inode, link_depth + 1, rctx);
+            }
+            return ext2_lookup_from(cur_inum, combined, out_inum, out_inode, link_depth + 1, ctx);
         }
 
         cur_inum = next_inum;
@@ -1867,13 +1935,37 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
         if (last) {
             *out_inum = cur_inum;
             if (out_inode) *out_inode = cur;
+            lookup_done(ctx);
             return true;
         }
     }
 
     *out_inum = cur_inum;
     if (out_inode) *out_inode = cur;
+    lookup_done(ctx);
     return true;
+}
+
+/* the mount a path's directory lies in (link and rename stay inside one) */
+static const void *dir_mount(const char *path) {
+    char dir[MAX_PATH], base[MAX_FILENAME];
+    uint32_t i;
+    Ext2Inode n;
+    if (!split_path(path, dir, base) || !ext2_lookup_path(dir, &i, &n)) return (const void *)1;
+    return sched_current()->lookup_mnt;
+}
+
+/* Does a change at `path` fall on a read-only mount? (self: the path's
+   own mount; else, or when it does not exist, its directory's) */
+static bool ro_path(const char *path, bool self) {
+    if (!mnt_any_ro()) return false;
+    uint32_t i;
+    Ext2Inode n;
+    if (self && ext2_lookup_path(path, &i, &n)) return sched_current()->lookup_ro;
+    char dir[MAX_PATH], base[MAX_FILENAME];
+    if (!split_path(path, dir, base)) return false;
+    if (ext2_lookup_path(dir, &i, &n)) return sched_current()->lookup_ro;
+    return false;
 }
 
 /* Like ext2_lookup_path, but a symlink as the LAST component is not
@@ -1970,16 +2062,16 @@ static VfsFile *alloc_device_file(const char *name, uint32_t size,
 VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     /* Device nodes first -- exact or suffix match (handles relative
        paths), byte-identical behavior to the previous FAT32 driver. */
-    if (str_compare(path, "/dev/fb0") == 0 || path_ends_with(path, "/dev/fb0") || path_ends_with(path, "dev/fb0")) {
+    if (str_compare(path, "/dev/fb0") == 0) {
         extern BootInfo *g_boot_info;
         return alloc_device_file("fb0",
                                  g_boot_info ? (g_boot_info->fb_pitch * g_boot_info->fb_height) : 0,
                                  false, DEV_FB0, flags);
     }
-    if (str_compare(path, "/dev/input/mice") == 0 || path_ends_with(path, "/dev/input/mice") || path_ends_with(path, "dev/input/mice")) {
+    if (str_compare(path, "/dev/input/mice") == 0) {
         return alloc_device_file("mice", 0, false, DEV_MICE, flags);
     }
-    if (str_compare(path, "/dev/input/kbd") == 0 || path_ends_with(path, "/dev/input/kbd") || path_ends_with(path, "dev/input/kbd")) {
+    if (str_compare(path, "/dev/input/kbd") == 0) {
         return alloc_device_file("kbd", 0, false, DEV_KBD, flags);
     }
     /* DRM nodes (drivers/video/virtgpu_drm.c): ioctl/mmap-only devices */
@@ -1993,7 +2085,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         if (f) f->current_cluster = drm_open_client();
         return f;
     }
-    if (str_compare(path, "/dev/tty") == 0 || path_ends_with(path, "/dev/tty") || path_ends_with(path, "dev/tty")) {
+    if (str_compare(path, "/dev/tty") == 0) {
         return alloc_device_file("tty", 0, false, DEV_TTY, flags);
     }
 
@@ -2003,12 +2095,12 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
        next hung indefinitely. Real /dev/null semantics: writes discard
        everything, reads always return EOF immediately (see the
        DEV_NULL branches in vfs_read/vfs_write below). */
-    if (str_compare(path, "/dev/null") == 0 || path_ends_with(path, "/dev/null") || path_ends_with(path, "dev/null")) {
+    if (str_compare(path, "/dev/null") == 0) {
         return alloc_device_file("null", 0, false, DEV_NULL, flags);
     }
 
     /* /dev/dsp: the HD Audio output (drivers/sound/hda.c), OSS style */
-    if (str_compare(path, "/dev/dsp") == 0 || path_ends_with(path, "/dev/dsp")) {
+    if (str_compare(path, "/dev/dsp") == 0) {
         extern bool hda_present(void);
         extern void hda_dsp_open(void);
         if (!hda_present()) return NULL;
@@ -2024,15 +2116,18 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
        reads return zeros (getrandom syscall is the real entropy source
        elsewhere); writes silently succeed. */
     if (str_compare(path, "/dev/urandom") == 0 ||
-        str_compare(path, "/dev/random")  == 0 ||
-        path_ends_with(path, "/dev/urandom") ||
-        path_ends_with(path, "/dev/random")) {
+        str_compare(path, "/dev/random")  == 0) {
         return alloc_device_file("urandom", 0, false, DEV_URANDOM, flags);
     }
 
     uint32_t inum;
     Ext2Inode inode;
     bool found = ext2_lookup_path(path, &inum, &inode);
+    /* a read-only mount: no writing, creating or truncating there */
+    bool on_ro = found && sched_current()->lookup_ro;
+    if ((flags & (VFS_O_WRITE | VFS_O_CREATE | VFS_O_TRUNC | VFS_O_APPEND)) &&
+        (found ? on_ro : ro_path(path, false)))
+        return NULL;
 
     if (!found) {
         if (flags & VFS_O_CREATE) {
@@ -2045,6 +2140,18 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     }
 
     bool is_dir = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+    if ((inode.i_mode & EXT2_S_IFMT) == 0x2000) {
+        /* a character device node on the disk (bound into a sandbox under
+           another path): the device of its number, whatever it is called;
+           the rest -- /dev/full, and /dev/tty, whose terminal is the
+           caller's (opened by its own name) -- read as empty and swallow
+           writes */
+        uint32_t rdev = ext2_rdev(&inode);
+        if (rdev == ((1u << 8) | 5)) return alloc_device_file("zero", 0, false, DEV_ZERO, flags);
+        if (rdev == ((1u << 8) | 8) || rdev == ((1u << 8) | 9))
+            return alloc_device_file("urandom", 0, false, DEV_URANDOM, flags);
+        return alloc_device_file("null", 0, false, DEV_NULL, flags);
+    }
     if (is_dir && ((flags & VFS_O_WRITE) || (flags & VFS_O_CREATE) || (flags & VFS_O_TRUNC))) {
         return NULL; /* directories can only be opened read-only */
     }
@@ -2065,6 +2172,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     file->dir_entry_sector = 0;
     file->dir_entry_offset = 0;
     file->dirty = false;
+    if (on_ro) file->flags |= VFS_F_ROMNT;   /* fchmod, fchown, futimes, ftruncate refuse */
     if (!is_dir) {
         /* no pin, no open: unpinned, an unlink would free the inode under
            the fd and a new file could take it */
@@ -2348,6 +2456,7 @@ bool vfs_mksock(const char *path) {
 }
 
 static bool create_node(const char *path, uint16_t mode, uint8_t ft) {
+    if (ro_path(path, false)) return false;   /* a read-only mount */
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
     if (dot_name(basename)) return false;
@@ -2434,6 +2543,7 @@ static int chown_inode(uint32_t inum, Ext2Inode *inode, uint32_t uid, uint32_t g
 }
 
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
+    if (ro_path(path, !nofollow)) return -30;
     uint32_t inum;
     Ext2Inode inode;
     bool ok = nofollow ? ext2_lookup_nofollow(path, &inum, &inode, NULL) : ext2_lookup_path(path, &inum, &inode);
@@ -2442,6 +2552,7 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
 }
 
 int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
+    if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -9;
     uint32_t inum = file->node.first_cluster;
     if (inum == 0 || inum >= 0xFFFFFF00u) return 0;    /* devices, pipes: nothing kept */
@@ -2454,6 +2565,7 @@ int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
 
 /* chmod: the owner or root; only the permission bits change */
 bool vfs_chmod(const char *path, uint32_t mode) {
+    if (ro_path(path, true)) return false;
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return false;
@@ -2524,6 +2636,7 @@ static void ext2_free_blocks_from(Ext2Inode *inode, uint32_t first)
    it (it was ENOSYS: those operations failed). 0 ok, -1 error. */
 int vfs_ftruncate(VfsFile *file, uint32_t len)
 {
+    if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -1;
     uint32_t inum = file->node.first_cluster;
     if (inum == 0 || inum >= 0xFFFFFF00u) return -1;
@@ -2554,6 +2667,7 @@ int vfs_ftruncate(VfsFile *file, uint32_t len)
 /* fchmod(): the open file's inode, owner or root only. -1 not an ext2
    file, 0 not allowed, 1 done. */
 int vfs_fchmod(VfsFile *file, uint32_t mode) {
+    if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -1;
     uint32_t inum = file->node.first_cluster;
     if (inum == 0 || inum >= 0xFFFFFF00u) return -1;    /* device/socket/pipe sentinels */
@@ -2568,6 +2682,7 @@ int vfs_fchmod(VfsFile *file, uint32_t mode) {
 }
 
 bool vfs_set_readonly(const char *path) {
+    if (ro_path(path, true)) return false;
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return false;
@@ -2582,6 +2697,7 @@ bool vfs_set_readonly(const char *path) {
  * ============================================================ */
 
 bool vfs_mkdir(const char *path) {
+    if (ro_path(path, false)) return false;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
     if (dot_name(basename)) return false;
@@ -2595,12 +2711,14 @@ bool vfs_mkdir(const char *path) {
 }
 
 bool vfs_delete(const char *path) {
+    if (ro_path(path, false)) return false;
     if (!path || str_compare(path, "/") == 0) return false; /* never delete root */
 
     uint32_t inum;
     Ext2Inode inode;
     /* a symlink is removed itself, never what it points to */
     if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return false;
+    if (mnt_is_point(inum)) return false;    /* something is mounted there: busy */
 
     bool is_dir = ((inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR);
 
@@ -2688,6 +2806,7 @@ void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *fi
 static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t mtime);
 
 int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) {
+    if (ro_path(path, !nofollow)) return -30;
     uint32_t inum;
     Ext2Inode inode;
     bool ok = nofollow ? ext2_lookup_nofollow(path, &inum, &inode, NULL)
@@ -2697,6 +2816,7 @@ int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) 
 }
 
 int vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime) {
+    if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     Ext2Inode inode;
     if (!file || !ext2_read_inode(file->node.first_cluster, &inode)) return -9;   /* -EBADF */
     return utimes_inode(file->node.first_cluster, inode, atime, mtime);
@@ -2728,6 +2848,13 @@ bool vfs_lstat(const char *path, VfsStat *out) {
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return false;
+    /* a mountpoint shows what is mounted on it */
+    const void *ctx = NULL;
+    uint32_t m = mnt_enter(inum, &ctx);
+    if (m != inum) {
+        inum = m;
+        if (!ext2_read_inode(inum, &inode)) return false;
+    }
     fill_stat(out, path, inum, &inode);
     return true;
 }
@@ -2741,6 +2868,7 @@ int vfs_readlink(const char *path, char *buf, uint32_t cap) {
 }
 
 bool vfs_symlink(const char *target, const char *linkpath) {
+    if (ro_path(linkpath, false)) return false;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     if (!split_path(linkpath, dirname, basename) || !basename[0]) return false;
     if (dot_name(basename)) return false;
@@ -2753,6 +2881,8 @@ bool vfs_symlink(const char *target, const char *linkpath) {
 }
 
 int vfs_link(const char *oldpath, const char *newpath) {
+    if (ro_path(newpath, false) || ro_path(oldpath, false)) return -30;   /* -EROFS */
+    if (dir_mount(oldpath) != dir_mount(newpath)) return -18;            /* -EXDEV: another mount */
     uint32_t inum, dinum, x;
     Ext2Inode inode, dir;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
@@ -2800,6 +2930,8 @@ static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2I
     out->ctime = inode.i_ctime;
     out->is_link = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFLNK;
     out->is_sock = (inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFSOCK;
+    out->is_chr = (inode.i_mode & EXT2_S_IFMT) == 0x2000;   /* S_IFCHR */
+    out->rdev = out->is_chr ? ext2_rdev(&inode) : 0;
     out->nlink = inode.i_links_count;
 }
 
@@ -2864,6 +2996,8 @@ bool vfs_readdir(const char *path, void (*callback)(VfsNode *node)) {
  * ============================================================ */
 
 bool vfs_rename(const char *oldpath, const char *newpath) {
+    if (ro_path(oldpath, false) || ro_path(newpath, false)) return false;
+    if (dir_mount(oldpath) != dir_mount(newpath)) return false;          /* another mount (EXDEV) */
     char old_dir[MAX_PATH], old_base[MAX_FILENAME];
     char new_dir[MAX_PATH], new_base[MAX_FILENAME];
     split_path(oldpath, old_dir, old_base);
@@ -2875,6 +3009,7 @@ bool vfs_rename(const char *oldpath, const char *newpath) {
     if (!ext2_lookup_path(old_dir, &old_dir_inum, &old_dir_inode)) return false;
     if (!ext2_lookup_path(new_dir, &new_dir_inum, &new_dir_inode)) return false;
     if (!ext2_dir_lookup(&old_dir_inode, old_base, &old_inum, NULL)) return false;
+    if (mnt_is_point(old_inum)) return false;    /* a mountpoint stays where it is */
     if (!ext2_read_inode(old_inum, &old_inode)) return false;
     if (!may_write_dir(&old_dir_inode) || !may_write_dir(&new_dir_inode)) return false;
 

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -368,6 +369,174 @@ static int t_bpf_div0(void) {
     return 2;
 }
 
+/* ------------------------------------------------------- mount namespace */
+
+static char g_mt[64];       /* /tmp/sandboxmnt-PID, made by main */
+
+static int put(const char *path, const char *s) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int n = write(fd, s, strlen(s));
+    close(fd);
+    return n == (int)strlen(s) ? 0 : -1;
+}
+
+static int got(const char *path, const char *s) {
+    char b[64] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    int n = read(fd, b, sizeof b - 1);
+    close(fd);
+    return n == (int)strlen(s) && !memcmp(b, s, n);
+}
+
+static int t_mount_needs_cap(void) {
+    char b[96];
+    snprintf(b, sizeof b, "%s/b", g_mt);
+    return mount("tmpfs", b, "tmpfs", 0, NULL) == -1 && errno == EPERM ? 0 : 1;
+}
+
+static int t_bind(void) {
+    char a[96], b[96], p[128];
+    snprintf(a, sizeof a, "%s/a", g_mt);
+    snprintf(b, sizeof b, "%s/b", g_mt);
+    if (become_ns_root() != 0) return 1;
+    if (unshare(CLONE_NEWNS) != 0) return 2;
+    if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) return 3;   /* bwrap's first step */
+    if (mount(a, b, NULL, MS_BIND | MS_REC, NULL) != 0) return 4;
+    snprintf(p, sizeof p, "%s/f", b);
+    if (!got(p, "hello")) return 5;                     /* a's file, seen at b */
+    /* ".." of the mount's root is b's directory, not a's */
+    struct stat s1, s2;
+    snprintf(p, sizeof p, "%s/..", b);
+    if (stat(p, &s1) != 0 || stat(g_mt, &s2) != 0 || s1.st_ino != s2.st_ino) return 6;
+    char cwd[128];
+    if (chdir(b) != 0 || !getcwd(cwd, sizeof cwd) || strcmp(cwd, b)) return 7;
+    chdir("/");
+    /* read-only */
+    if (mount(NULL, b, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) return 8;
+    snprintf(p, sizeof p, "%s/f", b);
+    if (open(p, O_WRONLY) >= 0) return 9;
+    snprintf(p, sizeof p, "%s/new", b);
+    if (open(p, O_WRONLY | O_CREAT, 0644) >= 0 || mkdir(p, 0755) == 0) return 10;
+    snprintf(p, sizeof p, "%s/g", a);                    /* the source itself stays writable */
+    if (put(p, "x") != 0) return 11;
+    unlink(p);
+    if (rmdir(b) == 0) return 12;                        /* a mountpoint is busy */
+    if (umount2(b, MNT_DETACH) != 0) return 13;
+    snprintf(p, sizeof p, "%s/f", b);
+    if (access(p, F_OK) == 0) return 14;                 /* b is b again */
+    /* tmpfs */
+    if (mount("tmpfs", b, "tmpfs", 0, "mode=0755") != 0) return 15;
+    snprintf(p, sizeof p, "%s/t", b);
+    if (put(p, "tmp") != 0 || !got(p, "tmp")) return 16;
+    if (umount2(b, 0) != 0) return 17;
+    if (access(p, F_OK) == 0) return 18;
+    /* this is ours: the parent's view gets a mount for good, it must not see it */
+    if (mount(a, b, NULL, MS_BIND, NULL) != 0) return 19;
+    /* a hard link does not cross from one mount to another */
+    char f1[128], f2[128];
+    snprintf(f1, sizeof f1, "%s/f", b);
+    snprintf(f2, sizeof f2, "%s/f-link", g_mt);
+    if (link(f1, f2) == 0 || errno != EXDEV) return 20;
+    /* a symlink is not a mount target (its directory is not the textual one) */
+    snprintf(p, sizeof p, "%s/lnk", g_mt);
+    symlink(a, p);
+    if (mount(a, p, NULL, MS_BIND, NULL) == 0) return 21;
+    return 0;
+}
+
+/* a directory without search permission is not walked through (root's
+   home is 0700: nothing in it, whatever its name) */
+static int t_search(void) {
+    struct stat st;
+    if (stat("/root", &st) != 0 || (st.st_mode & 0777) != 0700) return 0;   /* (no /root here) */
+    if (stat("/root/.", &st) == 0) return 1;
+    if (access("/root/.bashrc", F_OK) == 0 || errno != EACCES && errno != ENOENT) return 2;
+    return 0;
+}
+
+/* what bubblewrap does: a tmpfs as the new root, the system's /usr in it
+   read-only, pivot_root, the old root detached -- and a socket from
+   outside bound in */
+static int t_pivot(void) {
+    char base[96], p[160], sock[128];
+    snprintf(base, sizeof base, "%s/base", g_mt);
+    snprintf(sock, sizeof sock, "%s/sock/s", g_mt);
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    strcpy(a.sun_path, sock);
+    if (bind(srv, (struct sockaddr *)&a, sizeof a) != 0 || listen(srv, 2) != 0) return 1;
+    if (become_ns_root() != 0) return 2;
+    if (unshare(CLONE_NEWNS) != 0) return 3;
+    if (mount("tmpfs", base, "tmpfs", 0, NULL) != 0) return 4;
+    snprintf(p, sizeof p, "%s/usr", base);  mkdir(p, 0755);
+    if (mount("/usr", p, NULL, MS_BIND | MS_REC, NULL) != 0) return 5;
+    if (mount(NULL, p, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL) != 0) return 6;
+    snprintf(p, sizeof p, "%s/run", base);  mkdir(p, 0755);
+    char sockdir[128];
+    snprintf(sockdir, sizeof sockdir, "%s/sock", g_mt);
+    if (mount(sockdir, p, NULL, MS_BIND, NULL) != 0) return 7;
+    snprintf(p, sizeof p, "%s/oldroot", base);  mkdir(p, 0755);
+    if (chdir(base) != 0) return 8;
+    if (syscall(SYS_pivot_root, ".", "oldroot") != 0) return 9;
+    if (umount2("/oldroot", MNT_DETACH) != 0) return 10;
+    if (chdir("/") != 0) return 11;
+    if (access("/usr/bin/fish", X_OK) != 0) return 12;        /* the system's programs */
+    if (access("/etc/passwd", F_OK) == 0) return 13;           /* nothing else */
+    if (access("/usr/../etc/passwd", F_OK) == 0) return 14;
+    if (access("/oldroot/etc/passwd", F_OK) == 0) return 15;
+    if (open("/usr/sandboxtest-x", O_WRONLY | O_CREAT, 0644) >= 0) return 16;   /* read-only */
+    if (put("/scratch", "ok") != 0) return 17;                  /* the tmpfs root is ours */
+    char cwd[64];
+    if (!getcwd(cwd, sizeof cwd) || strcmp(cwd, "/")) return 18;
+    /* the socket from outside, through the bind mount */
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un in;
+    memset(&in, 0, sizeof in);
+    in.sun_family = AF_UNIX;
+    strcpy(in.sun_path, "/run/s");
+    if (connect(c, (struct sockaddr *)&in, sizeof in) != 0) return 19;
+    /* a mount's root, held open: its path is where it is mounted
+       (bubblewrap checks every mount this way) */
+    int ufd = open("/usr", O_PATH | O_CLOEXEC);
+    char lp[64], lk[128] = {0};
+    snprintf(lp, sizeof lp, "/proc/self/fd/%d", ufd);
+    if (ufd < 0) return 20;
+    if (readlink(lp, lk, sizeof lk - 1) <= 0) { printf("[sandboxtest] readlink %s: %s\n", lp, strerror(errno)); return 21; }
+    if (strcmp(lk, "/usr")) { printf("[sandboxtest] readlink %s = %s\n", lp, lk); return 22; }
+    return 0;
+}
+
+/* the real bubblewrap from Ubuntu, if the image has it */
+static int t_bwrap(void) {
+    if (access("/usr/bin/bwrap", X_OK) != 0) return 0;
+    int pfd[2];
+    if (pipe(pfd) != 0) return 1;
+    pid_t c = fork();
+    if (c == 0) {
+        dup2(pfd[1], 1);
+        dup2(pfd[1], 2);
+        /* the libraries live in /lib64 here, not under /usr */
+        execl("/usr/bin/bwrap", "bwrap", "--unshare-all", "--die-with-parent",
+              "--ro-bind", "/usr", "/usr", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/lib", "/lib",
+              "--symlink", "usr/bin", "/bin", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+              "/usr/bin/sh", "-c", "test -e /etc/passwd || echo sandboxed-$(id -u)", (char *)NULL);
+        _exit(127);
+    }
+    close(pfd[1]);
+    char out[512] = {0};
+    int n = 0, r;
+    while (n < (int)sizeof out - 1 && (r = read(pfd[0], out + n, sizeof out - 1 - n)) > 0) n += r;
+    int st;
+    waitpid(c, &st, 0);
+    printf("[sandboxtest] bwrap said: %s (status %d)\n", out, WIFEXITED(st) ? WEXITSTATUS(st) : -WTERMSIG(st));
+    if (!strstr(out, "sandboxed-")) return 2;
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? 0 : 3;
+}
+
 static int t_procfd(void) {
     char b[64];
     return readlink("/proc/self/fd/99999999999999", b, sizeof b) == -1 ? 0 : 1;
@@ -399,6 +568,26 @@ int main(int argc, char **argv) {
     check(in_child(t_file_not_dir) == 0, "paths: a file's bytes are not directory entries");
     check(in_child(t_bpf_div0) == 1000 + SIGSYS, "seccomp: division by a zero X kills");
     check(in_child(t_procfd) == 0, "/proc/self/fd/<huge>: no such fd, no crash");
+    snprintf(g_mt, sizeof g_mt, "/tmp/sandboxmnt-%d", (int)getpid());
+    {
+        char p[128];
+        mkdir(g_mt, 0755);
+        snprintf(p, sizeof p, "%s/a", g_mt);    mkdir(p, 0755);
+        snprintf(p, sizeof p, "%s/a/f", g_mt);  put(p, "hello");
+        snprintf(p, sizeof p, "%s/b", g_mt);    mkdir(p, 0755);
+        snprintf(p, sizeof p, "%s/base", g_mt); mkdir(p, 0755);
+        snprintf(p, sizeof p, "%s/sock", g_mt); mkdir(p, 0755);
+    }
+    check(in_child(t_mount_needs_cap) == 0, "mount: refused without the capability");
+    check(in_child(t_search) == 0, "paths: no way through a directory without search permission");
+    check(in_child(t_bind) == 0, "mount namespace: bind, read-only, .., getcwd, tmpfs, umount");
+    {
+        char p[128];
+        snprintf(p, sizeof p, "%s/b/f", g_mt);
+        check(access(p, F_OK) != 0, "mount namespace: its mounts are its own");
+    }
+    check(in_child(t_pivot) == 0, "mount namespace: tmpfs root, ro /usr, pivot_root, a socket bound in");
+    check(in_child(t_bwrap) == 0, "bubblewrap runs a program in a sandbox");
     printf("[sandboxtest] DONE pass=%d fail=%d\n", pass, fail);
     return fail ? 1 : 0;
 }

@@ -36,6 +36,7 @@
 #include <wynland/kfile.h>
 #include <wynland/unix_socket.h>
 #include <wynland/sandbox.h>
+#include <wynland/vfs.h>
 
 extern uint64_t timer_get_ms(void);
 
@@ -100,6 +101,7 @@ typedef struct USock {
     bool     bound;
     uint16_t name_len;
     uint32_t scope;                /* whose name it is: name_scope() */
+    bool pinned;                   /* holds its socket file's inode */
     char     name[USOCK_NAME_MAX];
     struct UCred cred;       /* creator's */
     struct UCred peer_cred;  /* peer's, captured at connect/socketpair time */
@@ -172,6 +174,10 @@ static void disconnect(USock *s) {
 
 static void usock_destroy(USock *s) {
     g_usock[s->idx] = NULL;
+    if (s->pinned) {
+        extern void ext2_unpin_inode(uint32_t inum);
+        ext2_unpin_inode(s->scope);
+    }
     disconnect(s);
     /* A datagram socket connect()ed to s points at it one-directionally
        (s->peer doesn't point back): clear those too. */
@@ -251,18 +257,32 @@ static bool name_eq(const USock *s, const char *name, uint32_t len) {
     return true;
 }
 
-/* Whose names: a filesystem name belongs to the root it was bound under
-   (a chroot's "/tmp/x" is not the host's), an abstract one to the network
-   namespace (as on Linux). */
+/* What a name means, as on Linux: a filesystem name is its socket file --
+   the inode the path leads to from the caller (its chroot, its mounts: a
+   socket bound into a sandbox by a bind mount is the same socket); an
+   abstract name belongs to the network namespace. */
+#define SCOPE_ABSTRACT 0x80000000u
+#define SCOPE_NONE     0xFFFFFFFFu
 static uint32_t name_scope(const char *name, uint32_t len) {
-    if (len && name[0] == '\0') return 0x80000000u | sandbox_netns(sched_current()->proc);
-    return sandbox_lookup_root();
+    if (len && name[0] == '\0') return SCOPE_ABSTRACT | sandbox_netns(sched_current()->proc);
+    char path[USOCK_NAME_MAX + 1];
+    uint32_t n = len < USOCK_NAME_MAX ? len : USOCK_NAME_MAX;
+    kmemcpy(path, name, n);
+    path[n] = 0;
+    VfsStat st;
+    if (!vfs_stat(path, &st) || !st.is_sock) return SCOPE_NONE;
+    if (!vfs_may_access(path, 2)) return SCOPE_NONE;    /* connecting needs write permission on it */
+    return st.first_cluster;
 }
 
 static USock *find_bound(const char *name, uint32_t len) {
     uint32_t scope = name_scope(name, len);
+    if (scope == SCOPE_NONE) return NULL;
+    bool abstract = (scope & SCOPE_ABSTRACT) != 0;
     for (int i = 0; i < USOCK_SLOTS; i++) {
-        if (g_usock[i] && g_usock[i]->scope == scope && name_eq(g_usock[i], name, len)) return g_usock[i];
+        USock *s = g_usock[i];
+        if (!s || !s->bound || s->scope != scope) continue;
+        if (!abstract || name_eq(s, name, len)) return s;
     }
     return NULL;
 }
@@ -283,10 +303,19 @@ int64_t usock_bind(int idx, const char *name, uint32_t len) {
     if (len == 0) return -EINVAL; /* autobind isn't implemented */
     if (s->bound) return -EINVAL;
     if (find_bound(name, len)) return -EADDRINUSE;
+    /* a filesystem name: its file was made just before (SYS_bind) */
+    uint32_t scope = name_scope(name, len);
+    if (scope == SCOPE_NONE) return -ENOENT;
     kmemcpy(s->name, name, len);
     s->name_len = (uint16_t)len;
-    s->scope = name_scope(name, len);
+    s->scope = scope;
     s->bound = true;
+    /* its file's inode stays while it is bound (unlinked, an orphan): the
+       number must not come back as another socket's name */
+    if (!(scope & SCOPE_ABSTRACT)) {
+        extern bool ext2_pin_inode(uint32_t inum);
+        s->pinned = ext2_pin_inode(scope);
+    }
     return 0;
 }
 

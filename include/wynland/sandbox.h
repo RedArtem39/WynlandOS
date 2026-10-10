@@ -14,8 +14,15 @@
  *  - chroot() moves the working directory to the new root too.
  *  - a user namespace maps one range of ids; ids not mapped read as 65534.
  *  - CLONE_NEWUTS / NEWIPC / NEWCGROUP / NEWTIME are accepted and isolate
- *    nothing (there is no hostname to set, no SysV IPC, no cgroups);
- *    CLONE_NEWNS (mount namespaces) is refused with EINVAL.
+ *    nothing (there is no hostname to set, no SysV IPC, no cgroups).
+ *  - mounts are bind mounts of the one ext2 filesystem and tmpfs (a fresh
+ *    directory of it, hidden, gone with its last mount); proc, sysfs,
+ *    devpts, mqueue and cgroup mounts are accepted and change nothing (those
+ *    files exist by name everywhere). MS_REC binds the directory without
+ *    the mounts under it; propagation flags are accepted, mounts never
+ *    propagate. Read-only mounts refuse changes by path and through files
+ *    opened on them; a file opened for writing before a read-only remount
+ *    keeps writing. At most 256 mounts per namespace, 16 stacked.
  *
  * Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
  */
@@ -27,6 +34,7 @@ struct Thread;
 typedef struct SeccompFilter SeccompFilter;
 typedef struct UserNs UserNs;
 typedef struct PidNs PidNs;
+typedef struct MntNs MntNs;
 
 /* capabilities (the bits Linux uses) */
 #define CAP_SETGID     6
@@ -88,9 +96,26 @@ uint64_t pid_from_ns(uint64_t local, const struct Process *viewer);
 /* a new process or thread id `global` exists in p's pid namespace */
 void     pidns_register(uint64_t global, struct Process *p);
 
-/* /proc/self/{uid_map,gid_map,setgroups}: kind 1, 2, 3 */
-int  sandbox_proc_file(const char *path);            /* kind, or 0 */
-int64_t sandbox_proc_read(int kind, char *out, uint32_t cap);
-int64_t sandbox_proc_write(int kind, const char *buf, uint32_t len);
+/* ---- mounts (the ext2 walker's side) ----
+   `ctx` is the mount a lookup is in (NULL: none). */
+uint32_t mnt_enter(uint32_t ino, const void **ctx);   /* through mountpoints */
+bool     mnt_leave(uint32_t ino, const void **ctx, uint32_t *parent);   /* ".." out of a mount */
+bool     mnt_ro(const void *ctx);
+bool     mnt_any_ro(void);            /* the caller's namespace has read-only mounts */
+bool     mnt_is_point(uint32_t ino);  /* something is mounted there */
+uint32_t mnt_up(uint32_t ino);        /* a mount's root -> its mountpoint (getcwd) */
+int64_t  sandbox_mount(const char *src, const char *tgt, const char *type, uint64_t flags);
+int64_t  sandbox_umount(const char *tgt, int flags);
+int64_t  sandbox_pivot_root(const char *new_root, const char *put_old);
+void     sandbox_mnt_reap(void);      /* the flusher: tmpfs directories nothing mounts */
+/* /proc/self/mountinfo or /proc/self/mounts of the caller: the length */
+uint32_t sandbox_mountinfo(char *out, uint32_t cap, bool mountinfo);
+
+/* /proc/{self,PID}/{uid_map,gid_map,setgroups}: kind 1, 2, 3, and the
+   process's global pid */
+int  sandbox_proc_file(const char *path, uint64_t *gpid);   /* kind, or 0 */
+bool sandbox_proc_dir(const char *path);   /* /proc/self, /proc/PID, their ns/ and fd/ */
+int64_t sandbox_proc_read(int kind, uint64_t gpid, char *out, uint32_t cap);
+int64_t sandbox_proc_write(int kind, uint64_t gpid, const char *buf, uint32_t len);
 /* readlink("/proc/self/ns/NAME"): "user:[4026531837]" */
 bool sandbox_ns_link(const char *name, char *out, uint32_t cap);

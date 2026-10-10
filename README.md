@@ -64,7 +64,8 @@ libav, VP8/9, AV1); sound through an Intel HD Audio driver (`/dev/dsp`).
 - Pseudo-terminals with a real line discipline (`/dev/ptmx`, `/dev/pts/N`,
   canonical mode, ^C to the foreground group, `SIGWINCH`).
 - Sandboxing, as browsers build theirs: seccomp-bpf, no_new_privs,
-  capabilities, chroot, and user, pid and network namespaces.
+  capabilities, chroot, user, pid, network and mount namespaces --
+  Ubuntu's bubblewrap runs on it.
 - Networking: virtio-net, ARP/IPv4/ICMP/UDP/TCP, DHCP, DNS; Unix domain
   sockets with fd passing; `poll`, `select`, `epoll`, `eventfd`, `timerfd`,
   `memfd`.

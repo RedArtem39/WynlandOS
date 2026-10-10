@@ -141,11 +141,14 @@ typedef struct Process {
     bool       caps_set;             /* capabilities given/changed: cap_* hold them;
                                         else root (outside any user namespace) has all */
     uint64_t   cap_eff, cap_prm, cap_inh;
-    uint32_t   root_inum;            /* chroot(): lookups start there; 0 = the real root */
+    uint32_t   root_inum;            /* chroot(), pivot_root(): lookups start there; 0 = the real root */
+    bool       chrooted;             /* by chroot() (not the root of its mount namespace):
+                                        no new user namespace from there */
     struct UserNs *userns;           /* NULL: the initial user namespace */
     struct PidNs  *pidns;            /* where it is (NULL: the initial one) */
     struct PidNs  *pidns_child;      /* where its children go (unshare(CLONE_NEWPID)) */
     uint32_t   netns;                /* 0: the host's network; else isolated (no IP) */
+    struct MntNs  *mntns;            /* its mounts (NULL: the initial namespace's) */
     bool       nondumpable;          /* prctl(PR_SET_DUMPABLE, 0) */
     int        pdeathsig;            /* prctl(PR_SET_PDEATHSIG): kept, not sent */
     struct Process *next;

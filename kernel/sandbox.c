@@ -28,6 +28,11 @@ extern void serial_write_string(const char *str);
 
 static Process *cur(void) { Thread *t = sched_current(); return t ? t->proc : NULL; }
 
+/* mount namespaces (further down) */
+static MntNs *mntns_of(const Process *p);
+static MntNs *mntns_copy(MntNs *from, UserNs *owner);
+static void mntns_unref(MntNs *ns);
+
 static uint64_t caps_of(const Process *p) {
     if (!p) return 0;
     if (p->caps_set) return p->cap_eff;
@@ -583,6 +588,8 @@ static UserNs *userns_new(Process *p) {
     ns->level = level;
     ns->owner = p->uid;
     ns->id = g_ns_ids++;
+    /* "deny" in setgroups is inherited, as on Linux (and cannot be undone) */
+    ns->setgroups_deny = p->userns && p->userns->setgroups_deny;
     return ns;
 }
 
@@ -695,9 +702,8 @@ uint32_t sandbox_netns(const Process *p) { return p ? p->netns : 0; }
 /* may p make the namespaces in `flags`? (a new user namespace first gives
    it the right to the others, as on Linux) */
 static int64_t ns_check(const Process *p, uint64_t flags) {
-    if (flags & CLONE_NEWNS) return -EINVAL;             /* mount namespaces: not yet */
     if (flags & CLONE_NEWUSER) {
-        if (p->root_inum) return -EPERM;                 /* not from inside a chroot */
+        if (p->chrooted) return -EPERM;                  /* not from inside a chroot */
         if ((p->userns ? p->userns->level : 0) >= NS_MAX_LEVEL) return -EUSERS;
         return 0;
     }
@@ -725,6 +731,12 @@ int64_t sandbox_unshare(uint64_t flags) {
         pn = pidns_new(p->pidns_child ? p->pidns_child : p->pidns);
         if (!pn) { if (un) kfree(un); return -ENOMEM; }
     }
+    MntNs *mn = NULL;
+    if (flags & CLONE_NEWNS) {
+        mn = mntns_copy(mntns_of(p), un ? un : p->userns);
+        if (!mn) { if (un) kfree(un); if (pn) kfree(pn); return -ENOMEM; }
+    }
+    if (mn) { mntns_unref(p->mntns); p->mntns = mn; }
     if (un) {                    /* the new user namespace's creator has every capability in it */
         p->userns = un;
         p->caps_set = true;
@@ -740,16 +752,17 @@ int64_t sandbox_unshare(uint64_t flags) {
    fork so that it either gets them or fails */
 static UserNs *g_pend_user;
 static PidNs  *g_pend_pid;
+static MntNs  *g_pend_mnt;
 
 int64_t sandbox_clone_check(uint64_t flags) {
     g_pend_user = NULL;
     g_pend_pid = NULL;
+    g_pend_mnt = NULL;
     if (!(flags & NS_FLAGS)) return 0;
     Process *p = cur();
     if (flags & CLONE_NEWUSER) {
-        if (p->root_inum) return -EPERM;
+        if (p->chrooted) return -EPERM;
         if ((p->userns ? p->userns->level : 0) >= NS_MAX_LEVEL) return -EUSERS;
-        if (flags & CLONE_NEWNS) return -EINVAL;
         /* the child is admin in its new namespace: the rest is allowed */
     } else {
         int64_t r = ns_check(p, flags);
@@ -767,6 +780,10 @@ int64_t sandbox_clone_check(uint64_t flags) {
             return -ENOMEM;
         }
     }
+    if (flags & CLONE_NEWNS) {
+        g_pend_mnt = mntns_copy(mntns_of(p), g_pend_user ? g_pend_user : p->userns);
+        if (!g_pend_mnt) { sandbox_clone_abort(); return -ENOMEM; }
+    }
     return 0;
 }
 
@@ -774,8 +791,10 @@ int64_t sandbox_clone_check(uint64_t flags) {
 void sandbox_clone_abort(void) {
     if (g_pend_user) kfree(g_pend_user);
     if (g_pend_pid) kfree(g_pend_pid);
+    mntns_unref(g_pend_mnt);
     g_pend_user = NULL;
     g_pend_pid = NULL;
+    g_pend_mnt = NULL;
 }
 
 void sandbox_clone_apply(Process *child, uint64_t flags) {
@@ -787,6 +806,11 @@ void sandbox_clone_apply(Process *child, uint64_t flags) {
         g_pend_user = NULL;
     }
     if (flags & CLONE_NEWNET) child->netns = g_netns_ids++;
+    if (g_pend_mnt) {
+        mntns_unref(child->mntns);
+        child->mntns = g_pend_mnt;
+        g_pend_mnt = NULL;
+    }
 }
 
 /* May a new process be made into p's children's pid namespace (its init
@@ -803,6 +827,605 @@ int64_t sandbox_thread_check(Process *p) {
     return pidns_reserve(p->pidns) ? 0 : -ENOMEM;
 }
 
+
+/* =====================================================================
+ * mount namespaces
+ *
+ * Every mount is of the one ext2 filesystem: a bind mount shows a
+ * directory (or file) at another one's place; a tmpfs is a fresh directory
+ * under /.tmpfs (root-only), given to whoever mounted it, removed by the
+ * flusher once nothing mounts it. The path walker (drivers/fs/ext2.c)
+ * steps from a mountpoint to the mount's root (mnt_enter) and, for ".." at
+ * a mount's root, to the mountpoint's directory (mnt_leave) -- never to
+ * the real parent of what is mounted.
+ * ===================================================================== */
+
+typedef struct Tmpfs {
+    uint32_t refs;
+    char path[40];
+} Tmpfs;
+
+typedef struct Mount {
+    uint32_t mp;                /* the inode it covers, as reached from where it was mounted */
+    uint32_t mp_parent;         /* the directory holding the mountpoint */
+    uint32_t root;              /* what it shows */
+    struct Mount *in;           /* the mount the mountpoint lies in (NULL: none) */
+    bool ro;
+    bool locked;                /* inherited by a less privileged namespace: stays, stays read-only */
+    Tmpfs *tmp;                 /* the tmpfs it shows (or a part of): kept while it is mounted */
+    struct Mount *next;         /* newest first */
+} Mount;
+
+struct MntNs {
+    uint32_t refs;
+    uint32_t id;
+    Mount *mounts;
+    UserNs *owner;              /* whose capabilities may change it */
+    uint32_t count;
+};
+
+#define MNT_MAX 256             /* mounts per namespace */
+
+static MntNs g_init_mnt = { 1u << 30, 0, NULL, NULL, 0 };
+
+/* the inodes a mount shows and covers stay (unlinked, they are orphans
+   until it goes): a deleted mount root's inode could be reused */
+extern bool ext2_pin_inode(uint32_t inum);
+extern void ext2_unpin_inode(uint32_t inum);
+static void mnt_pin(Mount *m) {
+    ext2_pin_inode(m->root);
+    ext2_pin_inode(m->mp);
+}
+static void mnt_unpin(Mount *m) {
+    ext2_unpin_inode(m->root);
+    ext2_unpin_inode(m->mp);
+}
+
+static MntNs *mntns_of(const Process *p) { return p && p->mntns ? p->mntns : &g_init_mnt; }
+static MntNs *cur_mnt(void) {
+    Thread *t = sched_current();
+    /* the kernel's own file work (sandbox_real_root): the real root, and
+       none of the calling process's mounts either */
+    if (!t || t->fs_real_root) return &g_init_mnt;
+    return mntns_of(t->proc);
+}
+
+/* 0: more mounts stacked there than are followed (the lookup fails rather
+   than show what one of them covers) */
+#define MNT_STACK 16
+uint32_t mnt_enter(uint32_t ino, const void **ctx) {
+    MntNs *ns = cur_mnt();
+    if (!ns->mounts) return ino;
+    /* stacked mounts: each mount crossed once, the newest first */
+    const Mount *used[MNT_STACK];
+    int nu = 0;
+    for (bool again = true; again; ) {
+        again = false;
+        for (Mount *m = ns->mounts; m; m = m->next) {
+            if (m->mp != ino) continue;
+            bool seen = false;
+            for (int k = 0; k < nu; k++) if (used[k] == m) seen = true;
+            if (seen) continue;
+            if (nu == MNT_STACK) return 0;
+            used[nu++] = m;
+            ino = m->root;
+            *ctx = m;
+            again = true;
+            break;
+        }
+    }
+    return ino;
+}
+
+bool mnt_leave(uint32_t ino, const void **ctx, uint32_t *parent) {
+    const Mount *m = (const Mount *)*ctx;
+    if (!m || m->root != ino) return false;
+    *parent = m->mp_parent;
+    *ctx = m->in;
+    return true;
+}
+
+bool mnt_ro(const void *ctx) { return ctx && ((const Mount *)ctx)->ro; }
+
+bool mnt_any_ro(void) {
+    for (Mount *m = cur_mnt()->mounts; m; m = m->next) if (m->ro) return true;
+    return false;
+}
+
+bool mnt_is_point(uint32_t ino) {
+    for (Mount *m = cur_mnt()->mounts; m; m = m->next) if (m->mp == ino) return true;
+    return false;
+}
+
+uint32_t mnt_up(uint32_t ino) {
+    for (Mount *m = cur_mnt()->mounts; m; m = m->next)
+        if (m->root == ino && m->mp != ino) return m->mp;
+    return ino;
+}
+
+/* ---- tmpfs directories ---- */
+
+static void tmp_unref(Tmpfs *t);
+#define REAP_MAX 64
+static char g_reap[REAP_MAX][40];
+static int g_nreap;
+static uint32_t g_tmp_seq;
+static bool g_tmp_cleaned;
+
+extern void *g_vfs_root_override;
+
+/* as root, at the real root (whoever asks, wherever its root is) */
+static void kernel_fs(bool on) {
+    g_vfs_root_override = on ? (void *)sched_current() : NULL;
+    sandbox_real_root(on);
+}
+
+/* everything under (and with) path; a few levels of directories */
+static char g_rm_names[64][MAX_FILENAME];
+static int g_rm_n;
+static bool g_rm_dir[64];
+static void rm_collect(VfsNode *n) {
+    if (!n->name[0] || (n->name[0] == '.' && (!n->name[1] || (n->name[1] == '.' && !n->name[2])))) return;
+    if (g_rm_n >= 64) return;
+    int k = 0;
+    while (n->name[k] && k < MAX_FILENAME - 1) { g_rm_names[g_rm_n][k] = n->name[k]; k++; }
+    g_rm_names[g_rm_n][k] = 0;
+    g_rm_dir[g_rm_n] = n->is_dir;
+    g_rm_n++;
+}
+static void rm_rf(const char *path, int depth) {
+    /* the thing itself first: a symlink (or a file) is removed, never
+       followed -- a symlink to /etc among a tmpfs's files must not take
+       /etc's contents with it */
+    VfsStat st;
+    if (depth > 16 || !vfs_lstat(path, &st)) return;
+    if (st.is_link || !st.is_dir) { vfs_delete(path); return; }
+    for (int round = 0; round < 64; round++) {
+        g_rm_n = 0;
+        if (!vfs_readdir(path, rm_collect) || g_rm_n == 0) break;
+        int n = g_rm_n;
+        /* whole names, our own copy: the recursion reuses the buffer */
+        char (*names)[MAX_FILENAME] = kmalloc((uint64_t)n * MAX_FILENAME);
+        if (!names) break;
+        for (int k = 0; k < n; k++) memcpy(names[k], g_rm_names[k], MAX_FILENAME);
+        bool removed = false;
+        for (int k = 0; k < n; k++) {
+            char child[MAX_PATH];
+            uint32_t pl = 0, nl2 = 0;
+            while (path[pl] && pl < MAX_PATH - 2) { child[pl] = path[pl]; pl++; }
+            child[pl++] = '/';
+            while (names[k][nl2] && pl + nl2 < MAX_PATH - 1) { child[pl + nl2] = names[k][nl2]; nl2++; }
+            if (names[k][nl2]) continue;                  /* too long: left alone */
+            child[pl + nl2] = 0;
+            VfsStat cs;
+            bool had = vfs_lstat(child, &cs);
+            rm_rf(child, depth + 1);
+            if (had && !vfs_lstat(child, &cs)) removed = true;
+        }
+        kfree(names);
+        if (!removed) break;
+    }
+    vfs_delete(path);
+}
+
+static Tmpfs *tmp_new(Process *owner, uint32_t mode) {
+    kernel_fs(true);
+    VfsStat st;
+    if (!vfs_stat("/.tmpfs", &st)) {
+        vfs_mkdir("/.tmpfs");
+        vfs_chmod("/.tmpfs", 0700);
+    }
+    Tmpfs *t = (Tmpfs *)kmalloc(sizeof(Tmpfs));
+    if (!t) { kernel_fs(false); return NULL; }
+    memset(t, 0, sizeof(*t));
+    const char *pre = "/.tmpfs/";
+    uint32_t n = 0;
+    while (pre[n]) { t->path[n] = pre[n]; n++; }
+    for (int tries = 0; tries < 1000; tries++) {
+        char d[12];
+        int k = 0;
+        uint32_t m = n;
+        uint32_t v = ++g_tmp_seq;
+        do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (k) t->path[m++] = d[--k];
+        t->path[m] = 0;
+        if (!vfs_stat(t->path, &st)) break;     /* a fresh name */
+    }
+    bool ok = vfs_mkdir(t->path) && vfs_chown(t->path, owner->uid, owner->gid, false) == 0 &&
+              vfs_chmod(t->path, mode & 07777);
+    kernel_fs(false);
+    if (!ok) { kfree(t); return NULL; }
+    t->refs = 1;
+    return t;
+}
+
+static void tmp_unref(Tmpfs *t) {
+    if (!t || --t->refs) return;
+    /* the flusher removes it (here we may be in the scheduler's reaper) */
+    if (g_nreap < REAP_MAX) {
+        int k = 0;
+        while (t->path[k]) { g_reap[g_nreap][k] = t->path[k]; k++; }
+        g_reap[g_nreap][k] = 0;
+        g_nreap++;
+    }
+    kfree(t);
+}
+
+/* the flusher thread (nothing else runs rm_rf: its buffers are static) */
+void sandbox_mnt_reap(void) {
+    if (!g_tmp_cleaned) {                 /* tmpfs directories left from before a reboot */
+        g_tmp_cleaned = true;
+        kernel_fs(true);
+        g_rm_n = 0;
+        if (vfs_readdir("/.tmpfs", rm_collect)) {
+            rm_rf("/.tmpfs", 0);
+            vfs_mkdir("/.tmpfs");
+            vfs_chmod("/.tmpfs", 0700);
+        }
+        kernel_fs(false);
+    }
+    while (g_nreap > 0) {
+        char p[40];
+        int i = --g_nreap, k = 0;
+        while (g_reap[i][k]) { p[k] = g_reap[i][k]; k++; }
+        p[k] = 0;
+        kernel_fs(true);
+        rm_rf(p, 0);
+        kernel_fs(false);
+    }
+}
+
+/* ---- namespaces ---- */
+
+static void mnt_free_list(Mount *m) {
+    while (m) {
+        Mount *n = m->next;
+        tmp_unref(m->tmp);
+        mnt_unpin(m);
+        kfree(m);
+        m = n;
+    }
+}
+
+static void mntns_unref(MntNs *ns) {
+    if (!ns || ns == &g_init_mnt || --ns->refs) return;
+    mnt_free_list(ns->mounts);
+    kfree(ns);
+}
+
+/* a copy of `from`'s mounts (CLONE_NEWNS), owned by `owner`'s
+   capabilities; inherited into a less privileged namespace, they are
+   locked (cannot be unmounted, nor made writable) */
+static MntNs *mntns_copy(MntNs *from, UserNs *owner) {
+    MntNs *ns = (MntNs *)kmalloc(sizeof(MntNs));
+    if (!ns) return NULL;
+    memset(ns, 0, sizeof(*ns));
+    ns->refs = 1;
+    ns->id = g_ns_ids++;
+    ns->owner = owner;
+    bool lock = owner != from->owner;
+    /* all of them (MNT_MAX at most), same order; `in` pointers mapped to the copies */
+    Mount **olds = kmalloc(MNT_MAX * sizeof(Mount *)), **news = kmalloc(MNT_MAX * sizeof(Mount *));
+    if (!olds || !news) { if (olds) kfree(olds); if (news) kfree(news); kfree(ns); return NULL; }
+    int n = 0;
+    Mount **tail = &ns->mounts;
+    for (Mount *m = from->mounts; m; m = m->next) {
+        Mount *c = n < MNT_MAX ? (Mount *)kmalloc(sizeof(Mount)) : NULL;
+        if (!c) { mnt_free_list(ns->mounts); kfree(ns); kfree(olds); kfree(news); return NULL; }
+        *c = *m;
+        c->next = NULL;
+        if (lock) c->locked = true;
+        if (c->tmp) c->tmp->refs++;
+        mnt_pin(c);
+        olds[n] = m;
+        news[n] = c;
+        n++;
+        *tail = c;
+        tail = &c->next;
+    }
+    for (int i = 0; i < n; i++) {
+        if (!news[i]->in) continue;
+        Mount *mapped = NULL;
+        for (int j = 0; j < n; j++) if (news[i]->in == olds[j]) { mapped = news[j]; break; }
+        news[i]->in = mapped;             /* (every ancestor was copied: never a stale pointer) */
+    }
+    ns->count = (uint32_t)n;
+    kfree(olds);
+    kfree(news);
+    return ns;
+}
+
+#define MS_RDONLY      1u
+#define MS_REMOUNT     32u
+#define MS_BIND        4096u
+#define MS_MOVE        8192u
+#define MS_REC         16384u
+#define MS_UNBINDABLE  (1u << 17)
+#define MS_PRIVATE     (1u << 18)
+#define MS_SLAVE       (1u << 19)
+#define MS_SHARED      (1u << 20)
+#define MS_PROPAGATION (MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED)
+
+/* who may mount: CAP_SYS_ADMIN -- in a mount namespace of its own (a user
+   namespace gives it), or as the real root in the initial one */
+static bool may_mount(const Process *p) {
+    /* CAP_SYS_ADMIN in the user namespace that owns its mount namespace */
+    return has_cap(p, CAP_SYS_ADMIN) && mntns_of(p)->owner == p->userns;
+}
+
+static bool streq(const char *a, const char *b);
+
+/* the inode at path, the mount the lookup ended in, and the inode of its
+   directory */
+static bool resolve(const char *path, uint32_t *ino, const void **ctx, uint32_t *parent, bool *is_dir) {
+    VfsStat st;
+    if (!vfs_stat(path, &st)) return false;
+    *ino = st.first_cluster;
+    *is_dir = st.is_dir;
+    *ctx = sched_current()->lookup_mnt;
+    if (parent) {
+        char dir[MAX_PATH];
+        uint32_t n = 0, last = 0;
+        while (path[n] && n < MAX_PATH - 1) { dir[n] = path[n]; if (path[n] == '/') last = n; n++; }
+        dir[last ? last : 1] = 0;
+        VfsStat ds;
+        if (!vfs_stat(dir, &ds)) return false;
+        *parent = ds.first_cluster;
+        /* the mountpoint's own context, not its directory's */
+        if (!vfs_stat(path, &st)) return false;
+        *ctx = sched_current()->lookup_mnt;
+    }
+    return true;
+}
+
+static int64_t add_mount(uint32_t mp, uint32_t mp_parent, uint32_t root, const void *in, bool ro, Tmpfs *tmp) {
+    Process *p = cur();
+    MntNs *ns = mntns_of(p);
+    if (ns->count >= MNT_MAX) return -28;                   /* -ENOSPC */
+    Mount *m = (Mount *)kmalloc(sizeof(Mount));
+    if (!m) return -ENOMEM;
+    memset(m, 0, sizeof(*m));
+    m->mp = mp;
+    m->mp_parent = mp_parent;
+    m->root = root;
+    m->in = (Mount *)in;
+    m->ro = ro;
+    m->tmp = tmp;
+    m->next = ns->mounts;
+    ns->mounts = m;
+    ns->count++;
+    mnt_pin(m);
+    return 0;
+}
+
+int64_t sandbox_mount(const char *src, const char *tgt, const char *type, uint64_t flags) {
+    Process *p = cur();
+    if (!may_mount(p)) return -EPERM;
+    uint32_t tino, tpar;
+    const void *tctx;
+    bool tdir;
+    /* a symlink as the last component: its target's directory is not the
+       one the textual path names (mounted there, ".." led anywhere) */
+    VfsStat lst;
+    if (vfs_lstat(tgt, &lst) && lst.is_link) return -EINVAL;
+    if (!resolve(tgt, &tino, &tctx, &tpar, &tdir)) return -2;   /* -ENOENT */
+
+    /* propagation only: accepted, nothing propagates */
+    if ((flags & MS_PROPAGATION) && !(flags & (MS_BIND | MS_REMOUNT))) return 0;
+
+    if (flags & MS_REMOUNT) {
+        /* the mount whose root is the target: read-only or not */
+        const Mount *m = (const Mount *)tctx;
+        if (m && m->root == tino) {
+            if (m->locked && m->ro && !(flags & MS_RDONLY)) return -EPERM;   /* inherited read-only */
+            ((Mount *)m)->ro = (flags & MS_RDONLY) != 0;
+            return 0;
+        }
+        return 0;                       /* the filesystem itself: nothing to change */
+    }
+    if (flags & MS_MOVE) return -EINVAL;
+
+    if (flags & MS_BIND) {
+        uint32_t sino;
+        const void *sctx;
+        bool sdir;
+        if (!src || !resolve(src, &sino, &sctx, NULL, &sdir)) return -2;
+        if (sdir != tdir) return sdir ? -20 : -21;          /* -ENOTDIR / -EISDIR */
+        /* a read-only source stays read-only where it is bound again; a
+           part of a tmpfs keeps that tmpfs */
+        bool ro = (flags & MS_RDONLY) != 0 || mnt_ro(sctx);
+        Tmpfs *tmp = NULL;
+        for (const Mount *c = (const Mount *)sctx; c && !tmp; c = c->in) tmp = c->tmp;
+        if (tmp) tmp->refs++;
+        int64_t r = add_mount(tino, tpar, sino, tctx, ro, tmp);
+        if (r && tmp) tmp_unref(tmp);
+        return r;
+    }
+
+    if (!type) return -EINVAL;
+    if (streq(type, "tmpfs") || streq(type, "ramfs")) {
+        if (!tdir) return -20;
+        Tmpfs *t = tmp_new(p, 0755);
+        if (!t) return -ENOMEM;
+        VfsStat st;
+        kernel_fs(true);
+        bool ok = vfs_stat(t->path, &st);
+        kernel_fs(false);
+        if (!ok) { tmp_unref(t); return -ENOMEM; }
+        int64_t r = add_mount(tino, tpar, st.first_cluster, tctx, (flags & MS_RDONLY) != 0, t);
+        if (r) tmp_unref(t);
+        return r;
+    }
+    /* filesystems whose files exist by name everywhere here */
+    if (streq(type, "proc") || streq(type, "sysfs") || streq(type, "devpts") || streq(type, "mqueue") ||
+        streq(type, "cgroup") || streq(type, "cgroup2") || streq(type, "devtmpfs") ||
+        streq(type, "securityfs") || streq(type, "debugfs") || streq(type, "binfmt_misc"))
+        return tdir ? 0 : -20;
+    return -19;                                              /* -ENODEV */
+}
+
+#define MNT_DETACH 2
+
+int64_t sandbox_umount(const char *tgt, int flags) {
+    (void)flags;
+    Process *p = cur();
+    if (!may_mount(p)) return -EPERM;
+    uint32_t ino;
+    const void *ctx;
+    bool dir;
+    if (!resolve(tgt, &ino, &ctx, NULL, &dir)) return -2;
+    Mount *m = (Mount *)ctx;
+    if (!m || m->root != ino) return -EINVAL;               /* not a mountpoint */
+    if (m->locked) return -EINVAL;                          /* inherited: stays */
+    MntNs *ns = mntns_of(p);
+    /* it, and (detached) every mount inside it */
+    bool removed = true;
+    while (removed) {
+        removed = false;
+        for (Mount **pp = &ns->mounts; *pp; pp = &(*pp)->next) {
+            Mount *x = *pp;
+            bool inside = x == m;
+            for (Mount *c = x->in; c && !inside; c = c->in) if (c == m) inside = true;
+            if (!inside || x == m) continue;    /* the mounts inside it first */
+            *pp = x->next;
+            tmp_unref(x->tmp);
+            mnt_unpin(x);
+            kfree(x);
+            ns->count--;
+            removed = true;
+            break;
+        }
+    }
+    for (Mount **pp = &ns->mounts; *pp; pp = &(*pp)->next) {
+        if (*pp != m) continue;
+        *pp = m->next;
+        tmp_unref(m->tmp);
+        mnt_unpin(m);
+        kfree(m);
+        ns->count--;
+        break;
+    }
+    return 0;
+}
+
+/* /proc/self/mountinfo (or /proc/self/mounts): the root and every mount
+   of the caller's namespace it can reach, at their paths from its root */
+static uint32_t put_s(char *o, uint32_t n, uint32_t cap, const char *s) {
+    while (*s && n + 1 < cap) o[n++] = *s++;
+    return n;
+}
+static uint32_t put_n(char *o, uint32_t n, uint32_t cap, uint32_t v) {
+    char d[12];
+    int k = 0;
+    do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (k && n + 1 < cap) o[n++] = d[--k];
+    return n;
+}
+
+uint32_t sandbox_mountinfo(char *out, uint32_t cap, bool mountinfo) {
+    Process *p = cur();
+    MntNs *ns = mntns_of(p);
+    uint32_t root = sandbox_lookup_root();
+    uint32_t n = 0;
+    /* oldest first: the list is newest first */
+    Mount *order[128];
+    int cnt = 0;
+    for (Mount *m = ns->mounts; m && cnt < 128; m = m->next) order[cnt++] = m;
+    /* the filesystem itself, unless a mount is the root */
+    bool root_is_mount = false;
+    for (int i = 0; i < cnt; i++) if (order[i]->root == root) root_is_mount = true;
+    if (!root_is_mount) {
+        n = put_s(out, n, cap, mountinfo ? "1 0 8:1 / / rw,relatime - ext2 /dev/root rw\n"
+                                         : "/dev/root / ext2 rw,relatime 0 0\n");
+    }
+    for (int i = cnt - 1; i >= 0; i--) {
+        Mount *m = order[i];
+        char where[MAX_PATH];
+        if (m->root == root) {
+            where[0] = '/'; where[1] = 0;
+        } else {
+            char dir[MAX_PATH], name[MAX_FILENAME];
+            if (!vfs_dir_path(m->mp_parent, dir, sizeof(dir))) continue;     /* not reachable from here */
+            if (!vfs_name_in_dir(m->mp_parent, m->mp, name, sizeof(name))) continue;
+            uint32_t k = 0, j = 0;
+            while (dir[k] && k < MAX_PATH - 2) { where[k] = dir[k]; k++; }
+            if (k == 0 || where[k - 1] != '/') where[k++] = '/';
+            while (name[j] && k < MAX_PATH - 1) where[k++] = name[j++];
+            where[k] = 0;
+        }
+        /* what is mounted, as a path of the filesystem ("/" for a tmpfs) */
+        char what[MAX_PATH];
+        what[0] = '/'; what[1] = 0;
+        if (!m->tmp) {
+            sandbox_real_root(true);
+            Process *self = p;
+            MntNs *keep = self->mntns;
+            self->mntns = NULL;                  /* the plain filesystem, no mounts */
+            if (!vfs_dir_path(m->root, what, sizeof(what))) { what[0] = '/'; what[1] = 0; }
+            self->mntns = keep;
+            sandbox_real_root(false);
+        }
+        const char *opts = m->ro ? "ro,relatime" : "rw,relatime";
+        const char *fs = m->tmp ? "tmpfs" : "ext2";
+        const char *src = m->tmp ? "tmpfs" : "/dev/root";
+        if (mountinfo) {
+            int parent = 1;
+            for (int j = cnt - 1; j >= 0; j--) if (order[j] == m->in) parent = cnt - j + 1;
+            n = put_n(out, n, cap, (uint32_t)(cnt - i + 1));
+            n = put_s(out, n, cap, " ");
+            n = put_n(out, n, cap, (uint32_t)parent);
+            n = put_s(out, n, cap, m->tmp ? " 0:20 " : " 8:1 ");
+            n = put_s(out, n, cap, what);
+            n = put_s(out, n, cap, " ");
+            n = put_s(out, n, cap, where);
+            n = put_s(out, n, cap, " ");
+            n = put_s(out, n, cap, opts);
+            n = put_s(out, n, cap, " - ");
+            n = put_s(out, n, cap, fs);
+            n = put_s(out, n, cap, " ");
+            n = put_s(out, n, cap, src);
+            n = put_s(out, n, cap, m->ro ? " ro\n" : " rw\n");
+        } else {
+            n = put_s(out, n, cap, src);
+            n = put_s(out, n, cap, " ");
+            n = put_s(out, n, cap, where);
+            n = put_s(out, n, cap, " ");
+            n = put_s(out, n, cap, fs);
+            n = put_s(out, n, cap, " ");
+            n = put_s(out, n, cap, opts);
+            n = put_s(out, n, cap, " 0 0\n");
+        }
+    }
+    out[n] = 0;
+    return n;
+}
+
+int64_t sandbox_pivot_root(const char *new_root, const char *put_old) {
+    Process *p = cur();
+    if (!may_mount(p) || !p->mntns) return -EPERM;           /* only in a namespace of its own */
+    uint32_t nino, oino, opar;
+    const void *nctx, *octx;
+    bool ndir, odir;
+    if (!resolve(new_root, &nino, &nctx, NULL, &ndir) || !ndir) return -20;
+    const Mount *nm = (const Mount *)nctx;
+    if (!nm || nm->root != nino) return -EINVAL;             /* new_root must be a mount */
+    if (!resolve(put_old, &oino, &octx, &opar, &odir) || !odir) return -20;
+    uint32_t old_root = p->root_inum ? p->root_inum : 2;
+    if (nino == old_root) return -16;                         /* -EBUSY */
+    /* the old root goes under put_old ... */
+    int64_t r = add_mount(oino, opar, old_root, octx, false, NULL);
+    if (r) return r;
+    /* ... and new_root is "/" for the namespace's processes still at the old one */
+    for (Process *q = process_list_head(); q; q = q->next) {
+        if (q->mntns != p->mntns || q->exited) continue;
+        uint32_t qr = q->root_inum ? q->root_inum : 2;
+        if (qr != old_root) continue;
+        q->root_inum = nino == 2 ? 0 : nino;
+        if (q == p) { q->cwd[0] = '/'; q->cwd[1] = 0; }
+    }
+    return 0;
+}
+
 /* =====================================================================
  * process life
  * ===================================================================== */
@@ -817,8 +1440,11 @@ void sandbox_fork(Process *child, Process *parent) {
     child->cap_prm = parent->cap_prm;
     child->cap_inh = parent->cap_inh;
     child->root_inum = parent->root_inum;
+    child->chrooted = parent->chrooted;
     child->userns = parent->userns;
     child->netns = parent->netns;
+    child->mntns = parent->mntns;
+    if (child->mntns) child->mntns->refs++;
     child->nondumpable = parent->nondumpable;
     /* the pid namespace: the parent's for children (unshare), or a new one
        (clone(CLONE_NEWPID)) */
@@ -845,9 +1471,30 @@ void sandbox_exec(Process *p) {
 void sandbox_teardown(Process *p) {
     filter_unref(p->seccomp);
     p->seccomp = NULL;
+    mntns_unref(p->mntns);
+    p->mntns = NULL;
+}
+
+/* a signal to every thread of q, as kill(2) sends it: pending, sleepers woken */
+static void send_sig(Process *q, int sig) {
+    Thread *start = sched_get_thread_list();
+    if (!start) return;
+    Thread *t = start;
+    int guard = 0;
+    do {
+        if (t->proc == q && t->state != THREAD_STATE_TERMINATED) {
+            t->sig_pending |= 1ULL << sig;
+            if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, sig)) sched_unblock(t, -4 /* EINTR */);
+        }
+        t = t->next;
+    } while (t != start && ++guard < 100000);
 }
 
 void sandbox_on_exit(Process *p) {
+    /* children that asked (prctl(PR_SET_PDEATHSIG)) learn their parent died
+       -- bubblewrap's --die-with-parent */
+    for (Process *q = process_list_head(); q; q = q->next)
+        if (!q->exited && q->ppid == p->pid && q->pdeathsig > 0 && q->pdeathsig < 65) send_sig(q, q->pdeathsig);
     PidNs *ns = p->pidns;
     if (!ns || ns->init != p->pid || ns->dead) return;
     /* the init of a pid namespace died: everything in it (and below) gets
@@ -897,6 +1544,7 @@ int64_t sandbox_chroot(const char *kpath) {
     if (!st.is_dir) return -20;                        /* -ENOTDIR */
     if (!vfs_may_access(kpath, 1)) return -EACCES;
     p->root_inum = st.first_cluster == EXT2_ROOT ? 0 : st.first_cluster;
+    p->chrooted = p->root_inum != 0;
     /* the working directory is its "/" now (Linux leaves it outside, the
        classic way out; every sandbox follows chroot() with chdir("/")) */
     p->cwd[0] = '/';
@@ -909,12 +1557,33 @@ int64_t sandbox_chroot(const char *kpath) {
  * ===================================================================== */
 
 static bool streq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+static bool streq_prefix(const char *s, const char *pre) { while (*pre) if (*s++ != *pre++) return false; return true; }
 
-int sandbox_proc_file(const char *path) {
-    if (streq(path, "/proc/self/uid_map") || streq(path, "/proc/thread-self/uid_map")) return 1;
-    if (streq(path, "/proc/self/gid_map") || streq(path, "/proc/thread-self/gid_map")) return 2;
-    if (streq(path, "/proc/self/setgroups") || streq(path, "/proc/thread-self/setgroups")) return 3;
-    return 0;
+/* /proc/{self,thread-self,PID}/{uid_map,gid_map,setgroups}: the kind, and
+   the process (global pid) it is about -- a PID of the caller's pid
+   namespace (bubblewrap writes its child's maps from outside) */
+int sandbox_proc_file(const char *path, uint64_t *gpid) {
+    const char *pre = "/proc/";
+    int i = 0;
+    while (pre[i]) { if (path[i] != pre[i]) return 0; i++; }
+    const char *q = path + i;
+    Process *me = cur();
+    uint64_t target = me->pid;
+    if (q[0] == 's' && q[1] == 'e' && q[2] == 'l' && q[3] == 'f' && q[4] == '/') q += 5;
+    else if (streq_prefix(q, "thread-self/")) q += 12;
+    else if (*q >= '0' && *q <= '9') {
+        uint64_t v = 0;
+        while (*q >= '0' && *q <= '9') { v = v * 10 + (uint64_t)(*q - '0'); if (v > 0xFFFFFFFFull) return 0; q++; }
+        if (*q != '/') return 0;
+        q++;
+        target = pid_from_ns(v, me);
+        if (!target) return 0;
+    } else {
+        return 0;
+    }
+    int kind = streq(q, "uid_map") ? 1 : streq(q, "gid_map") ? 2 : streq(q, "setgroups") ? 3 : 0;
+    if (kind) *gpid = target;
+    return kind;
 }
 
 static uint32_t put_u(char *o, uint32_t n, uint32_t cap, uint32_t v, uint32_t width) {
@@ -926,8 +1595,35 @@ static uint32_t put_u(char *o, uint32_t n, uint32_t cap, uint32_t v, uint32_t wi
     return n;
 }
 
-int64_t sandbox_proc_read(int kind, char *out, uint32_t cap) {
-    Process *p = cur();
+/* /proc/self, /proc/thread-self, /proc/PID (visible to the caller), and
+   their ns/ and fd/: directories without inodes */
+bool sandbox_proc_dir(const char *path) {
+    const char *pre = "/proc/";
+    int i = 0;
+    while (pre[i]) { if (path[i] != pre[i]) return false; i++; }
+    const char *q = path + i;
+    if (streq_prefix(q, "self")) q += 4;
+    else if (streq_prefix(q, "thread-self")) q += 11;
+    else if (*q >= '0' && *q <= '9') {
+        uint64_t v = 0;
+        while (*q >= '0' && *q <= '9') { v = v * 10 + (uint64_t)(*q - '0'); if (v > 0xFFFFFFFFull) return false; q++; }
+        if (!pid_from_ns(v, cur())) return false;
+    } else {
+        return false;
+    }
+    while (*q == '/') q++;
+    if (!*q) return true;
+    if (streq_prefix(q, "ns") || streq_prefix(q, "fd")) {
+        q += 2;
+        while (*q == '/') q++;
+        return !*q;
+    }
+    return false;
+}
+
+int64_t sandbox_proc_read(int kind, uint64_t gpid, char *out, uint32_t cap) {
+    Process *p = process_find_by_pid(gpid);
+    if (!p) return -ESRCH;
     const UserNs *ns = p->userns;
     uint32_t n = 0;
     if (kind == 3) {
@@ -956,14 +1652,21 @@ static bool parse_u(const char **s, uint32_t *v) {
     return true;
 }
 
-/* Writing a map: once; one line "inside outside count". Unprivileged (no
-   CAP_SETUID/CAP_SETGID over the parent namespace -- here: not root of
-   the initial namespace) a process may map exactly one id: its own euid
-   (egid, and only after "deny" went to setgroups) as seen from the
-   parent namespace. */
-int64_t sandbox_proc_write(int kind, const char *buf, uint32_t len) {
-    Process *p = cur();
+/* Writing a map: once; one line "inside outside count". A writer with
+   CAP_SETUID (CAP_SETGID for gid_map) in the parent namespace -- the real
+   root, or root of the namespace the new one was made from -- may map any
+   ids that exist there. Anyone else exactly one id: its own euid (egid,
+   and only after "deny" went to setgroups) as the parent namespace sees
+   it. */
+int64_t sandbox_proc_write(int kind, uint64_t gpid, const char *buf, uint32_t len) {
+    Process *w = cur();                            /* who writes */
+    Process *p = process_find_by_pid(gpid);        /* whose namespace */
+    if (!p || p->exited) return -ESRCH;
     UserNs *ns = p->userns;
+    /* the process itself, or one in the namespace its user namespace was
+       made from, as the namespace's creator (or the real root) */
+    if (p != w && !(ns && ns->parent == w->userns && (w->uid == ns->owner || has_cap(w, CAP_SETUID))))
+        return -EPERM;
     char t[64];
     if (len >= sizeof(t)) return -EINVAL;
     memcpy(t, buf, len);
@@ -986,13 +1689,17 @@ int64_t sandbox_proc_write(int kind, const char *buf, uint32_t len) {
     while (*s == ' ' || *s == '\n') s++;
     if (*s) return -EINVAL;                        /* one line only */
     if (cnt == 0 || (uint64_t)in + cnt > 0xFFFFFFFFull || (uint64_t)out + cnt > 0xFFFFFFFFull) return -EINVAL;
-    bool privileged = !ns->parent && p->uid == 0 && ns->owner == 0;
-    if (!privileged) {
+    bool privileged = w->userns == ns->parent && has_cap(w, kind == 1 ? CAP_SETUID : CAP_SETGID);
+    if (privileged) {
+        /* the outside ids must exist in the parent namespace */
+        if (id_up(ns->parent, out, kind == 2) == NOID || id_up(ns->parent, out + cnt - 1, kind == 2) == NOID)
+            return -EPERM;
+    } else {
         if (cnt != 1) return -EPERM;
-        if (kind == 1 && out != id_down(ns->parent, p->uid, false)) return -EPERM;
+        if (kind == 1 && out != id_down(ns->parent, w->uid, false)) return -EPERM;
         if (kind == 2) {
             if (!ns->setgroups_deny) return -EPERM;
-            if (out != id_down(ns->parent, p->gid, true)) return -EPERM;
+            if (out != id_down(ns->parent, w->gid, true)) return -EPERM;
         }
     }
     if (kind == 1) { ns->uid_in = in; ns->uid_out = out; ns->uid_cnt = cnt; ns->uid_set = true; }
@@ -1014,7 +1721,7 @@ bool sandbox_ns_link(const char *name, char *out, uint32_t cap) {
     else if (streq(name, "net"))    { base = 4026531840u; own = p->netns ? 0x8000u + p->netns : 0; }
     else if (streq(name, "uts"))    base = 4026531838u;
     else if (streq(name, "ipc"))    base = 4026531839u;
-    else if (streq(name, "mnt"))    base = 4026531841u;
+    else if (streq(name, "mnt"))    { base = 4026531841u; own = p->mntns ? p->mntns->id : 0; }
     else if (streq(name, "cgroup")) base = 4026531835u;
     else if (streq(name, "time") || streq(name, "time_for_children")) base = 4026531834u;
     else return false;

@@ -55,6 +55,7 @@ def main() -> None:
 
     perms: list[tuple[str, int, int]] = []
     links: list[tuple[str, str]] = []
+    nodes: list[tuple[str, str, int, int]] = []
     with open(manifest_path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.split("#", 1)[0].strip()
@@ -70,6 +71,10 @@ def main() -> None:
                 perms.append((parts[1], int(uid), int(mode, 8)))
             elif kind == "S" and len(parts) == 3:
                 links.append((parts[1], parts[2]))
+            elif kind == "N" and len(parts) == 3:
+                # N /dev/null c 1 3 -- a device node (its number in the inode)
+                t, major, minor = parts[2].split()
+                nodes.append((parts[1], t, int(major), int(minor)))
             elif kind in ("F", "Fo") and len(parts) == 3:
                 (required if kind == "F" else optional).append((parts[1], parts[2]))
             else:
@@ -104,6 +109,11 @@ def main() -> None:
     add_writes(optional, False)
     for dest, target in links:
         cmds.append(f"symlink {dest} {target}")
+    for dest, t, major, minor in nodes:
+        # debugfs makes the node in its working directory, named by the last part
+        parent, name = os.path.split(dest)
+        cmds += [f"cd {parent or '/'}", f"mknod {name} {t} {major} {minor}", "cd /",
+                 f"sif {dest} uid 0", f"sif {dest} gid 0", f"sif {dest} mode 0{0o20000 | 0o666:o}"]
 
     # Ownership and modes: everything root's, directories 0755, programs
     # (ELF or #! script) 0755, other files 0644 -- sources on a Windows

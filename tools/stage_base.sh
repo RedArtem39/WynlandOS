@@ -28,7 +28,8 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  gpgv ubuntu-keyring
  foot libfcft4t64 libutf8proc3 xkb-data ncurses-term libc-bin
  xwayland xserver-common x11-xkb-utils xterm xbitmaps libxfont2 libfontenc1 libxcvt0
- libxkbfile1 libxaw7 libxmu6 libxft2 libxpm4 libutempter0 libei1 liboeffis1"
+ libxkbfile1 libxaw7 libxmu6 libxft2 libxpm4 libutempter0 libei1 liboeffis1
+ bubblewrap"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)

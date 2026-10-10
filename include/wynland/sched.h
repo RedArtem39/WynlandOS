@@ -92,6 +92,10 @@ typedef struct Thread {
     uint32_t sys_trap_data;
     uint64_t sys_trap_ip;
     bool     fs_real_root;    /* path lookups ignore the process's chroot (kernel files) */
+    /* what the last path lookup ended in: the mount (kernel/sandbox.c),
+       and whether that mount is read-only */
+    const void *lookup_mnt;
+    bool     lookup_ro;
     uint32_t in_syscall;      /* syscall_dispatcher() depth: >0 inside one (its own
                                  nested calls -- clone's fork -- are not filtered again) */
     char     comm[16];        /* prctl(PR_SET_NAME) */

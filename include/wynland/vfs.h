@@ -24,6 +24,7 @@
    (and every copy kfile_get() made of it) is open, so an unlinked file
    stays readable and writable through its fds, as on Linux */
 #define VFS_F_PINNED  0x80000000u
+#define VFS_F_ROMNT   0x40000000u  /* opened on a read-only mount: no changes through it */
 
 /* Seek whence */
 #define VFS_SEEK_SET  0
@@ -62,6 +63,8 @@ typedef struct {
     uint32_t dir_entry_sector;       /* unused under ext2 */
     uint32_t dir_entry_offset;       /* unused under ext2 */
     bool     dirty;
+    char     path[256];              /* what it was opened as (readlink /proc/self/fd/N);
+                                        "" when unknown or too long */
 } VfsFile;
 
 /* File statistics */
@@ -81,6 +84,8 @@ typedef struct {
     uint32_t mtime, atime, ctime; /* unix seconds */
     bool     is_link;       /* vfs_lstat(): the path names a symlink */
     bool     is_sock;       /* an AF_UNIX socket's name */
+    bool     is_chr;        /* a character device node (/dev/null & co. on the disk) */
+    uint32_t rdev;          /* its device number: major << 8 | minor */
     uint16_t nlink;         /* ext2 i_links_count */
 } VfsStat;
 
@@ -98,6 +103,8 @@ uint32_t vfs_tell(VfsFile *file);
 
 /* Directory operations */
 bool vfs_readdir(const char *path, void (*callback)(VfsNode *node));
+bool vfs_name_in_dir(uint32_t dir_inum, uint32_t child, char *name, uint32_t cap);
+bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap);
 bool vfs_mkdir(const char *path);
 int  vfs_getdents(VfsFile *file, void *dirp, uint32_t count); /* linux_dirent64 */
 
