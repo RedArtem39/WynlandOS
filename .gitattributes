@@ -7,3 +7,4 @@ apps/** text eol=lf
 *.ttf binary
 *.otf binary
 *.elf binary
+tests/*.sh text eol=lf
