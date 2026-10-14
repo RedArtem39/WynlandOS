@@ -34,3 +34,12 @@ def cut(src, dst, thr=24, inset=3, pad=6):
 
 for n in ['mascot', 'icon', 'logo']:
     cut(f'docs/brand/{n}.jpg', f'docs/brand/{n}.png')
+
+# for dark backgrounds (GitHub's dark theme): the logo's dark grey
+# "Wynland" made light, the blues kept
+im = np.asarray(Image.open('docs/brand/logo.png')).astype(np.float32)
+rgb, a = im[..., :3], im[..., 3:]
+grey = (rgb.max(axis=2) - rgb.min(axis=2) < 40) & (rgb.max(axis=2) < 90)
+light = np.array([230, 237, 243], np.float32)
+rgb = np.where(grey[..., None], light, rgb)
+Image.fromarray(np.dstack([rgb, a[..., 0]]).round().astype(np.uint8), 'RGBA').save('docs/brand/logo-dark.png', optimize=True)

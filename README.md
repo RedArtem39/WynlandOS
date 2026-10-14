@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/brand/logo.jpg" alt="WynlandOS" width="640">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.png">
+    <img src="docs/brand/logo.png" alt="WynlandOS" width="640">
+  </picture>
 </p>
 
 <p align="center">
@@ -130,7 +133,7 @@ of its own (an X window manager in Zerp), a lock screen, and real hardware:
 USB, NVMe, Realtek 2.5GbE.
 
 <p align="center">
-  <img src="docs/brand/mascot.jpg" alt="the WynlandOS snail" width="200">
+  <img src="docs/brand/mascot.png" alt="the WynlandOS snail" width="200">
 </p>
 
 ## License
