@@ -32,6 +32,7 @@
 
 #include "zerp2.h"
 #include "greeter.h"
+#include "hypripc.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -111,6 +112,7 @@ private:
     void mouse(const ZMouseEvent &e)
     {
         const QPointF p(e.x, e.y);
+        HyprIpc::setCursor(QPoint(e.x, e.y));
         Qt::MouseButtons now;
         if (e.buttons & 1) now |= Qt::LeftButton;
         if (e.buttons & 2) now |= Qt::RightButton;
@@ -353,6 +355,8 @@ int main(int argc, char **argv)
         // (ours, the Zerp clients, pick their own)
         qputenv("WAYLAND_DISPLAY", "wayland-0");
         qputenv("QT_QPA_PLATFORM", "wayland");
+        // shells made for Hyprland (Quickshell's) talk to us as to it
+        new HyprIpc(&server, app.primaryScreen() ? app.primaryScreen()->name() : QStringLiteral("Virtual-1"), scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
         // debugging: boot.cfg "wlrun=CMD[;CMD...]" -- programs started a few
         // seconds in (Wayland clients, for the picture and the tests)

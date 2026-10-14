@@ -571,6 +571,18 @@ static bool std_console(Process *p, uint64_t fd) {
     return fd <= 2 && p->fd_table[fd] == NULL && !(p->std_closed & (1u << fd));
 }
 
+/* An unopened 0-2 made a real open file of the console (/dev/tty, which
+   reads and writes the same), for what needs one: dup() and fcntl() of it
+   -- a shell saving stdout around `> /dev/null` and putting it back. */
+static void std_materialize(Process *p, uint64_t fd) {
+    if (!std_console(p, fd)) return;
+    VfsFile *f = vfs_open_flags("/dev/tty", 0x01 | 0x02);
+    if (!f) return;
+    p->fd_table[fd] = f;
+    p->fd_flags[fd] = 0;
+    p->fd_oflags[fd] = fd == 0 ? LINUX_O_RDONLY : LINUX_O_WRONLY;
+}
+
 /* dma-buf (PRIME) fds for drivers/video/virtgpu_drm.c */
 int drm_install_prime_fd(uint32_t idx, bool cloexec)
 {
@@ -2464,6 +2476,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 32: // SYS_dup(oldfd)
             {
                 int oldfd = (int)a1;
+                std_materialize(proc, a1);
                 if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || fd_table[oldfd] == NULL) return (uint64_t)-9; // EBADF
                 int newfd = get_free_fd(fd_table);
                 if (newfd < 0) return (uint64_t)-24; // EMFILE
@@ -2486,6 +2499,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int oldfd = (int)a1;
                 int newfd = (int)a2;
                 uint32_t dflags = (num == 292) ? (uint32_t)a3 : 0;
+                std_materialize(proc, a1);
                 if (num == 292 && (dflags & ~02000000u)) return (uint64_t)-22; // EINVAL
                 if (oldfd < 0 || oldfd >= MAX_OPEN_FILES || fd_table[oldfd] == NULL) return (uint64_t)-9; // EBADF
                 if (newfd < 0 || newfd >= MAX_OPEN_FILES) return (uint64_t)-9; // EBADF
@@ -4489,6 +4503,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 uint64_t fd = a1;
                 int cmd = (int)a2;
+                std_materialize(proc, fd);
 
                 /* stdin/stdout/stderr are always valid */
                 if (fd > 2 && (fd >= MAX_OPEN_FILES || fd_table[fd] == NULL)) {

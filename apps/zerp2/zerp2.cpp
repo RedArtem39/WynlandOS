@@ -10,6 +10,7 @@
 #include <QtQuick/QQuickWindow>
 #include <QtQuick/QSGSimpleTextureNode>
 #include <QtQuick/QSGTexture>
+#include <QtWaylandCompositor/QWaylandClient>
 #include <QtWaylandCompositor/QWaylandCompositor>
 #include <QtWaylandCompositor/QWaylandSeat>
 #include <QtWaylandCompositor/QWaylandSurface>
@@ -164,8 +165,17 @@ void ZClient::wlKeyboardFocus(bool on)
         seat->setKeyboardFocus(on ? surf : nullptr);
 }
 
+long ZClient::pid() const
+{
+    if (!m_wayland) return m_pid;
+    auto *xdg = qobject_cast<QWaylandXdgSurface *>(m_xdg.data());
+    QWaylandSurface *surf = xdg ? xdg->surface() : nullptr;
+    return surf && surf->client() ? (long)surf->client()->processId() : 0;
+}
+
 void ZClient::configure(int x, int y, int w, int h)
 {
+    m_geom = QRect(x, y, w, h);
     if (m_wayland) {
         Q_UNUSED(x); Q_UNUSED(y);
         const QSize sz(qMax(w, 8), qMax(h, 8));

@@ -109,6 +109,7 @@ F  /usr/share/wynland/wallpapers/spiral.png  build/wall-spiral.png
 # fastfetch (tools/stage_base.sh ships it): our logo, the system's name
 F  /usr/share/wynland/logo.txt              rootfs/usr/share/wynland/logo.txt
 F  /etc/os-release                          rootfs/etc/os-release
+F  /hyprtest.sh                             tests/hyprtest.sh
 D /etc/xdg
 D /etc/xdg/fastfetch
 F  /etc/xdg/fastfetch/config.jsonc          rootfs/etc/xdg/fastfetch/config.jsonc

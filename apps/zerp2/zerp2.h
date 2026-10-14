@@ -61,6 +61,8 @@ public:
     void setFullscreen(bool f);
     bool wayland() const { return m_wayland; }
     QObject *shellSurface() const { return m_xdg; }
+    QRect geometry() const { return m_geom; }   // where the layout put it (configure)
+    long pid() const;
 
     // QML: the size the client should render at (the layout's target,
     // not the animated in-between sizes)
@@ -107,6 +109,7 @@ private:
     long m_pid = -1;
     uint32_t *m_shm = nullptr;
     uint32_t m_shmBytes = 0;
+    QRect m_geom;
     int m_bufW = 0, m_bufH = 0;      // size the client renders at
     // asked for, not yet drawn: the SHM rows are still the old width until
     // the client's first full frame at the new size (or a timeout)

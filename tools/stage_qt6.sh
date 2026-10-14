@@ -107,20 +107,23 @@ g++ $CXXFLAGS -I"$ROOT/usr/include" -o "$OUT/term.elf" \
 echo "  QT6        built build/term.elf"
 
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
-Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick QtWaylandCompositor; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
+Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick QtWaylandCompositor QtNetwork; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
+"$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_hypripc.cpp" apps/zerp2/hypripc.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
 gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
 # wlcompat's two libwayland-server functions must win over the library's
 # own, for every library that calls them
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
-    apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" \
+    apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp apps/zerp2/hypripc.cpp     "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" "$B/moc_hypripc.cpp" \
     "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
     -Wl,--export-dynamic-symbol=mkstemp -Wl,--export-dynamic-symbol=wl_resource_create \
     "$LIB/libwayland-server.so.0" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6WaylandCompositorXdgShell -lQt6WaylandCompositor \
-    -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
+    -lQt6Quick -lQt6Qml -lQt6Network -lQt6Gui -lQt6Core
 echo "  QT6        built build/zerp2.elf"
+# hyprctl: Hyprland's command line, for Zerp 2.0's Hyprland IPC (apps/zerp2/hypripc.cpp)
+gcc -O2 -Wall -o "$OUT/hyprctl" apps/zerp2/hyprctl.c
 
 # 3. manifest: QML modules + ldd closure of the app and every QML plugin
 WLPLUG="wayland-shell-integration wayland-decoration-client wayland-graphics-integration-client wayland-graphics-integration-server"
@@ -155,6 +158,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     done
     echo "F /usr/bin/qmldemo build/qmldemo.elf"
     echo "F /usr/bin/zerp2 build/zerp2.elf"
+    echo "F /usr/bin/hyprctl build/hyprctl"
     echo "D /usr/share/zerp2"
     echo "D /usr/share/zerp2/qml"
     echo "F /usr/share/zerp2/kms.json apps/zerp2/kms.json"
