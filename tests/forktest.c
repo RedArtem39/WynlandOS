@@ -261,6 +261,26 @@ int main(int argc, char **argv)
         rc = run_capture("/usr/bin/rc-status", NULL, NULL, out, sizeof(out));
         fprintf(stderr, "[forktest] rc-status rc=%d out=%.120s\n", rc, out);
         check(rc == 0 && strstr(out, "SERVICE") && strstr(out, "forktest"), "rc-status talks to wynrc");
+        /* wynrc's control: not root, so only this test's own service; a
+           service file from outside /etc/wynrc/services used to run as root */
+        {
+            FILE *sf = fopen("/tmp/rcx", "w");
+            if (sf) { fputs("type=oneshot\nexec=/usr/bin/touch /tmp/rcx-ran\n", sf); fclose(sf); }
+            unlink("/tmp/rcx-ran");
+            run_capture("/usr/bin/rc-service", "../../../tmp/rcx", "start", out, sizeof(out));
+            fprintf(stderr, "[forktest] rc-service ../tmp start: %.80s\n", out);
+            bool bad_name = strstr(out, "no service") != NULL;
+            run_capture("/usr/bin/rc-service", "testuser", "restart", out, sizeof(out));
+            fprintf(stderr, "[forktest] rc-service testuser restart: %.80s\n", out);
+            bool denied = strstr(out, "permission denied") != NULL;
+            run_capture("/usr/bin/rc-service", "forktest", "start", out, sizeof(out));
+            fprintf(stderr, "[forktest] rc-service forktest start: %.80s\n", out);
+            bool own = strstr(out, "ok:") != NULL;
+            usleep(500000);
+            check(bad_name && access("/tmp/rcx-ran", F_OK) != 0, "wynrc refuses a service outside its directory");
+            check(denied && own, "wynrc: root's services refused, its own allowed");
+            unlink("/tmp/rcx");
+        }
         /* audit regressions: each of these used to reach kernel memory */
         {
             /* C1: /dev/fb0 maps the framebuffer and not one page more */

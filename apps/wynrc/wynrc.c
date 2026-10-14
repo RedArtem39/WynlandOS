@@ -23,7 +23,9 @@
 //                 uid); default root -- wynrc itself is root
 //
 // Control: an AF_UNIX socket (abstract "wynrc"), one line per request:
-// "status", "start NAME", "stop NAME", "restart NAME".
+// "status", "start NAME", "stop NAME", "restart NAME". Anyone may ask for
+// the status; start/stop/restart are root's, and the account a service
+// runs as may do them to it. Only root loads a service not loaded yet.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -185,8 +187,19 @@ static Svc *resolve(const char *name)
     return NULL;
 }
 
+// a service name is a file in WYNRC_SERVICES: no "/", no leading "."
+static int valid_name(const char *name)
+{
+    if (!*name || *name == '.' || strlen(name) >= 32) return 0;
+    for (const char *c = name; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') ||
+              *c == '-' || *c == '_' || *c == '.')) return 0;
+    return 1;
+}
+
 static int load_service(const char *name)
 {
+    if (!valid_name(name)) { logf_("bad service name"); return -1; }
     if (find(name) || g_n >= MAX_SVC) return 0;
     char path[160];
     snprintf(path, sizeof path, "%s/%s", WYNRC_SERVICES, name);
@@ -439,6 +452,17 @@ static void reply_status(int fd)
     }
 }
 
+// the uid a service runs as, -1 if its user= names no account
+static long svc_uid(const Svc *s)
+{
+    if (!s->user[0] || !strcmp(s->user, "root")) return 0;
+    struct passwd *pw = getpwnam(s->user);
+    if (pw) return pw->pw_uid;
+    char *end;
+    long num = strtol(s->user, &end, 10);
+    return *end ? -1 : num;
+}
+
 static void handle_request(int fd, char *req)
 {
     char *cmd = strtok(trim(req), " ");
@@ -446,11 +470,23 @@ static void handle_request(int fd, char *req)
     char out[160];
     if (!cmd) return;
     if (!strcmp(cmd, "status")) { reply_status(fd); return; }
+    struct ucred cr;
+    socklen_t crl = sizeof cr;
+    long peer = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &crl) == 0 && cr.uid != (uid_t)-1 ? (long)cr.uid : -1;
+    if (peer < 0) {
+        snprintf(out, sizeof out, "error: who is asking?\n");
+        if (write(fd, out, strlen(out)) < 0) { /* client gone */ }
+        return;
+    }
     Svc *s = arg ? find(arg) : NULL;
-    if (!s && arg && (!strcmp(cmd, "start") || !strcmp(cmd, "restart"))) {
+    if (!s && arg && peer == 0 && (!strcmp(cmd, "start") || !strcmp(cmd, "restart"))) {
         if (load_service(arg) == 0) s = find(arg);
     }
-    if (!s) { snprintf(out, sizeof out, "error: no service %s\n", arg ? arg : "(none)"); }
+    if (!s) { snprintf(out, sizeof out, "error: no service %s\n", arg && valid_name(arg) ? arg : "(none)"); }
+    else if (peer != 0 && svc_uid(s) != peer) {
+        logf_("uid %ld may not %s %s", peer, cmd, s->name);
+        snprintf(out, sizeof out, "error: permission denied (%s runs as %s)\n", s->name, s->user[0] ? s->user : "root");
+    }
     else if (!strcmp(cmd, "stop") || !strcmp(cmd, "restart")) {
         if (s->pid > 0) { s->stop_requested = 1; kill(s->pid, SIGTERM); }
         if (!strcmp(cmd, "restart")) { s->state = S_WAITING; s->restarts = 0; s->restart_at_ms = now_ms() + 300; }

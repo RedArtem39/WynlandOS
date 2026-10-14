@@ -350,6 +350,9 @@ int64_t usock_connect(int idx, const char *name, uint32_t len, bool nonblock) {
     if (s->state == US_CONNECTED) return -EISCONN;
     if (s->state == US_LISTENING) return -EINVAL;
 
+    /* SO_PEERCRED gives the server whoever connects, as on Linux, not
+       whoever made the socket (it may have been passed on) */
+    s->cred = current_cred();
     s->refs++; /* held across the wait below */
     int64_t ret;
     for (;;) {
