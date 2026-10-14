@@ -108,6 +108,8 @@ gcc -O2 -fPIE -pie -o "$OUT/python3.14" tools/python_launcher.c     "$ROOT/usr/l
 # manager -- yescrypt passwords through libcrypt, as Ubuntu
 gcc -O2 -Wall -o "$OUT/ary" apps/ary/ary.c apps/accounts/accounts.c -lcrypt
 gcc -O2 -Wall -o "$OUT/acct-tools" apps/accounts/tools.c apps/accounts/accounts.c -lcrypt
+# reboot, poweroff, halt (apps/power)
+gcc -O2 -Wall -o "$OUT/power" apps/power/power.c
 gcc -O2 -Wall -o "$OUT/wynlogin" apps/accounts/wynlogin.c apps/accounts/accounts.c -lcrypt
 
 # the .pycs made above are in no package
@@ -205,6 +207,7 @@ L=$REPO/apps/leaf
     echo "P /usr/bin/passwd 0 104755"
     echo "F /usr/sbin/useradd $OUT/acct-tools"
     echo "F /usr/sbin/userdel $OUT/acct-tools"
+    for t in reboot poweroff halt; do echo "F /usr/sbin/$t $OUT/power"; done
     echo "F /usr/sbin/wynlogin $OUT/wynlogin"
     echo "D /usr/lib/wynland"
     echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"

@@ -178,8 +178,7 @@ static bool mouse_hw_cursor(void)
 
 void mouse_hide(void)
 {
-    extern bool wm_is_gui_active(void);
-    if (wm_is_gui_active() || mouse_hw_cursor()) return;
+    if (mouse_hw_cursor()) return;
 
     if (mouse_hide_count == 0 && cursor_visible) {
         mouse_restore_background();
@@ -190,8 +189,7 @@ void mouse_hide(void)
 
 void mouse_show(void)
 {
-    extern bool wm_is_gui_active(void);
-    if (wm_is_gui_active() || mouse_hw_cursor()) return;
+    if (mouse_hw_cursor()) return;
 
     mouse_hide_count--;
     if (mouse_hide_count <= 0) {
@@ -397,12 +395,7 @@ void mouse_handle_interrupt(uint8_t data)
             if (new_y >= (int32_t)g_boot_info->fb_height) new_y = g_boot_info->fb_height - 1;
 
             if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons) || mouse_wheel) {
-                extern bool wm_is_gui_active(void);
-                bool gui = wm_is_gui_active();
-
-                if (!gui) {
-                    mouse_hide();
-                }
+                mouse_hide();
 
                 mouse_x = new_x;
                 mouse_y = new_y;
@@ -416,12 +409,7 @@ void mouse_handle_interrupt(uint8_t data)
                     virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
                 }
 
-                if (gui) {
-                    extern void wm_handle_mouse(int32_t mx, int32_t my, uint8_t buttons);
-                    wm_handle_mouse(mouse_x, mouse_y, mouse_buttons);
-                } else {
-                    mouse_show();
-                }
+                mouse_show();
             }
             /* Whole packets only: dropping one byte of a full queue would
                shift every packet after it for /dev/input/mice readers. */

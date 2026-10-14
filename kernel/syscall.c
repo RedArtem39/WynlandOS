@@ -353,8 +353,6 @@ static inline void wrmsr(uint32_t msr, uint64_t value) {
     __asm__ volatile("wrmsr" :: "a"(low), "d"(high), "c"(msr));
 }
 
-extern void comp_fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color);
-extern void comp_mark_dirty(void);
 extern void *kmalloc(size_t size);
 extern void kfree(void *ptr);
 
@@ -3891,13 +3889,6 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
         /* Custom / Extended Syscalls */
-        case 400: // SYS_draw_rect
-            comp_fill_rect((uint32_t)a1, (uint32_t)a2, (uint32_t)a3, (uint32_t)a4, (uint32_t)a5);
-            return 0;
-
-        case 401: // SYS_mark_dirty
-            comp_mark_dirty();
-            return 0;
 
         case 404: // SYS_kfree: was kfree() of any pointer a program passed in --
                   // a way to corrupt the kernel heap from user space. Gone.
@@ -5381,6 +5372,24 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (outp && copy_to_user((void *)outp, cur, sizeof(cur)) != 0) return (uint64_t)-14;
                 return 0;
+            }
+
+        case 169: // SYS_reboot(magic, magic2, cmd, arg): CAP_SYS_BOOT on the host
+            {
+                extern void sys_reboot(void);
+                extern void sys_poweroff(void);
+                if ((uint32_t)a1 != 0xFEE1DEADu) return (uint64_t)-22;
+                uint32_t m2 = (uint32_t)a2;
+                if (m2 != 672274793u && m2 != 85072278u && m2 != 369367448u && m2 != 537993216u)
+                    return (uint64_t)-22;
+                if (!sandbox_capable_host(proc, CAP_SYS_BOOT)) return (uint64_t)-1; /* -EPERM */
+                switch ((uint32_t)a3) {
+                    case 0x01234567u: sys_reboot(); break;                  /* RESTART */
+                    case 0x4321FEDCu: case 0xCDEF0123u: sys_poweroff(); break; /* POWER_OFF, HALT */
+                    case 0x89ABCDEFu: case 0u: return 0;                    /* Ctrl-Alt-Del on/off */
+                    default: return (uint64_t)-22;
+                }
+                return (uint64_t)-5; /* -EIO: still running */
             }
 
         case 99: // SYS_sysinfo

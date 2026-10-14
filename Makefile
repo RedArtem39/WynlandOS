@@ -39,18 +39,12 @@ OBJCOPY    = objcopy
 SRC_BOOT       = boot
 SRC_KERNEL     = kernel
 SRC_DRIVERS    = drivers
-SRC_LIB        = lib
-SRC_PKG        = pkg
-SRC_GUI        = gui
 INC_DIR        = include
 
 BUILD          = build
 BUILD_BOOT     = $(BUILD)/boot
 BUILD_KERNEL   = $(BUILD)/kernel
 BUILD_DRIVERS  = $(BUILD)/drivers
-BUILD_LIB      = $(BUILD)/lib
-BUILD_PKG      = $(BUILD)/pkg
-BUILD_GUI      = $(BUILD)/gui
 BUILD_ESP      = $(BUILD)/esp
 
 # ============================================================================
@@ -134,35 +128,8 @@ DRIVER_ASM_SRC = $(shell find $(SRC_DRIVERS) -name '*.asm' 2>/dev/null)
 DRIVER_C_OBJ   = $(patsubst $(SRC_DRIVERS)/%.c, $(BUILD_DRIVERS)/%.o, $(DRIVER_C_SRC))
 DRIVER_ASM_OBJ = $(patsubst $(SRC_DRIVERS)/%.asm, $(BUILD_DRIVERS)/%.o, $(DRIVER_ASM_SRC))
 
-# Lib sources
-LIB_C_SRC      = $(wildcard $(SRC_LIB)/*.c)
-LIB_OBJ        = $(patsubst $(SRC_LIB)/%.c, $(BUILD_LIB)/%.o, $(LIB_C_SRC))
-
-# Package manager sources
-PKG_C_SRC      = $(wildcard $(SRC_PKG)/*.c)
-PKG_OBJ        = $(patsubst $(SRC_PKG)/%.c, $(BUILD_PKG)/%.o, $(PKG_C_SRC))
-
-# GUI sources
-GUI_C_SRC      = $(wildcard $(SRC_GUI)/*.c)
-GUI_CPP_SRC    = $(wildcard $(SRC_GUI)/*.cpp $(SRC_GUI)/hyprland/*.cpp)
-GUI_OBJ        = $(patsubst $(SRC_GUI)/%.c, $(BUILD_GUI)/%.o, $(GUI_C_SRC))
-GUI_CPP_OBJ    = $(patsubst $(SRC_GUI)/%.cpp, $(BUILD_GUI)/%.o, $(GUI_CPP_SRC))
-
-# QuickJS sources
-QUICKJS_DIR    = pkg/quickjs
-QUICKJS_SRC    = $(QUICKJS_DIR)/quickjs.c \
-                 $(QUICKJS_DIR)/dtoa.c \
-                 $(QUICKJS_DIR)/libregexp.c \
-                 $(QUICKJS_DIR)/libunicode.c \
-                 $(QUICKJS_DIR)/cutils.c \
-                 $(QJS_COMPAT)/compat.c \
-                 $(QJS_COMPAT)/quickjs_binding.c
-# our libc shim + kernel binding for QuickJS (pkg/quickjs is upstream's submodule)
-QJS_COMPAT     = pkg/quickjs-compat
-QUICKJS_OBJ    = $(patsubst $(QJS_COMPAT)/%.c, $(BUILD_GUI)/quickjs_%.o, $(patsubst $(QUICKJS_DIR)/%.c, $(BUILD_GUI)/quickjs_%.o, $(QUICKJS_SRC)))
-
 # All kernel-side objects
-KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(LIB_OBJ) $(PKG_OBJ) $(GUI_OBJ) $(GUI_CPP_OBJ) $(QUICKJS_OBJ)
+KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ)
 
 # ============================================================================
 # Output Files
@@ -209,9 +176,6 @@ dirs:
 	@mkdir -p $(BUILD_BOOT)
 	@mkdir -p $(BUILD_KERNEL)
 	@mkdir -p $(BUILD_DRIVERS)
-	@mkdir -p $(BUILD_LIB)
-	@mkdir -p $(BUILD_PKG)
-	@mkdir -p $(BUILD_GUI)
 	@mkdir -p $(BUILD_ESP)/EFI/BOOT
 
 # ---------- Bootloader ----------
@@ -257,40 +221,6 @@ $(BUILD_DRIVERS)/%.o: $(SRC_DRIVERS)/%.asm
 	@mkdir -p $(dir $@)
 	@echo "  AS(DRV)    $<"
 	@$(AS) $(ASFLAGS) $< -o $@
-
-# Lib objects
-$(BUILD_LIB)/%.o: $(SRC_LIB)/%.c
-	@mkdir -p $(dir $@)
-	@echo "  CC(LIB)    $<"
-	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $< -o $@
-
-# Package manager objects
-$(BUILD_PKG)/%.o: $(SRC_PKG)/%.c
-	@mkdir -p $(dir $@)
-	@echo "  CC(PKG)    $<"
-	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $< -o $@
-
-$(BUILD_GUI)/%.o: $(SRC_GUI)/%.c
-	@mkdir -p $(dir $@)
-	@echo "  CC(GUI)    $<"
-	@$(CC_KERNEL) $(CFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
-
-$(BUILD_GUI)/%.o: $(SRC_GUI)/%.cpp
-	@mkdir -p $(dir $@)
-	@echo "  CXX(GUI)   $<"
-	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -I$(SRC_GUI) -c $< -o $@
-
-QJS_CFLAGS = -I$(QJS_COMPAT)/include -I$(QJS_COMPAT) -Ipkg/quickjs -include $(QJS_COMPAT)/compat.h
-
-$(BUILD_GUI)/quickjs_%.o: $(QJS_COMPAT)/%.c
-	@mkdir -p $(dir $@)
-	@echo "  CC(QJS)    $<"
-	@$(CC_KERNEL) $(CFLAGS_KERNEL) $(QJS_CFLAGS) -DCONFIG_VERSION=\"2024-01-13\" -DCONFIG_BIGNUM=0 -Wno-unused-parameter -Wno-unused-variable -Wno-implicit-fallthrough -Wno-return-type -Wno-sign-compare -Wno-unused-function -Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-format -Wno-int-conversion -c $< -o $@
-
-$(BUILD_GUI)/quickjs_%.o: $(QUICKJS_DIR)/%.c
-	@mkdir -p $(dir $@)
-	@echo "  CC(QJS)    $<"
-	@$(CC_KERNEL) $(CFLAGS_KERNEL) $(QJS_CFLAGS) -DCONFIG_VERSION=\"2024-01-13\" -DCONFIG_BIGNUM=0 -Wno-unused-parameter -Wno-unused-variable -Wno-implicit-fallthrough -Wno-return-type -Wno-sign-compare -Wno-unused-function -Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-format -Wno-int-conversion -c $< -o $@
 
 $(KERNEL_ELF): $(KERNEL_ALL_OBJ)
 	@echo "  LD(KERN)   $@"
@@ -481,7 +411,7 @@ endif
 WITH_BASE ?= 1
 ifeq ($(WITH_BASE),1)
 BASE_MANIFEST = $(BUILD)/base_manifest.txt
-$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c $(wildcard apps/accounts/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
+$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c $(wildcard apps/accounts/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
 	@bash tools/stage_base.sh
 else
 BASE_MANIFEST =

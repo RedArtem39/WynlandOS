@@ -80,12 +80,21 @@ static void keyboard_push_scancode(uint8_t scancode)
     }
 }
 
-/* Separate, always-on raw scancode queue for Ring-3 (/dev/input/kbd),
-   independent of kbd_buffer above -- mirrors drivers/input/mouse.c's
-   mouse_queue_push/mouse_read_queue exactly. kbd_buffer above is still
-   destructively drained by /dev/tty, SYS_read stdin, and the old Ring-0
-   wm_handle_key polling loop; this is a SEPARATE feed so a Ring-3 reader
-   doesn't steal scancodes from (or get stolen from by) those. */
+/* US layout, unshifted: the console's line input (/dev/tty, a stdin
+   that was never opened) */
+const char scancode_to_ascii_lower[59] = {
+    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
+    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
+    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
+    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
+};
+
+/* The display server's keyboard (/dev/input/kbd), apart from kbd_buffer
+   above (the console's). While the display server reads it, keys are its
+   alone: the console queue gets nothing, so what is typed in a window
+   never reaches a program reading the console. */
+static volatile uint64_t g_kbd_raw_read_ms;   /* last read of /dev/input/kbd */
+#define KBD_OWNER_MS 1000
 #define KBD_RAW_QUEUE_SIZE 256
 static uint8_t kbd_raw_queue[KBD_RAW_QUEUE_SIZE];
 static uint32_t kbd_raw_queue_head = 0;
@@ -103,6 +112,7 @@ void kbd_raw_queue_push(uint8_t scancode)
 int kbd_raw_read_queue(uint8_t *buf, int size)
 {
     int read_bytes = 0;
+    g_kbd_raw_read_ms = timer_ms;
     while (read_bytes < size) {
         if (kbd_raw_queue_head == kbd_raw_queue_tail) {
             break;
@@ -261,7 +271,8 @@ void irq_handler(InterruptRegisters *regs)
     } else if (irq == 1) {
         /* Keyboard interrupt */
         uint8_t scancode = inb(0x60);
-        keyboard_push_scancode(scancode);
+        if (!g_kbd_raw_read_ms || timer_ms - g_kbd_raw_read_ms > KBD_OWNER_MS)
+            keyboard_push_scancode(scancode);
         kbd_raw_queue_push(scancode);
     } else if (irq == 12) {
         /* Mouse interrupt */

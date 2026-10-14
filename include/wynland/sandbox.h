@@ -41,6 +41,7 @@ typedef struct MntNs MntNs;
 #define CAP_SETUID     7
 #define CAP_SYS_CHROOT 18
 #define CAP_SYS_ADMIN  21
+#define CAP_SYS_BOOT   22
 #define CAP_ALL        0x000001FFFFFFFFFFULL   /* 0..40 */
 
 /* ---- seccomp: in the syscall path ---- */
@@ -52,6 +53,8 @@ bool seccomp_filter_syscall(uint64_t nr, const uint64_t a[6], uint64_t ip, uint6
 int64_t sandbox_seccomp(uint32_t op, uint32_t flags, uint64_t uargs);
 int64_t sandbox_prctl(int option, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 int64_t sandbox_capget(uint64_t hdr, uint64_t data);
+/* has p the capability in the initial user namespace (the machine's)? */
+bool    sandbox_capable_host(const struct Process *p, int cap);
 int64_t sandbox_capset(uint64_t hdr, uint64_t data);
 
 /* ---- process life ---- */

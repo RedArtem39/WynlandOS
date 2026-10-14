@@ -40,6 +40,8 @@ static uint64_t caps_of(const Process *p) {
 }
 static bool has_cap(const Process *p, int cap) { return (caps_of(p) >> cap) & 1; }
 
+bool sandbox_capable_host(const Process *p, int cap) { return p && !p->userns && has_cap(p, cap); }
+
 /* =====================================================================
  * seccomp
  * ===================================================================== */

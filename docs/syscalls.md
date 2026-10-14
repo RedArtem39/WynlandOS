@@ -168,6 +168,7 @@ the `/proc/PID` directories beyond the namespace files.
 | 63 | `uname` | reports `Linux` so software takes its Linux paths |
 | 97, 302 | `getrlimit`, `prlimit64` | fixed limits; setting is accepted |
 | 99 | `sysinfo` | |
+| 169 | `reboot` | `RESTART`, `POWER_OFF`, `HALT` (the disks synced first); CAP_SYS_BOOT in the initial user namespace. `/usr/sbin/reboot`, `poweroff`, `halt` call it |
 | 37, 38, 36 | `alarm`, `setitimer`, `getitimer` | `ITIMER_REAL` (SIGALRM, 10 ms grain); `ITIMER_VIRTUAL`/`PROF` accepted, never fire. `timer_create` is `-ENOSYS` (callers fall back to these) |
 | 318 | `getrandom` | |
 | 444–446 | `landlock_*` | `-ENOSYS` (callers fall back to the sandboxing above) |
@@ -179,8 +180,7 @@ does. Arguments in the same registers as the Linux calls.
 
 | # | name | arguments → result |
 |---|------|--------------------|
-| 400 | `draw_rect` | `(x, y, w, h, color)` → 0. Fills a rectangle on the kernel's own framebuffer compositor (the boot console, Zerp 1). |
-| 401 | `mark_dirty` | `()` → 0. Asks that compositor to redraw. |
+| 400, 401 | `draw_rect`, `mark_dirty` | Removed: `-ENOSYS`. (They drew on the kernel's own desktop, gone with it.) |
 | 404 | `kfree` | Removed: `-ENOSYS`. (It freed any kernel pointer a program passed in.) |
 | 405 | `spawn` | `(path)` → pid or −1. Starts a new process running `path`, as the caller's user, with the caller's fds that are not close-on-exec. No argv. |
 | 406 | `fb_flush` | `(x, y, w, h)` → 0. Pushes a rectangle of `/dev/fb0` to the screen (virtio-gpu needs an explicit flush). |
