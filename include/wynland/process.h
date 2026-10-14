@@ -151,6 +151,10 @@ typedef struct Process {
     struct MntNs  *mntns;            /* its mounts (NULL: the initial namespace's) */
     bool       nondumpable;          /* prctl(PR_SET_DUMPABLE, 0) */
     int        pdeathsig;            /* prctl(PR_SET_PDEATHSIG): kept, not sent */
+    uint8_t    std_closed;           /* bit i: fd i (0-2) closed by the process -- free for the
+                                        next open/dup, not the console an unopened 0-2 is */
+    uint64_t   alarm_at_ms;          /* ITIMER_REAL (alarm, setitimer): when SIGALRM is due, 0 off */
+    uint64_t   alarm_every_ms;       /* and then every this often, 0 once */
     struct Process *next;
 } Process;
 

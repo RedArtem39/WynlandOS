@@ -29,7 +29,10 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  foot libfcft4t64 libutf8proc3 xkb-data ncurses-term libc-bin
  xwayland xserver-common x11-xkb-utils xterm xbitmaps libxfont2 libfontenc1 libxcvt0
  libxkbfile1 libxaw7 libxmu6 libxft2 libxpm4 libutempter0 libei1 liboeffis1
- bubblewrap"
+ bubblewrap
+ fastfetch libyyjson0
+ man-db groff-base libpipeline1 libgdbm6t64 libuchardet0 libseccomp2
+ w3m libgc1 libgpm2"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)
@@ -58,9 +61,11 @@ fi
 
 skip() {
     case "$1" in
+        # fish's own manual: `help` (HTML, read with w3m) and `CMD --help` (man pages)
+        /usr/share/doc/fish|/usr/share/doc/fish/*) return 1 ;;
         /usr/share/doc/*|/usr/share/man/*|/usr/share/locale/*|/usr/share/info/*) return 0 ;;
         /usr/share/lintian/*|/usr/share/bug/*|/usr/share/menu/*|/usr/share/doc-base/*) return 0 ;;
-        /usr/share/fish/man/*|/usr/share/fish/tools/*|/usr/share/applications/*) return 0 ;;
+        /usr/share/fish/tools/*|/usr/share/applications/*) return 0 ;;
         /usr/share/pixmaps/*|/usr/share/icons/*|/etc/init.d/*|/etc/cron*|/usr/lib/systemd/*) return 0 ;;
         /usr/lib/x86_64-linux-gnu/*.so*) return 0 ;;   # libraries go by soname below
         /usr/sbin/ldconfig) return 0 ;;                  # leaf's shim instead (libc-bin's would rebuild ld.so.cache)
@@ -116,7 +121,7 @@ BINS=""
     echo "S /bin usr/bin"
     for d in $(sort -u "$dirs"); do
         case "$d" in /bin|/bin/*|/sbin|/lib|/lib64) continue ;; esac
-        skip "$d/x" && continue
+        [ "$d" != /usr/share/doc ] && skip "$d/x" && continue
         echo "D $d"
     done
     sort -u "$files" | while read -r f; do

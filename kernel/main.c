@@ -2588,6 +2588,10 @@ void kernel_main(BootInfo *boot_info)
         extern void ext2_flusher_thread(void *arg);
         thread_create(ext2_flusher_thread, NULL);
     }
+    {   /* alarm(), setitimer(): SIGALRM when due */
+        extern void itimer_thread(void *arg);
+        thread_create(itimer_thread, NULL);
+    }
     /* The image ships these (ext2_manifest.txt); create only what is
        missing. Creating -- even a no-op on an existing name -- walked the
        ext2 bitmaps and cost ~1.5 s each, 9 s of every boot. */

@@ -279,6 +279,25 @@ int main(int argc, char **argv)
             usleep(500000);
             check(bad_name && access("/tmp/rcx-ran", F_OK) != 0, "wynrc refuses a service outside its directory");
             check(denied && own, "wynrc: root's services refused, its own allowed");
+        }
+        /* dup() takes the lowest free fd: close(0); dup(p) is stdin = p
+           (groff's pipeline; it used to get 3 and up, never 0-2) */
+        {
+            int p[2];
+            pid_t c = pipe(p) == 0 ? fork() : -1;
+            if (c == 0) {
+                close(0);
+                int d = dup(p[0]);
+                close(1);
+                int e = dup(p[1]);
+                _exit(d == 0 && e == 1 && write(1, "x", 1) == 1 ? 0 : 1);
+            }
+            int cs = -1;
+            if (c > 0) waitpid(c, &cs, 0);
+            char ch = 0;
+            bool got = c > 0 && read(p[0], &ch, 1) == 1 && ch == 'x';
+            check(c > 0 && WIFEXITED(cs) && WEXITSTATUS(cs) == 0 && got, "close(0); dup(): the lowest free fd");
+            close(p[0]); close(p[1]);
             unlink("/tmp/rcx");
         }
         /* audit regressions: each of these used to reach kernel memory */

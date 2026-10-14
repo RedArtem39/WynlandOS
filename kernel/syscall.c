@@ -440,6 +440,35 @@ static int64_t signal_process(Process *p, int sig)
     return 0;
 }
 
+extern uint64_t timer_get_ms(void);
+
+/* ITIMER_REAL: this thread sends the SIGALRMs that are due (10 ms grain) */
+void itimer_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        sched_sleep_ms(10);
+        uint64_t now = timer_get_ms();
+        for (Process *p = process_list_head(); p; p = p->next) {
+            if (!p->alarm_at_ms || p->exited || now < p->alarm_at_ms) continue;
+            p->alarm_at_ms = p->alarm_every_ms ? now + p->alarm_every_ms : 0;
+            Thread *t = p->main_thread;
+            if (!t || t->state == THREAD_STATE_TERMINATED) continue;
+            signal_raise_thread(t->id, p->pid, 14 /* SIGALRM */);
+            if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, 14)) sched_unblock(t, -LNX_EINTR);
+        }
+    }
+}
+
+/* the ITIMER_REAL left as {interval, value} timevals */
+static void itimer_get(Process *p, int64_t out[4])
+{
+    uint64_t now = timer_get_ms();
+    uint64_t left = p->alarm_at_ms > now ? p->alarm_at_ms - now : (p->alarm_at_ms ? 1 : 0);
+    out[0] = (int64_t)(p->alarm_every_ms / 1000); out[1] = (int64_t)(p->alarm_every_ms % 1000) * 1000;
+    out[2] = (int64_t)(left / 1000);              out[3] = (int64_t)(left % 1000) * 1000;
+}
+
 /* Unmap one user page and drop what the mapping owned: a private frame is
    freed; a shared one (PAGE_SHARED_MAP: fb0, SHM, DRM BO) is left to its
    owner, except that a mapping holding its own reference
@@ -524,13 +553,24 @@ static inline void trace_str(const char *s)
     if (SYSCALL_TRACE) serial_write_string(s);
 }
 
+/* The lowest free fd, as POSIX wants (the close(0); dup(fd) idiom). An
+   unopened 0-2 is the console, so it is free only once the process has
+   closed it (Process.std_closed). */
 static int get_free_fd(VfsFile **fd_table) {
+    Process *p = sched_current()->proc;
+    for (int i = 0; i < 3; i++)
+        if (p->fd_table == fd_table && fd_table[i] == NULL && (p->std_closed & (1u << i))) return i;
     for (int i = 3; i < MAX_OPEN_FILES; i++) {
         if (fd_table[i] == NULL) {
             return i;
         }
     }
     return -1;
+}
+
+/* is fd 0-2 the console (never opened, never closed)? */
+static bool std_console(Process *p, uint64_t fd) {
+    return fd <= 2 && p->fd_table[fd] == NULL && !(p->std_closed & (1u << fd));
 }
 
 /* dma-buf (PRIME) fds for drivers/video/virtgpu_drm.c */
@@ -898,6 +938,90 @@ static const char *proc_sys_text(const char *path) {
     for (unsigned i = 0; i < sizeof(k) / sizeof(k[0]); i++)
         if (str_compare(path, k[i].p) == 0) return k[i].t;
     return NULL;
+}
+
+/* /proc/meminfo, cpuinfo, stat, uptime, loadavg: made when opened (what
+   fastfetch, top and the Boehm GC in w3m read). One CPU. */
+typedef struct { char *b; uint32_t n, cap; } PText;
+static void pt_s(PText *t, const char *s) { while (*s && t->n + 1 < t->cap) t->b[t->n++] = *s++; }
+static void pt_u(PText *t, uint64_t v) { char d[24]; uint_to_str(v, d); pt_s(t, d); }
+static void pt_kv(PText *t, const char *k, uint64_t kb) { pt_s(t, k); pt_u(t, kb); pt_s(t, " kB\n"); }
+static void pt_cs(PText *t, uint64_t cs) { pt_u(t, cs / 100); pt_s(t, cs % 100 < 10 ? ".0" : "."); pt_u(t, cs % 100); }
+
+static void cpuid4(uint32_t leaf, uint32_t r[4]) {
+    __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0));
+}
+
+static bool proc_info_text(const char *path, PText *t) {
+    uint64_t ms = timer_get_ms(), cs = ms / 10;
+    if (str_compare(path, "/proc/meminfo") == 0) {
+        uint64_t total = pmm_get_total_memory() / 1024, free = pmm_get_free_memory() / 1024;
+        pt_kv(t, "MemTotal:       ", total);
+        pt_kv(t, "MemFree:        ", free);
+        pt_kv(t, "MemAvailable:   ", free);
+        pt_kv(t, "Buffers:        ", 0);
+        pt_kv(t, "Cached:         ", 0);
+        pt_kv(t, "SwapCached:     ", 0);
+        pt_kv(t, "Shmem:          ", 0);
+        pt_kv(t, "SReclaimable:   ", 0);
+        pt_kv(t, "SwapTotal:      ", 0);
+        pt_kv(t, "SwapFree:       ", 0);
+        return true;
+    }
+    if (str_compare(path, "/proc/cpuinfo") == 0) {
+        uint32_t r[4], v[4], brand[13] = {0};
+        cpuid4(0, v);
+        char vendor[13];
+        memcpy(vendor, &v[1], 4); memcpy(vendor + 4, &v[3], 4); memcpy(vendor + 8, &v[2], 4);
+        vendor[12] = 0;
+        cpuid4(1, r);
+        uint32_t fam = (r[0] >> 8) & 0xF, model = (r[0] >> 4) & 0xF, step = r[0] & 0xF;
+        if (fam == 0xF) fam += (r[0] >> 20) & 0xFF;
+        if (fam >= 6) model |= ((r[0] >> 16) & 0xF) << 4;
+        uint32_t ecx1 = r[2], edx1 = r[3];
+        cpuid4(0x80000000, v);
+        if (v[0] >= 0x80000004) for (uint32_t i = 0; i < 3; i++) cpuid4(0x80000002 + i, &brand[i * 4]);
+        const char *name = (const char *)brand;
+        while (*name == ' ') name++;
+        uint32_t ebx7 = 0;
+        cpuid4(0, v);
+        if (v[0] >= 7) { cpuid4(7, v); ebx7 = v[1]; }
+        pt_s(t, "processor\t: 0\nvendor_id\t: "); pt_s(t, vendor);
+        pt_s(t, "\ncpu family\t: "); pt_u(t, fam);
+        pt_s(t, "\nmodel\t\t: "); pt_u(t, model);
+        pt_s(t, "\nmodel name\t: "); pt_s(t, *name ? name : "unknown");
+        pt_s(t, "\nstepping\t: "); pt_u(t, step);
+        pt_s(t, "\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\nflags\t\t:");
+        static const struct { uint8_t reg, bit; const char *n; } fl[] = {
+            { 0, 0, "fpu" }, { 0, 4, "tsc" }, { 0, 15, "cmov" }, { 0, 23, "mmx" }, { 0, 25, "sse" },
+            { 0, 26, "sse2" }, { 1, 0, "pni" }, { 1, 9, "ssse3" }, { 1, 12, "fma" }, { 1, 19, "sse4_1" },
+            { 1, 20, "sse4_2" }, { 1, 23, "popcnt" }, { 1, 25, "aes" }, { 1, 28, "avx" },
+            { 2, 3, "bmi1" }, { 2, 5, "avx2" }, { 2, 8, "bmi2" }, { 2, 16, "avx512f" },
+        };
+        for (unsigned i = 0; i < sizeof(fl) / sizeof(fl[0]); i++) {
+            uint32_t reg = fl[i].reg == 0 ? edx1 : fl[i].reg == 1 ? ecx1 : ebx7;
+            if (reg & (1u << fl[i].bit)) { pt_s(t, " "); pt_s(t, fl[i].n); }
+        }
+        pt_s(t, "\n\n");
+        return true;
+    }
+    if (str_compare(path, "/proc/stat") == 0) {
+        /* user nice system idle ...: all of it as idle, which nobody measures */
+        pt_s(t, "cpu  0 0 0 "); pt_u(t, cs); pt_s(t, " 0 0 0 0 0 0\n");
+        pt_s(t, "cpu0 0 0 0 "); pt_u(t, cs); pt_s(t, " 0 0 0 0 0 0\n");
+        pt_s(t, "intr 0\nctxt 0\nbtime "); pt_u(t, rtc_get_unix_time() - ms / 1000);
+        pt_s(t, "\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n");
+        return true;
+    }
+    if (str_compare(path, "/proc/uptime") == 0) {
+        pt_cs(t, cs); pt_s(t, " "); pt_cs(t, cs); pt_s(t, "\n");
+        return true;
+    }
+    if (str_compare(path, "/proc/loadavg") == 0) {
+        pt_s(t, "0.00 0.00 0.00 1/1 1\n");
+        return true;
+    }
+    return false;
 }
 
 static int proc_text_memfd(const char *t) {
@@ -1932,7 +2056,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return (uint64_t)drm_read(fd_table[a1]->current_cluster, a2, a3,
                                           (fd_oflags[a1] & LINUX_O_NONBLOCK) != 0);
             }
-            if (a1 == 0 && fd_table[0] == NULL) { // stdin
+            if (a1 == 0 && std_console(proc, 0)) { // stdin
                 if (a3 == 0 || !a2) return 0;
                 char *cbuf = (char *)a2;
                 uint64_t read_bytes = 0;
@@ -2061,7 +2185,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             if (a3 != 0 && !user_check_read(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
             }
-            if ((a1 == 1 || a1 == 2) && fd_table[a1] == NULL) { // stdout/stderr
+            if ((a1 == 1 || a1 == 2) && std_console(proc, a1)) { // stdout/stderr
                 if (a3 == 0 || !a2) return 0;
                 extern bool g_quiet_console;
                 const char *cbuf = (const char *)a2;
@@ -2183,7 +2307,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
                 size_t total_written = 0;
 
-                if ((a1 == 1 || a1 == 2) && fd_table[a1] == NULL) { // stdout/stderr, not redirected
+                if ((a1 == 1 || a1 == 2) && std_console(proc, a1)) { // stdout/stderr, not redirected
                     extern bool g_quiet_console;
                     for (int i = 0; i < iovcnt; i++) {
                         if (kiov[i].iov_base && kiov[i].iov_len > 0) {
@@ -2293,9 +2417,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
         case 3: // SYS_close (Linux standard)
+            if (std_console(proc, a1)) { proc->std_closed |= (uint8_t)(1u << a1); return 0; }
             if (a1 >= MAX_OPEN_FILES || fd_table[a1] == NULL) {
-                return (uint64_t)-1;
+                return (uint64_t)-9; /* -EBADF */
             }
+            if (a1 <= 2) proc->std_closed |= (uint8_t)(1u << a1);
             if (IS_DRM_DEV(fd_table[a1]->node.first_cluster))
                 drm_release(fd_table[a1]->current_cluster, proc->pid, true);
             /* The next open()/socket() reusing this number must not inherit
@@ -2321,6 +2447,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (a3 & ~(uint64_t)(2 | 4)) return (uint64_t)-22;      /* only UNSHARE (no-op), CLOEXEC */
                 uint64_t last = a2 < MAX_OPEN_FILES - 1 ? a2 : MAX_OPEN_FILES - 1;
                 for (uint64_t fd = a1; fd <= last && fd < MAX_OPEN_FILES; fd++) {
+                    if (!(a3 & 4) && fd <= 2) proc->std_closed |= (uint8_t)(1u << fd);
                     if (!fd_table[fd]) continue;
                     if (a3 & 4) { fd_flags[fd] |= FD_CLOEXEC; continue; }  /* CLOSE_RANGE_CLOEXEC */
                     if (IS_DRM_DEV(fd_table[fd]->node.first_cluster))
@@ -3408,6 +3535,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         child->fd_oflags[i] = parent->fd_oflags[i];
                     }
                 }
+                child->std_closed = parent->std_closed;
 
                 /* Heap copy of the parent's exact syscall-entry register
                    state -- the child resumes execution from HERE (same RIP,
@@ -3621,6 +3749,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (fd_table[i] && (fd_flags[i] & FD_CLOEXEC)) {
                         VfsFile *cf = fd_table[i];
                         fd_table[i] = NULL;
+                        if (i <= 2) exec_proc->std_closed |= (uint8_t)(1u << i);
                         fd_flags[i] = 0;
                         fd_oflags[i] = 0;
                         kfile_close(cf);
@@ -4101,7 +4230,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!user_stat || !user_prepare_write(a2, sizeof(*user_stat))) return (uint64_t)-14; /* -EFAULT */
 
                 /* stdin/stdout/stderr that were never opened: the console */
-                if (fd <= 2 && fd_table[fd] == NULL) {
+                if (std_console(proc, fd)) {
                     memset(user_stat, 0, sizeof(*user_stat));
                     user_stat->st_mode    = S_IFCHR | 0666;
                     user_stat->st_blksize = 4096;
@@ -4385,8 +4514,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                            wrapper, which left the other fd dangling). */
                         if (fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return (uint64_t)-9; /* -EBADF */
                         int min_fd = (int)a3;
-                        if (min_fd < 3) min_fd = 3;
+                        if (min_fd < 0) min_fd = 0;
                         for (int i = min_fd; i < MAX_OPEN_FILES; i++) {
+                            if (i <= 2 && !(proc->std_closed & (1u << i))) continue;
                             if (fd_table[i] == NULL && i != (int)fd) {
                                 VfsFile *copy = kfile_dup(fd_table[fd]);
                                 if (!copy) return (uint64_t)-12; /* -ENOMEM */
@@ -4827,9 +4957,16 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                  str_compare(path, "/etc/mtab") == 0;
                 bool is_minfo = str_compare(path, "/proc/self/mountinfo") == 0;
                 const char *sys_text = proc_sys_text(path);
+                char *info = NULL;
+                if (!sys_text && path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c' && path[5] == '/' && (info = (char *)kmalloc(2048))) {
+                    PText pt = { info, 0, 2048 };
+                    if (proc_info_text(path, &pt)) { info[pt.n] = 0; sys_text = info; }
+                    else { kfree(info); info = NULL; }
+                }
                 if (str_compare(path, "/proc/self/maps") == 0 || is_mounts || is_minfo || sys_text) {
                     int mi = sys_text ? proc_text_memfd(sys_text)
                            : (is_mounts || is_minfo) ? proc_mounts_memfd(is_minfo) : proc_maps_memfd(proc);
+                    if (info) kfree(info);
                     if (mi < 0) return (uint64_t)-12;
                     VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
                     if (!f) { memfd_unref(mi); return (uint64_t)-12; }
@@ -5212,6 +5349,38 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 memcpy((void *)(uintptr_t)nw, (const void *)(uintptr_t)old, (size_t)old_sz);
                 syscall_dispatcher(11, old, old_sz, 0, 0, 0, regs);
                 return nw;
+            }
+
+        case 37: // SYS_alarm(seconds): the seconds left of the one before
+            {
+                int64_t was[4];
+                itimer_get(proc, was);
+                proc->alarm_every_ms = 0;
+                proc->alarm_at_ms = a1 ? timer_get_ms() + (uint64_t)(uint32_t)a1 * 1000 : 0;
+                return (uint64_t)(was[2] + (was[3] ? 1 : 0));
+            }
+
+        case 38: // SYS_setitimer(which, new, old): ITIMER_REAL; the CPU-time
+                 // ones (VIRTUAL, PROF) are accepted and never fire
+        case 36: // SYS_getitimer(which, cur)
+            {
+                if (a1 > 2) return (uint64_t)-22; /* -EINVAL */
+                int64_t cur[4] = {0, 0, 0, 0};
+                if (a1 == 0) itimer_get(proc, cur);
+                uint64_t outp = num == 36 ? a2 : a3;
+                if (num == 38 && a2) {
+                    int64_t nv[4];
+                    if (copy_from_user(nv, (const void *)a2, sizeof(nv)) != 0) return (uint64_t)-14;
+                    if (nv[1] < 0 || nv[1] >= 1000000 || nv[3] < 0 || nv[3] >= 1000000 || nv[0] < 0 || nv[2] < 0)
+                        return (uint64_t)-22;
+                    if (a1 == 0) {
+                        uint64_t val = (uint64_t)nv[2] * 1000 + ((uint64_t)nv[3] + 999) / 1000;
+                        proc->alarm_every_ms = (uint64_t)nv[0] * 1000 + ((uint64_t)nv[1] + 999) / 1000;
+                        proc->alarm_at_ms = val ? timer_get_ms() + val : 0;
+                    }
+                }
+                if (outp && copy_to_user((void *)outp, cur, sizeof(cur)) != 0) return (uint64_t)-14;
+                return 0;
             }
 
         case 99: // SYS_sysinfo

@@ -29,7 +29,7 @@ missing; anything not listed here is `-ENOSYS`.
 | 17, 18 | `pread64`, `pwrite64` | |
 | 19, 20 | `readv`, `writev` | |
 | 21, 269, 439 | `access`, `faccessat`, `faccessat2` | |
-| 32, 33, 292 | `dup`, `dup2`, `dup3` | |
+| 32, 33, 292 | `dup`, `dup2`, `dup3` | the lowest free fd; 0-2 count as free once the process has closed them (unopened, they are the console) |
 | 72 | `fcntl` | `F_DUPFD(_CLOEXEC)`, `F_GET/SETFD`, `F_GET/SETFL`; record locks are not tracked (`F_SETLK` succeeds, `F_GETLK` says unlocked) |
 | 73 | `flock` | always succeeds (one machine) |
 | 74, 75, 162, 306 | `fsync`, `fdatasync`, `sync`, `syncfs` | write back the block cache |
@@ -168,6 +168,7 @@ the `/proc/PID` directories beyond the namespace files.
 | 63 | `uname` | reports `Linux` so software takes its Linux paths |
 | 97, 302 | `getrlimit`, `prlimit64` | fixed limits; setting is accepted |
 | 99 | `sysinfo` | |
+| 37, 38, 36 | `alarm`, `setitimer`, `getitimer` | `ITIMER_REAL` (SIGALRM, 10 ms grain); `ITIMER_VIRTUAL`/`PROF` accepted, never fire. `timer_create` is `-ENOSYS` (callers fall back to these) |
 | 318 | `getrandom` | |
 | 444–446 | `landlock_*` | `-ENOSYS` (callers fall back to the sandboxing above) |
 
