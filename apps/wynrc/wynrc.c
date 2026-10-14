@@ -21,6 +21,9 @@
 //   restart=      always | on-failure | no      (daemons; default on-failure)
 //   user=         the account it runs as (a name from /etc/passwd, or a
 //                 uid); default root -- wynrc itself is root
+//   devices=      display: the display server's devices (keyboard, pointer,
+//                 framebuffer -- root's) opened here and handed over as
+//                 WYNLAND_KBD_FD, WYNLAND_MICE_FD, WYNLAND_FB_FD
 //
 // Control: an AF_UNIX socket (abstract "wynrc"), one line per request:
 // "status", "start NAME", "stop NAME", "restart NAME". Anyone may ask for
@@ -67,6 +70,7 @@ typedef struct {
     char provide[32];
     char when[256];
     char user[32];            /* user=: "" = root */
+    int display_devs;         /* devices=display: the keyboard, pointer, framebuffer handed over */
     int restart;              /* 0 no, 1 on-failure, 2 always */
     int state;
     char info[96];
@@ -227,6 +231,7 @@ static int load_service(const char *name)
         else if (!strcmp(k, "when")) snprintf(s->when, sizeof s->when, "%s", v);
         else if (!strcmp(k, "restart")) s->restart = !strcmp(v, "always") ? 2 : !strcmp(v, "no") ? 0 : 1;
         else if (!strcmp(k, "user")) snprintf(s->user, sizeof s->user, "%s", v);
+        else if (!strcmp(k, "devices")) s->display_devs = !strcmp(v, "display");
     }
     fclose(f);
     return 0;
@@ -332,7 +337,7 @@ static void start(Svc *s)
             return;
         }
         extern char **environ;
-        static char envbuf[6][256];
+        static char envbuf[8][256];
         char *envp[64];
         int n = 0;
         for (char **e = environ; *e && n < 56; e++)
@@ -345,6 +350,20 @@ static void start(Svc *s)
         snprintf(envbuf[3], sizeof envbuf[3], "SHELL=%s", pw ? pw->pw_shell : "/bin/sh");
         snprintf(envbuf[4], sizeof envbuf[4], "PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin");
         for (int k = 0; k < 5; k++) envp[n++] = envbuf[k];
+        /* devices=display: the display server's devices are root's -- opened
+           here, inherited by it (WYNLAND_*_FD), closed here after */
+        int dev[3] = { -1, -1, -1 };
+        static const char *const dev_path[3] = { "/dev/input/kbd", "/dev/input/mice", "/dev/fb0" };
+        static const char *const dev_var[3] = { "WYNLAND_KBD_FD", "WYNLAND_MICE_FD", "WYNLAND_FB_FD" };
+        if (s->display_devs)
+            for (int k = 0; k < 3; k++) {
+                dev[k] = open(dev_path[k], k == 2 ? O_RDWR : O_RDONLY);
+                if (dev[k] >= 0) {
+                    static char devbuf[3][32];
+                    snprintf(devbuf[k], sizeof devbuf[k], "%s=%d", dev_var[k], dev[k]);
+                    envp[n++] = devbuf[k];
+                }
+            }
         envp[n] = NULL;
         struct { uint32_t n; uint32_t g[32]; } groups = { 0, {0} };
         gid_t list[32];
@@ -352,6 +371,7 @@ static void start(Svc *s)
         if (pw && getgrouplist(pw->pw_name, gid, list, &ng) >= 0)
             for (int k = 0; k < ng && groups.n < 32; k++) groups.g[groups.n++] = list[k];
         pid = (pid_t)syscall(415, argv[0], argv, envp, (long)uid, (long)gid, &groups);
+        for (int k = 0; k < 3; k++) if (dev[k] >= 0) close(dev[k]);
         if (pid <= 0) { s->state = S_FAILED; snprintf(s->info, sizeof s->info, "spawn as %s failed", s->user); return; }
     } else {
         extern char **environ;

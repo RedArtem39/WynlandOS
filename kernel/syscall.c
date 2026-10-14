@@ -1240,6 +1240,8 @@ static uint32_t proc_umask(const Process *p) {
 /* What vfs_open_flags() does not know about, checked before it: O_EXCL,
    O_DIRECTORY, and directories are not opened for writing. 0 or -errno. */
 static int64_t open_precheck(const char *path, int linux_flags) {
+    extern bool vfs_display_device_denied(const char *path);
+    if (vfs_display_device_denied(path)) return -13; /* -EACCES */
     VfsStat st;
     bool exists = vfs_stat(path, &st);
     if ((linux_flags & 0100) && (linux_flags & 0200) && (exists || vfs_lstat(path, &st))) return -17; /* -EEXIST */
@@ -4131,6 +4133,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (max > 64) max = 64;
                 /* validate before claiming: a bad call must not take the stream */
                 if (!a1 || !user_prepare_write(a1, (uint64_t)max * sizeof(MouseEvent))) return (uint64_t)-14; /* -EFAULT */
+                /* only for the display server: it holds /dev/input/mice
+                   (root's; init and the login manager hand it over) */
+                {
+                    bool holds = false;
+                    for (int i = 0; i < MAX_OPEN_FILES && !holds; i++)
+                        holds = fd_table[i] && fd_table[i]->node.first_cluster == DEV_MICE;
+                    if (!holds) return (uint64_t)-1; /* -EPERM */
+                }
                 if (mouse_owner_pid != proc->pid) {
                     Process *owner = mouse_owner_pid ? process_find_by_pid(mouse_owner_pid) : NULL;
                     if (owner && !owner->exited) return (uint64_t)-16; /* -EBUSY */

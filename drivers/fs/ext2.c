@@ -2059,7 +2059,20 @@ static VfsFile *alloc_device_file(const char *name, uint32_t size,
     return file;
 }
 
+/* The display server's devices -- the keyboard, the pointer, the
+   framebuffer: whoever reads them sees every key typed and the screen.
+   Root's only (on the host): the login manager and init open them and
+   hand the fds to the display server they start. */
+bool vfs_display_device_denied(const char *path) {
+    if (str_compare(path, "/dev/input/kbd") != 0 && str_compare(path, "/dev/input/mice") != 0 &&
+        str_compare(path, "/dev/fb0") != 0) return false;
+    Thread *t = sched_current();
+    Process *p = t ? t->proc : NULL;
+    return p && p->pid != 0 && !(p->uid == 0 && !p->userns);
+}
+
 VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
+    if (vfs_display_device_denied(path)) return NULL;
     /* Device nodes first -- exact or suffix match (handles relative
        paths), byte-identical behavior to the previous FAT32 driver. */
     if (str_compare(path, "/dev/fb0") == 0) {

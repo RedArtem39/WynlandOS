@@ -99,6 +99,21 @@ static void reply(int fd, const char *s)
     dprintf(fd, "%s\n", s);
 }
 
+/* the input devices for the display server about to start: inherited by
+   it (not close-on-exec), closed here once it runs */
+static int g_kbd = -1, g_mice = -1;
+static void input_open(void)
+{
+    g_kbd = open("/dev/input/kbd", O_RDONLY);
+    g_mice = open("/dev/input/mice", O_RDONLY);
+}
+static void input_close(void)
+{
+    if (g_kbd >= 0) close(g_kbd);
+    if (g_mice >= 0) close(g_mice);
+    g_kbd = g_mice = -1;
+}
+
 /* the environment of a session or the greeter: ours (TZ, library paths)
    with the account's own values */
 static char **make_env(const struct passwd *pw)
@@ -124,6 +139,10 @@ static char **make_env(const struct passwd *pw)
     snprintf(bufs[b], sizeof bufs[b], "XDG_RUNTIME_DIR=%s", rt);       env[n++] = bufs[b++];
     env[n++] = "PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin";
     env[n++] = "LANG=C.UTF-8";
+    /* the keyboard and the pointer (root's devices): opened here for the
+       display server we start, which inherits them (input_open) */
+    if (g_kbd >= 0) { snprintf(bufs[b], sizeof bufs[b], "WYNLAND_KBD_FD=%d", g_kbd); env[n++] = bufs[b++]; }
+    if (g_mice >= 0) { snprintf(bufs[b], sizeof bufs[b], "WYNLAND_MICE_FD=%d", g_mice); env[n++] = bufs[b++]; }
     env[n] = NULL;
     return env;
 }
@@ -132,9 +151,11 @@ static void run_session(const char *user)
 {
     struct passwd *pw = getpwnam(user);
     if (!pw) { logf_("no account %s", user); return; }
+    input_open();
     char **env = make_env(pw);
     char *argv[] = { ZERP2, NULL };
     pid_t pid = spawn_as(ZERP2, argv, env, user, pw->pw_uid, pw->pw_gid);
+    input_close();
     if (pid < 0) { logf_("could not start the session of %s", user); sleep(2); return; }
     logf_("session of %s (uid %u): pid %d", user, pw->pw_uid, (int)pid);
     int st;
@@ -161,8 +182,10 @@ static void greet(char *who, size_t cap)
     char *argv[] = { ZERP2, "--greeter", a1, a2, first ? "--first" : NULL, NULL };
     struct passwd fake = { .pw_name = GREETER_USER, .pw_dir = "/var/lib/greeter", .pw_shell = "/bin/false",
                            .pw_uid = guid, .pw_gid = ggid };
+    input_open();
     char **env = make_env(g ? g : &fake);
     pid_t pid = spawn_as(ZERP2, argv, env, g ? GREETER_USER : NULL, guid, ggid);
+    input_close();
     close(req[1]);
     close(rep[0]);
     if (pid < 0) { logf_("could not start the login screen"); close(req[0]); close(rep[1]); sleep(2); return; }

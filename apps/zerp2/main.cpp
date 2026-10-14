@@ -40,6 +40,21 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// The input devices are root's: whoever starts the display server (the
+// login manager, init) opens them and passes the fds in WYNLAND_KBD_FD /
+// WYNLAND_MICE_FD. They stay ours alone: close-on-exec, and the variables
+// do not reach our clients. Run as root, we open them ourselves.
+static int inputFd(const char *var, const char *path)
+{
+    int fd = -1;
+    if (const char *v = getenv(var)) fd = atoi(v);
+    else fd = ::open(path, O_RDONLY);
+    unsetenv(var);
+    if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
+static int g_kbdFd = -1, g_miceFd = -1;   // the mouse stream (syscall 412) needs the mice fd held
+
 struct ZMouseEvent { int32_t x, y; uint32_t buttons; };
 static long mouse_events(ZMouseEvent *buf, long max) { return syscall(412, buf, max, 0); }
 
@@ -71,7 +86,7 @@ public:
     // greeter: the login screen -- no WM bindings (they start programs)
     InputPump(QQuickWindow *w, ZServer *srv, bool greeter = false) : m_win(w), m_srv(srv), m_greeter(greeter)
     {
-        m_kbd = ::open("/dev/input/kbd", O_RDONLY);
+        m_kbd = g_kbdFd;
         connect(&m_timer, &QTimer::timeout, this, &InputPump::poll);
         m_timer.start(4);
     }
@@ -248,6 +263,10 @@ static QByteArray bootCfg()
 
 int main(int argc, char **argv)
 {
+    g_kbdFd = inputFd("WYNLAND_KBD_FD", "/dev/input/kbd");
+    g_miceFd = inputFd("WYNLAND_MICE_FD", "/dev/input/mice");
+    fprintf(stderr, "[zerp2] input: keyboard %s, pointer %s\n", g_kbdFd >= 0 ? "ok" : "MISSING",
+            g_miceFd >= 0 ? "ok" : "MISSING");
     qputenv("QT_QPA_PLATFORM", "eglfs");
     qputenv("QT_QPA_EGLFS_INTEGRATION", "eglfs_kms");
     qputenv("QT_QPA_EGLFS_KMS_CONFIG", "/usr/share/zerp2/kms.json");

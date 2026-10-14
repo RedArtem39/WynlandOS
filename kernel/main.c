@@ -1006,9 +1006,10 @@ void kernel_main(BootInfo *boot_info)
             if (z2) {
                 vfs_close(z2);
                 console_print_string(boot_info, "Starting Zerp 2.0...\n", 0x0000FF00, term_bg_color);
-                process_spawn("/usr/bin/zerp2", NULL, 1000);
+                process_spawn("/usr/bin/zerp2", NULL, 0);
             } else {
-                process_spawn("/zerp.elf", NULL, 1000);
+                /* as root: without init nobody hands it the input devices */
+                process_spawn("/zerp.elf", NULL, 0);
             }
     
             /* end-to-end checks: virgl rendering (gltest), process lifecycle +

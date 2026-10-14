@@ -547,11 +547,31 @@ static void deliver_mouse(int32_t mx, int32_t my, uint8_t buttons, int motion, i
 #define ZERP_STATS 0
 #endif
 
+/* The display devices are root's: init opens them for us (devices=display
+   in the service) and passes the fds as WYNLAND_KBD_FD & co. They stay
+   ours alone (close-on-exec: our clients never get them). */
+extern char **zerp_envp;
+static long zdevice(const char *var, const char *path, long flags)
+{
+    long fd = -1;
+    for (char **e = zerp_envp; e && *e; e++) {
+        const char *a = *e, *b = var;
+        while (*b && *a == *b) { a++; b++; }
+        if (*b || *a != '=') continue;
+        fd = 0;
+        for (a++; *a >= '0' && *a <= '9'; a++) fd = fd * 10 + (*a - '0');
+        break;
+    }
+    if (fd < 0) fd = zopen(path, flags);
+    if (fd >= 0) zfcntl((int)fd, 2 /* F_SETFD */, 1 /* FD_CLOEXEC */);
+    return fd;
+}
+
 int zerp_main(int argc, char **argv) {
     (void)argc; (void)argv;
     zwrite(1, "[zerp] start\n", 13);
 
-    long fb_fd = zopen("/dev/fb0", O_RDWR);
+    long fb_fd = zdevice("WYNLAND_FB_FD", "/dev/fb0", O_RDWR);
     if (fb_fd < 0) { zwrite(1, "[zerp] FATAL: open /dev/fb0 failed\n", 36); zexit(1); }
 
     struct zerp_fb_var_screeninfo vinfo;
@@ -566,7 +586,9 @@ int zerp_main(int argc, char **argv) {
     g_fb = (uint32_t *)zsys6(SYS_mmap, 0, fb_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, (int)fb_fd, 0);
     if ((long)g_fb <= 0) { zwrite(1, "[zerp] FATAL: mmap /dev/fb0 failed\n", 36); zexit(1); }
 
-    long kbd_fd  = zopen("/dev/input/kbd", O_RDONLY);
+    long kbd_fd  = zdevice("WYNLAND_KBD_FD", "/dev/input/kbd", O_RDONLY);
+    long mice_fd = zdevice("WYNLAND_MICE_FD", "/dev/input/mice", O_RDONLY);  /* held: the pointer stream needs it */
+    (void)mice_fd;
 
     /* Screen-sized wallpaper buffer (an anonymous SHM segment is this
        freestanding binary's only allocator). Starts as a snapshot of the

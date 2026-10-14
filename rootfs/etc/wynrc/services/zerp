@@ -4,3 +4,4 @@ exec=/zerp.elf
 provide=display
 restart=always
 user=1000
+devices=display

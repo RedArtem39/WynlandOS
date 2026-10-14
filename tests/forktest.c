@@ -280,6 +280,21 @@ int main(int argc, char **argv)
             check(bad_name && access("/tmp/rcx-ran", F_OK) != 0, "wynrc refuses a service outside its directory");
             check(denied && own, "wynrc: root's services refused, its own allowed");
         }
+        /* the display server's devices are root's: a user reads no keys,
+           no pointer, no screen */
+        {
+            int k = open("/dev/input/kbd", O_RDONLY), ke = errno;
+            int m = open("/dev/input/mice", O_RDONLY), me = errno;
+            int f = open("/dev/fb0", O_RDWR), fe = errno;
+            long mv[3 * 4];
+            long r = syscall(412, mv, 4, 0), re = errno;
+            check(k < 0 && ke == EACCES && m < 0 && me == EACCES && f < 0 && fe == EACCES,
+                  "keyboard, pointer, framebuffer: not for users (EACCES)");
+            check(r < 0 && re == EPERM, "the pointer stream: not without /dev/input/mice");
+            if (k >= 0) close(k);
+            if (m >= 0) close(m);
+            if (f >= 0) close(f);
+        }
         /* dup() takes the lowest free fd: close(0); dup(p) is stdin = p
            (groff's pipeline; it used to get 3 and up, never 0-2) */
         {
