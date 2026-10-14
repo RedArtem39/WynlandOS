@@ -416,6 +416,16 @@ $(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py
 else
 BASE_MANIFEST =
 endif
+# Quickshell (the QML shell toolkit; tools/stage_quickshell.sh builds it
+# against Ubuntu's Qt). WITH_QS=0 leaves it out.
+WITH_QS ?= 1
+ifeq ($(WITH_QS),1)
+QS_MANIFEST = $(BUILD)/quickshell_manifest.txt
+$(QS_MANIFEST): tools/stage_quickshell.sh $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST)
+	@bash tools/stage_quickshell.sh
+else
+QS_MANIFEST =
+endif
 # Boot choices, read by the kernel from /etc/wynland/boot.cfg:
 #   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
 #   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
@@ -449,9 +459,9 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) > $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
 $(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf

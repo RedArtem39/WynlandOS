@@ -46,7 +46,14 @@ Window {
         WaylandOutput {
             sizeFollowsWindow: true
             window: shell
+            // the output's name for clients (xdg-output), the one the
+            // Hyprland IPC reports: shells pair screens and monitors by it
+            XdgOutputV1 {
+                name: outputName
+                description: "WynlandOS " + outputName
+            }
         }
+        XdgOutputManagerV1 { id: xdgOutputManager }
         XdgShell {
             onToplevelCreated: (toplevel, xdgSurface) => zerp.addWayland(xdgSurface)
         }

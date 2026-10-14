@@ -129,6 +129,16 @@ uint64_t memfd_page_phys(int idx, uint64_t page_index) {
     return m->pages[page_index];
 }
 
+bool memfd_find_phys(uint64_t phys, int *idx, uint64_t *page_index) {
+    for (int i = 0; i < MEMFD_SLOTS; i++) {
+        MemFd *m = g_memfd[i];
+        if (!m) continue;
+        for (uint32_t p = 0; p < m->npages; p++)
+            if (m->pages[p] == phys) { *idx = i; *page_index = p; return true; }
+    }
+    return false;
+}
+
 int64_t memfd_pread(int idx, uint64_t off, void *buf, uint64_t len) {
     MemFd *m = mslot(idx);
     if (!m) return -EINVAL;

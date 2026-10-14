@@ -5349,8 +5349,35 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     (old_sz && !user_check_read(old, old_sz))) return (uint64_t)-14; /* -EFAULT */
                 if (a4 & ~1ULL) return (uint64_t)-22; /* only MREMAP_MAYMOVE */
                 PageTable *pml4 = vmm_get_current_pml4();
-                /* Shared mappings would lose their sharing if copied. */
-                if (vmm_get_page_flags(pml4, old) & PAGE_SHARED_MAP) return (uint64_t)-12; /* -ENOMEM */
+                /* A memfd's mapping (a Wayland client's wl_shm pool the
+                   compositor grows): the same memfd mapped again at the new
+                   size, the old mapping dropped. */
+                uint64_t opte = vmm_get_pte(pml4, old);
+                int mfd;
+                uint64_t mfirst;
+                if ((opte & PAGE_SHARED_REF) && new_sz > old_sz &&
+                    memfd_find_phys(opte & PAGE_ADDR_MASK, &mfd, &mfirst)) {
+                    if (!(a4 & 1)) return (uint64_t)-12;
+                    uint64_t pages = new_sz / PAGE_SIZE;
+                    for (uint64_t i = 0; i < pages; i++)
+                        if (!memfd_page_phys(mfd, mfirst + i)) return (uint64_t)-12;
+                    uint64_t nw = mmap_bump(MMAP_SLOT_MEMFD, new_sz);
+                    if (!nw) return (uint64_t)-12;
+                    uint64_t pflags = PAGE_USER | PAGE_SHARED_MAP | PAGE_SHARED_REF |
+                                      (opte & PAGE_WRITE) | (opte & PAGE_NX);
+                    for (uint64_t i = 0; i < pages; i++) {
+                        uint64_t phys = memfd_page_phys(mfd, mfirst + i);
+                        pmm_page_incref((void *)(uintptr_t)phys);
+                        vmm_map_page(pml4, nw + i * PAGE_SIZE, phys, pflags);
+                    }
+                    uint32_t vprot = VMA_PROT_READ | ((opte & PAGE_WRITE) ? VMA_PROT_WRITE : 0) |
+                                     ((opte & PAGE_NX) ? 0 : VMA_PROT_EXEC);
+                    vma_insert(proc, nw, nw + new_sz, vprot, 0);
+                    syscall_dispatcher(11, old, old_sz, 0, 0, 0, regs);
+                    return nw;
+                }
+                /* Other shared mappings would lose their sharing if copied. */
+                if (vmm_get_page_flags(pml4, old) & PAGE_SHARED_MAP && new_sz > old_sz) return (uint64_t)-12; /* -ENOMEM */
                 if (new_sz <= old_sz) {
                     syscall_dispatcher(11, old + new_sz, old_sz - new_sz, 0, 0, 0, regs); /* munmap the tail */
                     return old;
@@ -6917,8 +6944,47 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             return (uint64_t)-95;       /* -EOPNOTSUPP: ext2 here keeps no extended attributes */
 
         case 294: // SYS_inotify_init1
-        case 326: // SYS_copy_file_range: cp falls back to read/write
-        case 40:  // SYS_sendfile: callers (Python's shutil) copy by hand
+        case 326: // SYS_copy_file_range(in, off_in*, out, off_out*, len, flags)
+        case 40:  // SYS_sendfile(out, in, off*, count)
+            {
+                /* read + write through a buffer in the caller's own memory:
+                   every kind of fd, every check, as the caller's read/write */
+                uint64_t in = num == 40 ? a2 : a1, out = num == 40 ? a1 : a3;
+                uint64_t offin_p = num == 40 ? a3 : a2, offout_p = num == 40 ? 0 : a4;
+                uint64_t len = num == 40 ? a4 : a5;
+                if (num == 326 && regs && regs->r9) return (uint64_t)-22;   /* flags must be 0 */
+                if (in >= MAX_OPEN_FILES || !fd_table[in] || out >= MAX_OPEN_FILES || !fd_table[out])
+                    return (uint64_t)-9;
+                int64_t offin = -1, offout = -1;
+                if (offin_p && copy_from_user(&offin, (const void *)offin_p, 8) != 0) return (uint64_t)-14;
+                if (offout_p && copy_from_user(&offout, (const void *)offout_p, 8) != 0) return (uint64_t)-14;
+                const uint64_t chunk = 64 * 1024;
+                uint64_t buf = syscall_dispatcher(9, 0, chunk, 0x3, 0x22, (uint64_t)-1, regs);
+                if ((int64_t)buf <= 0) return (uint64_t)-12;
+                uint64_t done = 0;
+                int64_t err = 0;
+                while (done < len) {
+                    uint64_t want = len - done < chunk ? len - done : chunk;
+                    int64_t r = offin >= 0 ? (int64_t)syscall_dispatcher(17, in, buf, want, (uint64_t)offin, 0, regs)
+                                           : (int64_t)syscall_dispatcher(0, in, buf, want, 0, 0, regs);
+                    if (r <= 0) { err = r; break; }
+                    int64_t w = 0;
+                    while (w < r) {
+                        int64_t x = offout >= 0 ? (int64_t)syscall_dispatcher(18, out, buf + (uint64_t)w, (uint64_t)(r - w), (uint64_t)offout, 0, regs)
+                                                : (int64_t)syscall_dispatcher(1, out, buf + (uint64_t)w, (uint64_t)(r - w), 0, 0, regs);
+                        if (x <= 0) { err = x ? x : -5; break; }
+                        w += x;
+                        if (offout >= 0) offout += x;
+                    }
+                    if (offin >= 0) offin += w;
+                    done += (uint64_t)w;
+                    if (err || w < r || (uint64_t)r < want) break;
+                }
+                syscall_dispatcher(11, buf, chunk, 0, 0, 0, regs);
+                if (offin_p) copy_to_user((void *)offin_p, &offin, 8);
+                if (offout_p) copy_to_user((void *)offout_p, &offout, 8);
+                return done ? done : (uint64_t)err;
+            }
         case 434: // SYS_pidfd_open: asyncio/subprocess fall back to waitpid
         case 435: // SYS_clone3: glibc falls back to clone()
         case 444: // SYS_landlock_create_ruleset

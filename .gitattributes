@@ -8,3 +8,4 @@ apps/** text eol=lf
 *.otf binary
 *.elf binary
 tests/*.sh text eol=lf
+tests/qs-smoke/*.sh text eol=lf

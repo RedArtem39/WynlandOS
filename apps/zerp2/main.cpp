@@ -313,6 +313,8 @@ int main(int argc, char **argv)
     engine.rootContext()->setContextProperty(QStringLiteral("greeter"), greeter);
     engine.rootContext()->setContextProperty(QStringLiteral("userName"),
         qEnvironmentVariableIsSet("USER") ? qEnvironmentVariable("USER") : QStringLiteral("user"));
+    const QString outputName = app.primaryScreen() ? app.primaryScreen()->name() : QStringLiteral("Virtual-1");
+    engine.rootContext()->setContextProperty(QStringLiteral("outputName"), outputName);
     const QString qml = greeterMode ? QStringLiteral("Greeter.qml") : QStringLiteral("Shell.qml");
     engine.load(QUrl::fromLocalFile(QStringLiteral("/usr/share/zerp2/qml/") + qml));
     if (engine.rootObjects().isEmpty()) {
@@ -356,7 +358,7 @@ int main(int argc, char **argv)
         qputenv("WAYLAND_DISPLAY", "wayland-0");
         qputenv("QT_QPA_PLATFORM", "wayland");
         // shells made for Hyprland (Quickshell's) talk to us as to it
-        new HyprIpc(&server, app.primaryScreen() ? app.primaryScreen()->name() : QStringLiteral("Virtual-1"), scr, &app);
+        new HyprIpc(&server, outputName, scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
         // debugging: boot.cfg "wlrun=CMD[;CMD...]" -- programs started a few
         // seconds in (Wayland clients, for the picture and the tests)

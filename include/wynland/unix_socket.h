@@ -84,6 +84,8 @@ uint64_t memfd_size(int idx);
 int64_t  memfd_pread(int idx, uint64_t off, void *buf, uint64_t len);    /* buf: kernel or prepared user */
 int64_t  memfd_pwrite(int idx, uint64_t off, const void *buf, uint64_t len);
 uint64_t memfd_page_phys(int idx, uint64_t page_index);  /* 0 past EOF */
+/* which memfd page a frame is (mremap() of a memfd mapping) */
+bool memfd_find_phys(uint64_t phys, int *idx, uint64_t *page_index);
 
 /* ---- timerfd ---- */
 int      timerfd_new(int clockid);                  /* refs=1 */
