@@ -584,7 +584,7 @@ static void std_materialize(Process *p, uint64_t fd) {
 }
 
 /* dma-buf (PRIME) fds for drivers/video/virtgpu_drm.c */
-int drm_install_prime_fd(uint32_t idx, bool cloexec)
+int drm_install_prime_fd(uint32_t idx, uint64_t size, bool cloexec)
 {
     Process *p = sched_current()->proc;
     int fd = get_free_fd(p->fd_table);
@@ -595,6 +595,7 @@ int drm_install_prime_fd(uint32_t idx, bool cloexec)
     str_copy(f->node.name, "dmabuf");
     f->node.first_cluster = DRM_PRIME_FD;
     f->current_cluster = idx;
+    f->node.size = (uint32_t)size;   /* lseek(SEEK_END) gives the buffer's size, as on Linux */
     p->fd_table[fd] = f;
     p->fd_flags[fd] = cloexec ? 1 : 0;
     p->fd_oflags[fd] = LINUX_O_RDWR;
@@ -944,6 +945,10 @@ static const char *proc_sys_text(const char *path) {
         { "/proc/sys/kernel/pid_max", "4194304\n" },
         { "/proc/sys/kernel/ngroups_max", "32\n" },
         { "/proc/sys/fs/nr_open", "128\n" },
+        /* the DRM nodes' own uevent: libdrm's drmGetDeviceNameFromFd2()
+           takes DEVNAME from it (Mesa names the device to Wayland clients) */
+        { "/sys/dev/char/226:0/uevent", "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n" },
+        { "/sys/dev/char/226:128/uevent", "MAJOR=226\nMINOR=128\nDEVNAME=dri/renderD128\nDEVTYPE=drm_minor\n" },
     };
     for (unsigned i = 0; i < sizeof(k) / sizeof(k[0]); i++)
         if (str_compare(path, k[i].p) == 0) return k[i].t;

@@ -277,10 +277,18 @@ int main(int argc, char **argv)
     qputenv("QT_QPA_EGLFS_DISABLE_INPUT", "1");   // no evdev here -- InputPump instead
     qputenv("QT_QPA_EGLFS_HIDECURSOR", "1");      // the GPU cursor plane is the pointer
     qputenv("QSG_RHI_BACKEND", "opengl");
+    // GPU buffers from clients: linux-dmabuf (ours, version 4 -- see
+    // tools/zerp2-dmabuf). Ubuntu's Mesa serves no wl_drm, so there is no
+    // eglBindWaylandDisplayWL for the plugin to wait on
+    qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "linux-dmabuf-unstable-v1");
+    qputenv("QT_WAYLAND_IGNORE_BIND_DISPLAY", "1");
     /* scene graph diagnostics on request only (BOOT_EXTRA=qsginfo): every
        Qt client inherits it, and it all lands on the synchronous serial
        console */
     if (bootCfg().contains("qsginfo")) qputenv("QSG_INFO", "1");
+    // BOOT_EXTRA=hwdebug: how client GPU buffers come in (linux-dmabuf)
+    if (bootCfg().contains("hwdebug"))
+        qputenv("QT_LOGGING_RULES", "qt.waylandcompositor.hardwareintegration.debug=true");
     if (!qEnvironmentVariableIsSet("HOME")) qputenv("HOME", "/tmp");
     // the session's own runtime directory: the Wayland socket lives there,
     // and /tmp/wayland-0 left by another user's session could not be
@@ -360,6 +368,10 @@ int main(int argc, char **argv)
         // (ours, the Zerp clients, pick their own)
         qputenv("WAYLAND_DISPLAY", "wayland-0");
         qputenv("QT_QPA_PLATFORM", "wayland");
+        // Qt clients read the same variable for their side: theirs is
+        // wayland-egl (Mesa's EGL; it speaks linux-dmabuf to us)
+        qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "wayland-egl");
+        qunsetenv("QT_WAYLAND_IGNORE_BIND_DISPLAY");
         // shells made for Hyprland (Quickshell's) talk to us as to it
         new HyprIpc(&server, outputName, scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with

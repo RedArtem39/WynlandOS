@@ -187,6 +187,8 @@ static const struct sh_case CASES[] = {
       "reboot: Operation not permitted\n1\n1\n" },
     { "/bin/sh", "clang + make from Ubuntu (leaf): C and C++ build and run",
       "sh /clangtest.sh", "c: argv[0] ./other\nc++: sum 6\nmake: works\n" },
+    { "/bin/sh", "vulkan: the loader finds Mesa's lavapipe",
+      "vulkaninfo --summary 2>/dev/null | grep -o -m1 'DRIVER_ID_MESA_LLVMPIPE'", "DRIVER_ID_MESA_LLVMPIPE\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
     { "/bin/sh", "man: groff's pipeline",

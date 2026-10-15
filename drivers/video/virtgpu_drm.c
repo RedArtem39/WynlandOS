@@ -92,6 +92,8 @@ static void dbg_num(const char *pre, int64_t v)
 
 #define DRM_NR_VERSION          0x00
 #define DRM_NR_GET_UNIQUE       0x01
+#define DRM_NR_GET_MAGIC        0x02
+#define DRM_NR_AUTH_MAGIC       0x11
 #define DRM_NR_GEM_CLOSE        0x09
 #define DRM_NR_GET_CAP          0x0c
 #define DRM_NR_SET_CLIENT_CAP   0x0d
@@ -282,12 +284,14 @@ typedef struct {
     uint32_t   clients;
     uint32_t   refs;
     bool       zombie;  /* clients == refs == 0: destroy from pending_gc() */
+    bool       destroying; /* claimed by one bo_destroy() (it sleeps) */
     bool       is_3d;   /* virgl resource (vs a 2D dumb buffer) */
     uint32_t   width, height, stride; /* dumb buffers */
     uint32_t   res_id;
     uint64_t   phys;
     uint32_t   pages;
     uint32_t   size;
+    uint32_t   dmabuf_size; /* what lseek(SEEK_END) on its dma-buf says (0: size) */
     bool       has_last;
     VgpuTicket last;    /* last host request touching this BO */
 } DrmBo;
@@ -324,7 +328,9 @@ static void fb_remove(DrmFb *fb);
 static void pending_gc(void)
 {
     for (uint32_t i = 0; i < DRM_MAX_CLIENTS; i++) {
-        if (g_clients[i].used && g_clients[i].orphaned) client_free(i + 1);
+        /* taken by one thread (client_free sleeps; see bo_destroy) */
+        if (g_clients[i].used && __atomic_exchange_n(&g_clients[i].orphaned, false, __ATOMIC_ACQ_REL))
+            client_free(i + 1);
     }
     for (uint32_t i = 0; i < DRM_MAX_BOS; i++) {
         if (g_bos[i].used && g_bos[i].zombie) bo_destroy(&g_bos[i]);
@@ -477,6 +483,11 @@ static void bo_release_client(uint32_t slot, DrmClient *c, DrmBo *bo)
 /* Final destruction: host resource and guest pages. Sleeps. */
 static void bo_destroy(DrmBo *bo)
 {
+    /* one destroyer: every ioctl runs pending_gc(), and two threads (a
+       client's render threads) used to both find the zombie, both unref it
+       and free its pages twice -- the later one, waking from the host,
+       wiped the BO that had taken the slot meanwhile */
+    if (!bo->used || __atomic_test_and_set(&bo->destroying, __ATOMIC_ACQ_REL)) return;
     if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
 
     VirtioGpuCtxResource cmd;
@@ -603,6 +614,17 @@ static int64_t ioctl_resource_create(uint32_t slot, DrmClient *c, uint64_t argp)
     bo->phys = phys;
     bo->pages = pages;
     bo->size = pages * PAGE_SZ;
+    /* the image lives on the host: Mesa backs a staged texture with one
+       guest page. An importer checks offset + stride * height against the
+       dma-buf's size (Qt's compositor, wlroots), so the dma-buf reports a
+       bound on the host image -- 16 bytes a texel, the widest format --
+       not its guest page */
+    {
+        uint64_t img = (uint64_t)rc.width * (rc.height ? rc.height : 1) * (rc.depth ? rc.depth : 1) *
+                       (rc.array_size ? rc.array_size : 1) * 16;
+        if (img > 0xFFFFF000ull) img = 0xFFFFF000ull;
+        bo->dmabuf_size = img > bo->size ? (uint32_t)img : bo->size;
+    }
 
     VirtioGpuResourceCreate3d cr;
     memset(&cr, 0, sizeof(cr));
@@ -639,6 +661,14 @@ static int64_t ioctl_resource_create(uint32_t slot, DrmClient *c, uint64_t argp)
     at.resource_id = bo->res_id;
     if (!send_sync(&ab, sizeof(ab), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA ||
         !send_sync(&at, sizeof(at), &rt) || rt != VIRTIO_GPU_RESP_OK_NODATA) {
+        serial_write_string("DRM: host refused a resource's backing\r\n");
+        {
+            extern void uint_to_hex(uint64_t val, char *buf);
+            char b[32];
+            uint64_t v[6] = { rc.width, rc.height, rc.format, rc.bind, bo->size, phys };
+            for (int i = 0; i < 6; i++) { uint_to_hex(v[i], b); serial_write_string(b); serial_write_string(" "); }
+            serial_write_string("\r\n");
+        }
         bo_destroy(bo);
         return -EINVAL;
     }
@@ -812,7 +842,7 @@ static int64_t ioctl_prime_handle_to_fd(uint32_t slot, uint64_t argp)
     if (copy_from_user(&ph, (void *)argp, sizeof(ph))) return -EFAULT;
     DrmBo *bo = bo_lookup(slot, ph.handle);
     if (!bo) return -ENOENT;
-    int fd = drm_install_prime_fd((uint32_t)(bo - g_bos) + 1, (ph.flags & 02000000) != 0 /* O_CLOEXEC */);
+    int fd = drm_install_prime_fd((uint32_t)(bo - g_bos) + 1, bo->dmabuf_size ? bo->dmabuf_size : bo->size, (ph.flags & 02000000) != 0 /* O_CLOEXEC */);
     if (fd < 0) return fd;
     bo->refs++;
     ph.fd = fd;
@@ -1364,6 +1394,13 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp)
     }
     case DRM_NR_SET_MASTER:
     case DRM_NR_DROP_MASTER:    return 0;
+    /* legacy primary-node auth (a Wayland client given card0): every
+       client may render already, so a magic is handed out and accepted */
+    case DRM_NR_GET_MAGIC: {
+        uint32_t magic = 0x5a7e0000u + *slot + 1;
+        return copy_to_user((void *)argp, &magic, sizeof(magic)) ? -EFAULT : 0;
+    }
+    case DRM_NR_AUTH_MAGIC:     return 0;
     case DRM_NR_MODE_GETRESOURCES: return ioctl_getresources(argp);
     case DRM_NR_MODE_GETCONNECTOR: return ioctl_getconnector(argp);
     case DRM_NR_MODE_GETENCODER:   return ioctl_getencoder(argp);

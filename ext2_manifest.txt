@@ -210,6 +210,15 @@ F  /dev/dri/renderD128              build/renderD128
 # ---- GLVND vendor config ----
 F  /usr/share/glvnd/egl_vendor.d/50_mesa.json /usr/share/glvnd/egl_vendor.d/50_mesa.json
 
+# ---- Vulkan: Mesa's lavapipe (CPU; the loader, libvulkan.so.1, comes with
+# GStreamer's libraries). The GPU's Vulkan (venus) needs blob resources in
+# drivers/video/virtgpu_drm.c and a host with Vulkan -- not yet ----
+D /usr/share/vulkan
+D /usr/share/vulkan/icd.d
+F  /usr/share/vulkan/icd.d/lvp_icd.json /usr/share/vulkan/icd.d/lvp_icd.json
+F  /lib64/libvulkan_lvp.so           /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+F  /lib64/libdisplay-info.so.3       /usr/lib/x86_64-linux-gnu/libdisplay-info.so.3
+
 # ---- Userspace software ported in Phases 13-19 ----
 # First time part of the real repeatable build. Host paths follow where
 # each phase staged its musl-built binaries; entries whose host source

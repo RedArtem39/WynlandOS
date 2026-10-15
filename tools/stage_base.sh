@@ -32,7 +32,8 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  bubblewrap
  fastfetch libyyjson0
  man-db groff-base libpipeline1 libgdbm6t64 libuchardet0 libseccomp2
- w3m libgc1 libgpm2"
+ w3m libgc1 libgpm2
+ vulkan-tools"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)

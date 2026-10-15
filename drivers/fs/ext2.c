@@ -3150,26 +3150,30 @@ int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
     if (!file || !file->node.is_dir || !dirp) return -1;
 
     /* Virtual DRM directory: /sys/dev/char/226:{0,128}/device/drm lists
-       "card0"/"renderD128" without any backing storage. Sentinels are
-       created by kernel/syscall.c's SYS_open, not by this driver --
+       "card0" and "renderD128" (one PCI device, both its nodes, as on
+       Linux: libdrm finds the render node of a card0 fd there, which Mesa
+       names to Wayland clients) without any backing storage. Sentinels
+       are created by kernel/syscall.c's SYS_open, not by this driver --
        but their read side lives here, same as before. */
     if (file->node.first_cluster == 0xFFFFFFF8 || file->node.first_cluster == 0xFFFFFFF9) {
-        if (file->offset > 0) return 0; // already enumerated
-        const char *name; uint64_t ino;
-        if (file->node.first_cluster == 0xFFFFFFF9) { name = "renderD128"; ino = 0xFB0F; }
-        else                                        { name = "card0";      ino = 0xFB0E; }
-        uint32_t name_len = 0; while (name[name_len]) name_len++;
-        uint32_t reclen = (24 + name_len + 1 + 7) & ~7u;
-        if (reclen > count) return 0;
-        linux_dirent64 *d = (linux_dirent64 *)dirp;
-        d->d_ino = ino;
-        d->d_off = reclen;
-        d->d_reclen = (unsigned short)reclen;
-        d->d_type = DT_DIR;
-        for (uint32_t i = 0; i < name_len; i++) d->d_name[i] = name[i];
-        d->d_name[name_len] = 0;
-        file->offset = 1; // mark as done
-        return reclen;
+        static const char *const names[2] = { "card0", "renderD128" };
+        uint32_t done = 0;
+        while (file->offset < 2) {
+            const char *name = names[file->offset];
+            uint32_t name_len = 0; while (name[name_len]) name_len++;
+            uint32_t reclen = (24 + name_len + 1 + 7) & ~7u;
+            if (done + reclen > count) break;
+            linux_dirent64 *d = (linux_dirent64 *)((uint8_t *)dirp + done);
+            d->d_ino = 0xFB0E + file->offset;
+            d->d_off = file->offset + 1;
+            d->d_reclen = (unsigned short)reclen;
+            d->d_type = DT_DIR;
+            for (uint32_t i = 0; i < name_len; i++) d->d_name[i] = name[i];
+            d->d_name[name_len] = 0;
+            done += reclen;
+            file->offset++;
+        }
+        return (int)done;
     }
 
     Ext2Inode dir;

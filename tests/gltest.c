@@ -8,7 +8,7 @@
  * to stdout (the serial log), so a failure says exactly where it stopped.
  *
  * Build (host, glibc -- same ABI as the /lib64 Mesa in the image):
- *   gcc -O2 -o build/gltest.elf tests/gltest.c -lEGL -lGLESv2 -lgbm
+ *   gcc -O2 -I/usr/include/libdrm -o build/gltest.elf tests/gltest.c -lEGL -lGLESv2 -lgbm -ldrm
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +19,9 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <xf86drm.h>
 
 #define W 64
 #define H 64
@@ -53,6 +56,34 @@ int main(void)
     int fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     if (fd < 0) { fprintf(stderr, "[gltest] FAIL: open renderD128\n"); return 1; }
     fprintf(stderr, "[gltest] render node fd=%d\n", fd);
+
+    /* what Mesa asks libdrm before it trusts the node: the device behind
+       the fd (PCI ids, the loader picks the driver by them) and, from a
+       device number, its render node (a Wayland client given the
+       compositor's GPU in linux-dmabuf feedback; Vulkan's device list) */
+    {
+        drmDevicePtr dev = NULL;
+        int r = drmGetDevice2(fd, 0, &dev);
+        if (r == 0) {
+            fprintf(stderr, "[gltest] drm device: bus %d, pci %04x:%04x\n", dev->bustype,
+                    dev->bustype == DRM_BUS_PCI ? dev->deviceinfo.pci->vendor_id : 0,
+                    dev->bustype == DRM_BUS_PCI ? dev->deviceinfo.pci->device_id : 0);
+            drmFreeDevice(&dev);
+        } else fprintf(stderr, "[gltest] FAIL: drmGetDevice2: %d\n", r);
+        struct stat st;
+        fstat(fd, &st);
+        dev = NULL;
+        r = drmGetDeviceFromDevId(st.st_rdev, 0, &dev);
+        if (r == 0 && (dev->available_nodes & (1 << DRM_NODE_RENDER)))
+            fprintf(stderr, "[gltest] drm device of %u:%u: render node %s\n", major(st.st_rdev),
+                    minor(st.st_rdev), dev->nodes[DRM_NODE_RENDER]);
+        else fprintf(stderr, "[gltest] FAIL: drmGetDeviceFromDevId(%u:%u): %d\n",
+                     major(st.st_rdev), minor(st.st_rdev), r);
+        if (dev) drmFreeDevice(&dev);
+        char *name = drmGetDeviceNameFromFd2(fd);
+        fprintf(stderr, "[gltest] %s: drm node name %s\n", name ? "ok" : "FAIL", name ? name : "(none)");
+        free(name);
+    }
 
     struct gbm_device *gbm = gbm_create_device(fd);
     if (!gbm) { fprintf(stderr, "[gltest] FAIL: gbm_create_device\n"); return 1; }

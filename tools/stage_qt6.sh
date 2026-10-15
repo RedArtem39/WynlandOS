@@ -44,7 +44,8 @@ PKGS="$PKGS libmtdev1t64 libinput10 libts0t64 libevdev2 libwacom9 libgudev-1.0-0
 # Qt programs can be its clients (the wayland platform plugin)
 PKGS="$PKGS qt6-wayland-dev libqt6waylandcompositor6 libqt6waylandcompositorxdgshell6
  qml6-module-qtwayland-compositor qt6-wayland libqt6waylandclient6 libqt6wlshellintegration6
- libwayland-server0 libwayland-client0 libwayland-cursor0 libwayland-egl1 libxkbcommon0"
+ libwayland-server0 libwayland-client0 libwayland-cursor0 libwayland-egl1 libxkbcommon0
+ qt6-wayland-private-dev"
 
 # 1. fetch + unpack (cached; only packages not downloaded yet are fetched)
 mkdir -p "$CACHE/debs" "$ROOT"
@@ -136,6 +137,30 @@ echo "  QT6        built build/zerp2.elf"
 # hyprctl: Hyprland's command line, for Zerp 2.0's Hyprland IPC (apps/zerp2/hypripc.cpp)
 gcc -O2 -Wall -o "$OUT/hyprctl" apps/zerp2/hyprctl.c
 
+# linux-dmabuf: GPU buffers from Wayland clients (Mesa's EGL, Vulkan WSI).
+# Qt's own client buffer plugin -- Ubuntu does not build it -- from
+# qtwayland's source at this Qt's version, taught protocol version 4
+# (tools/zerp2-dmabuf/apply.py: Mesa finds the GPU through its feedback)
+QW=$CACHE/qtwayland
+if [ ! -d "$QW/.git" ]; then git -c advice.detachedHead=false clone -q --depth 1 --branch "v$QTVER" https://code.qt.io/qt/qtwayland.git "$QW"; fi
+DB=$B/dmabuf; rm -rf "$DB"; mkdir -p "$DB"
+cp "$QW"/src/hardwareintegration/compositor/linux-dmabuf-unstable-v1/*.{cpp,h} \
+   "$QW"/src/plugins/hardwareintegration/compositor/linux-dmabuf-unstable-v1/{main.cpp,linux-dmabuf-unstable-v1.json} "$DB/"
+python3 tools/zerp2-dmabuf/apply.py "$DB"
+DX=apps/zerp2/protocols/linux-dmabuf-unstable-v1.xml
+wayland-scanner server-header "$DX" "$DB/wayland-linux-dmabuf-unstable-v1-server-protocol.h"
+wayland-scanner private-code "$DX" "$DB/linux-dmabuf-protocol.c"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-header "$DX" > "$DB/qwayland-server-linux-dmabuf-unstable-v1.h"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "$DX" > "$DB/qwayland-server-linux-dmabuf-unstable-v1.cpp"
+DBINC="$Z2INC -I$INC/QtOpenGL -I$INC/QtWaylandCompositor/$QTVER -I$INC/QtWaylandCompositor/$QTVER/QtWaylandCompositor -I$INC/QtGui/$QTVER/QtGui/qpa -I$INC/QtCore/$QTVER -I$INC/QtCore/$QTVER/QtCore -I$ROOT/usr/include/libdrm -I/usr/include/libdrm -I$DB"
+"$ROOT/usr/lib/qt6/libexec/moc" $DBINC -o "$DB/main.moc" "$DB/main.cpp"
+gcc -O2 -fPIC -c -o "$DB/linux-dmabuf-protocol.o" "$DB/linux-dmabuf-protocol.c"
+g++ -std=c++17 -O2 -fPIC -shared -DQT_NO_DEBUG -DQT_PLUGIN $DBINC -o "$OUT/libqt-wayland-compositor-linux-dmabuf-unstable-v1.so" \
+    "$DB/main.cpp" "$DB/linuxdmabuf.cpp" "$DB/linuxdmabufclientbufferintegration.cpp" \
+    "$DB/qwayland-server-linux-dmabuf-unstable-v1.cpp" "$DB/linux-dmabuf-protocol.o" \
+    -L"$LIB" -Wl,-rpath-link,"$LIB" -lQt6WaylandCompositor -lQt6OpenGL -lQt6Gui -lQt6Core -lEGL -lGLESv2 -lwayland-server
+echo "  QT6        built build/libqt-wayland-compositor-linux-dmabuf-unstable-v1.so"
+
 # 3. manifest: QML modules + ldd closure of the app and every QML plugin
 WLPLUG="wayland-shell-integration wayland-decoration-client wayland-graphics-integration-client wayland-graphics-integration-server"
 QMLSRC=$LIB/qt6/qml
@@ -188,6 +213,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
         echo "D /usr/lib/x86_64-linux-gnu/qt6/plugins/$d"
         for f in "$PL/$d"/*.so; do echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/$d/$(basename "$f") $f"; done
     done
+    echo "F /usr/lib/x86_64-linux-gnu/qt6/plugins/wayland-graphics-integration-server/libqt-wayland-compositor-linux-dmabuf-unstable-v1.so build/libqt-wayland-compositor-linux-dmabuf-unstable-v1.so"
     echo "F /usr/bin/qt.conf rootfs/usr/bin/qt.conf"
 } > "$MAN"
 

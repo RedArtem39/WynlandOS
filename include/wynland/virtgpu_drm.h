@@ -47,5 +47,5 @@ void    drm_tick(void); /* 1 kHz, IRQ context */
 /* Provided by kernel/syscall.c: install a dma-buf fd for BO `idx` in the
    current process (returns the fd or -errno), and resolve an fd back to
    its BO index (0 if it isn't a dma-buf). */
-int      drm_install_prime_fd(uint32_t idx, bool cloexec);
+int      drm_install_prime_fd(uint32_t idx, uint64_t size, bool cloexec);
 uint32_t drm_prime_fd_bo(int fd);

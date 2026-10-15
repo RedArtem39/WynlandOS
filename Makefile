@@ -300,7 +300,7 @@ $(ZERP_ELFS): $(BUILD)/%.elf: %.c $(ZERP_HDRS)
 $(BUILD)/gltest.elf: tests/gltest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, virgl test)"
-	@gcc -O2 -o $@ $< -lEGL -lGLESv2 -lgbm
+	@gcc -O2 -I/usr/include/libdrm -o $@ $< -lEGL -lGLESv2 -lgbm -ldrm
 
 $(BUILD)/kmstest.elf: tests/kmstest.c
 	@mkdir -p $(BUILD)
@@ -381,7 +381,7 @@ PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf 
 WITH_QT6 ?= 1
 ifeq ($(WITH_QT6),1)
 QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
-$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml apps/zerp2/protocols/*.xml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml apps/zerp2/protocols/*.xml) tools/zerp2-dmabuf/apply.py rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
 	@bash tools/stage_qt6.sh
 else
 QT6_MANIFEST =
