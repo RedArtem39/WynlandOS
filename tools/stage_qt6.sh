@@ -110,12 +110,23 @@ echo "  QT6        built build/term.elf"
 Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick QtWaylandCompositor QtNetwork; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_hypripc.cpp" apps/zerp2/hypripc.h
+# wlr-layer-shell: libwayland's C glue and Qt's server classes from the XML
+LS=apps/zerp2/protocols/wlr-layer-shell-unstable-v1.xml
+wayland-scanner server-header "$LS" "$B/wayland-wlr-layer-shell-unstable-v1-server-protocol.h"
+wayland-scanner private-code "$LS" "$B/wayland-wlr-layer-shell-unstable-v1-protocol.c"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-header "$LS" > "$B/qwayland-server-wlr-layer-shell-unstable-v1.h"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "$LS" > "$B/qwayland-server-wlr-layer-shell-unstable-v1.cpp"
+gcc -O2 -fPIC -c -o "$B/wlr-layer-shell-protocol.o" "$B/wayland-wlr-layer-shell-unstable-v1-protocol.c"
+# (its get_popup names xdg_popup: xdg-shell's interfaces, which Qt keeps to itself)
+wayland-scanner private-code apps/zerp2/protocols/xdg-shell.xml "$B/xdg-shell-protocol.c"
+gcc -O2 -fPIC -c -o "$B/xdg-shell-protocol.o" "$B/xdg-shell-protocol.c"
+"$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zlayershell.cpp" apps/zerp2/zlayershell.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
 gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
 # wlcompat's two libwayland-server functions must win over the library's
 # own, for every library that calls them
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
-    apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp apps/zerp2/hypripc.cpp     "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" "$B/moc_hypripc.cpp" \
+    apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp apps/zerp2/hypripc.cpp apps/zerp2/zlayershell.cpp     "$B/qwayland-server-wlr-layer-shell-unstable-v1.cpp" "$B/wlr-layer-shell-protocol.o" "$B/xdg-shell-protocol.o" -I"$B"     "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" "$B/moc_hypripc.cpp" "$B/moc_zlayershell.cpp" \
     "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
     -Wl,--export-dynamic-symbol=mkstemp -Wl,--export-dynamic-symbol=wl_resource_create \
     "$LIB/libwayland-server.so.0" \

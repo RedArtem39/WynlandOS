@@ -381,7 +381,7 @@ PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf 
 WITH_QT6 ?= 1
 ifeq ($(WITH_QT6),1)
 QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
-$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml apps/zerp2/protocols/*.xml) rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
 	@bash tools/stage_qt6.sh
 else
 QT6_MANIFEST =
@@ -459,9 +459,10 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): tools/multiarch_links.py $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) > $@
+	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 
 $(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf

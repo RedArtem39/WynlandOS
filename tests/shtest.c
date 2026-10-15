@@ -185,6 +185,8 @@ static const struct sh_case CASES[] = {
     { "/bin/sh", "reboot: root's only",
       "/usr/sbin/reboot; echo $?; /usr/sbin/poweroff 2>/dev/null; echo $?",
       "reboot: Operation not permitted\n1\n1\n" },
+    { "/bin/sh", "clang + make from Ubuntu (leaf): C and C++ build and run",
+      "sh /clangtest.sh", "c: argv[0] ./other\nc++: sum 6\nmake: works\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
     { "/bin/sh", "man: groff's pipeline",

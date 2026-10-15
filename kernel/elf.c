@@ -657,7 +657,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
        appended after) was tried first and produced a duplicated/shifted
        argv in the child -- caught live via a spawn test where the child's
        argv[1] came back as the path string instead of the intended arg. */
-    #define MAX_SPAWN_ARGV 64
+    #define MAX_SPAWN_ARGV 512
     uint64_t argv_addrs[MAX_SPAWN_ARGV];
     int argv_count = 0;
 
@@ -672,6 +672,15 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
         argv_addrs[argv_count++] = path_addr;
         argv_addrs[argv_count++] = dummy_addr;
     } else {
+        if (proc) {   /* /proc/self/cmdline */
+            uint32_t n = 0;
+            for (int a = 0; argv[a] != NULL && n < sizeof(proc->cmdline); a++)
+                for (uint32_t i = 0; n < sizeof(proc->cmdline); i++) {
+                    proc->cmdline[n++] = argv[a][i];
+                    if (!argv[a][i]) break;
+                }
+            proc->cmdline_len = (uint16_t)n;
+        }
         for (int a = 0; argv[a] != NULL && argv_count < MAX_SPAWN_ARGV; a++) {
             uint32_t len = 0;
             while (argv[a][len] != '\0') len++;

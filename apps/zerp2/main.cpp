@@ -33,6 +33,7 @@
 #include "zerp2.h"
 #include "greeter.h"
 #include "hypripc.h"
+#include "zlayershell.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -299,6 +300,8 @@ int main(int argc, char **argv)
     QGuiApplication app(argc, argv);
     qmlRegisterType<ZSurface>("Zerp", 1, 0, "ZSurface");
     qmlRegisterUncreatableType<ZClient>("Zerp", 1, 0, "ZClient", QStringLiteral("made by the server"));
+    qmlRegisterType<ZLayerShellQuickExtension>("Zerp", 1, 0, "LayerShell");
+    qmlRegisterUncreatableType<ZLayerSurface>("Zerp", 1, 0, "LayerSurface", QStringLiteral("made by the layer shell"));
     const QSize scr = app.primaryScreen() ? app.primaryScreen()->size() : QSize(1920, 1080);
     ZServer server(uint32_t(scr.width()) * uint32_t(scr.height()) * 4u);
     QQmlApplicationEngine engine;

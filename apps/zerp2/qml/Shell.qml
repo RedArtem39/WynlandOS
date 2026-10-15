@@ -25,10 +25,18 @@ Window {
     readonly property int barHeight: 34
     readonly property int dockReserve: 84
 
+    // a desktop shell of its own (Caelestia, any layer-shell panel with an
+    // exclusive zone): it has the edges, our bar and dock step aside
+    readonly property var reserved: layerShell.reserved
+    readonly property bool externalShell: reserved.top > 0 || reserved.bottom > 0 || reserved.left > 0 || reserved.right > 0
+
     // usable area for tiles
-    readonly property rect area: Qt.rect(gapOut, barHeight + gapOut,
-                                         width - 2 * gapOut,
-                                         height - barHeight - dockReserve - 2 * gapOut)
+    readonly property rect area: externalShell
+        ? Qt.rect(reserved.left + gapOut, reserved.top + gapOut,
+                  width - reserved.left - reserved.right - 2 * gapOut,
+                  height - reserved.top - reserved.bottom - 2 * gapOut)
+        : Qt.rect(gapOut, barHeight + gapOut, width - 2 * gapOut, height - barHeight - dockReserve - 2 * gapOut)
+    onAreaChanged: relayout()
 
     // a full-screen window in front: the bar and the dock step aside (they
     // sit above the windows and covered its top -- a browser's toolbar)
@@ -54,6 +62,11 @@ Window {
             }
         }
         XdgOutputManagerV1 { id: xdgOutputManager }
+        // wlr-layer-shell: panels, wallpapers, overlays of desktop shells
+        LayerShell {
+            id: layerShell
+            outputSize: Qt.size(shell.width, shell.height)
+        }
         XdgShell {
             onToplevelCreated: (toplevel, xdgSurface) => zerp.addWayland(xdgSurface)
         }
@@ -182,6 +195,7 @@ Window {
     Item {
         id: tiles
         anchors.fill: parent
+        z: 1   // over the background and bottom layers
         Repeater {
             model: zerp.model
             delegate: Tile {
@@ -194,11 +208,38 @@ Window {
         }
     }
 
+    // ---- layer surfaces: background and bottom under the windows, top
+    // over them, overlay over everything; placed by their anchors and margins
+    Repeater {
+        model: layerShell.surfaces
+        delegate: WaylandQuickItem {
+            required property var modelData
+            readonly property var ls: modelData
+            readonly property int a: ls.anchors
+            surface: ls.surface
+            visible: ls.mapped && (!shell.fullscreenOn || ls.layer === 3)
+            width: ls.width
+            height: ls.height
+            x: (a & 4) && !(a & 8) ? ls.margins.left
+             : (a & 8) && !(a & 4) ? shell.width - width - ls.margins.right
+             : (a & 4) && (a & 8) ? ls.margins.left
+             : (shell.width - width) / 2
+            y: (a & 1) && !(a & 2) ? ls.margins.top
+             : (a & 2) && !(a & 1) ? shell.height - height - ls.margins.bottom
+             : (a & 1) && (a & 2) ? ls.margins.top
+             : (shell.height - height) / 2
+            z: [0.5, 0.6, 45, 100][ls.layer]
+            focusOnClick: ls.keyboard > 0
+            // exclusive keyboard (a launcher, a lock): it takes the keys while there
+            onVisibleChanged: if (visible && ls.keyboard === 1) takeFocus()
+        }
+    }
+
     Bar {
         anchors { left: parent.left; right: parent.right; top: parent.top }
         height: shell.barHeight
         fps: zerp.showFps ? shell.fps : -1
-        visible: !shell.fullscreenOn
+        visible: !shell.fullscreenOn && !shell.externalShell
         z: 40
     }
 
@@ -206,7 +247,7 @@ Window {
         anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 10 }
         screenW: shell.width
         screenH: shell.height
-        visible: !shell.fullscreenOn
+        visible: !shell.fullscreenOn && !shell.externalShell
         z: 40
     }
 

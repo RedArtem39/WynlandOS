@@ -182,7 +182,7 @@ static int __attribute__((unused)) str_compare(const char *s1, const char *s2) {
 #define MAX_PIPES 256
 /* argv/envp a program gets: these were 8 and 16, and everything past
    them was dropped without a word */
-#define MAX_SPAWN_ARGV 64
+#define MAX_SPAWN_ARGV 512   /* clang -cc1 alone passes ~150 */
 #define ARG_STR_MAX    4096   /* one argv/envp string */
 #define PIPE_BUF_SIZE 4096
 /* Bound on how many struct iovec entries SYS_readv/SYS_writev will copy
@@ -3549,7 +3549,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         child->fd_oflags[i] = parent->fd_oflags[i];
                     }
                 }
-                child->std_closed = parent->std_closed;
+                child->std_closed = parent->std_closed; memcpy(child->cmdline, parent->cmdline, sizeof(child->cmdline)); child->cmdline_len = parent->cmdline_len;
 
                 /* Heap copy of the parent's exact syscall-entry register
                    state -- the child resumes execution from HERE (same RIP,
@@ -4973,6 +4973,31 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                  str_compare(path, "/etc/mtab") == 0;
                 bool is_minfo = str_compare(path, "/proc/self/mountinfo") == 0;
                 const char *sys_text = proc_sys_text(path);
+                if (str_compare(path, "/proc/self/cmdline") == 0) {   /* argv, '\0' after each */
+                    int mi = memfd_new("cmdline");
+                    if (mi < 0) return (uint64_t)-12;
+                    memfd_pwrite(mi, 0, proc->cmdline, proc->cmdline_len);
+                    VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+                    if (!f) { memfd_unref(mi); return (uint64_t)-12; }
+                    memset(f, 0, sizeof(VfsFile));
+                    str_copy(f->node.name, "cmdline");
+                    f->node.first_cluster = MEMFD_FD;
+                    f->current_cluster = (uint32_t)mi;
+                    fd_table[fd] = f;
+                    fd_flags[fd]  = (linux_flags & 02000000) ? FD_CLOEXEC : 0;
+                    fd_oflags[fd] = LINUX_O_RDONLY;
+                    return (uint64_t)fd;
+                }
+                char comm[24];
+                if (str_compare(path, "/proc/self/comm") == 0) {   /* argv[0]'s last part, 15 chars */
+                    const char *b = proc->cmdline;
+                    for (const char *q = proc->cmdline; *q; q++) if (*q == '/') b = q + 1;
+                    int n = 0;
+                    while (b[n] && n < 15) { comm[n] = b[n]; n++; }
+                    comm[n++] = '\n';
+                    comm[n] = 0;
+                    sys_text = comm;
+                }
                 char *info = NULL;
                 if (!sys_text && path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c' && path[5] == '/' && (info = (char *)kmalloc(2048))) {
                     PText pt = { info, 0, 2048 };

@@ -5,6 +5,19 @@ import Quickshell
 import Quickshell.Hyprland
 
 ShellRoot {
+    // a panel through wlr-layer-shell: across the top, keeping its strip
+    PanelWindow {
+        anchors { top: true; left: true; right: true }
+        implicitHeight: 36
+        color: "#e01e2030"
+        Text {
+            anchors.centerIn: parent
+            color: "#8aadf4"
+            font.pixelSize: 16
+            text: "a Quickshell panel (wlr-layer-shell)  ·  workspace " + (Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : "?")
+        }
+    }
+
     FloatingWindow {
         implicitWidth: 420
         implicitHeight: 160
@@ -35,7 +48,12 @@ ShellRoot {
         running: true
         onTriggered: {
             console.log("[qs-smoke] after dispatch: focused=" + (Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : "none"));
-            Qt.quit();
+            Hyprland.dispatch("workspace 1");
         }
+    }
+    Timer {
+        interval: 120000
+        running: true
+        onTriggered: Qt.quit()
     }
 }
