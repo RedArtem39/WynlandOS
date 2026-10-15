@@ -9,3 +9,4 @@ apps/** text eol=lf
 *.elf binary
 tests/*.sh text eol=lf
 tests/qs-smoke/*.sh text eol=lf
+tools/caelestia-qt610/** text eol=lf

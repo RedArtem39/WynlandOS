@@ -426,6 +426,16 @@ $(QS_MANIFEST): tools/stage_quickshell.sh $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST
 else
 QS_MANIFEST =
 endif
+# The Caelestia desktop shell (tools/stage_caelestia.sh: its plugin built
+# against the same Qt, fonts, libcava). WITH_CAELESTIA=0 leaves it out.
+WITH_CAELESTIA ?= 1
+ifeq ($(WITH_QS)$(WITH_CAELESTIA),11)
+CAE_MANIFEST = $(BUILD)/caelestia_manifest.txt
+$(CAE_MANIFEST): tools/stage_caelestia.sh $(QS_MANIFEST)
+	@bash tools/stage_caelestia.sh
+else
+CAE_MANIFEST =
+endif
 # Boot choices, read by the kernel from /etc/wynland/boot.cfg:
 #   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
 #   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
@@ -459,9 +469,9 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): tools/multiarch_links.py $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): tools/multiarch_links.py $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
 

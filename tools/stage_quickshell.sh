@@ -5,7 +5,8 @@
 # Its source at a pinned commit, Ubuntu's development packages unpacked
 # into a cache of their own (nothing installed on the host), a CMake build
 # there; build/quickshell is the program. Off: what this system has no
-# service for yet (PipeWire, PAM, polkit, greetd, X11, i3, screencopy).
+# service for yet (polkit, greetd, X11, i3). PipeWire and PAM
+# are on: Caelestia imports them (no PipeWire daemon: no sound there yet).
 #
 # usage: tools/stage_quickshell.sh       (from the repo root, inside WSL)
 set -euo pipefail
@@ -27,7 +28,8 @@ PKGS="qt6-base-dev qt6-base-private-dev qt6-base-dev-tools qt6-declarative-dev
  libqt6svg6 libqt6waylandclient6 libqt6waylandcompositor6 libqt6wlshellintegration6
  libqt6quickcontrols2-6 libqt6quicktemplates2-6 libqt6quickshapes6 libqt6qmlcompiler6
  libqt6widgets6
- qmake6 qmake6-bin libcli11-dev wayland-protocols libb2-1 libdouble-conversion3 libmd4c0 libxkbcommon-dev"
+ qmake6 qmake6-bin libcli11-dev
+ libpipewire-0.3-dev libpipewire-0.3-0t64 libspa-0.2-dev libpam0g-dev libpam0g libvulkan-dev wayland-protocols libb2-1 libdouble-conversion3 libmd4c0 libxkbcommon-dev"
 
 mkdir -p "$CACHE/debs" "$ROOT"
 NEW=0
@@ -51,9 +53,13 @@ for w in "$ROOT"/usr/bin/x86_64-linux-gnu-*; do
     [ -n "$t" ] && printf '#!/bin/sh\nexec %s "$@"\n' "$ROOT$t" > "$w"
 done
 QTLIB=$ROOT/usr/lib/x86_64-linux-gnu
-# wayland-protocols' .pc names /usr: its XML is in the cache here
+# the .pc files of the cache name /usr: their headers, libraries and
+# protocol XML are here (copies with /usr moved; tools/stage_caelestia.sh
+# unpacks into the same root and does the same)
 mkdir -p "$CACHE/pc"
-sed "s|^prefix=.*|prefix=$ROOT/usr|" "$ROOT/usr/share/pkgconfig/wayland-protocols.pc" > "$CACHE/pc/wayland-protocols.pc"
+for pc in "$QTLIB"/pkgconfig/*.pc "$ROOT"/usr/share/pkgconfig/*.pc; do
+    sed "s|=/usr\$|=$ROOT/usr|; s|=/usr/|=$ROOT/usr/|; s|-I/usr/|-I$ROOT/usr/|g; s|-L/usr/|-L$ROOT/usr/|g; s|-isystem /usr/include/mit-krb5||g" "$pc" > "$CACHE/pc/$(basename "$pc")"
+done
 export PKG_CONFIG_PATH=$CACHE/pc:$QTLIB/pkgconfig:$ROOT/usr/share/pkgconfig
 export LD_LIBRARY_PATH=$QTLIB      # Qt's build tools (qmlcachegen...) run from the cache
 cmake -S "$SRC" -B "$BLD" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
@@ -61,9 +67,9 @@ cmake -S "$SRC" -B "$BLD" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX=/usr -DINSTALL_QML_PREFIX=lib/x86_64-linux-gnu/qt6/qml \
     -DDISTRIBUTOR="WynlandOS" -DDISTRIBUTOR_DEBUGINFO_AVAILABLE=NO \
     -DCRASH_HANDLER=OFF -DUSE_JEMALLOC=OFF -DX11=OFF -DI3=OFF \
-    -DSERVICE_PIPEWIRE=OFF -DSERVICE_PAM=OFF -DSERVICE_POLKIT=OFF -DSERVICE_GREETD=OFF \
-    -DSCREENCOPY=OFF -DBUILD_TESTING=OFF -DQT_QML_GENERATE_QMLLS_INI=OFF \
-    -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$QTLIB" -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,$QTLIB" \
+    -DSERVICE_PIPEWIRE=ON -DSERVICE_PAM=ON -DSERVICE_POLKIT=OFF -DSERVICE_GREETD=OFF \
+    -DSCREENCOPY=ON -DBUILD_TESTING=OFF -DQT_QML_GENERATE_QMLLS_INI=OFF \
+    -DCMAKE_CXX_FLAGS="-idirafter $ROOT/usr/include" -DCMAKE_C_FLAGS="-idirafter $ROOT/usr/include" -DCMAKE_LIBRARY_PATH="$QTLIB" \n    -DCMAKE_EXE_LINKER_FLAGS="-L$QTLIB -Wl,-rpath-link,$QTLIB" -DCMAKE_SHARED_LINKER_FLAGS="-L$QTLIB -Wl,-rpath-link,$QTLIB" \
     > "$CACHE/configure.log" 2>&1 || { tail -40 "$CACHE/configure.log"; exit 1; }
 cmake --build "$BLD" -j "${QS_JOBS:-4}" > "$CACHE/build.log" 2>&1 || { grep -m20 -B2 -A8 'error' "$CACHE/build.log"; exit 1; }
 rm -rf "$CACHE/install"

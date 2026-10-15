@@ -5241,8 +5241,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
-        case 204: // SYS_sched_getparam (Linux standard)
-            return (uint64_t)-38; /* -ENOSYS */
+        case 204: // SYS_sched_getaffinity(pid, size, mask): one CPU
+            {
+                if (a2 < 8) return (uint64_t)-22;                   /* -EINVAL */
+                uint64_t mask = 1;
+                if (!a3 || copy_to_user((void *)a3, &mask, 8) != 0) return (uint64_t)-14;
+                return 8;
+            }
+        case 203: // SYS_sched_setaffinity: CPU 0 is all there is
+            return 0;
 
         case 319: // SYS_memfd_create(name, flags) -- anonymous resizable
                    // file (kernel/memfd.c); MAP_SHARED mappings of it are
