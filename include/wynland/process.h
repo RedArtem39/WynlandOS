@@ -23,13 +23,9 @@
 /* Phase 2 (sec hardening): private per-process heap slot. PML4 index 176
    (0x580000000000) -- strictly between the ET_DYN/PIE load offset (index
    160, 0x500000000000, kernel/elf.c) and the user stack (index 192,
-   0x600000000000, kernel/elf.c), and nowhere near the shared kernel/RAM/
-   framebuffer identity map (index 0, see vmm_new_process_pml4() in
-   kernel/vmm.c) that the OLD single-global brk (kernel/syscall.c, started
-   at 0x60000000) collided with -- mapping heap pages there modified a
-   page-table chain shared BY POINTER across every process, so one
-   process's malloc() could appear in (or corrupt) another's address
-   space. One full PML4 slot (512 GB of address space) is reserved for
+   0x600000000000, kernel/elf.c). (The old single global brk at
+   0x60000000 was in a page-table chain then shared by every process:
+   one process's malloc() could appear in another's.) One full PML4 slot (512 GB of address space) is reserved for
    it, only ever backed by as many physical pages as the process actually
    grows into. */
 #define HEAP_BASE 0x580000000000ULL

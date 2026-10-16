@@ -312,6 +312,16 @@ $(BUILD)/jittest.elf: tests/jittest.c
 	@echo "  CC(HOST)   $< (glibc, JIT memory policy)"
 	@gcc -O2 -o $@ $<
 
+$(BUILD)/nopietest.elf: tests/nopietest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, not PIE: linked at 0x400000)"
+	@gcc -O2 -no-pie -o $@ $<
+
+$(BUILD)/nopietest-static.elf: tests/nopietest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (static glibc, not PIE)"
+	@gcc -O2 -static -no-pie -o $@ $<
+
 $(BUILD)/sandboxtest.elf: tests/sandboxtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, seccomp/namespaces/chroot)"
@@ -477,7 +487,7 @@ $(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/etc/wynland/jit.allow $(E
 	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 
-$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf
+$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

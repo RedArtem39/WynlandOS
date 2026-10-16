@@ -401,7 +401,7 @@ static bool schedule_core(void) {
             uint64_t *sp;
             __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
             for (int i = 0, shown = 0; i < 1024 && shown < 16; i++) {
-                if (sp[i] >= 0x100000 && sp[i] < (uint64_t)(uintptr_t)__text_end) {
+                if (sp[i] >= KERNEL_VMA + KERNEL_PHYS && sp[i] < (uint64_t)(uintptr_t)__text_end) {
                     serial_write_string(" ");
                     uint_to_hex(sp[i], b); serial_write_string(b);
                     shown++;
@@ -582,8 +582,8 @@ static bool schedule_core(void) {
     {
         PageTable *want = (next_thread->proc && next_thread->proc->pml4)
                           ? next_thread->proc->pml4 : vmm_get_kernel_pml4();
-        if (cpu->cr3 != (uint64_t)(uintptr_t)want) {
-            cpu->cr3 = (uint64_t)(uintptr_t)want;
+        if (cpu->cr3 != V2P(want)) {
+            cpu->cr3 = V2P(want);
             __asm__ volatile("mov %0, %%cr3" :: "r"(cpu->cr3) : "memory");
         }
     }
@@ -784,7 +784,7 @@ static bool dump_read_u64(PageTable *pml4, uint64_t va, uint64_t *out)
     if ((va & 7) || va >= 0x0000800000000000ULL || !vmm_is_user_page(pml4, va)) return false;
     uint64_t phys = vmm_get_phys(pml4, va);
     if (!phys) return false;
-    *out = *(volatile uint64_t *)(uintptr_t)phys;   /* RAM is identity-mapped */
+    *out = *(volatile uint64_t *)P2V(phys);
     return true;
 }
 

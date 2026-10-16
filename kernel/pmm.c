@@ -4,6 +4,7 @@
 
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
+#include <wynland/memlayout.h>
 
 extern uint8_t __kernel_end[];
 extern void serial_write_string(const char *str);
@@ -59,8 +60,9 @@ void pmm_init(BootInfo *boot_info)
     uint64_t bitmap_phys_addr = 0;
     for (uint32_t i = 0; i < region_count; i++) {
         if (regions[i].type == MEMORY_USABLE && regions[i].size >= bitmap_size + 2 * total_pages + 2 * PAGE_SIZE) {
-            /* Keep it aligned above the kernel region to be safe */
-            if (regions[i].base >= 0x100000) {
+            /* Keep it aligned above the kernel region to be safe, and in the
+               first 64 GB: the loader's tables map no more (boot/boot.c) */
+            if (regions[i].base >= 0x100000 && regions[i].base + regions[i].size <= (64ULL << 30)) {
                 bitmap_phys_addr = regions[i].base;
                 break;
             }
@@ -77,7 +79,7 @@ void pmm_init(BootInfo *boot_info)
         }
     }
 
-    bitmap = (uint8_t *)(uintptr_t)bitmap_phys_addr;
+    bitmap = (uint8_t *)P2V(bitmap_phys_addr);
 
     /* 3. Mark the entire memory space as used/reserved by default (bits = 1) */
     memset(bitmap, 0xFF, bitmap_size);
@@ -112,7 +114,7 @@ void pmm_init(BootInfo *boot_info)
 
     /* 6. Manually reserve the kernel memory space [0x100000, __kernel_end] */
     uint64_t kernel_start_page = 0x100000 / PAGE_SIZE;
-    uint64_t kernel_end_phys = ((uint64_t)__kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t kernel_end_phys = ((uint64_t)__kernel_end - KERNEL_VMA + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint64_t kernel_end_page = kernel_end_phys / PAGE_SIZE;
 
     for (uint64_t i = kernel_start_page; i < kernel_end_page; i++) {
@@ -145,7 +147,7 @@ void pmm_init(BootInfo *boot_info)
     uint64_t refcount_size = total_pages * sizeof(uint16_t);
     uint64_t refcount_phys_addr = (bitmap_phys_addr + bitmap_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-    refcount = (uint16_t *)(uintptr_t)refcount_phys_addr;
+    refcount = (uint16_t *)P2V(refcount_phys_addr);
     memset(refcount, 0, refcount_size);
 
     uint64_t refcount_start_page = refcount_phys_addr / PAGE_SIZE;
@@ -158,6 +160,28 @@ void pmm_init(BootInfo *boot_info)
             }
         }
     }
+}
+
+/* The frame number of a physical address. A kernel pointer here is a bug
+   (pmm deals in physical addresses; P2V()/V2P() convert): said once, with
+   the caller, and converted. */
+static uint64_t frame_of(void *addr, void *caller)
+{
+    uint64_t a = (uint64_t)(uintptr_t)addr;
+    if (a >= HHDM_BASE) {
+        static int said;
+        if (said++ < 8) {
+            extern void uint_to_hex(uint64_t val, char *buf);
+            char b[32];
+            serial_write_string("PMM: BUG a kernel pointer, not a physical address: ");
+            uint_to_hex(a, b); serial_write_string(b);
+            serial_write_string(" from ");
+            uint_to_hex((uint64_t)(uintptr_t)caller, b); serial_write_string(b);
+            serial_write_string("\r\n");
+        }
+        a = V2P(addr);
+    }
+    return a / PAGE_SIZE;
 }
 
 /* Where the search for a free frame starts: the byte of the last frame
@@ -196,19 +220,6 @@ void *pmm_alloc_page(void)
                     refcount[idx] = 1;
                     g_alloc_hint = i;
                     result = (void *)(idx * PAGE_SIZE);
-                    {
-                        extern uint64_t heap_end_addr;
-                        static int alias_logged;
-                        if (idx * PAGE_SIZE >= 0x10000000ULL && idx * PAGE_SIZE < heap_end_addr && !alias_logged) {
-                            extern void serial_write_string(const char *);
-                            /* Known gap: the kernel heap's virtual window (HEAP_START..) sits on top of
-                               the RAM identity map, so a frame with this physical
-                               address is not reachable through its identity address.
-                               Not hit yet (under 256 MB in use); say so if it is. */
-                            serial_write_string("PMM: WARNING frame aliased by the kernel heap window handed out\r\n");
-                            alias_logged = 1;
-                        }
-                    }
                     goto cleanup;
                 }
             }
@@ -276,7 +287,7 @@ void pmm_free_page(void *addr)
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
-    uint64_t idx = (uint64_t)addr / PAGE_SIZE;
+    uint64_t idx = frame_of(addr, __builtin_return_address(0));
     if (idx < total_pages) {
         if (bitmap_test(idx)) {
             if (refcount[idx] > 1) {
@@ -302,7 +313,7 @@ void pmm_page_incref(void *addr)
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
-    uint64_t idx = (uint64_t)addr / PAGE_SIZE;
+    uint64_t idx = frame_of(addr, __builtin_return_address(0));
     if (idx < total_pages && bitmap_test(idx)) {
         if (refcount[idx] == 0xFFFF) {
             /* saturated: never wrap (a wrap frees a frame still in use);
@@ -321,7 +332,7 @@ void pmm_page_incref(void *addr)
 
 uint32_t pmm_page_refcount(void *addr)
 {
-    uint64_t idx = (uint64_t)addr / PAGE_SIZE;
+    uint64_t idx = frame_of(addr, __builtin_return_address(0));
     if (idx < total_pages && bitmap_test(idx)) {
         return refcount[idx];
     }

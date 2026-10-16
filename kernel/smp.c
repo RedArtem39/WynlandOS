@@ -366,7 +366,7 @@ void tlb_shootdown(void *pml4)
     for (uint32_t i = 0; i < g_cpu_count; i++) {
         Cpu *c = &g_cpus[i];
         if (c == me || !c->online) continue;
-        if (pml4 && c->cr3 != (uint64_t)(uintptr_t)pml4) continue;
+        if (pml4 && c->cr3 != V2P(pml4)) continue;
         c->tlb_flush = 1;
         pending |= 1u << i;
         lapic_send_ipi(c->apic_id, VEC_IPI_TLB);
@@ -409,31 +409,31 @@ typedef struct PACKED {
     uint32_t oem_rev, creator, creator_rev;
 } AcpiHeader;
 
-/* ACPI tables live in firmware memory the identity map may have left out
-   (reserved ranges): map what is read. */
+/* ACPI tables live in firmware memory the direct map may have left out
+   (reserved ranges): map what is read, at P2V() of it. */
 static void acpi_map(uint64_t addr, uint64_t len)
 {
     PageTable *k = vmm_get_kernel_pml4();
     for (uint64_t a = addr & ~0xFFFULL; a < addr + len; a += PAGE_SIZE)
-        if (!vmm_get_phys(k, a)) vmm_map_page(k, a, a, PAGE_NX);
+        if (!vmm_get_phys(k, HHDM_BASE + a)) vmm_map_page(k, HHDM_BASE + a, a, PAGE_NX);
 }
 
 static const AcpiHeader *acpi_find(uint64_t rsdp, const char *sig)
 {
     if (!rsdp) return NULL;
     acpi_map(rsdp, 36);
-    const uint8_t *r = (const uint8_t *)(uintptr_t)rsdp;
+    const uint8_t *r = (const uint8_t *)P2V(rsdp);
     bool xsdt = r[15] >= 2 && *(const uint64_t *)(r + 24);
     uint64_t sdt = xsdt ? *(const uint64_t *)(r + 24) : *(const uint32_t *)(r + 16);
     acpi_map(sdt, sizeof(AcpiHeader));
-    const AcpiHeader *h = (const AcpiHeader *)(uintptr_t)sdt;
+    const AcpiHeader *h = (const AcpiHeader *)P2V(sdt);
     acpi_map(sdt, h->len);
     uint32_t n = (h->len - sizeof(AcpiHeader)) / (xsdt ? 8 : 4);
     const uint8_t *ents = (const uint8_t *)h + sizeof(AcpiHeader);
     for (uint32_t i = 0; i < n; i++) {
         uint64_t p = xsdt ? *(const uint64_t *)(ents + 8 * i) : *(const uint32_t *)(ents + 4 * i);
         acpi_map(p, sizeof(AcpiHeader));
-        const AcpiHeader *t = (const AcpiHeader *)(uintptr_t)p;
+        const AcpiHeader *t = (const AcpiHeader *)P2V(p);
         if (t->sig[0] == sig[0] && t->sig[1] == sig[1] && t->sig[2] == sig[2] && t->sig[3] == sig[3]) {
             acpi_map(p, t->len);
             return t;
@@ -446,7 +446,7 @@ static const AcpiHeader *acpi_find(uint64_t rsdp, const char *sig)
 
 extern char ap_trampoline_start[], ap_trampoline_end[];
 extern char ap_tr_cr3[], ap_tr_stack[], ap_tr_cpu[], ap_tr_entry[];
-#define TR_VAR(base, sym) (*(volatile uint64_t *)((base) + ((uintptr_t)(sym) - (uintptr_t)ap_trampoline_start)))
+#define TR_VAR(base, sym) (*(volatile uint64_t *)P2V((base) + ((uintptr_t)(sym) - (uintptr_t)ap_trampoline_start)))
 
 /* What every core must have like the boot core (control registers, the
    FPU components, the PAT's write-combining slot). */
@@ -476,8 +476,8 @@ void ap_main(Cpu *c)
     syscall_init_cpu();
 
     PageTable *k = vmm_get_kernel_pml4();
-    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)k) : "memory");
-    c->cr3 = (uint64_t)(uintptr_t)k;
+    c->cr3 = V2P(k);
+    __asm__ volatile("mov %0, %%cr3" :: "r"(c->cr3) : "memory");
 
     __asm__ volatile("fninit");
     uint32_t mxcsr = 0x1F80;
@@ -523,8 +523,7 @@ void smp_init(BootInfo *bi)
     g_x2apic = (apic_base & (1u << 10)) != 0;
     if (!g_x2apic) {
         uint64_t phys = apic_base & 0xFFFFF000ULL;
-        vmm_map_mmio(phys, PAGE_SIZE);
-        g_lapic = (volatile uint32_t *)(uintptr_t)phys;
+        g_lapic = (volatile uint32_t *)vmm_map_mmio(phys, PAGE_SIZE);
     }
     Cpu *bsp = &g_cpus[0];
     bsp->apic_id = lapic_id();
@@ -544,11 +543,14 @@ void smp_init(BootInfo *bi)
         serial_write_string("SMP: no low memory for the start-up code, one core\r\n");
         return;
     }
+    /* the start-up code turns paging on while running at its physical
+       address: the kernel's PML4 (and so the copy) maps that page at
+       itself -- the kernel's own, not any process's (their lower half is
+       theirs alone) */
     PageTable *k = vmm_get_kernel_pml4();
     vmm_map_page(k, tramp, tramp, PAGE_WRITE);       /* executable, identity */
-    vmm_map_page(k, pml4c, pml4c, PAGE_WRITE);
-    memcpy((void *)(uintptr_t)tramp, ap_trampoline_start, tr_len);
-    memcpy((void *)(uintptr_t)pml4c, k, PAGE_SIZE);
+    memcpy(P2V(tramp), ap_trampoline_start, tr_len);
+    memcpy(P2V(pml4c), k, PAGE_SIZE);
     TR_VAR(tramp, ap_tr_cr3) = pml4c;
     TR_VAR(tramp, ap_tr_entry) = (uint64_t)(uintptr_t)ap_main;
 

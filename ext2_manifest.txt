@@ -76,6 +76,8 @@ Fo /dlsymtest.elf       build/dlsymtest.elf
 Fo /forktest.elf        build/forktest.elf
 Fo /sndtest.elf         build/sndtest.elf
 Fo /jittest.elf         build/jittest.elf
+Fo /nopietest.elf       build/nopietest.elf
+Fo /nopietest-static.elf build/nopietest-static.elf
 Fo /sandboxtest.elf     build/sandboxtest.elf
 
 # wynrc: init, rc tools, services, runlevels

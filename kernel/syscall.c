@@ -485,10 +485,10 @@ static void user_unmap_page(PageTable *pml4, uint64_t va)
 }
 
 /* The part of the address space a process may map, unmap and protect
-   itself. PML4 slot 0 (below 512 GB) is the kernel/RAM identity map,
-   shared by pointer with every process: MAP_FIXED or munmap there used to
-   replace or free kernel pages. Above 2^47 is the canonical hole. */
-#define USER_MAP_MIN     0x0000008000000000ULL
+   itself: the lower half, which holds nothing of the kernel's (include/
+   wynland/memlayout.h), minus the first 64 KB (Linux's mmap_min_addr: a
+   NULL dereference stays a fault). Above 2^47 is the canonical hole. */
+#define USER_MAP_MIN     0x0000000000010000ULL
 #define USER_MAP_MAX     0x0000800000000000ULL
 #define USER_MAP_LEN_MAX (64ULL << 30)   /* one mapping, at most */
 
@@ -1844,14 +1844,14 @@ static bool poke_user_u32(PageTable *pml4, uint64_t va, uint32_t val) {
     if (flags & PAGE_COW) {
         void *np = pmm_alloc_page();
         if (!np) return false;
-        memcpy(np, (void *)(uintptr_t)phys, PAGE_SIZE);
+        memcpy(P2V((uint64_t)(uintptr_t)np), P2V(phys), PAGE_SIZE);
         vmm_map_page(pml4, page, (uint64_t)(uintptr_t)np, PAGE_USER | PAGE_WRITE | PAGE_NX);
         pmm_free_page((void *)(uintptr_t)phys); /* drop this process's share */
         phys = (uint64_t)(uintptr_t)np;
     } else if (!(flags & PAGE_WRITE)) {
         return false;
     }
-    *(uint32_t *)(uintptr_t)(phys + (va & (PAGE_SIZE - 1))) = val;
+    *(uint32_t *)P2V(phys + (va & (PAGE_SIZE - 1))) = val;
     return true;
 }
 
@@ -2041,8 +2041,8 @@ void process_teardown(Process *proc) {
     /* Real address-space teardown: walks the actual page tables (never a
        side list -- see vmm_destroy_process_pml4()'s own comment) freeing
        every leaf frame and private page-table page this process owns,
-       then the PML4 root itself. Never touches the shared kernel/RAM/
-       framebuffer identity map every process's PML4 aliases by pointer. */
+       then the PML4 root itself. Never touches the kernel half every
+       process's PML4 shares. */
     if (proc->pml4 && proc->vfork_shared) {
         proc->pml4 = NULL; /* the parent's, borrowed by a vfork child */
     } else if (proc->pml4) {
@@ -2736,7 +2736,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint64_t size_aligned = pages * PAGE_SIZE;
 
                 /* MAP_FIXED: only where the process may map at all (not
-                   over the shared kernel identity map). Without MAP_FIXED
+                   over kernel memory). Without MAP_FIXED
                    the address is a hint the paths below ignore. */
                 if ((flags & 0x10) && (!user_map_range_ok(addr, size_aligned) ||
                     range_has_kernel_pages(vmm_get_current_pml4(), addr, addr + size_aligned)))
@@ -3362,8 +3362,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 /* Only the process's own part of the address space: this
                    used to unmap (and free!) whatever was at any address,
-                   kernel identity-map pages shared with every process
-                   included, and munmap(x, 2^63) looped page by page with
+                   kernel pages shared with every process included, and
+                   munmap(x, 2^63) looped page by page with
                    interrupts off for ever. */
                 if (a2 > USER_MAP_MAX) return (uint64_t)-22; /* -EINVAL */
                 uint64_t addr = a1;
@@ -3417,10 +3417,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    PML4 slot (HEAP_BASE/HEAP_MAX, include/wynland/process.h)
                    -- replaces the old single function-static current_brk
                    shared by every process on the system, starting at
-                   0x60000000 (PML4 index 0, the SAME shared kernel/RAM/
-                   framebuffer identity-map chain every process's PML4
-                   aliases by pointer, see vmm_new_process_pml4()). Mapping
-                   heap pages there modified that shared chain directly:
+                   0x60000000, in a page-table chain then shared by every
+                   process. Mapping heap pages there modified that chain:
                    one process's malloc() could appear in (or corrupt)
                    every other process's address space, and the single
                    global counter made unrelated processes fight over each
@@ -3940,6 +3938,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 // Update syscall regs to jump to the new entry point on return
                 regs->rip = entry_point;
                 regs->rsp = stack_top;
+                /* the new program starts with clean registers, as on Linux:
+                   the old program's values must not reach it -- RDX is
+                   the function _start registers with atexit() (the dynamic
+                   loader's fini; 0 = none), and a static binary called the
+                   leftover address at exit */
+                regs->rdx = regs->rsi = regs->rdi = regs->rbx = regs->rbp = 0;
+                regs->r8 = regs->r9 = regs->r10 = regs->r12 = 0;
+                regs->r13 = regs->r14 = regs->r15 = 0;
                 
                 str_copy(exec_proc->exe_path, kernel_path);
                 /* a setuid/setgid program runs as its file's owner/group */
@@ -4365,14 +4371,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 uint64_t phys_addr = (uint64_t)(uintptr_t)phys_ptr;
 
-                /* Zero it through the caller's own mapping of the kernel's
-                   identity-mapped physical range (kernel range is aliased
-                   into every process's PML4, see vmm_new_process_pml4()),
-                   so this is safe regardless of which process's CR3 is
-                   currently loaded. Plain memset -- proven safe from
-                   syscall context after the Phase 3 stack-alignment fix
-                   (kernel/syscall_entry.asm), no workaround needed. */
-                memset((void *)(uintptr_t)phys_addr, 0, pages * PAGE_SIZE);
+                /* zeroed through the kernel's direct map of RAM */
+                memset(P2V(phys_addr), 0, pages * PAGE_SIZE);
 
                 int seg_idx = -1;
                 for (int i = 0; i < MAX_SHM_SEGMENTS; i++) {

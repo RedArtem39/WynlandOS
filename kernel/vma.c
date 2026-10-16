@@ -166,9 +166,8 @@ static void *zeroed_frame(void)
     void *frame = pmm_alloc_page();
     if (!frame) { pcache_shrink(1024); frame = pmm_alloc_page(); }   /* cached file pages first */
     if (!frame) return NULL;
-    /* RAM is identity-mapped in the kernel's half: zero it there, before
-       the process can see it */
-    uint64_t *z = (uint64_t *)(uintptr_t)frame;
+    /* zeroed through the kernel's direct map, before the process can see it */
+    uint64_t *z = (uint64_t *)P2V((uint64_t)(uintptr_t)frame);
     for (uint32_t i = 0; i < PAGE_SIZE / 8; i++) z[i] = 0;
     return frame;
 }
@@ -352,7 +351,7 @@ static void map_cached(Process *proc, VMA *v, uint64_t page, void *frame)
     if (pmm_page_refcount(frame) >= 60000) {
         void *own = pmm_alloc_page();
         if (own) {
-            memcpy(own, frame, PAGE_SIZE);
+            memcpy(P2V((uint64_t)(uintptr_t)own), P2V((uint64_t)(uintptr_t)frame), PAGE_SIZE);
             vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)own, pte_flags_for(v));
             return;
         }
@@ -433,7 +432,7 @@ static void sh_writeback(ShEntry *e)
     VfsFile w;
     memcpy(&w, e->file->vf, sizeof w);
     if (!(w.flags & VFS_O_WRITE)) return;
-    if (vfs_seek(&w, (int32_t)off, 0) >= 0) vfs_write(&w, e->frame, (uint32_t)n);
+    if (vfs_seek(&w, (int32_t)off, 0) >= 0) vfs_write(&w, P2V((uint64_t)(uintptr_t)e->frame), (uint32_t)n);
 }
 
 /* a shared page into the process: the one frame, created from the file
@@ -451,7 +450,7 @@ static bool fault_in_shared(Process *proc, VMA *v, uint64_t page)
         if (!fresh) return false;
         VfsFile r;                                   /* its own offset */
         memcpy(&r, cf, sizeof r);
-        if (vfs_seek(&r, (int32_t)(v->file_off + in_vma), 0) >= 0) vfs_read(&r, fresh, PAGE_SIZE);
+        if (vfs_seek(&r, (int32_t)(v->file_off + in_vma), 0) >= 0) vfs_read(&r, P2V((uint64_t)(uintptr_t)fresh), PAGE_SIZE);
         ShEntry *e = (ShEntry *)kmalloc(sizeof(ShEntry));
         if (!e) { pmm_free_page(fresh); return false; }
         e->inum = inum;
@@ -586,7 +585,7 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
     if (!buf) {                       /* no read-ahead buffer: just this page */
         single = (uint8_t *)zeroed_frame();
         if (!single) return false;
-        buf = single;
+        buf = (uint8_t *)P2V((uint64_t)(uintptr_t)single);
     }
 
     int32_t got = 0;
@@ -598,7 +597,7 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
     }
 
     if (single) {
-        for (uint64_t i = (uint64_t)got; i < PAGE_SIZE; i++) single[i] = 0;
+        for (uint64_t i = (uint64_t)got; i < PAGE_SIZE; i++) buf[i] = 0;
         vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)single, pte_flags_for(v));
         return true;
     }
@@ -618,8 +617,9 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
             if (i == 0) return false;     /* out of memory: the access faults for real */
             break;                        /* read-ahead is only a bonus */
         }
+        uint8_t *fv = (uint8_t *)P2V((uint64_t)(uintptr_t)frame);
         for (uint64_t k = 0; k < PAGE_SIZE; k++)
-            frame[k] = off + k < (uint64_t)got ? buf[off + k] : 0;
+            fv[k] = off + k < (uint64_t)got ? buf[off + k] : 0;
         if (cache_it) {
             pcache_put(inum, index, frame);
             if (pmm_page_refcount(frame) > 1) {      /* cached: share it */

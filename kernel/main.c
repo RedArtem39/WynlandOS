@@ -51,7 +51,7 @@ static void fb_put_pixel(BootInfo *info, uint32_t x, uint32_t y, uint32_t color)
 
     uint32_t actual_x = screen_flip ? (info->fb_width - 1 - x) : x;
     uint32_t offset = y * info->fb_pitch + actual_x * (info->fb_bpp / 8);
-    uint8_t *fb = (uint8_t *)(uintptr_t)info->fb_addr;
+    uint8_t *fb = (uint8_t *)P2V(info->fb_addr);
     *((uint32_t *)(fb + offset)) = color;
 }
 
@@ -184,7 +184,7 @@ static void fb_draw_gradient(BootInfo *info)
 {
     uint32_t w = info->fb_width;
     uint32_t h = info->fb_height;
-    uint8_t *fb = (uint8_t *)(uintptr_t)info->fb_addr;
+    uint8_t *fb = (uint8_t *)P2V(info->fb_addr);
 
     for (uint32_t y = 0; y < h; y++) {
         /* Base interpolated color components */
@@ -504,7 +504,7 @@ static void draw_terminal_window(BootInfo *info)
     
     /* Draw window background & title bar */
     for (uint32_t y = term_y; y < term_y + term_h; y++) {
-        uint32_t *row_ptr = (uint32_t *)((uint8_t *)(uintptr_t)info->fb_addr + y * info->fb_pitch);
+        uint32_t *row_ptr = (uint32_t *)((uint8_t *)P2V(info->fb_addr) + y * info->fb_pitch);
         for (uint32_t x = term_x; x < term_x + term_w; x++) {
             if (y < term_y + 30) {
                 row_ptr[x] = 0x001A1A26; /* Title bar color */
@@ -517,12 +517,12 @@ static void draw_terminal_window(BootInfo *info)
     /* Draw window border */
     uint32_t border_color = 0x00886EFF; /* Purple accent */
     for (uint32_t x = term_x; x < term_x + term_w; x++) {
-        *((uint32_t *)((uint8_t *)(uintptr_t)info->fb_addr + term_y * info->fb_pitch + x * 4)) = border_color;
-        *((uint32_t *)((uint8_t *)(uintptr_t)info->fb_addr + (term_y + term_h - 1) * info->fb_pitch + x * 4)) = border_color;
+        *((uint32_t *)((uint8_t *)P2V(info->fb_addr) + term_y * info->fb_pitch + x * 4)) = border_color;
+        *((uint32_t *)((uint8_t *)P2V(info->fb_addr) + (term_y + term_h - 1) * info->fb_pitch + x * 4)) = border_color;
     }
     for (uint32_t y = term_y; y < term_y + term_h; y++) {
-        *((uint32_t *)((uint8_t *)(uintptr_t)info->fb_addr + y * info->fb_pitch + term_x * 4)) = border_color;
-        *((uint32_t *)((uint8_t *)(uintptr_t)info->fb_addr + y * info->fb_pitch + (term_x + term_w - 1) * 4)) = border_color;
+        *((uint32_t *)((uint8_t *)P2V(info->fb_addr) + y * info->fb_pitch + term_x * 4)) = border_color;
+        *((uint32_t *)((uint8_t *)P2V(info->fb_addr) + y * info->fb_pitch + (term_x + term_w - 1) * 4)) = border_color;
     }
     
     /* Draw macOS-style window controls */
@@ -596,7 +596,7 @@ static void console_scroll(BootInfo *info)
 {
     uint32_t bpp = info->fb_bpp / 8;
     uint32_t bytes_per_line = info->fb_pitch;
-    uint8_t *fb = (uint8_t *)(uintptr_t)info->fb_addr;
+    uint8_t *fb = (uint8_t *)P2V(info->fb_addr);
     
     /* Shift terminal content rows up by LINE_STEP pixels */
     uint32_t copy_height = console_end_y - console_start_y - LINE_STEP;
@@ -757,14 +757,26 @@ void user_exec_wrapper(void *arg) {
     thread_enter_user_mode((void (*)(void))entry, stack);
 }
 
-void kernel_main(BootInfo *boot_info)
+void kernel_main(BootInfo *boot_info_loader)
 {
     /* ---- Validate the boot info magic ---- */
-    if (!boot_info || boot_info->magic != WYNLAND_BOOT_MAGIC) {
+    if (!boot_info_loader || boot_info_loader->magic != WYNLAND_BOOT_MAGIC) {
         while (1) {
             __asm__ volatile("hlt");
         }
     }
+
+    /* ---- The loader's BootInfo and memory map into the kernel: they are
+       reached through the loader's identity mapping, which the kernel's
+       own page tables (vmm_init()) don't have ---- */
+    static BootInfo g_boot_info;
+    static MemoryRegion g_boot_regions[512];
+    memcpy(&g_boot_info, boot_info_loader, sizeof g_boot_info);
+    if (g_boot_info.mmap_entries > 512) g_boot_info.mmap_entries = 512;
+    memcpy(g_boot_regions, (void *)(uintptr_t)boot_info_loader->mmap_addr,
+           g_boot_info.mmap_entries * sizeof(MemoryRegion));
+    g_boot_info.mmap_addr = (uint64_t)(uintptr_t)g_boot_regions;
+    BootInfo *boot_info = &g_boot_info;
 
     /* ---- This core's data (GS) before anything asks for it: the
        scheduler's current thread, the entry stubs' kernel stack ---- */

@@ -6,7 +6,7 @@
  * `(char *)a2`-style cast in kernel/syscall.c used to dereference a
  * user-supplied address directly at CPL0 with no validation: an
  * unmapped address panics the kernel, and a mapped *kernel* address
- * (identity-mapped RAM, a page table page, etc.) lets a process read
+ * (the direct map of RAM, a page table page, etc.) lets a process read
  * or corrupt kernel memory outright.
  *
  * These helpers are the single choke point that closes that hole.

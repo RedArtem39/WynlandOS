@@ -77,7 +77,7 @@ static uint8_t   g_cad;
 static uint32_t  g_dac;
 static uint32_t  g_afg;
 static uint32_t  g_sd;                       /* our output stream descriptor */
-static uint8_t  *g_ring;                     /* identity-mapped, physically contiguous */
+static uint8_t  *g_ring;                     /* in the direct map, physically contiguous */
 static uint64_t *g_bdl;
 
 /* playback state (touched by write()/ioctl() with interrupts off and by
@@ -228,7 +228,7 @@ static void stream_start(void)
     w8(g_sd + SD_CTL0, 0x00);
     for (int i = 0; i < 1000 && (r8(g_sd + SD_CTL0) & 0x01); i++) delay_us(10);
 
-    uint64_t bdl = (uint64_t)(uintptr_t)g_bdl;
+    uint64_t bdl = V2P(g_bdl);
     w32(g_sd + SD_BDPL, (uint32_t)bdl);
     w32(g_sd + SD_BDPU, (uint32_t)(bdl >> 32));
     w32(g_sd + SD_CBL, RING_BYTES);
@@ -258,8 +258,8 @@ static bool setup_rings(void)
 {
     void *cp = pmm_alloc_page(), *rp = pmm_alloc_page();
     if (!cp || !rp) return false;
-    g_corb = (uint32_t *)cp;
-    g_rirb = (uint32_t *)rp;
+    g_corb = (uint32_t *)P2V((uint64_t)(uintptr_t)cp);
+    g_rirb = (uint32_t *)P2V((uint64_t)(uintptr_t)rp);
     for (int i = 0; i < 1024; i++) { g_corb[i] = 0; g_rirb[i] = 0; }
 
     w8(CORBCTL, 0);
@@ -381,8 +381,7 @@ void hda_init(void)
     /* memory space + bus master */
     uint32_t cmdreg = pci_read_config(d.bus, d.slot, d.func, 0x04);
     pci_write_config(d.bus, d.slot, d.func, 0x04, cmdreg | 0x6);
-    vmm_map_mmio(base, 0x4000);
-    g_mmio = (volatile uint8_t *)(uintptr_t)base;
+    g_mmio = (volatile uint8_t *)vmm_map_mmio(base, 0x4000);
     log_hex("HDA: controller at 0x", base);
 
     /* controller reset */
@@ -407,13 +406,14 @@ void hda_init(void)
     if (!oss) { serial_write_string("HDA: no output stream\r\n"); return; }
     g_sd = SD_BASE + iss * SD_SIZE;                         /* first output stream */
 
-    g_ring = (uint8_t *)pmm_alloc_contiguous(RING_PAGES);
-    g_bdl = (uint64_t *)pmm_alloc_page();
+    void *ring = pmm_alloc_contiguous(RING_PAGES), *bdlp = pmm_alloc_page();
+    g_ring = ring ? (uint8_t *)P2V((uint64_t)(uintptr_t)ring) : NULL;
+    g_bdl = bdlp ? (uint64_t *)P2V((uint64_t)(uintptr_t)bdlp) : NULL;
     if (!g_ring || !g_bdl) { serial_write_string("HDA: out of memory\r\n"); return; }
     for (int i = 0; i < 512; i++) g_bdl[i] = 0;
     for (uint32_t i = 0; i < BDL_ENTRIES; i++) {
         uint32_t chunk = RING_BYTES / BDL_ENTRIES;
-        g_bdl[i * 2]     = (uint64_t)(uintptr_t)g_ring + i * chunk;   /* address */
+        g_bdl[i * 2]     = V2P(g_ring) + i * chunk;   /* address */
         g_bdl[i * 2 + 1] = chunk;                                      /* length, IOC=0 */
     }
 

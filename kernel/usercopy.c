@@ -19,12 +19,9 @@
 extern void *memcpy(void *dest, const void *src, size_t n);
 
 /* Highest exclusive address this kernel ever treats as a legitimate
-   user address: bit 47 and above must be zero (the canonical-low-half
-   requirement), which also happens to exclude PML4 index 0 only when
-   combined with the PAGE_USER check below -- the shared kernel/RAM/
-   framebuffer identity map (see vmm_new_process_pml4()) lives inside
-   this same bound but is never PAGE_USER, so it's rejected on that
-   basis instead. */
+   user address: bit 47 and above must be zero (the canonical lower
+   half; the kernel lives in the upper one, include/wynland/memlayout.h).
+   The PAGE_USER check below rejects anything else not the process's. */
 #define USER_ADDR_LIMIT 0x0000800000000000ULL
 
 bool user_range_valid(PageTable *pml4, uint64_t addr, uint64_t len, uint32_t required_access)

@@ -34,12 +34,8 @@ void compositor_init(BootInfo *info)
         serial_write_string("backbuffer: no contiguous memory for the screen\r\n");
         return;
     }
-    const uint64_t virt = 0x90000000ULL;
-    PageTable *pml4 = vmm_get_current_pml4();
-    for (uint64_t i = 0; i < pages; i++)
-        vmm_map_page(pml4, virt + i * 4096, (uint64_t)(uintptr_t)phys + i * 4096, PAGE_WRITE | PAGE_NX);
-    g_back = (uint32_t *)(uintptr_t)virt;
     g_back_phys = (uint64_t)(uintptr_t)phys;
+    g_back = (uint32_t *)P2V(g_back_phys);     /* the kernel's direct map */
 
     for (uint64_t i = 0; i < (uint64_t)g_width * g_height; i++) g_back[i] = 0x002E3440;
 }

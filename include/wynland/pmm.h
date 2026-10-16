@@ -5,6 +5,7 @@
 #pragma once
 
 #include <wynland/types.h>
+#include <wynland/memlayout.h>
 #include <wynland/boot_info.h>
 
 #define PAGE_SIZE 4096

@@ -50,7 +50,7 @@ void heap_init(void)
 {
     serial_write_string("Heap: Initializing kernel heap...\r\n");
 
-    PageTable *pml4 = vmm_get_current_pml4();
+    PageTable *pml4 = vmm_get_kernel_pml4();   /* the shared kernel half */
 
     /* Allocate initial pages for the heap */
     for (uint64_t i = 0; i < HEAP_INITIAL_PAGES; i++) {
@@ -81,7 +81,7 @@ void heap_init(void)
 
 static bool heap_grow(size_t size_needed)
 {
-    PageTable *pml4 = vmm_get_current_pml4();
+    PageTable *pml4 = vmm_get_kernel_pml4();   /* the shared kernel half */
 
     /* Determine how many pages we need to allocate */
     size_t total_needed = size_needed + sizeof(HeapHeader);

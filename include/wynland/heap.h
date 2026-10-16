@@ -5,7 +5,7 @@
 
 #include <wynland/types.h>
 
-#define HEAP_START 0x10000000ULL
+#define HEAP_START 0xFFFFC00000000000ULL  /* KHEAP_BASE, include/wynland/memlayout.h */
 #define HEAP_INITIAL_PAGES 512   /* 2 MB initial heap */
 #define HEAP_MAX_PAGES 245760    /* 960 MB max heap */
 

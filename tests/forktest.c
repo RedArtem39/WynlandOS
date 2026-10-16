@@ -325,19 +325,19 @@ int main(int argc, char **argv)
                 if (m != MAP_FAILED) munmap(m, 1UL << 30);
                 close(fb);
             }
-            /* C3: MAP_FIXED / munmap / mprotect over the kernel identity map */
-            void *k = mmap((void *)0x200000, 4096, PROT_READ | PROT_WRITE,
+            /* C3: MAP_FIXED / munmap / mprotect over the kernel (its image,
+               at the top of the address space) */
+            void *const kimg = (void *)0xFFFFFFFF80100000UL;
+            void *k = mmap(kimg, 4096, PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
             check(k == MAP_FAILED, "MAP_FIXED over kernel memory refused");
-            check(munmap((void *)0x200000, 4096) != 0, "munmap of kernel memory refused");
-            check(mprotect((void *)0x200000, 4096, PROT_READ) != 0, "mprotect of kernel memory refused");
+            check(munmap(kimg, 4096) != 0, "munmap of kernel memory refused");
+            check(mprotect(kimg, 4096, PROT_READ) != 0, "mprotect of kernel memory refused");
             long t0 = now_ms();
             munmap((void *)0x8000000000UL, 1UL << 46);   /* huge, empty: must not hang */
             check(now_ms() - t0 < 1000, "munmap of a huge empty range returns at once");
-            /* the kernel has pages in the user half too (virtio-gpu queues):
-               that munmap must have left them alone -- the GPU still works */
             /* mremap copying from a kernel address */
-            void *r = (void *)syscall(SYS_mremap, (void *)0x200000UL, 4096UL, 8192UL, 1UL, 0UL);
+            void *r = (void *)syscall(SYS_mremap, kimg, 4096UL, 8192UL, 1UL, 0UL);
             check(r == MAP_FAILED, "mremap from kernel memory refused");
             /* C5: a signal handler outside user space */
             struct { unsigned long h, f, r, m; } sa = { 0xffff800000001000UL, 0x04000000UL, 0, 0 };

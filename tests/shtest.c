@@ -176,7 +176,7 @@ static const struct sh_case CASES[] = {
     { "/bin/sh", "leaf: update (InRelease checked by gpgv)",
       "echo wyn | ary -S leaf update > /tmp/leaf-update.log 2>&1; echo $?; ls /var/lib/leaf/lists | wc -l", "0\n6\n" },
     { "/bin/sh", "leaf: install tree + jq from Ubuntu",
-      "echo wyn | ary -S leaf install tree jq > /tmp/leaf-install.log 2>&1; echo $?; tree -d /etc/leaf | tail -1; echo '{\"a\":[1,2]}' | jq -c '.a|add'",
+      "echo wyn | ary -S leaf install tree jq > /tmp/leaf-install.log 2>&1; r=$?; [ $r = 0 ] || tail -4 /tmp/leaf-install.log; echo $r; tree -d /etc/leaf | tail -1; echo '{\"a\":[1,2]}' | jq -c '.a|add'",
       "0\n0 directories\n3\n" },
     { "/bin/sh", "leaf: remove",
       "echo wyn | ary -S leaf remove tree > /dev/null 2>&1; command -v tree || echo gone; leaf list | cut -d' ' -f1 | tr '\\n' ' '",
@@ -209,6 +209,8 @@ static const struct sh_case CASES[] = {
       "const srv=h.createServer((q,r)=>r.end(\"pong\")).listen(0,()=>h.get(\"http://127.0.0.1:\"+srv.address().port,r=>{"
       "let d=\"\"; r.on(\"data\",c=>d+=c); r.on(\"end\",()=>{console.log(s,d,require(\"child_process\").execSync(\"echo kid\").toString().trim()); srv.close()})}))'",
       "2999997 pong kid\n" },
+    { "/bin/sh", "not PIE (linked at 0x400000), dynamic and static; the kernel's memory unreadable",
+      "/nopietest.elf; /nopietest-static.elf", "nopie ok\nnopie ok\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
     { "/bin/sh", "man: groff's pipeline",

@@ -435,9 +435,9 @@ void exception_handler(InterruptRegisters *regs)
         extern char __text_end[];
         uint64_t *sp = (uint64_t *)(uintptr_t)regs->rsp;
         for (int i = 0, shown = 0; i < 512 && shown < 24 && (regs->cs & 3) == 0 &&
-                                     regs->rsp >= 0x100000 && regs->rsp < 0x100000000ULL; i++) {
+                                     regs->rsp >= HHDM_BASE; i++) {
             uint64_t w = sp[i];
-            if (w >= 0x100000 && w < (uint64_t)(uintptr_t)__text_end) {
+            if (w >= KERNEL_VMA + KERNEL_PHYS && w < (uint64_t)(uintptr_t)__text_end) {
                 extern void uint_to_hex(uint64_t val, char *buf);
                 uint_to_hex(w, b);
                 serial_write_string(" ");
@@ -455,7 +455,7 @@ void exception_handler(InterruptRegisters *regs)
 
         /* Draw a red panic box in the terminal console */
         for (uint32_t y = g_boot_info->fb_height / 4; y < g_boot_info->fb_height * 3 / 4; y++) {
-            uint32_t *row_ptr = (uint32_t *)((uint8_t *)(uintptr_t)g_boot_info->fb_addr + y * g_boot_info->fb_pitch);
+            uint32_t *row_ptr = (uint32_t *)((uint8_t *)P2V(g_boot_info->fb_addr) + y * g_boot_info->fb_pitch);
             for (uint32_t x = g_boot_info->fb_width / 8; x < g_boot_info->fb_width * 7 / 8; x++) {
                 row_ptr[x] = bg_color;
             }
@@ -525,15 +525,15 @@ void exception_handler(InterruptRegisters *regs)
             PageTableEntry pml4_e = pml4->entries[pml4_idx];
             print_reg(g_boot_info, "PML4E", pml4_e);
             if (pml4_e & PAGE_PRESENT) {
-                PageTable *pdpt = (PageTable *)(uintptr_t)(pml4_e & PAGE_ADDR_MASK);
+                PageTable *pdpt = (PageTable *)P2V(pml4_e & PAGE_ADDR_MASK);
                 PageTableEntry pdpt_e = pdpt->entries[pdpt_idx];
                 print_reg(g_boot_info, "PDPTE", pdpt_e);
                 if (pdpt_e & PAGE_PRESENT) {
-                    PageTable *pd = (PageTable *)(uintptr_t)(pdpt_e & PAGE_ADDR_MASK);
+                    PageTable *pd = (PageTable *)P2V(pdpt_e & PAGE_ADDR_MASK);
                     PageTableEntry pd_e = pd->entries[pd_idx];
                     print_reg(g_boot_info, "PDE  ", pd_e);
                     if (pd_e & PAGE_PRESENT) {
-                        PageTable *pt = (PageTable *)(uintptr_t)(pd_e & PAGE_ADDR_MASK);
+                        PageTable *pt = (PageTable *)P2V(pd_e & PAGE_ADDR_MASK);
                         PageTableEntry pt_e = pt->entries[pt_idx];
                         print_reg(g_boot_info, "PTE  ", pt_e);
                     }

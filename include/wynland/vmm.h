@@ -6,6 +6,7 @@
 
 #include <wynland/types.h>
 #include <wynland/boot_info.h>
+#include <wynland/memlayout.h>
 
 #define PAGE_PRESENT  (1ULL << 0)
 #define PAGE_WRITE    (1ULL << 1)
@@ -69,7 +70,7 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt);
 /* Get the current PML4 page table root */
 PageTable *vmm_get_current_pml4(void);
 
-/* Get the kernel's boot-time PML4 (kernel code + identity-mapped RAM + framebuffer) */
+/* The kernel's PML4 (its upper half is every process's; include/wynland/memlayout.h) */
 PageTable *vmm_get_kernel_pml4(void);
 /* CR3 := pml4 on this core, and its record of it (the scheduler and the
    TLB shootdowns go by include/wynland/smp.h's Cpu.cr3) */
@@ -98,13 +99,13 @@ uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt);
 uint64_t vmm_next_mapped(PageTable *pml4, uint64_t virt, uint64_t end);
 
 /* True if the mapping at virt has PAGE_USER set (i.e. genuinely owned by
-   this process, not an aliased kernel-identity-map page it happens to
-   overlap -- see vmm_new_process_pml4()). Used by the ELF loader to refuse
-   writing user segment content over shared kernel memory it doesn't own. */
+   this process, not kernel memory). Used by the ELF loader to refuse
+   writing user segment content over kernel memory it doesn't own. */
 bool vmm_is_user_page(PageTable *pml4, uint64_t virt);
 
 /* Map a memory-mapped I/O (MMIO) region */
-void vmm_map_mmio(uint64_t phys_addr, uint64_t size);
+/* Map device memory into the kernel half (uncached); returns P2V(phys_addr) */
+void *vmm_map_mmio(uint64_t phys_addr, uint64_t size);
 
 /* Deep-copy every PAGE_USER leaf mapping from parent_pml4 into child_pml4,
    each with its own fresh physical page (eager copy, not COW). Superseded
@@ -151,12 +152,8 @@ bool vmm_resolve_cow_page(PageTable *pml4, uint64_t page_addr);
 /* Frees every mapping this process PRIVATELY owns in `pml4`: every present
    leaf (via the refcount-aware pmm_free_page(), so a COW-shared leaf just
    drops this owner's share) and every PT/PD/PDPT page-table page under a
-   top-level PML4 entry that ISN'T aliased from the shared kernel/RAM/
-   framebuffer identity map (vmm_new_process_pml4() copies those entries by
-   raw value from vmm_get_kernel_pml4()'s snapshot -- an entry that still
-   matches that snapshot exactly is shared and is skipped entirely; anything
-   else present was mapped later, specifically for this process, by
-   vmm_map_page(), and is safe to free). Walks the actual page tables rather
+   lower-half PML4 entry (the upper half is the kernel's, shared by every
+   process: vmm_new_process_pml4(); never touched here). Walks the actual page tables rather
    than any side list, so there is no size limit on how much can be torn
    down. Does NOT free the `pml4` root itself -- see
    vmm_destroy_process_pml4() for that, and elf_load()'s failure path

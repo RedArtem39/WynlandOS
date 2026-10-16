@@ -636,6 +636,45 @@ static EFI_STATUS ExitBootServicesAndGetMemoryMap(BootInfo *info) {
 }
 
 /* ============================================================
+ * Page tables for the jump into the kernel
+ *
+ * The kernel is linked at KERNEL_VMA (0xFFFFFFFF80000000) + its physical
+ * address and reaches physical memory through HHDM_BASE + address (see
+ * include/wynland/memlayout.h); UEFI's own tables have neither. These map,
+ * with 2 MB pages: the first 64 GB at itself (this loader's code, stack and
+ * the BootInfo it hands over) and at HHDM_BASE, and the first 1 GB at
+ * KERNEL_VMA. The kernel builds its real tables in vmm_init(); these stay
+ * in loader memory, which the kernel never reuses.
+ * ============================================================ */
+
+#define BOOT_MAP_GB 64
+
+static EFI_STATUS BuildKernelPageTables(UINT64 *pml4_out) {
+    UINTN pages = 1 + 1 + 1 + BOOT_MAP_GB;     /* PML4, two PDPTs, the PDs */
+    EFI_PHYSICAL_ADDRESS base = 0xFFFFFFFF;     /* below 4 GB */
+    EFI_STATUS status = gBS->AllocatePages(AllocateMaxAddress, EfiLoaderData, pages, &base);
+    if (EFI_IS_ERROR(status)) return status;
+    memset((VOID*)(UINTN)base, 0, pages * 4096);
+
+    UINT64 *pml4 = (UINT64*)(UINTN)base;
+    UINT64 *pdpt_low = pml4 + 512;
+    UINT64 *pdpt_kernel = pdpt_low + 512;
+    UINT64 *pds = pdpt_kernel + 512;
+    for (UINTN g = 0; g < BOOT_MAP_GB; g++) {
+        UINT64 *pd = pds + g * 512;
+        for (UINTN m = 0; m < 512; m++)
+            pd[m] = (((UINT64)g << 30) + ((UINT64)m << 21)) | 0x83;  /* present, write, 2 MB */
+        pdpt_low[g] = (UINT64)(UINTN)pd | 0x03;
+    }
+    pdpt_kernel[510] = (UINT64)(UINTN)pds | 0x03;    /* 0xFFFFFFFF80000000: the first GB */
+    pml4[0]   = (UINT64)(UINTN)pdpt_low | 0x03;      /* identity */
+    pml4[256] = (UINT64)(UINTN)pdpt_low | 0x03;      /* 0xFFFF800000000000 */
+    pml4[511] = (UINT64)(UINTN)pdpt_kernel | 0x03;
+    *pml4_out = base;
+    return EFI_SUCCESS;
+}
+
+/* ============================================================
  * EfiMain - UEFI application entry point
  * ============================================================ */
 
@@ -688,6 +727,13 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     Print(L"[3/4] Finding ACPI tables...\r\n");
     bootInfo.rsdp_addr = (UINT64)(UINTN)FindRSDP();
 
+    UINT64 kernelPml4;
+    status = BuildKernelPageTables(&kernelPml4);
+    if (EFI_IS_ERROR(status)) {
+        Print(L"ERROR: No memory for the kernel's page tables!\r\n");
+        while(1);
+    }
+
     /* [4/4] Get memory map and exit boot services */
     Print(L"[4/4] Exiting boot services...\r\n");
     status = ExitBootServicesAndGetMemoryMap(&bootInfo);
@@ -708,6 +754,9 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
      */
     typedef void (*KernelEntryFunc)(BootInfo*);
     KernelEntryFunc kernel = (KernelEntryFunc)(UINTN)kernelEntry;
+    /* the kernel's addresses exist only in these tables (this code, its
+       stack and bootInfo stay reachable: identity-mapped there too) */
+    __asm__ volatile("cli; mov %0, %%cr3" :: "r"(kernelPml4) : "memory");
     kernel(&bootInfo);
 
     /* Should never reach here */

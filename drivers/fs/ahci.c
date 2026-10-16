@@ -31,8 +31,7 @@ void ahci_init(void) {
     
     // Map the BAR5 MMIO space
     uint64_t bar5_addr = dev.bar5 & 0xFFFFFFF0; // Clear flag bits
-    vmm_map_mmio(bar5_addr, sizeof(HbaMem));
-    hba_mem = (volatile HbaMem *)(uintptr_t)bar5_addr;
+    hba_mem = (volatile HbaMem *)vmm_map_mmio(bar5_addr, sizeof(HbaMem));
 
     // Enable AHCI globally
     hba_mem->ghc |= (1U << 31); // Set AHCI Enable (AE)
@@ -86,7 +85,7 @@ void ahci_init(void) {
     // 2. Allocate and set Command List Base and FIS Base
     // Allocate 1 physical page (4096 bytes) for Command List (1024 bytes) and FIS (256 bytes)
     void *cl_phys = pmm_alloc_page();
-    memset(cl_phys, 0, 4096);
+    memset(P2V((uint64_t)(uintptr_t)cl_phys), 0, 4096);
     
     uint64_t cl_addr = (uint64_t)(uintptr_t)cl_phys;
     uint64_t fis_addr = cl_addr + 1024;
@@ -99,7 +98,7 @@ void ahci_init(void) {
     port->fbu = (uint32_t)(fis_addr >> 32);
     
     // 3. Set command headers
-    HbaCmdHeader *cmd_header = (HbaCmdHeader *)(uintptr_t)cl_phys;
+    HbaCmdHeader *cmd_header = (HbaCmdHeader *)P2V(cl_addr);
     for (int i = 0; i < 32; i++) {
         cmd_header[i].flags0 = 5; // CFL = 5 dwords (20 bytes)
         cmd_header[i].flags1 = 0;
@@ -166,7 +165,8 @@ static uint8_t *bounce(void)
 {
     if (!g_bounce) {
         extern void *pmm_alloc_contiguous(uint32_t count);
-        g_bounce = (uint8_t *)pmm_alloc_contiguous(AHCI_BOUNCE_PAGES);  /* identity-mapped */
+        void *p = pmm_alloc_contiguous(AHCI_BOUNCE_PAGES);
+        if (p) g_bounce = (uint8_t *)P2V((uint64_t)(uintptr_t)p);
     }
     return g_bounce;
 }
@@ -252,13 +252,13 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
         }
     }
 
-    HbaCmdHeader *cmd_headers = (HbaCmdHeader *)(uintptr_t)port->clb;
+    HbaCmdHeader *cmd_headers = (HbaCmdHeader *)P2V(port->clb | ((uint64_t)port->clbu << 32));
     HbaCmdHeader *hdr = &cmd_headers[slot];
     hdr->flags0 = 5; // CFL = 5 dwords, W = 0 (Read)
     hdr->flags1 = 0;
     hdr->prdtl = 1; // 1 PRDT entry
     
-    HbaCmdTable *tbl = (HbaCmdTable *)(uintptr_t)hdr->ctba;
+    HbaCmdTable *tbl = (HbaCmdTable *)P2V(hdr->ctba | ((uint64_t)hdr->ctbau << 32));
     memset(tbl, 0, sizeof(HbaCmdTable) + sizeof(HbaPrdtEntry));
     
     tbl->prdt_entry[0].dba = (uint32_t)phys_buf;
@@ -372,13 +372,13 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf) {
         }
     }
 
-    HbaCmdHeader *cmd_headers = (HbaCmdHeader *)(uintptr_t)port->clb;
+    HbaCmdHeader *cmd_headers = (HbaCmdHeader *)P2V(port->clb | ((uint64_t)port->clbu << 32));
     HbaCmdHeader *hdr = &cmd_headers[slot];
     hdr->flags0 = 5 | (1 << 6); // CFL = 5 dwords, W = 1 (Write)
     hdr->flags1 = 0;
     hdr->prdtl = 1; // 1 PRDT entry
     
-    HbaCmdTable *tbl = (HbaCmdTable *)(uintptr_t)hdr->ctba;
+    HbaCmdTable *tbl = (HbaCmdTable *)P2V(hdr->ctba | ((uint64_t)hdr->ctbau << 32));
     memset(tbl, 0, sizeof(HbaCmdTable) + sizeof(HbaPrdtEntry));
     
     tbl->prdt_entry[0].dba = (uint32_t)phys_buf;

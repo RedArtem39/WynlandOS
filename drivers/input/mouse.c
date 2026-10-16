@@ -2,6 +2,7 @@
  * WynlandOS - PS/2 Mouse Driver Implementation
  */
 
+#include <wynland/memlayout.h>
 #include <wynland/mouse.h>
 
 #define CURSOR_W 18
@@ -107,7 +108,7 @@ static void mouse_write_mouse(uint8_t val)
 
 static void mouse_save_background(void)
 {
-    uint32_t *fb = (uint32_t *)(uintptr_t)g_boot_info->fb_addr;
+    uint32_t *fb = (uint32_t *)P2V(g_boot_info->fb_addr);
     uint32_t pitch_pixels = g_boot_info->fb_pitch / 4;
 
     for (int y = 0; y < CURSOR_H; y++) {
@@ -123,7 +124,7 @@ static void mouse_save_background(void)
 
 static void mouse_restore_background(void)
 {
-    uint32_t *fb = (uint32_t *)(uintptr_t)g_boot_info->fb_addr;
+    uint32_t *fb = (uint32_t *)P2V(g_boot_info->fb_addr);
     uint32_t pitch_pixels = g_boot_info->fb_pitch / 4;
 
     for (int y = 0; y < CURSOR_H; y++) {
@@ -139,7 +140,7 @@ static void mouse_restore_background(void)
 
 static void mouse_draw_cursor(void)
 {
-    uint32_t *fb = (uint32_t *)(uintptr_t)g_boot_info->fb_addr;
+    uint32_t *fb = (uint32_t *)P2V(g_boot_info->fb_addr);
     uint32_t pitch_pixels = g_boot_info->fb_pitch / 4;
 
     for (int y = 0; y < CURSOR_H; y++) {

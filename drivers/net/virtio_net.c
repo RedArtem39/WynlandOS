@@ -231,22 +231,12 @@ static bool virtqueue_setup(Virtqueue *vq, uint16_t queue_idx)
 
     /* Allocate enough contiguous pages */
     uint32_t pages_needed = (total_size + 4095) / 4096;
-    uint8_t *mem = (uint8_t *)pmm_alloc_page();
-    if (!mem) {
-        log_str("VIRTIO-NET: Failed to allocate first page for queue\r\n");
+    void *qphys = pmm_alloc_contiguous(pages_needed);
+    if (!qphys) {
+        log_str("VIRTIO-NET: Failed to allocate memory for queue\r\n");
         return false;
     }
-
-    /* Allocate remaining pages to ensure contiguous memory.
-     * pmm_alloc_page() returns consecutive pages in WynlandOS's PMM. */
-    for (uint32_t i = 1; i < pages_needed; i++) {
-        void *extra = pmm_alloc_page();
-        if (!extra) {
-            log_str("VIRTIO-NET: Failed to allocate memory for queue\r\n");
-            return false;
-        }
-        (void)extra;  /* Pages are contiguous, we just need to allocate them */
-    }
+    uint8_t *mem = (uint8_t *)P2V((uint64_t)(uintptr_t)qphys);
 
     /* Zero all memory */
     memset(mem, 0, total_size);
@@ -266,7 +256,7 @@ static bool virtqueue_setup(Virtqueue *vq, uint16_t queue_idx)
     vq->last_used = 0;
 
     /* Tell device the physical page number of this queue */
-    uint32_t pfn = (uint32_t)((uintptr_t)mem / 4096);
+    uint32_t pfn = (uint32_t)(V2P(mem) / 4096);
     outl(io_base + VIRTIO_PCI_QUEUE_PFN, pfn);
 
     log_hex("VIRTIO-NET: Queue PFN = ", pfn);
@@ -320,7 +310,7 @@ static void rx_queue_fill(void)
             break;
 
         /* Point descriptor at static RX buffer */
-        rxq.desc[desc_idx].addr  = (uint64_t)(uintptr_t)rx_buffers[desc_idx];
+        rxq.desc[desc_idx].addr  = V2P(rx_buffers[desc_idx]);
         rxq.desc[desc_idx].len   = RX_BUF_SIZE;
         rxq.desc[desc_idx].flags = VIRTQ_DESC_F_WRITE;  /* Device writes into this buffer */
         rxq.desc[desc_idx].next  = 0;
@@ -451,7 +441,7 @@ bool virtio_net_send(const void *data, uint32_t len)
     memcpy(buf + VIRTIO_NET_HDR_SIZE, data, len);     /* Copy the packet data */
 
     /* Set up the descriptor */
-    txq.desc[desc_idx].addr  = (uint64_t)(uintptr_t)buf;
+    txq.desc[desc_idx].addr  = V2P(buf);
     txq.desc[desc_idx].len   = VIRTIO_NET_HDR_SIZE + len;
     txq.desc[desc_idx].flags = 0;   /* No WRITE (device reads), no NEXT (single buffer) */
     txq.desc[desc_idx].next  = 0;
@@ -527,7 +517,7 @@ int virtio_net_receive(void *buf, uint32_t max_len)
 
 requeue:
     /* Re-add the descriptor to the RX available ring for reuse */
-    rxq.desc[desc_idx].addr  = (uint64_t)(uintptr_t)rx_buffers[desc_idx];
+    rxq.desc[desc_idx].addr  = V2P(rx_buffers[desc_idx]);
     rxq.desc[desc_idx].len   = RX_BUF_SIZE;
     rxq.desc[desc_idx].flags = VIRTQ_DESC_F_WRITE;
     rxq.desc[desc_idx].next  = 0;

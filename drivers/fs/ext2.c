@@ -1048,7 +1048,8 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
     if (!g_run_buf) {
         extern void *pmm_alloc_contiguous(uint32_t count);
         uint32_t bytes = EXT2_RUN_BLOCKS * g_block_size;
-        g_run_buf = (uint8_t *)pmm_alloc_contiguous((bytes + 4095) / 4096); /* identity-mapped */
+        void *run = pmm_alloc_contiguous((bytes + 4095) / 4096);  /* contiguous: one DMA */
+        g_run_buf = run ? (uint8_t *)P2V((uint64_t)(uintptr_t)run) : NULL;
         g_run_cap = g_run_buf ? bytes : 0;
     }
 
@@ -2381,7 +2382,7 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
             if (file->offset >= fb_size) return 0;
             if (file->offset + size > fb_size) size = fb_size - file->offset;
             extern uint64_t fb_active_phys_addr(void);
-            uint8_t *fb = (uint8_t *)(uintptr_t)fb_active_phys_addr();
+            uint8_t *fb = (uint8_t *)P2V(fb_active_phys_addr());
             for (uint32_t i = 0; i < size; i++) ((uint8_t *)buf)[i] = fb[file->offset + i];
             file->offset += size;
             return (int)size;

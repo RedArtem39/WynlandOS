@@ -103,7 +103,7 @@ int64_t memfd_truncate(int idx, uint64_t size) {
     while (m->npages < want) {
         void *p = pmm_alloc_page();
         if (!p) return -ENOMEM; /* size stays at what we could back */
-        memset(p, 0, PAGE_SIZE); /* physical RAM is identity-mapped in every PML4 */
+        memset(P2V((uint64_t)(uintptr_t)p), 0, PAGE_SIZE);
         m->pages[m->npages++] = (uint64_t)(uintptr_t)p;
     }
     while (m->npages > want) {
@@ -111,7 +111,7 @@ int64_t memfd_truncate(int idx, uint64_t size) {
     }
     /* zero the tail of a partial last page so a later grow reads zeros */
     if (size < m->size && (size % PAGE_SIZE) && m->npages > 0) {
-        uint8_t *last = (uint8_t *)(uintptr_t)m->pages[m->npages - 1];
+        uint8_t *last = (uint8_t *)P2V(m->pages[m->npages - 1]);
         memset(last + size % PAGE_SIZE, 0, PAGE_SIZE - size % PAGE_SIZE);
     }
     m->size = size;
@@ -150,7 +150,7 @@ int64_t memfd_pread(int idx, uint64_t off, void *buf, uint64_t len) {
         uint64_t in = pos % PAGE_SIZE;
         uint64_t take = PAGE_SIZE - in;
         if (take > len - done) take = len - done;
-        memcpy((uint8_t *)buf + done, (uint8_t *)(uintptr_t)m->pages[pos / PAGE_SIZE] + in, (size_t)take);
+        memcpy((uint8_t *)buf + done, (uint8_t *)P2V(m->pages[pos / PAGE_SIZE]) + in, (size_t)take);
         done += take;
     }
     return (int64_t)done;
@@ -170,7 +170,7 @@ int64_t memfd_pwrite(int idx, uint64_t off, const void *buf, uint64_t len) {
         uint64_t in = pos % PAGE_SIZE;
         uint64_t take = PAGE_SIZE - in;
         if (take > len - done) take = len - done;
-        memcpy((uint8_t *)(uintptr_t)m->pages[pos / PAGE_SIZE] + in, (const uint8_t *)buf + done, (size_t)take);
+        memcpy((uint8_t *)P2V(m->pages[pos / PAGE_SIZE]) + in, (const uint8_t *)buf + done, (size_t)take);
         done += take;
     }
     return (int64_t)done;

@@ -2,8 +2,8 @@
  * WynlandOS - Process Management
  * ============================================================
  * Phase 0: real per-process address spaces. A Process owns a
- * private PML4 (aliasing the kernel/RAM/framebuffer identity map
- * by pointer, see vmm_new_process_pml4()) and its own fd table.
+ * private PML4 (sharing the kernel half, see vmm_new_process_pml4())
+ * and its own fd table.
  */
 #include <wynland/process.h>
 #include <wynland/sandbox.h>
@@ -48,7 +48,7 @@ Process *process_create(PageTable *pml4) {
 }
 
 void process_init(void) {
-    /* Process 0: the kernel itself, using the boot-time identity-map PML4.
+    /* Process 0: the kernel itself, using the kernel's PML4.
        sched_init() has already created Thread 0; wire it to this process
        right after so sched_current()->proc is always valid from here on. */
     g_kernel_process = process_create(vmm_get_kernel_pml4());

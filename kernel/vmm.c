@@ -6,17 +6,18 @@
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/smp.h>
+#include <wynland/memlayout.h>
 
 extern uint8_t __kernel_end[];
 extern void *memset(void *s, int c, size_t n);
 extern void *memcpy(void *dest, const void *src, size_t n);
 extern void serial_write_string(const char *str);
 
-/* Snapshot of the boot-time PML4 (kernel code + all identity-mapped RAM +
-   framebuffer). Taken once, right after vmm_init() finishes building it and
-   before any user process exists -- see vmm_init() below. Every new
-   process's PML4 aliases these same top-level entries by pointer so kernel
-   code/data/MMIO stay reachable after a CR3 switch into a process. */
+/* The kernel's PML4: its upper half (entries 256..511: the kernel image,
+   the direct map of physical memory, the heap, device memory; include/
+   wynland/memlayout.h) is built by vmm_init() and copied into every new
+   process's PML4, so the kernel stays reachable after a CR3 switch into a
+   process. Its lower half holds only the SMP start-up page (kernel/smp.c). */
 static PageTable *g_kernel_pml4 = NULL;
 
 /* Helper to allocate and zero a new page table */
@@ -27,8 +28,9 @@ static PageTable *vmm_alloc_table(void)
         serial_write_string("VMM Error: Out of physical memory for page table!\r\n");
         return NULL;
     }
-    memset(phys, 0, PAGE_SIZE);
-    return (PageTable *)phys;
+    PageTable *t = (PageTable *)P2V((uint64_t)(uintptr_t)phys);
+    memset(t, 0, PAGE_SIZE);
+    return t;
 }
 
 PageTable *vmm_get_kernel_pml4(void)
@@ -38,8 +40,9 @@ PageTable *vmm_get_kernel_pml4(void)
 
 void vmm_load_cr3(PageTable *pml4)
 {
-    this_cpu()->cr3 = (uint64_t)(uintptr_t)pml4;
-    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)pml4) : "memory");
+    uint64_t phys = V2P(pml4);
+    this_cpu()->cr3 = phys;
+    __asm__ volatile("mov %0, %%cr3" :: "r"(phys) : "memory");
 }
 
 /* ---- the other cores' TLBs (include/wynland/smp.h) ----------------------
@@ -106,15 +109,12 @@ PageTable *vmm_new_process_pml4(void)
     PageTable *pml4 = vmm_alloc_table();
     if (!pml4) return NULL;
 
-    /* Alias every present top-level entry from the kernel PML4 by value --
-       this shares the same physical PDPT chains (cheap, no deep copy), and
-       is safe because ring-3 access is gated by the PAGE_USER bit at the
-       leaf PT entry, not by presence in this table; the kernel's own
-       identity-map calls never set PAGE_USER (see vmm_init()). Looping all
-       512 entries rather than hardcoding a single index keeps this correct
-       even if RAM/framebuffer placement ever grows past what one entry
-       covers. */
-    for (int i = 0; i < 512; i++) {
+    /* The kernel half: the kernel PML4's entries 256..511 by value -- the
+       same PDPTs (made once in vmm_init(), never replaced), so what is
+       mapped there later is seen here too. They carry no PAGE_USER: ring 3
+       reaches nothing below them. The lower half starts empty: the
+       process's alone. */
+    for (int i = 256; i < 512; i++) {
         if (g_kernel_pml4->entries[i] & PAGE_PRESENT) {
             pml4->entries[i] = g_kernel_pml4->entries[i];
         }
@@ -134,23 +134,21 @@ bool vmm_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
        Only walks PRESENT entries at each level (cheap in practice -- bounded
        by how much is actually mapped, not the full 512^4 address space), and
        only acts on leaves with PAGE_USER set, which automatically skips the
-       kernel/RAM/framebuffer identity-map region every process's PML4
-       aliases from vmm_new_process_pml4() (that region is never PAGE_USER,
-       see that function's own comment) -- no special-casing needed to avoid
-       re-copying it. */
+       kernel half every process's PML4 shares (vmm_new_process_pml4(); never
+       PAGE_USER) -- no special-casing needed to avoid re-copying it. */
     for (uint64_t i4 = 0; i4 < 512; i4++) {
         if (!(parent_pml4->entries[i4] & PAGE_PRESENT)) continue;
-        PageTable *pdpt = (PageTable *)(uintptr_t)(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
+        PageTable *pdpt = (PageTable *)P2V(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
 
         for (uint64_t i3 = 0; i3 < 512; i3++) {
             if (!(pdpt->entries[i3] & PAGE_PRESENT)) continue;
             if (pdpt->entries[i3] & PAGE_PS) continue; /* 1GB huge page -- never produced for user mappings by vmm_map_page, skip defensively */
-            PageTable *pd = (PageTable *)(uintptr_t)(pdpt->entries[i3] & PAGE_ADDR_MASK);
+            PageTable *pd = (PageTable *)P2V(pdpt->entries[i3] & PAGE_ADDR_MASK);
 
             for (uint64_t i2 = 0; i2 < 512; i2++) {
                 if (!(pd->entries[i2] & PAGE_PRESENT)) continue;
                 if (pd->entries[i2] & PAGE_PS) continue; /* 2MB huge page -- same as above */
-                PageTable *pt = (PageTable *)(uintptr_t)(pd->entries[i2] & PAGE_ADDR_MASK);
+                PageTable *pt = (PageTable *)P2V(pd->entries[i2] & PAGE_ADDR_MASK);
 
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
@@ -183,7 +181,7 @@ bool vmm_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
                         serial_write_string("vmm_clone_user_pages: out of physical memory\r\n");
                         return false;
                     }
-                    memcpy(new_phys, (void *)(uintptr_t)phys, PAGE_SIZE);
+                    memcpy(P2V((uint64_t)(uintptr_t)new_phys), P2V(phys), PAGE_SIZE);
                     vmm_map_page(child_pml4, virt, (uint64_t)(uintptr_t)new_phys, flags);
                 }
             }
@@ -202,17 +200,17 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
     vmm_tlb_batch_begin();   /* the parent's other threads: one flush at the end */
     for (uint64_t i4 = 0; i4 < 512; i4++) {
         if (!(parent_pml4->entries[i4] & PAGE_PRESENT)) continue;
-        PageTable *pdpt = (PageTable *)(uintptr_t)(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
+        PageTable *pdpt = (PageTable *)P2V(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
 
         for (uint64_t i3 = 0; i3 < 512; i3++) {
             if (!(pdpt->entries[i3] & PAGE_PRESENT)) continue;
             if (pdpt->entries[i3] & PAGE_PS) continue;
-            PageTable *pd = (PageTable *)(uintptr_t)(pdpt->entries[i3] & PAGE_ADDR_MASK);
+            PageTable *pd = (PageTable *)P2V(pdpt->entries[i3] & PAGE_ADDR_MASK);
 
             for (uint64_t i2 = 0; i2 < 512; i2++) {
                 if (!(pd->entries[i2] & PAGE_PRESENT)) continue;
                 if (pd->entries[i2] & PAGE_PS) continue;
-                PageTable *pt = (PageTable *)(uintptr_t)(pd->entries[i2] & PAGE_ADDR_MASK);
+                PageTable *pt = (PageTable *)P2V(pd->entries[i2] & PAGE_ADDR_MASK);
 
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
@@ -276,22 +274,22 @@ void vmm_free_user_mappings(PageTable *pml4)
        actually mapped) and only frees a top-level branch that ISN'T shared
        with the kernel snapshot -- see this function's own header comment
        in vmm.h for exactly why that comparison is safe. */
-    for (uint64_t i4 = 0; i4 < 512; i4++) {
+    for (uint64_t i4 = 0; i4 < 256; i4++) {     /* the user half */
         uint64_t pml4_entry = pml4->entries[i4];
         if (!(pml4_entry & PAGE_PRESENT)) continue;
         if (kernel_pml4 && pml4_entry == kernel_pml4->entries[i4]) continue; /* shared -- never touch */
 
-        PageTable *pdpt = (PageTable *)(uintptr_t)(pml4_entry & PAGE_ADDR_MASK);
+        PageTable *pdpt = (PageTable *)P2V(pml4_entry & PAGE_ADDR_MASK);
 
         for (uint64_t i3 = 0; i3 < 512; i3++) {
             if (!(pdpt->entries[i3] & PAGE_PRESENT)) continue;
             if (pdpt->entries[i3] & PAGE_PS) continue; /* 1GB huge page -- never produced for a private branch, skip defensively */
-            PageTable *pd = (PageTable *)(uintptr_t)(pdpt->entries[i3] & PAGE_ADDR_MASK);
+            PageTable *pd = (PageTable *)P2V(pdpt->entries[i3] & PAGE_ADDR_MASK);
 
             for (uint64_t i2 = 0; i2 < 512; i2++) {
                 if (!(pd->entries[i2] & PAGE_PRESENT)) continue;
                 if (pd->entries[i2] & PAGE_PS) continue; /* 2MB huge page -- same as above */
-                PageTable *pt = (PageTable *)(uintptr_t)(pd->entries[i2] & PAGE_ADDR_MASK);
+                PageTable *pt = (PageTable *)P2V(pd->entries[i2] & PAGE_ADDR_MASK);
 
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
@@ -304,11 +302,11 @@ void vmm_free_user_mappings(PageTable *pml4)
                        this owner's share here instead of freeing outright. */
                     pmm_free_page((void *)(uintptr_t)(pte & PAGE_ADDR_MASK));
                 }
-                pmm_free_page(pt); /* privately owned -- this whole branch isn't shared */
+                pmm_free_page((void *)V2P(pt)); /* privately owned -- this whole branch isn't shared */
             }
-            pmm_free_page(pd);
+            pmm_free_page((void *)V2P(pd));
         }
-        pmm_free_page(pdpt);
+        pmm_free_page((void *)V2P(pdpt));
         pml4->entries[i4] = 0;
     }
     /* Another core still running these tables (a thread of the process
@@ -321,7 +319,7 @@ void vmm_destroy_process_pml4(PageTable *pml4)
 {
     if (!pml4) return;
     vmm_free_user_mappings(pml4);
-    pmm_free_page(pml4);
+    pmm_free_page((void *)V2P(pml4));
 }
 
 void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
@@ -343,9 +341,9 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     PageTable *pdpt = NULL;
     if (!(*pml4_entry & PAGE_PRESENT)) {
         pdpt = vmm_alloc_table();
-        *pml4_entry = (uint64_t)(uintptr_t)pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        *pml4_entry = V2P(pdpt) | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
     } else {
-        pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+        pdpt = (PageTable *)P2V(*pml4_entry & PAGE_ADDR_MASK);
     }
 
     /* 2. Traverse PDPT -> PD */
@@ -353,9 +351,9 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     PageTable *pd = NULL;
     if (!(*pdpt_entry & PAGE_PRESENT)) {
         pd = vmm_alloc_table();
-        *pdpt_entry = (uint64_t)(uintptr_t)pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        *pdpt_entry = V2P(pd) | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
     } else {
-        pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+        pd = (PageTable *)P2V(*pdpt_entry & PAGE_ADDR_MASK);
     }
 
     /* 3. Traverse PD -> PT */
@@ -363,9 +361,9 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     PageTable *pt = NULL;
     if (!(*pd_entry & PAGE_PRESENT)) {
         pt = vmm_alloc_table();
-        *pd_entry = (uint64_t)(uintptr_t)pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        *pd_entry = V2P(pt) | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
     } else {
-        pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+        pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     }
 
     /* 4. Map the physical address in the Page Table */
@@ -407,15 +405,15 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
     if (!(*pml4_entry & PAGE_PRESENT)) goto cleanup;
     
-    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTable *pdpt = (PageTable *)P2V(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
     if (!(*pdpt_entry & PAGE_PRESENT)) goto cleanup;
 
-    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTable *pd = (PageTable *)P2V(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
     if (!(*pd_entry & PAGE_PRESENT)) goto cleanup;
 
-    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTable *pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     
     /* Clear entry */
     bool was_present = (pt->entries[pt_idx] & PAGE_PRESENT) != 0;
@@ -446,15 +444,15 @@ bool vmm_protect_page(PageTable *pml4, uint64_t virt, uint64_t flags)
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
     if (!(*pml4_entry & PAGE_PRESENT)) goto cleanup;
 
-    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTable *pdpt = (PageTable *)P2V(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
     if (!(*pdpt_entry & PAGE_PRESENT)) goto cleanup;
 
-    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTable *pd = (PageTable *)P2V(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
     if (!(*pd_entry & PAGE_PRESENT)) goto cleanup;
 
-    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTable *pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     PageTableEntry *pt_entry = &pt->entries[pt_idx];
     if (!(*pt_entry & PAGE_PRESENT)) goto cleanup;
 
@@ -481,15 +479,15 @@ uint64_t vmm_get_page_flags(PageTable *pml4, uint64_t virt)
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
     if (!(*pml4_entry & PAGE_PRESENT)) return 0;
 
-    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTable *pdpt = (PageTable *)P2V(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
     if (!(*pdpt_entry & PAGE_PRESENT)) return 0;
 
-    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTable *pd = (PageTable *)P2V(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
     if (!(*pd_entry & PAGE_PRESENT)) return 0;
 
-    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTable *pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     PageTableEntry *pt_entry = &pt->entries[pt_idx];
     return *pt_entry & 0xFFFULL;
 }
@@ -513,7 +511,7 @@ bool vmm_resolve_cow_page(PageTable *pml4, uint64_t page_addr)
     void *new_phys = pmm_alloc_page();
     if (!new_phys) return false; /* OOM duplicating a still-shared page */
 
-    memcpy(new_phys, (void *)(uintptr_t)phys, PAGE_SIZE);
+    memcpy(P2V((uint64_t)(uintptr_t)new_phys), P2V(phys), PAGE_SIZE);
     vmm_map_page(pml4, page_addr, (uint64_t)(uintptr_t)new_phys, (flags & ~PAGE_COW) | PAGE_WRITE);
     pmm_free_page((void *)(uintptr_t)phys); /* drop this owner's share of the old, still-shared frame */
     return true;
@@ -523,13 +521,13 @@ uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt)
 {
     PageTableEntry e = pml4->entries[PML4_INDEX(virt)];
     if (!(e & PAGE_PRESENT)) return 0;
-    PageTable *pdpt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+    PageTable *pdpt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
     e = pdpt->entries[PDPT_INDEX(virt)];
     if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return 0;
-    PageTable *pd = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+    PageTable *pd = (PageTable *)P2V(e & PAGE_ADDR_MASK);
     e = pd->entries[PD_INDEX(virt)];
     if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return 0;
-    PageTable *pt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+    PageTable *pt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
     e = pt->entries[PT_INDEX(virt)];
     return (e & PAGE_PRESENT) ? e : 0;
 }
@@ -545,13 +543,13 @@ uint64_t vmm_next_mapped(PageTable *pml4, uint64_t virt, uint64_t end)
         uint64_t step;
         PageTableEntry e = pml4->entries[PML4_INDEX(virt)];
         if (!(e & PAGE_PRESENT)) { step = 1ULL << 39; goto skip; }
-        PageTable *pdpt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+        PageTable *pdpt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
         e = pdpt->entries[PDPT_INDEX(virt)];
         if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) { step = 1ULL << 30; goto skip; }
-        PageTable *pd = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+        PageTable *pd = (PageTable *)P2V(e & PAGE_ADDR_MASK);
         e = pd->entries[PD_INDEX(virt)];
         if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) { step = 1ULL << 21; goto skip; }
-        PageTable *pt = (PageTable *)(uintptr_t)(e & PAGE_ADDR_MASK);
+        PageTable *pt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
         if (pt->entries[PT_INDEX(virt)] & PAGE_PRESENT) return virt;
         step = PAGE_SIZE;
     skip:
@@ -574,7 +572,7 @@ uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
     if (!(*pml4_entry & PAGE_PRESENT)) return 0;
     
-    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTable *pdpt = (PageTable *)P2V(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
     if (!(*pdpt_entry & PAGE_PRESENT)) return 0;
     if (*pdpt_entry & PAGE_PS) {
@@ -582,7 +580,7 @@ uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
         return (*pdpt_entry & PAGE_ADDR_MASK) | (virt & 0x3FFFFFFFULL);
     }
 
-    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTable *pd = (PageTable *)P2V(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
     if (!(*pd_entry & PAGE_PRESENT)) return 0;
     if (*pd_entry & PAGE_PS) {
@@ -590,7 +588,7 @@ uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt)
         return (*pd_entry & PAGE_ADDR_MASK) | (virt & 0x1FFFFFULL);
     }
 
-    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTable *pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     PageTableEntry *pt_entry = &pt->entries[pt_idx];
     if (!(*pt_entry & PAGE_PRESENT)) return 0;
 
@@ -607,17 +605,17 @@ bool vmm_is_user_page(PageTable *pml4, uint64_t virt)
     PageTableEntry *pml4_entry = &pml4->entries[pml4_idx];
     if (!(*pml4_entry & PAGE_PRESENT)) return false;
 
-    PageTable *pdpt = (PageTable *)(uintptr_t)(*pml4_entry & PAGE_ADDR_MASK);
+    PageTable *pdpt = (PageTable *)P2V(*pml4_entry & PAGE_ADDR_MASK);
     PageTableEntry *pdpt_entry = &pdpt->entries[pdpt_idx];
     if (!(*pdpt_entry & PAGE_PRESENT)) return false;
     if (*pdpt_entry & PAGE_PS) return (*pdpt_entry & PAGE_USER) != 0;
 
-    PageTable *pd = (PageTable *)(uintptr_t)(*pdpt_entry & PAGE_ADDR_MASK);
+    PageTable *pd = (PageTable *)P2V(*pdpt_entry & PAGE_ADDR_MASK);
     PageTableEntry *pd_entry = &pd->entries[pd_idx];
     if (!(*pd_entry & PAGE_PRESENT)) return false;
     if (*pd_entry & PAGE_PS) return (*pd_entry & PAGE_USER) != 0;
 
-    PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
+    PageTable *pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     PageTableEntry *pt_entry = &pt->entries[pt_idx];
     if (!(*pt_entry & PAGE_PRESENT)) return false;
 
@@ -680,14 +678,25 @@ void vmm_init(BootInfo *boot_info)
         return;
     }
 
-    /* 1. Identity map the kernel code & data [0x100000, __kernel_end] */
-    uint64_t kernel_start = 0x100000;
-    uint64_t kernel_end = ((uint64_t)__kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    for (uint64_t addr = kernel_start; addr < kernel_end; addr += PAGE_SIZE) {
-        vmm_map_page(pml4, addr, addr, PAGE_WRITE);
+    /* 1. The kernel half: one PDPT for each of PML4 entries 256..511, made
+       now and never replaced -- every process's PML4 copies these entries
+       (vmm_new_process_pml4()), so whatever is mapped in the upper half
+       later (heap, device memory) is seen by all of them. No PAGE_USER at
+       this level: user code can reach nothing below it. */
+    for (int i = 256; i < 512; i++) {
+        PageTable *pdpt = vmm_alloc_table();
+        if (!pdpt) return;
+        pml4->entries[i] = V2P(pdpt) | PAGE_PRESENT | PAGE_WRITE;
     }
 
-    /* 2. Identity map all memory regions from UEFI memory map */
+    /* 2. The kernel image at KERNEL_VMA + its physical address */
+    uint64_t kernel_start = KERNEL_PHYS;
+    uint64_t kernel_end = ((uint64_t)__kernel_end - KERNEL_VMA + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (uint64_t addr = kernel_start; addr < kernel_end; addr += PAGE_SIZE) {
+        vmm_map_page(pml4, KERNEL_VMA + addr, addr, PAGE_WRITE);
+    }
+
+    /* 3. All memory from the UEFI memory map at HHDM_BASE + its address */
     MemoryRegion *regions = (MemoryRegion *)(uintptr_t)boot_info->mmap_addr;
     uint32_t region_count = boot_info->mmap_entries;
 
@@ -699,19 +708,11 @@ void vmm_init(BootInfo *boot_info)
 
         uint64_t base = regions[i].base;
         uint64_t size = regions[i].size;
+        if (base >= HHDM_SIZE) continue;
 
-        uint64_t flags = PAGE_WRITE;
-        if (regions[i].type != MEMORY_USABLE) {
-            flags |= PAGE_NX; /* Mark non-usable memory as No-Execute */
-        }
-
+        uint64_t flags = PAGE_WRITE | PAGE_NX;   /* data: the kernel runs from its image */
         for (uint64_t offset = 0; offset < size; offset += PAGE_SIZE) {
-            uint64_t addr = base + offset;
-            /* Skip only the pages that fall within the kernel boundaries (already mapped) */
-            if (addr >= kernel_start && addr < kernel_end) {
-                continue;
-            }
-            vmm_map_page(pml4, addr, addr, flags);
+            vmm_map_page(pml4, HHDM_BASE + base + offset, base + offset, flags);
         }
     }
 
@@ -721,22 +722,22 @@ void vmm_init(BootInfo *boot_info)
     pat |= (0x01ULL << 32);  /* Set PAT4 to WC (01h) */
     write_msr(0x277, pat);
 
-    /* 3. Identity map the Graphics Output Protocol (GOP) Framebuffer */
+    /* 4. The Graphics Output Protocol (GOP) framebuffer, write-combining */
     uint64_t fb_start = boot_info->fb_addr;
     uint64_t fb_size = boot_info->fb_pitch * boot_info->fb_height;
     fb_size = (fb_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
     for (uint64_t offset = 0; offset < fb_size; offset += PAGE_SIZE) {
-        vmm_map_page(pml4, fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX | PAGE_PAT);
+        vmm_map_page(pml4, HHDM_BASE + fb_start + offset, fb_start + offset, PAGE_WRITE | PAGE_NX | PAGE_PAT);
     }
 
     /* Snapshot this as the kernel PML4 -- at this exact point it's
-       guaranteed to contain only the kernel/RAM/framebuffer identity map
-       and nothing else, since no user process has run yet. New processes
-       (see vmm_new_process_pml4()) alias these entries by pointer. */
+       guaranteed to contain only the kernel half, since no user process has
+       run yet. New processes (see vmm_new_process_pml4()) copy its entries
+       256..511. */
     g_kernel_pml4 = pml4;
 
-    /* 4. Switch to our new PML4 page table by loading it into CR3 */
+    /* 5. Switch to our new PML4 page table by loading it into CR3 */
     vmm_load_cr3(pml4);
 
     serial_write_string("VMM: Switched to new page tables successfully!\r\n");
@@ -746,17 +747,22 @@ PageTable *vmm_get_current_pml4(void)
 {
     uint64_t cr3;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    return (PageTable *)(uintptr_t)cr3;
+    return (PageTable *)P2V(cr3 & PAGE_ADDR_MASK);
 }
 
-void vmm_map_mmio(uint64_t phys_addr, uint64_t size)
+void *vmm_map_mmio(uint64_t phys_addr, uint64_t size)
 {
-    PageTable *pml4 = vmm_get_current_pml4();
+    /* in the kernel half, which every process shares: at P2V(phys_addr) */
     uint64_t start = phys_addr & ~(PAGE_SIZE - 1);
     uint64_t end = (phys_addr + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    
+
     for (uint64_t addr = start; addr < end; addr += PAGE_SIZE) {
-        vmm_map_page(pml4, addr, addr, PAGE_WRITE | PAGE_NX | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH);
+        vmm_map_page(g_kernel_pml4, HHDM_BASE + addr, addr, PAGE_WRITE | PAGE_NX | PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH);
     }
+    return P2V(phys_addr);
 }
 
+uint64_t vmm_kernel_heap_phys(uint64_t virt)
+{
+    return vmm_get_phys(g_kernel_pml4, virt);
+}

@@ -269,18 +269,13 @@ static volatile uint8_t *virtio_gpu_pci_find(void)
                 pci_write_config((uint8_t)bus, slot, func, 0x04, cmd);
 
                 /* Map the MMIO regions */
-                extern void vmm_map_mmio(uint64_t phys_addr, uint64_t size);
+                extern void *vmm_map_mmio(uint64_t phys_addr, uint64_t size);
                 vmm_map_mmio(common_phys & ~4095ULL, 4096);
-                vmm_map_mmio(notify_phys & ~4095ULL, 4096);
-
-                mmio_notify = (volatile uint8_t *)(uintptr_t)notify_phys;
-                if (devcfg_phys) {
-                    vmm_map_mmio(devcfg_phys & ~4095ULL, 4096);
-                    mmio_devcfg = (volatile uint8_t *)(uintptr_t)devcfg_phys;
-                }
+                mmio_notify = (volatile uint8_t *)vmm_map_mmio(notify_phys, 4096);
+                if (devcfg_phys) mmio_devcfg = (volatile uint8_t *)vmm_map_mmio(devcfg_phys, 4096);
 
                 log_str("VIRTIO-GPU: MMIO mapped and Bus mastering enabled\r\n");
-                return (volatile uint8_t *)(uintptr_t)common_phys;
+                return (volatile uint8_t *)P2V(common_phys);
             }
         }
     }
@@ -324,10 +319,11 @@ static bool virtqueue_setup(Virtqueue *vq, uint16_t queue_idx)
     /* One physically contiguous block: the device gets ONE base address
        per ring, so back-to-back pmm_alloc_page() calls that merely
        happen to be adjacent are not good enough. */
-    uint8_t *mem = (uint8_t *)pmm_alloc_contiguous(pages_needed);
-    if (!mem) {
+    void *qphys = pmm_alloc_contiguous(pages_needed);
+    if (!qphys) {
         return false;
     }
+    uint8_t *mem = (uint8_t *)P2V((uint64_t)(uintptr_t)qphys);
 
     memset(mem, 0, pages_needed * 4096);
 

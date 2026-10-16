@@ -604,7 +604,7 @@ static int64_t ioctl_resource_create(uint32_t slot, DrmClient *c, uint64_t argp)
     void *mem = pmm_alloc_contiguous(pages);
     if (!mem) return -ENOMEM;
     uint64_t phys = (uint64_t)(uintptr_t)mem;
-    memset((void *)(uintptr_t)phys, 0, (size_t)pages * PAGE_SZ); /* identity-mapped RAM */
+    memset(P2V(phys), 0, (size_t)pages * PAGE_SZ);
 
     DrmBo *bo = &g_bos[h];
     memset(bo, 0, sizeof(*bo));
@@ -921,7 +921,7 @@ static int64_t ioctl_create_dumb(uint32_t slot, uint64_t argp)
     void *mem = pmm_alloc_contiguous(pages);
     if (!mem) return -ENOMEM;
     uint64_t phys = (uint64_t)(uintptr_t)mem;
-    memset((void *)(uintptr_t)phys, 0, (size_t)pages * PAGE_SZ);
+    memset(P2V(phys), 0, (size_t)pages * PAGE_SZ);
 
     DrmBo *bo = &g_bos[h];
     memset(bo, 0, sizeof(*bo));

@@ -215,24 +215,16 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
         for (uint64_t addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
             void *phys = find_mapped_page(pml4, addr);
 
-            /* An existing mapping at this address that ISN'T PAGE_USER means
-               this virtual address collides with kernel-identity-mapped
-               memory this process's PML4 aliases (see vmm_new_process_pml4()
-               in vmm.c) -- e.g. a low ET_EXEC link address that happens to
-               land in the shared low region. Writing segment content
-               straight into it would silently corrupt whatever the kernel
-               actually uses that shared physical page for (in the worst
-               case, a live page table). Refuse instead of corrupting
-               memory. Link the binary at a high, non-aliased address
-               (compare the stack/ET_DYN/interpreter fixes above) instead. */
+            /* An existing mapping at this address that ISN'T PAGE_USER is
+               the kernel's (its half: a segment linked there). Writing
+               segment content into it would corrupt kernel memory: refuse. */
             if (phys && !vmm_is_user_page(pml4, addr)) {
                 serial_write_string("ELF Loader Error: segment at ");
                 extern void uint_to_hex(uint64_t val, char *buf);
                 char hb[20];
                 uint_to_hex(addr, hb);
                 serial_write_string(hb);
-                serial_write_string(" collides with shared kernel memory -- refusing to load. "
-                                     "Link this binary at a high, non-identity-mapped address.\r\n");
+                serial_write_string(" collides with kernel memory -- refusing to load.\r\n");
                 return false;
             }
 
@@ -448,16 +440,10 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     /* Load main program segments */
     uint64_t load_offset = 0;
     if (hdr.e_type == 3) { // ET_DYN (PIE executable or shared library)
-        /* PML4 index 160 (0x500000000000) -- was 0x400000000 (16 GB, PML4
-           index 0) which aliases the same top-level PML4 slot as the
-           kernel/RAM/framebuffer identity map. Under per-process address
-           spaces (vmm_new_process_pml4()) that slot is shared by pointer
-           across every process, so any PIE (ET_DYN) binary loaded there
-           would be visible/writable from every other process -- silently
-           breaking isolation for anything built PIE (the common default
-           for modern toolchains). Moved to a disjoint slot, clear of
-           index 0, the interpreter base (index 224), and the user stack
-           (index 192, see below). */
+        /* PML4 index 160 (0x500000000000): clear of the low addresses a
+           program linked at a fixed address (ET_EXEC, 0x400000) uses, the
+           interpreter base (index 224) and the user stack (index 192, see
+           below). */
         load_offset = 0x500000000000ULL; // PML4 index 160
     }
     
@@ -529,13 +515,9 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     }
 
     /* 5. Map user stack (8 MB -- see below for why it grew from 64 KB).
-       PML4 index 192 (0x600000000000) -- was 0x50000000, which aliases
-       PML4 index 0, the same shared slot as the kernel/RAM/framebuffer
-       identity map. Under per-process address spaces every process's
-       stack would land in a page-table chain shared by pointer across
-       ALL processes, silently breaking isolation (see vmm_new_process_pml4()
-       in kernel/vmm.c). Moved to a slot disjoint from index 0, the ET_DYN
-       load offset (index 160), and the interpreter base (index 224). Each
+       PML4 index 192 (0x600000000000): disjoint from the low addresses of
+       fixed-address programs, the ET_DYN load offset (index 160) and the
+       interpreter base (index 224). Each
        PML4 index spans 512GB, so growing this by orders of magnitude below
        still leaves enormous headroom before the next region (/dev/fb0 at
        index 194, 0x610000000000).
