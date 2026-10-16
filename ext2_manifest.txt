@@ -118,6 +118,7 @@ F  /usr/share/wynland/qs-smoke/shell.qml    tests/qs-smoke/shell.qml
 F  /usr/share/wynland/qs-smoke/run.sh       tests/qs-smoke/run.sh
 F  /usr/share/wynland/qs-smoke/caelestia.sh tests/qs-smoke/caelestia.sh
 F  /usr/share/wynland/qs-smoke/node.sh      tests/qs-smoke/node.sh
+F  /usr/share/wynland/qs-smoke/gcc.sh       tests/qs-smoke/gcc.sh
 D /etc/xdg
 D /etc/xdg/fastfetch
 F  /etc/xdg/fastfetch/config.jsonc          rootfs/etc/xdg/fastfetch/config.jsonc
