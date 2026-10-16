@@ -134,6 +134,7 @@ syscall_entry:
     ; 5. Restore user execution context
     pop rcx                          ; Restore User RIP
     pop r11                          ; Restore User RFLAGS
+    and r11, ~0x3000                 ; IOPL 0: user code gets no port I/O, cli or sti
     pop rsp                          ; Restore User RSP
 
     ; 6. Return to User Mode (Ring 3), with the user's GS base

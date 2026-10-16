@@ -371,6 +371,32 @@ static int t_bpf_div0(void) {
 
 /* ------------------------------------------------------- mount namespace */
 
+/* user code runs with IOPL 0: the I/O ports and the interrupt flag are
+   the kernel's (a #GP, SIGSEGV), and no syscall return hands IOPL back */
+static int t_iopl_zero(void) {
+    unsigned long f;
+    getpid();
+    __asm__ volatile("pushfq; popq %0" : "=r"(f));
+    if (f & 0x3000) return 1;
+    pid_t c = fork();
+    if (c == 0) {
+        __asm__ volatile("pushfq; popq %0" : "=r"(f));
+        _exit((f & 0x3000) ? 1 : 0);
+    }
+    int st = 0;
+    waitpid(c, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 2;
+}
+static int t_port_in(void) {
+    unsigned char v;
+    __asm__ volatile("inb $0x64, %0" : "=a"(v));   /* the PS/2 controller */
+    return 0;
+}
+static int t_cli(void) {
+    __asm__ volatile("cli");
+    return 0;
+}
+
 static char g_mt[64];       /* /tmp/sandboxmnt-PID, made by main */
 
 static int put(const char *path, const char *s) {
@@ -568,6 +594,9 @@ int main(int argc, char **argv) {
     check(in_child(t_file_not_dir) == 0, "paths: a file's bytes are not directory entries");
     check(in_child(t_bpf_div0) == 1000 + SIGSYS, "seccomp: division by a zero X kills");
     check(in_child(t_procfd) == 0, "/proc/self/fd/<huge>: no such fd, no crash");
+    check(in_child(t_iopl_zero) == 0, "IOPL 0 in user code, after a syscall and in a fork child");
+    check(in_child(t_port_in) == 1000 + SIGSEGV, "I/O ports: inb from user code is a SIGSEGV");
+    check(in_child(t_cli) == 1000 + SIGSEGV, "cli from user code is a SIGSEGV");
     snprintf(g_mt, sizeof g_mt, "/tmp/sandboxmnt-%d", (int)getpid());
     {
         char p[128];

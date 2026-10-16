@@ -110,6 +110,7 @@ fork_child_entry:
     mov rbp, [rax + 96]
     mov rcx, [rax + 104]     ; saved RIP -> RCX, sysret's return-address source
     mov r11, [rax + 112]     ; saved RFLAGS -> R11, sysret's RFLAGS source
+    and r11, ~0x3000         ; IOPL 0
     mov rsp, [rax + 120]     ; saved user RSP -- child's own copy, same virtual address as the parent's
     mov r12, [rax + 24]      ; now safe: rax (the base pointer) is no longer needed after this
     xor eax, eax              ; RAX = 0: this is fork()'s return value in the child

@@ -50,7 +50,7 @@ thread_enter_user_mode:
 
     push 0x1B                ; SS (User Data 0x18 | RPL 3)
     push rsi                 ; RSP
-    push 0x3202              ; RFLAGS (Interrupts enabled, IOPL = 3)
+    push 0x202               ; RFLAGS: interrupts on, IOPL 0 (no port I/O, cli/sti from user code)
     push 0x23                ; CS (User Code 0x20 | RPL 3)
     push rdi                 ; RIP
     iretq
@@ -86,6 +86,7 @@ thread_enter_user_mode_clone:
     push rax             ; RSP
     mov rax, [rbx + 112] ; regs->rflags
     or rax, 0x200        ; Ensure interrupts are enabled (IF = 1)
+    and rax, ~0x3000     ; and IOPL 0, whatever the saved copy says
     push rax             ; RFLAGS
     push qword 0x23      ; CS
     mov rax, [rbx + 104] ; regs->rip
