@@ -792,6 +792,7 @@ typedef struct {
     int refs;                       /* 0: the slot is free */
     struct {
         int target_fd;
+        VfsFile *target_file;       /* the file it was added for (epoll_forget_fd()) */
         struct epoll_event ev;
         bool armed;                 /* EPOLLONESHOT: false once reported, until MOD */
         bool out_reported;          /* EPOLLET: EPOLLOUT already said, until it drops */
@@ -810,6 +811,34 @@ static EpollInstance *epoll_of(VfsFile *f) {
 static EpollInstance *get_epoll_instance(VfsFile **fd_table, int fd) {
     if (fd < 0 || fd >= MAX_OPEN_FILES) return NULL;
     return epoll_of(fd_table[fd]);
+}
+
+/* close(fd): as on Linux, its registrations leave every epoll set of the
+   process (unless another fd still holds the same file). They stayed: a
+   new fd with the number got EEXIST from EPOLL_CTL_ADD -- dbus-daemon
+   then turned away every client that got that number. */
+static void epoll_forget_fd(VfsFile **fd_table, int fd) {
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !fd_table[fd]) return;
+    VfsFile *f = fd_table[fd];
+    /* another fd of this process on the same object (dup() copies the
+       wrapper): the object stays open, its registrations too */
+    for (int j = 0; j < MAX_OPEN_FILES; j++) {
+        VfsFile *g = fd_table[j];
+        if (j == fd || !g) continue;
+        if (g == f || (g->node.first_cluster == f->node.first_cluster &&
+                       (f->node.first_cluster < 0xFFFFFF00u || g->current_cluster == f->current_cluster)))
+            return;
+    }
+    /* by file, not number: a set shared with a fork() child holds the
+       parent's files (the child has copies), untouched by its closes */
+    for (int i = 0; i < MAX_EPOLL_INSTANCES; i++) {
+        EpollInstance *inst = &epoll_instances[i];
+        if (inst->refs <= 0) continue;
+        for (int w = 0; w < inst->num_watches; ) {
+            if (inst->watches[w].target_file == f) inst->watches[w] = inst->watches[--inst->num_watches];
+            else w++;
+        }
+    }
 }
 
 static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int64_t timeout_ms);
@@ -1598,6 +1627,9 @@ void kfile_get(VfsFile *f) {
         KPipe *kp = g_pipes[f->current_cluster];
         if (fc == 0xFFFFFFFA) kp->readers++; else kp->writers++;
     }
+    else if (fc == 0xFFFFFFFC && f->current_cluster < MAX_PIPES && g_pipes[f->current_cluster] &&
+             g_pipes[f->current_cluster]->is_eventfd)
+        g_pipes[f->current_cluster]->readers++;     /* an eventfd: its fds (see kfile_close()) */
     else if (fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) pty_ref((int)f->current_cluster, fc == PTY_FD_MASTER);
     else if (fc == 0xFFFFFFFD) { /* SHM segment: keep close()'s decrement balanced */
         int seg_idx = (int)f->current_cluster;
@@ -1674,10 +1706,22 @@ void kfile_close(VfsFile *f) {
         int idx = (int)f->current_cluster;
         kfree(f);
         pty_unref(idx, fc == PTY_FD_MASTER);
+    } else if (fc == 0xFFFFFFFC && f->current_cluster < MAX_PIPES && g_pipes[f->current_cluster] &&
+               g_pipes[f->current_cluster]->is_eventfd) {
+        /* an eventfd: `readers` counts its fds; the last one frees it. It
+           was never freed: GLib, fish, WebKit and Qt make eventfds all the
+           time, and the 256-entry table ran out ("Too many open files in
+           system") */
+        uint32_t idx = f->current_cluster;
+        KPipe *kp = g_pipes[idx];
+        kfree(f);
+        if (kp->readers) kp->readers--;
+        if (kp->readers == 0) {
+            g_pipes[idx] = NULL;
+            kfree(kp);
+        }
     } else if (fc == 0xFFFFFFFA || fc == 0xFFFFFFFB || fc == 0xFFFFFFFC) {
-        /* Pipes/eventfd: only the small per-fd VfsFile wrapper is
-           freed, never the underlying KPipe object -- a real refcount
-           for those is still the accepted gap described at SYS_close. */
+        /* what is left of the old sentinels: only the wrapper to free */
         kfree(f);
     } else {
         vfs_close(f); /* frees f itself */
@@ -2490,6 +2534,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                Unlink first: a socket teardown may close other fds. */
             {
                 VfsFile *f = fd_table[a1];
+                epoll_forget_fd(fd_table, (int)a1);
                 fd_table[a1] = NULL;
                 kfile_close(f);
             }
@@ -2509,6 +2554,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     fd_oflags[fd] = 0;
                     fd_flags[fd] = 0;
                     VfsFile *f = fd_table[fd];
+                    epoll_forget_fd(fd_table, (int)fd);
                     fd_table[fd] = NULL;
                     kfile_close(f);
                 }
@@ -3100,6 +3146,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)-22; /* -EINVAL: only SEMAPHORE, NONBLOCK, CLOEXEC */
                 }
                 p->is_eventfd = true;
+                p->readers = 1;                           /* its fds (kfile_get/kfile_close) */
                 p->ev_semaphore = (a2 & 1) != 0;          /* EFD_SEMAPHORE */
                 p->evcount = (uint32_t)initval;
 
@@ -6311,6 +6358,12 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     case 7:                                        /* SO_SNDBUF */
                     case 8:  iv = 208 * 1024; break;               /* SO_RCVBUF */
                     case 39: iv = 1; break;                        /* SO_DOMAIN: AF_UNIX */
+                    /* SO_PEERSEC (no security module), SO_PEERGROUPS,
+                       SO_PEERPIDFD: not here. "0" for SO_PEERPIDFD was a pidfd
+                       numbered 0 to dbus-daemon -- it closed its own stdin
+                       with the connection and lost track of its fds */
+                    case 31: case 59: case 77:
+                        return (uint64_t)-92;                      /* -ENOPROTOOPT */
                     default: iv = 0; break;                        /* SO_PASSCRED etc. */
                 }
                 if (vlen == sizeof(int)) memcpy(val, &iv, sizeof(int));
@@ -6483,6 +6536,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (at >= 0) return (uint64_t)-17;     /* -EEXIST */
                     if (inst->num_watches >= MAX_EPOLL_EVENTS) return (uint64_t)-28; /* -ENOSPC */
                     inst->watches[inst->num_watches].target_fd = fd;
+                    inst->watches[inst->num_watches].target_file = fd_table[fd];
                     inst->watches[inst->num_watches].ev = event;
                     inst->watches[inst->num_watches].armed = true;
                     inst->watches[inst->num_watches].out_reported = false;

@@ -40,6 +40,7 @@
 #define SYS_spawn_as 415
 #define ZERP2 "/usr/bin/zerp2"
 #define GREETER_USER "greeter"
+#define DBUS_DAEMON "/usr/bin/dbus-daemon"
 
 extern char **environ;
 
@@ -147,21 +148,53 @@ static char **make_env(const struct passwd *pw)
     return env;
 }
 
+/* The session's D-Bus (the message bus desktop programs talk over: media
+   players, notifications, the tray): a dbus-daemon of the user's own at
+   $XDG_RUNTIME_DIR/bus, up before the session starts; its address goes
+   into the session's environment. -1: none (the session runs without). */
+static pid_t start_session_bus(const struct passwd *pw, char **env, char *addr, size_t cap)
+{
+    char sock[160];
+    snprintf(sock, sizeof sock, "/tmp/runtime-%u/bus", pw->pw_uid);
+    unlink(sock);
+    char a[200];
+    snprintf(a, sizeof a, "--address=unix:path=%s", sock);
+    char *argv[] = { DBUS_DAEMON, "--session", a, "--nofork", "--nopidfile", NULL };
+    if (access(DBUS_DAEMON, X_OK) != 0) return -1;
+    pid_t pid = spawn_as(DBUS_DAEMON, argv, env, pw->pw_name, pw->pw_uid, pw->pw_gid);
+    if (pid < 0) { logf_("could not start the session bus"); return -1; }
+    struct stat st;
+    for (int i = 0; i < 50 && stat(sock, &st) != 0; i++) usleep(100000);   /* listening: the socket is there */
+    if (stat(sock, &st) != 0) { logf_("the session bus did not come up"); kill(pid, SIGTERM); waitpid(pid, NULL, 0); return -1; }
+    snprintf(addr, cap, "DBUS_SESSION_BUS_ADDRESS=unix:path=%s", sock);
+    return pid;
+}
+
 static void run_session(const char *user)
 {
     struct passwd *pw = getpwnam(user);
     if (!pw) { logf_("no account %s", user); return; }
     input_open();
     char **env = make_env(pw);
+    static char bus_addr[200];
+    pid_t bus = start_session_bus(pw, env, bus_addr, sizeof bus_addr);
+    if (bus > 0) {
+        int n = 0;
+        while (env[n]) n++;
+        env[n] = bus_addr;
+        env[n + 1] = NULL;
+    }
     char *argv[] = { ZERP2, NULL };
     pid_t pid = spawn_as(ZERP2, argv, env, user, pw->pw_uid, pw->pw_gid);
     input_close();
+    if (pid < 0 && bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }
     if (pid < 0) { logf_("could not start the session of %s", user); sleep(2); return; }
     logf_("session of %s (uid %u): pid %d", user, pw->pw_uid, (int)pid);
     int st;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     logf_("session of %s ended (%s %d)", user, WIFEXITED(st) ? "exit" : "signal",
           WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
+    if (bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }   /* the session's bus goes with it */
 }
 
 /* The desktop the account chose on the first boot ("zerp", "caelestia"):
@@ -282,10 +315,32 @@ static void autologin_name(char *out, size_t cap)
     fclose(f);
 }
 
+/* /etc/machine-id: this installation's random id (D-Bus wants one; systemd
+   systems make it on the first boot), made once */
+static void ensure_machine_id(void)
+{
+    struct stat st;
+    if (stat("/etc/machine-id", &st) == 0 && st.st_size >= 32) return;
+    unsigned char r[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0 || read(fd, r, sizeof r) != (ssize_t)sizeof r) { if (fd >= 0) close(fd); return; }
+    close(fd);
+    FILE *f = fopen("/etc/machine-id", "w");
+    if (!f) return;
+    for (int i = 0; i < 16; i++) fprintf(f, "%02x", r[i]);
+    fputc('\n', f);
+    fclose(f);
+    chmod("/etc/machine-id", 0444);
+    mkdir("/var/lib/dbus", 0755);
+    unlink("/var/lib/dbus/machine-id");
+    if (symlink("/etc/machine-id", "/var/lib/dbus/machine-id") < 0) {}
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
     if (geteuid() != 0) { logf_("must run as root"); return 1; }
+    ensure_machine_id();
     char auto_user[64];
     autologin_name(auto_user, sizeof auto_user);
     for (;;) {

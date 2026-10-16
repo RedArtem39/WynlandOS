@@ -1,0 +1,15 @@
+#!/bin/sh
+# WynlandOS - the system's D-Bus (wynrc service "dbus"): the bus system
+# services and the desktop talk over (Ubuntu's dbus-daemon, its
+# /usr/share/dbus-1/system.conf). It runs as "messagebus".
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin
+# this installation's random id, made on the first boot (D-Bus wants one;
+# wynlogin makes it too, for a session started before this runs)
+[ -s /etc/machine-id ] || dbus-uuidgen --ensure=/etc/machine-id
+mkdir -p /var/lib/dbus
+[ -e /var/lib/dbus/machine-id ] || ln -s /etc/machine-id /var/lib/dbus/machine-id
+mkdir -p /run/dbus
+chown messagebus:messagebus /run/dbus
+rm -f /run/dbus/system_bus_socket /run/dbus/pid   # a previous boot's
+# a daemon: no console for stdin
+exec dbus-daemon --system --nofork --nopidfile </dev/null

@@ -1,0 +1,5 @@
+description=the system message bus (D-Bus)
+type=daemon
+exec=/usr/lib/wynland/dbus-system
+provide=dbus
+restart=always

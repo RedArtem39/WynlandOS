@@ -3,3 +3,4 @@ wheel:x:10:
 users:x:100:
 greeter:x:990:
 nogroup:x:65534:
+messagebus:x:991:

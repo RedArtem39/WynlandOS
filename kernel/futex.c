@@ -22,6 +22,7 @@
 #include <wynland/rtc.h>
 #include <wynland/process.h>
 #include <wynland/usercopy.h>
+#include <wynland/signal.h>
 
 extern void serial_write_string(const char *str);
 
@@ -203,6 +204,19 @@ static uint64_t abs_deadline_from_timespec(uint64_t ts_ptr, bool realtime) {
     return now_ticks + (uint64_t)(delta_ns / NS_PER_TICK) + 1;
 }
 
+/* A signal that would do something (run a handler, kill) waits for the
+   calling thread. Raised from another core between the caller's look at
+   its word and this call (a child's SIGCHLD, whose handler posts the
+   semaphore it is about to wait on -- fish): sleeping now would never end,
+   nothing else wakes it. Linux's futex_wait returns -EINTR then. */
+static bool wake_signal_pending(void) {
+    Thread *t = sched_current();
+    uint64_t p = t ? t->sig_pending : 0;
+    for (int sig = 1; p && sig < 65; sig++)
+        if ((p & (1ULL << sig)) && signal_wants_wake(t, sig)) return true;
+    return false;
+}
+
 int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                       uint64_t timeout_arg, uint64_t uaddr2, uint32_t val3) {
     uint32_t op = op_raw & ~FUTEX_OP_MASK;
@@ -239,6 +253,10 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         if (*addr != val) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return -11; /* -EAGAIN: value changed before we could sleep */
+        }
+        if (wake_signal_pending()) {
+            if (rflags & 0x200) __asm__ volatile("sti");
+            return -4;  /* -EINTR */
         }
 
         FutexQueue *q = queue_lookup(key, kaddr, true);

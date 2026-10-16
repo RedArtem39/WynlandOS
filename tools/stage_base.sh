@@ -33,7 +33,8 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  fastfetch libyyjson0
  man-db groff-base libpipeline1 libgdbm6t64 libuchardet0 libseccomp2
  w3m libgc1 libgpm2
- vulkan-tools"
+ vulkan-tools
+ dbus-daemon dbus-bin dbus-session-bus-common dbus-system-bus-common libexpat1"
 
 # 1. fetch + unpack (each package into its own dir: we ship packages, not
 #    whatever else the host would have)
@@ -212,7 +213,8 @@ L=$REPO/apps/leaf
     echo "F /usr/sbin/wynlogin $OUT/wynlogin"
     echo "D /usr/lib/wynland"
     echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"
-    for s in wynlogin testuser; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
+    for s in wynlogin testuser dbus; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     echo "F /usr/bin/leaf $L/leaf"
