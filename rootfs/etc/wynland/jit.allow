@@ -1,0 +1,8 @@
+# WynlandOS: programs that may have writable+executable memory (W^X off
+# for them). JIT compilers that write their code in place need it: V8 in
+# Node.js (and later Chromium, Electron). One absolute path per line, as
+# the program is started; read by the kernel at every execve
+# (kernel/elf.c, jit_listed()). Everything else keeps W^X, unless it is
+# started with WYNLAND_ALLOW_JIT=1.
+/usr/bin/node
+/usr/bin/nodejs

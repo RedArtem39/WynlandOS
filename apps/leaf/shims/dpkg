@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # WynlandOS - leaf's stand-in for dpkg, for what maintainer scripts ask it:
-# --compare-versions, --print-architecture, --assert-*, -s/-l of a package.
+# --compare-versions, --print-architecture, --assert-*, -s/-L of a package
+# leaf installed.
 import json, os, sys
 sys.path.insert(0, "/usr/lib/leaf")
 a = sys.argv[1:]
@@ -31,6 +32,27 @@ if a[0] == "--compare-versions" and len(a) == 4:
         r = leaf.vcmp(x, y)
     ok = {"<<": r < 0, "<=": r <= 0, "=": r == 0, "!=": r != 0, ">=": r >= 0, ">>": r > 0}[o]
     sys.exit(0 if ok else 1)
+if a[0] in ("-L", "--listfiles", "-s", "--status") and len(a) >= 2:
+    # leaf's record of the package (saved before its postinst runs);
+    # py3compile asks -L for the .py files to compile
+    try:
+        db = json.load(open("/var/lib/leaf/installed.json"))
+    except (OSError, ValueError):
+        db = {}
+    rc = 0
+    for p in a[1:]:
+        p = p.split(":")[0]
+        rec = db.get(p)
+        if rec is None:
+            sys.stderr.write(f"dpkg-query: package '{p}' is not installed\n")
+            rc = 1
+            continue
+        if a[0] in ("-L", "--listfiles"):
+            for f in sorted(set(rec.get("dirs", [])) | set(rec.get("files", []))):
+                print(f)
+        else:
+            print(f"Package: {p}\nStatus: install ok installed\nVersion: {rec.get('version', '')}\n")
+    sys.exit(rc)
 if a[0] in ("-s", "--status", "-l", "--list", "-L", "--listfiles", "-S", "--search", "--validate-version"):
     sys.exit(0 if a[0] == "--validate-version" else 1)
 sys.exit(0)

@@ -8,6 +8,7 @@
 #include <wynland/heap.h>
 #include <wynland/vma.h>
 #include <wynland/process.h>
+#include <wynland/sandbox.h>
 
 #define PF_X 1
 #define PF_W 2
@@ -313,6 +314,46 @@ static bool load_elf_segments(VfsFile *f, Elf64_Ehdr *hdr, uint64_t load_offset,
     return true;
 }
 
+/* /etc/wynland/jit.allow: programs that may have writable+executable
+   memory -- JIT compilers that write their code in place (V8: Node.js,
+   Chromium, Electron), one absolute path per line, '#' starts a comment.
+   It is root's file, read from the real root (a chroot's own copy does
+   not count, nor does a chrooted program); what it lists is the
+   administrator's choice, like starting a program with
+   WYNLAND_ALLOW_JIT=1 (W^X is hardening, not a privilege line). */
+static bool jit_listed(const char *path, const struct Process *proc)
+{
+    if (!path || path[0] != '/' || !proc || proc->root_inum) return false;
+    sandbox_real_root(true);
+    VfsFile *f = vfs_open("/etc/wynland/jit.allow");
+    char buf[2048];
+    int n = f ? vfs_read(f, buf, sizeof(buf) - 1) : 0;
+    if (f) vfs_close(f);
+    sandbox_real_root(false);
+    if (n <= 0) return false;
+    buf[n] = 0;
+    for (char *line = buf; *line; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        char save = *end;
+        *end = 0;
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        char *e = s;
+        while (*e && *e != '#' && *e != ' ' && *e != '\t' && *e != '\r') e++;
+        *e = 0;
+        bool match = *s != 0;
+        for (int k = 0; match; k++) {
+            if (s[k] != path[k]) match = false;
+            else if (!s[k]) break;
+        }
+        if (save) end++;
+        line = end;
+        if (match) return true;
+    }
+    return false;
+}
+
 bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, PageTable *pml4, const char **argv, const char **envp, struct Process *proc)
 {
     VfsFile *f = vfs_open(path);
@@ -598,7 +639,7 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     uint64_t envp_addrs[MAX_SPAWN_ENVP];
     int envp_count = 0;
 
-    if (proc) proc->allow_wx = false;   /* decided again by every image */
+    if (proc) proc->allow_wx = jit_listed(path, proc);   /* decided again by every image */
     if (envp == NULL) {
         /* g_tz_envp_line (kernel/rtc.c) is a mutable global, not a string
            literal -- filled at boot by tz_auto_detect() (or left at its

@@ -1915,10 +1915,84 @@ static int64_t sun_from_user(uint64_t uaddr, uint64_t alen, char *name, uint32_t
 
 /* name bytes -> struct sockaddr_un at uaddr, with *ulen (socklen_t) in/out
    semantics: copy at most the caller's size, report the real size. */
+/* ---- TCP over loopback (127.0.0.0/8, 0.0.0.0, our own address) ----------
+   Not through the IP stack, which only ever connected outward (no listen,
+   no accept, no 127.0.0.1): a local TCP listener is a stream Unix socket
+   named "\0inet:PORT" in the kernel, a local connect() one bound to
+   "\0inet:EPHEMERAL" and connected to it. Reads, writes, poll, epoll,
+   shutdown are the Unix socket's; its names come out as IPv4 addresses
+   (sun_to_user()). Node's servers (http.createServer, dev servers), and
+   later Chromium's and Electron's local ones, need it. */
+static bool inet_name(const char *name, uint32_t nlen, uint16_t *port) {
+    static const char pre[] = "\0inet:";
+    if (nlen < 7) return false;
+    for (int i = 0; i < 6; i++) if (name[i] != pre[i]) return false;
+    uint32_t v = 0;
+    for (uint32_t i = 6; i < nlen; i++) {
+        if (name[i] < '0' || name[i] > '9') return false;
+        v = v * 10 + (uint32_t)(name[i] - '0');
+    }
+    if (v > 65535) return false;
+    if (port) *port = (uint16_t)v;
+    return true;
+}
+
+static uint32_t inet_make_name(char *out, uint16_t port) {
+    static const char pre[] = "\0inet:";
+    uint32_t n = 0;
+    for (; n < 6; n++) out[n] = pre[n];
+    char d[8]; int k = 0;
+    do { d[k++] = (char)('0' + port % 10); port /= 10; } while (port);
+    while (k) out[n++] = d[--k];
+    return n;
+}
+
+static bool inet_is_local(uint32_t ip_be) {
+    extern uint32_t net_get_ip(void);
+    uint32_t me = net_get_ip();
+    return ip_be == 0 || (ip_be & 0xFF) == 127 || (me && ip_be == me);
+}
+
+/* the TCP fd f becomes a loopback socket bound to `port` (0: a free
+   ephemeral one) */
+static int64_t tcp_make_local(VfsFile *f, uint16_t port) {
+    static uint16_t next_port = 40000;
+    int us = usock_create(USOCK_STREAM);
+    if (us < 0) return us;
+    char name[16];
+    int64_t r = -98;   /* -EADDRINUSE */
+    if (port) {
+        r = usock_bind(us, name, inet_make_name(name, port));
+    } else {
+        for (int tries = 0; tries < 20000 && r == -98; tries++) {
+            uint16_t p = next_port++;
+            if (next_port >= 61000) next_port = 40000;
+            r = usock_bind(us, name, inet_make_name(name, p));
+        }
+    }
+    if (r < 0) { usock_unref(us); return r; }
+    f->node.first_cluster = USOCK_FD;
+    f->current_cluster = (uint32_t)us;
+    return 0;
+}
+
 static int64_t sun_to_user(uint64_t uaddr, uint64_t ulenp, const char *name, uint32_t nlen) {
     if (!uaddr || !ulenp) return 0;
     uint32_t have;
     if (copy_from_user(&have, (const void *)ulenp, sizeof(have)) != 0) return -14;
+    uint16_t iport;
+    if (inet_name(name, nlen, &iport)) {      /* a loopback TCP socket: IPv4 */
+        struct linux_sockaddr_in sin;
+        memset(&sin, 0, sizeof(sin));
+        sin.sin_family = 2;                      /* AF_INET */
+        sin.sin_port = (uint16_t)((iport >> 8) | (iport << 8));
+        sin.sin_addr = 0x0100007F;               /* 127.0.0.1 */
+        uint32_t real = sizeof(sin);
+        uint32_t c = real < have ? real : have;
+        if (c && copy_to_user((void *)uaddr, &sin, c) != 0) return -14;
+        if (copy_to_user((void *)ulenp, &real, sizeof(real)) != 0) return -14;
+        return 0;
+    }
     uint8_t buf[2 + 108 + 1];
     memset(buf, 0, sizeof(buf));
     buf[0] = 1; /* AF_UNIX */
@@ -5994,6 +6068,18 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 struct linux_sockaddr_in addr;
                 bool have_addr = (a2 != 0) && (copy_from_user(&addr, (const void *)a2, sizeof(addr)) == 0);
 
+                /* TCP to this machine: the loopback (tcp_make_local()) */
+                if (file->node.first_cluster == SOCK_FD_TCP && file->current_cluster == TCP_FD_NOT_CONNECTED &&
+                    have_addr && addr.sin_family == 2 && inet_is_local(addr.sin_addr)) {
+                    int64_t r = tcp_make_local(file, 0);
+                    if (r < 0) return (uint64_t)r;
+                    char name[16];
+                    r = usock_connect((int)file->current_cluster, name, inet_make_name(name, ntohs(addr.sin_port)),
+                                      (fd_oflags[fd] & LINUX_O_NONBLOCK) != 0);
+                    if (r == -2) r = -111;                         /* nobody listens: -ECONNREFUSED */
+                    return (uint64_t)r;
+                }
+
                 if (file->node.first_cluster == SOCK_FD_UDP) {
                     if (!have_addr) return -14; // EFAULT
                     udp_socket_connect((int)file->current_cluster, addr.sin_addr, ntohs(addr.sin_port));
@@ -6326,9 +6412,25 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 return (uint64_t)usock_bind((int)fd_table[a1]->current_cluster, name, nlen);
             }
+            if (a1 < MAX_OPEN_FILES && fd_table[a1] && fd_table[a1]->node.first_cluster == SOCK_FD_TCP &&
+                fd_table[a1]->current_cluster == TCP_FD_NOT_CONNECTED && a2) {
+                /* a TCP socket bound to a local address: a loopback listener
+                   to be (see tcp_make_local()) */
+                struct linux_sockaddr_in addr;
+                if (copy_from_user(&addr, (const void *)a2, sizeof(addr)) != 0) return (uint64_t)-14;
+                if (addr.sin_family != 2) return (uint64_t)-97;            /* -EAFNOSUPPORT */
+                if (!inet_is_local(addr.sin_addr)) return (uint64_t)-99;   /* -EADDRNOTAVAIL */
+                return (uint64_t)tcp_make_local(fd_table[a1], ntohs(addr.sin_port));
+            }
             return 0; // other sockets: pretend success (unchanged)
 
         case 50: // SYS_listen
+            if (a1 < MAX_OPEN_FILES && fd_table[a1] && fd_table[a1]->node.first_cluster == SOCK_FD_TCP &&
+                fd_table[a1]->current_cluster == TCP_FD_NOT_CONNECTED) {
+                /* never bound: an ephemeral port, as Linux autobinds */
+                int64_t r = tcp_make_local(fd_table[a1], 0);
+                if (r < 0) return (uint64_t)r;
+            }
             if (fd_is_usock(fd_table, a1)) return (uint64_t)usock_listen((int)fd_table[a1]->current_cluster, (int)a2);
             return 0;
 
@@ -6357,7 +6459,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     case 4:  iv = (int)usock_sock_error(s); break; /* SO_ERROR */
                     case 7:                                        /* SO_SNDBUF */
                     case 8:  iv = 208 * 1024; break;               /* SO_RCVBUF */
-                    case 39: iv = 1; break;                        /* SO_DOMAIN: AF_UNIX */
+                    case 39: {                                     /* SO_DOMAIN: AF_UNIX, or AF_INET (loopback TCP) */
+                        char nm[108]; uint32_t nl = 0;
+                        iv = (usock_getname(s, false, nm, &nl) == 0 && inet_name(nm, nl, NULL)) ? 2 : 1;
+                        break;
+                    }
                     /* SO_PEERSEC (no security module), SO_PEERGROUPS,
                        SO_PEERPIDFD: not here. "0" for SO_PEERPIDFD was a pidfd
                        numbered 0 to dbus-daemon -- it closed its own stdin

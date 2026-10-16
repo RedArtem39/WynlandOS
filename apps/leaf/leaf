@@ -135,6 +135,14 @@ def satisfies(have, op, want):
             "<": r <= 0, ">": r >= 0}[op]
 
 
+def prov_ok(pver, op, ver):
+    """a Provides entry of version pver (None: unversioned) for a dependency
+    (op, ver): dpkg lets an unversioned one meet only unversioned needs"""
+    if op is None:
+        return True
+    return pver is not None and satisfies(pver, op, ver)
+
+
 def parse_rel(field):
     """'a (>= 1) | b, c:any' -> [[('a','>=','1'), ('b',None,None)], [('c',None,None)]]"""
     out = []
@@ -285,7 +293,7 @@ def parse_packages(raw, url):
 class Index:
     def __init__(self):
         self.pkgs = {}       # name -> newest record
-        self.provides = {}   # virtual -> [names]
+        self.provides = {}   # virtual -> [(name, version it provides or None)]
         if not os.path.isdir(LISTS) or not os.listdir(LISTS):
             die("no package lists: run 'leaf update'")
         for fn in sorted(os.listdir(LISTS)):
@@ -298,8 +306,8 @@ class Index:
                     self.pkgs[name] = rec
         for name, rec in self.pkgs.items():
             for alts in parse_rel(rec.get("Provides", "")):
-                for pname, _, _ in alts:
-                    self.provides.setdefault(pname, []).append(name)
+                for pname, _, pver in alts:
+                    self.provides.setdefault(pname, []).append((name, pver))
 
 
 class State:
@@ -324,11 +332,15 @@ class State:
             return self.db[name]["version"]
         return self.base.get(name)
 
-    def provided(self, name):
-        """installed packages that Provide name"""
+    def provided(self, name, op=None, ver=None):
+        """installed packages that Provide name (at a version meeting op ver)"""
         out = []
         for n, rec in self.db.items():
-            if name in rec.get("provides", []):
+            pv = rec.get("provides_v", {})
+            if name in pv:
+                if prov_ok(pv[name], op, ver):
+                    out.append(n)
+            elif op is None and name in rec.get("provides", []):
                 out.append(n)
         return out
 
@@ -344,8 +356,9 @@ def dep_met(state, plan, name, op, ver):
     v = plan[name]["Version"] if name in plan else state.version(name)
     if v is not None and (op is None or satisfies(v, op, ver)):
         return True
-    if op is None and (state.provided(name) or any(
-            name in [a[0] for g in parse_rel(r.get("Provides", "")) for a in g] for r in plan.values())):
+    if state.provided(name, op, ver) or any(
+            a[0] == name and prov_ok(a[2], op, ver)
+            for r in plan.values() for g in parse_rel(r.get("Provides", "")) for a in g):
         return True
     return False
 
@@ -361,8 +374,8 @@ def resolve(index, state, names, upgrade=False):
             return True
         rec = index.pkgs.get(name)
         if rec is None:
-            for prov in index.provides.get(name, []):
-                if op is None:
+            for prov, pver in index.provides.get(name, []):
+                if prov_ok(pver, op, ver):
                     rec = index.pkgs[prov]
                     break
         if rec is None or (op and rec["Package"] == name and not satisfies(rec["Version"], op, ver)):
@@ -512,13 +525,14 @@ def install_deb(state, rec, path, conffiles_keep=True):
         if not dest.endswith(".leaf-new"):
             files.append(abspath)
     provides = [a[0] for g in parse_rel(control.get("Provides", "")) for a in g]
+    provides_v = {a[0]: a[2] for g in parse_rel(control.get("Provides", "")) for a in g}
     if old:
         for f in set(old.get("files", [])) - set(files):
             p = os.path.join(ROOT, f.lstrip("/"))
             if os.path.lexists(p) and not os.path.isdir(p):
                 os.unlink(p)
     state.db[pkg] = {"version": control.get("Version", rec["Version"]), "files": files, "dirs": dirs,
-                     "provides": provides, "depends": control.get("Depends", ""),
+                     "provides": provides, "provides_v": provides_v, "depends": control.get("Depends", ""),
                      "summary": control.get("Description", "").split("\n")[0],
                      "postrm": (scripts.get("postrm") or b"").decode("utf-8", "replace"),
                      "prerm": (scripts.get("prerm") or b"").decode("utf-8", "replace"),

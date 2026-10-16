@@ -471,11 +471,11 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): tools/multiarch_links.py $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
-	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\n' >> $@
+	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 
 $(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)

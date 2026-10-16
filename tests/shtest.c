@@ -203,6 +203,12 @@ static const struct sh_case CASES[] = {
     { "/bin/sh", "Bluetooth STAND-IN (bluez-stub, not Bluetooth): org.bluez says no adapters",
       "dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects | grep -c 'array \\['",
       "1\n" },
+    { "/bin/sh", "node: leaf install nodejs; JS + JIT, child_process, an http server on 127.0.0.1",
+      "echo wyn | ary -S leaf install nodejs > /tmp/leaf-node.log 2>&1; "
+      "node -e 'const h=require(\"http\"); let s=0; for (let i=0;i<1e6;i++) s+=i%7; "
+      "const srv=h.createServer((q,r)=>r.end(\"pong\")).listen(0,()=>h.get(\"http://127.0.0.1:\"+srv.address().port,r=>{"
+      "let d=\"\"; r.on(\"data\",c=>d+=c); r.on(\"end\",()=>{console.log(s,d,require(\"child_process\").execSync(\"echo kid\").toString().trim()); srv.close()})}))'",
+      "2999997 pong kid\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
     { "/bin/sh", "man: groff's pipeline",
