@@ -1,5 +1,6 @@
 # wynrc default runlevel (order matters for providers: wynlogin before zerp)
 dbus
+bluez-stub
 wynlogin
 testuser
 zerp

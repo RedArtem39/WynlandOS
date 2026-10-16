@@ -113,6 +113,8 @@ gcc -O2 -Wall -o "$OUT/acct-tools" apps/accounts/tools.c apps/accounts/accounts.
 # reboot, poweroff, halt (apps/power)
 gcc -O2 -Wall -o "$OUT/power" apps/power/power.c
 gcc -O2 -Wall -o "$OUT/wynlogin" apps/accounts/wynlogin.c apps/accounts/accounts.c -lcrypt
+# bluez-stub: a STAND-IN for BlueZ (no Bluetooth here), apps/bluez-stub
+gcc -O2 -Wall -o "$OUT/bluez-stub" apps/bluez-stub/bluez-stub.c $(pkg-config --cflags --libs dbus-1)
 
 # the .pycs made above are in no package
 find $PYDIRS -type d -name __pycache__ | sed "s|^$ROOT||" >> "$dirs"
@@ -214,7 +216,11 @@ L=$REPO/apps/leaf
     echo "D /usr/lib/wynland"
     echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"
     echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
-    for s in wynlogin testuser dbus; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
+    echo "D /etc/dbus-1"
+    echo "D /etc/dbus-1/system.d"
+    echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"
+    for s in wynlogin testuser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     echo "F /usr/bin/leaf $L/leaf"

@@ -1,0 +1,5 @@
+description=STAND-IN for BlueZ: answers org.bluez with "no adapters" (no Bluetooth on this system)
+type=daemon
+exec=/usr/lib/wynland/bluez-stub
+after=dbus
+restart=always
