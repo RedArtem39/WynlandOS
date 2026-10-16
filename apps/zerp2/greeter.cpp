@@ -53,12 +53,21 @@ void Greeter::login(const QString &user, const QString &password)
     send("LOGIN " + user.toUtf8().toHex() + ' ' + password.toUtf8().toHex());
 }
 
-void Greeter::createAccount(const QString &user, const QString &fullName, const QString &password)
+void Greeter::createAccount(const QString &user, const QString &fullName, const QString &password,
+                            const QString &desktop)
 {
     if (m_busy) return;
     QByteArray full = fullName.toUtf8();
     if (full.isEmpty()) full = user.toUtf8();
-    send("CREATE " + user.toUtf8().toHex() + ' ' + full.toHex() + ' ' + password.toUtf8().toHex());
+    QByteArray line = "CREATE " + user.toUtf8().toHex() + ' ' + full.toHex() + ' ' + password.toUtf8().toHex();
+    if (!desktop.isEmpty()) line += ' ' + desktop.toUtf8().toHex();
+    send(line);
+}
+
+bool Greeter::caelestia() const
+{
+    return QFile::exists(QStringLiteral("/usr/bin/quickshell")) &&
+           QFile::exists(QStringLiteral("/etc/xdg/quickshell/caelestia/shell.qml"));
 }
 
 void Greeter::readReply()

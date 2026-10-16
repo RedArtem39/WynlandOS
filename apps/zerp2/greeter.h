@@ -17,15 +17,20 @@ class Greeter : public QObject
     Q_PROPERTY(QVariantList users READ users CONSTANT)
     Q_PROPERTY(bool firstBoot READ firstBoot CONSTANT)
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
+    // the Caelestia shell is installed: the first boot offers it as the desktop
+    Q_PROPERTY(bool caelestia READ caelestia CONSTANT)
 public:
     Greeter(int reqFd, int repFd, bool firstBoot, QObject *parent = nullptr);
 
     QVariantList users() const { return m_users; }
     bool firstBoot() const { return m_first; }
     bool busy() const { return m_busy; }
+    bool caelestia() const;
 
     Q_INVOKABLE void login(const QString &user, const QString &password);
-    Q_INVOKABLE void createAccount(const QString &user, const QString &fullName, const QString &password);
+    // desktop: "zerp" (Zerp's own bar and dock) or "caelestia"
+    Q_INVOKABLE void createAccount(const QString &user, const QString &fullName, const QString &password,
+                                   const QString &desktop = QString());
     Q_INVOKABLE void quit();          // after the fade-out: wynlogin takes over
 
 signals:

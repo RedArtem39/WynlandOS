@@ -164,6 +164,30 @@ static void run_session(const char *user)
           WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
 }
 
+/* The desktop the account chose on the first boot ("zerp", "caelestia"):
+   ~/.config/wynland/desktop, the user's own file (Zerp 2.0 reads it when
+   the session starts; changing it later is editing it) */
+static void save_desktop(const char *user, const char *desktop)
+{
+    if (strcmp(desktop, "zerp") && strcmp(desktop, "caelestia")) return;
+    struct passwd *pw = getpwnam(user);
+    if (!pw || !pw->pw_dir) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/.config", pw->pw_dir);
+    mkdir(path, 0755);
+    if (chown(path, pw->pw_uid, pw->pw_gid) < 0) {}
+    snprintf(path, sizeof path, "%s/.config/wynland", pw->pw_dir);
+    mkdir(path, 0755);
+    if (chown(path, pw->pw_uid, pw->pw_gid) < 0) {}
+    snprintf(path, sizeof path, "%s/.config/wynland/desktop", pw->pw_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) { logf_("could not save the desktop choice of %s", user); return; }
+    fprintf(f, "%s\n", desktop);
+    fclose(f);
+    if (chown(path, pw->pw_uid, pw->pw_gid) < 0) {}
+    logf_("desktop of %s: %s", user, desktop);
+}
+
 /* the login screen until someone logs in: their name, or "" */
 static void greet(char *who, size_t cap)
 {
@@ -193,9 +217,9 @@ static void greet(char *who, size_t cap)
 
     char line[1024];
     while (read_line(req[0], line, sizeof line)) {
-        char f1[128], f2[256], f3[256];
-        char user[64] = "", full[128] = "", pwd[256] = "";
-        int n = sscanf(line, "%*s %127s %255s %255s", f1, f2, f3);
+        char f1[128], f2[256], f3[256], f4[64];
+        char user[64] = "", full[128] = "", pwd[256] = "", desktop[32] = "";
+        int n = sscanf(line, "%*s %127s %255s %255s %63s", f1, f2, f3, f4);
         if (!strncmp(line, "LOGIN ", 6) && n >= 2) {
             unhex(f1, user, sizeof user);
             unhex(f2, pwd, sizeof pwd);
@@ -223,6 +247,10 @@ static void greet(char *who, size_t cap)
                 continue;
             }
             logf_("first account: %s (administrator)", user);
+            if (n >= 4) {
+                unhex(f4, desktop, sizeof desktop);
+                save_desktop(user, desktop);
+            }
             snprintf(who, cap, "%s", user);
             reply(rep[1], "OK");
             break;

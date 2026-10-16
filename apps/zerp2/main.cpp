@@ -353,10 +353,11 @@ int main(int argc, char **argv)
         const int at = cfg.indexOf("greeterdemo=");
         if (at >= 0) {
             const QList<QByteArray> np = cfg.mid(at + 12).split('\n').first().trimmed().split(':');
-            if (np.size() == 2) {
+            if (np.size() == 2 || np.size() == 3) {   // NAME:PASSWORD[:DESKTOP] (zerp, caelestia)
                 const int when = cfg.contains("snapat=") ? 30000 : 8000;   // after the screen's own picture
                 QTimer::singleShot(when, greeter, [greeter, np] {
-                    if (greeter->firstBoot()) greeter->createAccount(QString::fromUtf8(np[0]), QString(), QString::fromUtf8(np[1]));
+                    if (greeter->firstBoot()) greeter->createAccount(QString::fromUtf8(np[0]), QString(), QString::fromUtf8(np[1]),
+                                                                     np.size() == 3 ? QString::fromUtf8(np[2]) : QString());
                     else greeter->login(QString::fromUtf8(np[0]), QString::fromUtf8(np[1]));
                 });
             }
@@ -375,6 +376,19 @@ int main(int argc, char **argv)
         // shells made for Hyprland (Quickshell's) talk to us as to it
         new HyprIpc(&server, outputName, scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
+        // the desktop the account chose on its first boot (wynlogin saved
+        // it): Caelestia takes the edges, our bar and dock step aside
+        // (Shell.qml: externalShell) -- and come back if it dies
+        {
+            QFile df(qEnvironmentVariable("HOME") + QStringLiteral("/.config/wynland/desktop"));
+            if (df.open(QIODevice::ReadOnly) && df.readAll().trimmed() == "caelestia" &&
+                QFile::exists(QStringLiteral("/usr/bin/quickshell"))) {
+                QTimer::singleShot(1000, &server, [&server] {
+                    server.run(QStringLiteral("mkdir -p \"$HOME/.cache\"; QT_QUICK_BACKEND=opengl "
+                                              "exec quickshell -c caelestia > \"$HOME/.cache/caelestia.log\" 2>&1"));
+                });
+            }
+        }
         // debugging: boot.cfg "wlrun=CMD[;CMD...]" -- programs started a few
         // seconds in (Wayland clients, for the picture and the tests)
         const QByteArray cfg = bootCfg();

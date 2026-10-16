@@ -35,6 +35,8 @@ Window {
     readonly property var user: users.length > 0 ? users[Math.min(current, users.length - 1)] : null
 
     property bool active: greeter.firstBoot          // the panel is up
+    // first boot: the desktop the new account starts with
+    property string desktop: "zerp"
     property bool failed: false
     property string status: greeter.firstBoot ? "new system" : "locked"
 
@@ -120,7 +122,7 @@ Window {
         id: panel
         anchors.centerIn: parent
         width: root.s(440)
-        height: root.s(580)
+        height: root.s(greeter.firstBoot && greeter.caelestia ? 640 : 580)
         radius: root.radius * 1.5
         color: root.surface0
         border.width: 1.5
@@ -210,6 +212,26 @@ Window {
                 }
             }
 
+            // first boot: which desktop -- Zerp's own bar and dock, or the
+            // Caelestia shell (Quickshell) when it is installed
+            Row {
+                visible: greeter.firstBoot && greeter.caelestia
+                anchors.horizontalCenter: parent.horizontalCenter
+                spacing: root.s(10)
+                Pill {
+                    icon: "desktop"; label: "Zerp"
+                    fg: root.desktop === "zerp" ? root.accent : root.subtext
+                    border.width: root.desktop === "zerp" ? 1 : 0; border.color: root.accent
+                    onClicked: root.desktop = "zerp"
+                }
+                Pill {
+                    icon: "desktop"; label: "Caelestia"
+                    fg: root.desktop === "caelestia" ? root.accent : root.subtext
+                    border.width: root.desktop === "caelestia" ? 1 : 0; border.color: root.accent
+                    onClicked: root.desktop = "caelestia"
+                }
+            }
+
             // the keyboard layout
             Row {
                 anchors.horizontalCenter: parent.horizontalCenter
@@ -260,7 +282,7 @@ Window {
         if (!input.text.length) { root.refuse("choose a password"); return }
         if (input.text !== againField.text) { againField.clear(); root.refuse("passwords differ"); return }
         root.status = "creating";
-        greeter.createAccount(nameField.text, "", input.text);
+        greeter.createAccount(nameField.text, "", input.text, greeter.caelestia ? root.desktop : "");
     }
     function refuse(why) {
         root.failed = true;
@@ -401,6 +423,10 @@ Window {
                 c.beginPath(); c.moveTo(w * 0.28, h * 0.38); c.lineTo(w * 0.28, h * 0.46);
                 c.moveTo(w * 0.72, h * 0.38); c.lineTo(w * 0.72, h * 0.46); c.stroke();
                 c.fillRect(w * 0.18, h * 0.46, w * 0.64, h * 0.44);
+            } else if (kind === "desktop") {
+                c.strokeRect(w * 0.1, h * 0.18, w * 0.8, h * 0.52);
+                c.beginPath(); c.moveTo(w * 0.5, h * 0.7); c.lineTo(w * 0.5, h * 0.84);
+                c.moveTo(w * 0.3, h * 0.86); c.lineTo(w * 0.7, h * 0.86); c.stroke();
             } else if (kind === "keyboard") {
                 c.strokeRect(w * 0.08, h * 0.25, w * 0.84, h * 0.5);
                 for (var i = 0; i < 4; i++) c.fillRect(w * (0.2 + i * 0.17), h * 0.36, w * 0.08, h * 0.08);
