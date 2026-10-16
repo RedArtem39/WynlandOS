@@ -66,7 +66,12 @@ static int capture(char *const argv[], char *buf, size_t cap, int timeout_ms)
     int timed_out = 0;
     for (;;) {
         long left = timeout_ms - (now_ms() - t0);
-        if (left <= 0) { timed_out = 1; kill(pid, SIGKILL); break; }
+        if (left <= 0) {
+            /* what was it stuck on: every user thread on the serial log
+               (WynlandOS debugging syscall 1000) */
+            syscall(1000);
+            timed_out = 1; kill(pid, SIGKILL); break;
+        }
         struct pollfd pf = { p[0], POLLIN, 0 };
         int r = poll(&pf, 1, (int)left);
         if (r < 0 && errno == EINTR) continue;

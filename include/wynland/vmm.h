@@ -71,6 +71,15 @@ PageTable *vmm_get_current_pml4(void);
 
 /* Get the kernel's boot-time PML4 (kernel code + identity-mapped RAM + framebuffer) */
 PageTable *vmm_get_kernel_pml4(void);
+/* CR3 := pml4 on this core, and its record of it (the scheduler and the
+   TLB shootdowns go by include/wynland/smp.h's Cpu.cr3) */
+void vmm_load_cr3(PageTable *pml4);
+/* Several page-table changes, one TLB shootdown at the end (other cores
+   running the same tables). Frames unmapped inside go back through
+   vmm_free_page_after_flush(): not before the others have flushed. */
+void vmm_tlb_batch_begin(void);
+void vmm_tlb_batch_end(void);
+void vmm_free_page_after_flush(void *frame);
 
 /* Allocate a fresh PML4 for a new process, pre-populated with the kernel's
    mappings (aliased by pointer, not deep-copied) so kernel code/interrupts/

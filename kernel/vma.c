@@ -640,7 +640,11 @@ bool vma_fault_in(Process *proc, uint64_t addr, uint32_t access)
     if ((v->prot & access) != access) return false;   /* PROT_NONE, or no write/exec */
 
     uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
-    if (vmm_get_page_flags(proc->pml4, page) & PAGE_PRESENT) return false;   /* not ours to fix */
+    /* Present by now: another core's thread of this process faulted on the
+       same page and filled it while this one waited for the kernel lock.
+       The access just runs again (a permission problem faults anew, with
+       the present bit set). */
+    if (vmm_get_page_flags(proc->pml4, page) & PAGE_PRESENT) return true;
 
     if ((v->flags & VMA_FILE) && v->file) return fault_in_file(proc, v, page);
 

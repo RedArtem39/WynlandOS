@@ -62,7 +62,7 @@ missing; anything not listed here is `-ENOSYS`.
 | 25 | `mremap` | |
 | 28 | `madvise` | `MADV_DONTNEED` frees; the rest are advice |
 | 319 | `memfd_create` | |
-| 324 | `membarrier` | `-ENOSYS` (one CPU) |
+| 324 | `membarrier` | `-ENOSYS` (callers fall back to their own fences) |
 
 ### Processes and threads
 

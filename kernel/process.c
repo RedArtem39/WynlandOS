@@ -239,7 +239,7 @@ Process *process_spawn_env(const char *path, const char **argv, const char **env
     Thread *self = sched_current();
     Process *caller_proc = self->proc;
     self->proc = p;
-    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)new_pml4) : "memory");
+    vmm_load_cr3(new_pml4);
 
     /* argv, like path, must already be kernel-owned memory (kmalloc'd
        copies, or kernel rodata string literals) by the time it reaches
@@ -251,7 +251,7 @@ Process *process_spawn_env(const char *path, const char **argv, const char **env
     bool ok = elf_load(path, &entry_point, &stack_top, new_pml4, argv, envp, p);
 
     self->proc = caller_proc;
-    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)caller_proc->pml4) : "memory");
+    vmm_load_cr3(caller_proc->pml4);
 
     if (!ok) {
         serial_write_string("process_spawn: elf_load failed for ");
@@ -291,4 +291,21 @@ Process *process_spawn_env(const char *path, const char **argv, const char **env
     p->thread_count = 1;
 
     return p;
+}
+
+/* Debugging (the thread dump, syscall 1000): processes that have exited
+   but are not torn down yet -- a thread of theirs is still around. */
+void process_dump_unreaped(void)
+{
+    extern void uint_to_str(uint64_t val, char *buf);
+    char b[24];
+    for (Process *p = g_process_list; p; p = p->next) {
+        if (!p->exited || !p->pml4 || p->pid == 0) continue;
+        serial_write_string("exited, not torn down: pid ");
+        uint_to_str(p->pid, b); serial_write_string(b);
+        serial_write_string(" "); serial_write_string(p->exe_path);
+        serial_write_string(", threads ");
+        uint_to_str((uint64_t)(int64_t)p->thread_count, b); serial_write_string(b);
+        serial_write_string("\r\n");
+    }
 }

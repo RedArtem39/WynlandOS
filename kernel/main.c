@@ -28,6 +28,7 @@
 #include <wynland/elf.h>
 #include <wynland/process.h>
 #include <wynland/rtc.h>
+#include <wynland/smp.h>
 
 /* the screen's back-buffer (drivers/video/backbuffer.c) */
 extern void compositor_init(BootInfo *info);
@@ -765,6 +766,11 @@ void kernel_main(BootInfo *boot_info)
         }
     }
 
+    /* ---- This core's data (GS) before anything asks for it: the
+       scheduler's current thread, the entry stubs' kernel stack ---- */
+    g_cpus[0].id = 0;
+    smp_set_gs(&g_cpus[0]);
+
     /* ---- Enable SSE on CPU ---- */
     {
         uint64_t cr0, cr4;
@@ -815,6 +821,7 @@ void kernel_main(BootInfo *boot_info)
 
     /* ---- Initialize Process 0 (kernel) and wire it to Thread 0 ---- */
     process_init();
+    sched_start_reaper();   /* dead processes are torn down by a thread of their own */
 
     /* ---- Initialize IRQs ---- */
     irq_init();
@@ -956,6 +963,27 @@ void kernel_main(BootInfo *boot_info)
     boot_mark("console window drawn");
     serial_write_string("Main: Terminal window drawn successfully.\r\n");
 
+    /* ---- The other CPU cores (they idle until userspace gives them
+       something to run) ---- */
+    smp_init(boot_info);
+    boot_mark("other cores up");
+
+    /* boot.cfg "dumpevery=N" (debugging): every user thread on the serial
+       log every N seconds -- what is a slow or stuck program doing? */
+    {
+        char cfg[512] = {0};
+        VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
+        if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
+        for (int i = 0; cfg[i]; i++) {
+            if ((i == 0 || cfg[i - 1] == '\n') && str_starts_with(cfg + i, "dumpevery=")) {
+                uint64_t n = 0;
+                for (const char *q = cfg + i + 10; *q >= '0' && *q <= '9'; q++) n = n * 10 + (uint64_t)(*q - '0');
+                extern uint64_t g_dump_every_ms;
+                g_dump_every_ms = n * 1000;
+            }
+        }
+    }
+
     cursor_x = 0;
     cursor_y = 0;
 
@@ -1028,5 +1056,5 @@ void kernel_main(BootInfo *boot_info)
        userspace's (init, the display server, the user's programs). There
        used to be a shell here reading every key typed -- in Zerp too --
        and running it as a kernel command. */
-    for (;;) __asm__ volatile("hlt");
+    for (;;) sched_block(NULL, SCHED_NO_DEADLINE);   /* parked for good: nothing wakes it */
 }

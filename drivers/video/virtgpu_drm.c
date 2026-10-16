@@ -33,7 +33,8 @@
  *   transfers) are heap-allocated and parked on a pending list, freed once
  *   their ticket completes.
  *
- * Runs in syscall context (interrupts off, uniprocessor): no locking.
+ * Runs in syscall context (interrupts off, under the kernel lock --
+ * include/wynland/smp.h): no locking of its own.
  */
 #include <wynland/types.h>
 #include <wynland/virtio_gpu.h>

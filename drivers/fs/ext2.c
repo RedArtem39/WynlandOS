@@ -423,6 +423,18 @@ static bool ext2_read_block(uint32_t block, void *buf) {
     return ok;
 }
 
+/* Part of a block straight from the block cache (no whole-block copy):
+   false when it is not cached */
+static bool ext2_read_cached_bytes(uint32_t block, uint32_t off, void *out, uint32_t len) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    BCacheSlot *e = bcache_slot(block);
+    bool hit = BCACHE_ON && e->valid && e->block == block && e->data;
+    if (hit) { memcpy(out, (const uint8_t *)e->data + off, len); g_bcache_hits++; }
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+    return hit;
+}
+
 static bool ext2_write_block(uint32_t block, const void *buf) {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
@@ -672,6 +684,8 @@ bool ext2_read_inode(uint32_t inum, Ext2Inode *out) {
     uint32_t off   = (index % g_inodes_per_block) * g_inode_size;
 
     if (g_inode_size < sizeof(Ext2Inode)) return false;
+
+    if (ext2_read_cached_bytes(block, off, out, sizeof(Ext2Inode))) return true;
 
     uint8_t *buf = (uint8_t *)kmalloc(g_block_size);
     if (!buf) return false;
@@ -1225,6 +1239,72 @@ bool ext2_dir_lookup(const Ext2Inode *dir, const char *name,
     return false;
 }
 
+/* ---- name lookups, cached ------------------------------------------------
+   (directory inode, name) -> inode, found or not. A path walk read every
+   directory on the way block by block, each lookup again: Qt resolving
+   QML imports (readlink and stat of every component, of paths that mostly
+   do not exist) spent ~200 us per call there -- and with several cores,
+   all of it under the kernel lock the others wait for. Any change to any
+   directory (an entry added, removed, renamed) makes the whole cache
+   stale at once: a new generation. */
+#define DCACHE_SLOTS 4096
+#define DCACHE_NAME  56
+typedef struct {
+    uint32_t gen;      /* g_dcache_gen when filled; 0: empty */
+    uint32_t dir;
+    uint32_t inum;     /* 0: the name is not there */
+    uint8_t  type;
+    uint8_t  len;
+    char     name[DCACHE_NAME];
+} DCacheEnt;
+static DCacheEnt g_dcache[DCACHE_SLOTS];
+static uint32_t g_dcache_gen = 1;
+
+static void dcache_invalidate(void)
+{
+    if (++g_dcache_gen == 0) g_dcache_gen = 1;
+}
+
+/* the directory changers (wrappers at the end of this file) */
+bool ext2_dir_add_entry(uint32_t dir_inum, Ext2Inode *dir,
+                        const char *name, uint32_t child_inum, uint8_t child_type);
+bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name);
+
+static bool ext2_dir_lookup_cached(uint32_t dir_inum, const Ext2Inode *dir, const char *name,
+                                   uint32_t *out_inum, uint8_t *out_type)
+{
+    uint32_t len = str_len_local(name);
+    if (!dir_inum || len == 0 || len >= DCACHE_NAME)
+        return ext2_dir_lookup(dir, name, out_inum, out_type);
+    uint32_t h = 2166136261u ^ dir_inum;                 /* FNV-1a */
+    for (uint32_t k = 0; k < len; k++) h = (h ^ (uint8_t)name[k]) * 16777619u;
+    DCacheEnt *e = &g_dcache[h % DCACHE_SLOTS];
+    if (e->gen == g_dcache_gen && e->dir == dir_inum && e->len == len) {
+        bool same = true;
+        for (uint32_t k = 0; k < len; k++) if (e->name[k] != name[k]) { same = false; break; }
+        if (same) {
+            if (!e->inum) return false;
+            *out_inum = e->inum;
+            if (out_type) *out_type = e->type;
+            return true;
+        }
+    }
+    uint32_t gen = g_dcache_gen;          /* the walk may wait for the disk */
+    uint32_t inum = 0;
+    uint8_t type = 0;
+    bool ok = ext2_dir_lookup(dir, name, &inum, &type);
+    e->gen = gen;
+    e->dir = dir_inum;
+    e->len = (uint8_t)len;
+    for (uint32_t k = 0; k < len; k++) e->name[k] = name[k];
+    e->inum = ok ? inum : 0;
+    e->type = type;
+    if (!ok) return false;
+    *out_inum = inum;
+    if (out_type) *out_type = type;
+    return true;
+}
+
 /* The name under which directory `dir` lists inode `inum` (not "." or
    ".."); false if it does not. */
 static bool ext2_dir_name_of(const Ext2Inode *dir, uint32_t inum, char *name, uint32_t cap) {
@@ -1331,7 +1411,7 @@ static inline uint32_t dir_entry_min_len(uint32_t name_len) {
         block.
    The parent's on-disk inode (i_size/i_mtime) is written back here so
    no caller has to remember to. */
-bool ext2_dir_add_entry(uint32_t dir_inum, Ext2Inode *dir,
+static bool ext2_dir_add_entry_impl(uint32_t dir_inum, Ext2Inode *dir,
                         const char *name, uint32_t child_inum, uint8_t child_type) {
     if (!g_group_desc || !dir || !name) return false;
 
@@ -1599,7 +1679,7 @@ static void ext2_reap_orphans(void) {
     }
 }
 
-bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
+static bool ext2_unlink_impl(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
     (void)dir_inum;
     if (!may_write_dir(dir)) return false;
     uint32_t name_len = 0;
@@ -1895,7 +1975,7 @@ static bool ext2_lookup_from(uint32_t start_inum, const char *path,
             }
             continue;
         }
-        if (!ext2_dir_lookup(&cur, comp, &next_inum, &next_type)) return false;
+        if (!ext2_dir_lookup_cached(cur_inum, &cur, comp, &next_inum, &next_type)) return false;
         next_inum = mnt_enter(next_inum, &ctx);       /* a mountpoint: what is mounted */
         if (!next_inum) return false;                 /* too many mounts stacked there */
 
@@ -1987,7 +2067,7 @@ static bool ext2_lookup_nofollow(const char *path, uint32_t *out_inum, Ext2Inode
     Ext2Inode d;
     if (!ext2_lookup_path(dir, &dinum, &d)) return false;
     if ((d.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
-    if (!ext2_dir_lookup(&d, base, out_inum, NULL)) return false;
+    if (!ext2_dir_lookup_cached(dinum, &d, base, out_inum, NULL)) return false;
     if (out_parent) *out_parent = dinum;
     return ext2_read_inode(*out_inum, out_inode);
 }
@@ -3008,7 +3088,7 @@ bool vfs_readdir(const char *path, void (*callback)(VfsNode *node)) {
  * VFS API -- rename
  * ============================================================ */
 
-bool vfs_rename(const char *oldpath, const char *newpath) {
+static bool vfs_rename_impl(const char *oldpath, const char *newpath) {
     if (ro_path(oldpath, false) || ro_path(newpath, false)) return false;
     if (dir_mount(oldpath) != dir_mount(newpath)) return false;          /* another mount (EXDEV) */
     char old_dir[MAX_PATH], old_base[MAX_FILENAME];
@@ -3258,3 +3338,28 @@ uint32_t ext2_fs_free_blocks(void)  { return g_sb.s_free_blocks_count; }
 uint32_t ext2_fs_free_inodes(void)  { return g_sb.s_free_inodes_count; }
 uint32_t ext2_fs_root_lba(void)     { return mbr_root_partition_lba(); }
 uint32_t ext2_fs_root_sectors(void) { return mbr_root_partition_sectors(); }
+
+/* The functions that change directories: the name cache goes stale before
+   (nothing caches the old state as new) and after (nor what a lookup saw
+   while one of them waited for the disk) */
+bool ext2_dir_add_entry(uint32_t dir_inum, Ext2Inode *dir,
+                        const char *name, uint32_t child_inum, uint8_t child_type) {
+    dcache_invalidate();
+    bool r = ext2_dir_add_entry_impl(dir_inum, dir, name, child_inum, child_type);
+    dcache_invalidate();
+    return r;
+}
+
+bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
+    dcache_invalidate();
+    bool r = ext2_unlink_impl(dir_inum, dir, name);
+    dcache_invalidate();
+    return r;
+}
+
+bool vfs_rename(const char *oldpath, const char *newpath) {
+    dcache_invalidate();
+    bool r = vfs_rename_impl(oldpath, newpath);
+    dcache_invalidate();
+    return r;
+}

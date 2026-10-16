@@ -18,6 +18,7 @@ SECTIONS
         KEEP(*(.text.entry))    /* Kernel entry point - must be first */
         *(.text .text.*)
     }
+    __text_end = .;             /* kernel code ends: stack dumps pick return addresses by it */
 
     /* Read-only data */
     .rodata ALIGN(4K) : {

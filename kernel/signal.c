@@ -135,6 +135,12 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
 
     Thread *t = sched_current();
     if (!t || !t->proc) return 0;
+    /* killed (signal_kill_process()) while it ran on another core: it was
+       in the middle of this syscall then -- it ends here, not in user mode */
+    if (t->state == THREAD_STATE_TERMINATED && t->proc->pid != 0) {
+        extern void thread_exit(void);
+        thread_exit();
+    }
 
     int sig;
     SigAct *act;

@@ -5,6 +5,7 @@
 #include <wynland/irq.h>
 #include <wynland/process.h>
 #include <wynland/sched.h>
+#include <wynland/smp.h>
 
 
 #define PIC1          0x20
@@ -180,72 +181,179 @@ void irq_init(void)
     serial_write_string("IRQ: Interrupts enabled on CPU.\r\n");
 }
 
+/* PS/2 bytes as they come, until the lock holder hands them on (the
+   console's and the display server's keyboard queues, the mouse driver
+   -- which moves the cursor through the GPU queue). The interrupt
+   handler only appends; whoever holds the kernel lock drains. */
+#define PS2_RING 512
+static volatile uint8_t ps2_byte[PS2_RING];
+static volatile uint8_t ps2_mouse[PS2_RING];   /* 1: from the mouse (IRQ 12) */
+static volatile uint32_t ps2_head, ps2_tail;
+
+static void ps2_push(uint8_t b, uint8_t mouse)
+{
+    uint32_t next = (ps2_head + 1) % PS2_RING;
+    if (next == ps2_tail) return;           /* full: drop */
+    ps2_byte[ps2_head] = b;
+    ps2_mouse[ps2_head] = mouse;
+    __atomic_store_n(&ps2_head, next, __ATOMIC_RELEASE);
+}
+
+static void ps2_drain(void)
+{
+    extern void mouse_handle_interrupt(uint8_t data);
+    while (ps2_tail != __atomic_load_n(&ps2_head, __ATOMIC_ACQUIRE)) {
+        uint8_t b = ps2_byte[ps2_tail];
+        uint8_t m = ps2_mouse[ps2_tail];
+        ps2_tail = (ps2_tail + 1) % PS2_RING;
+        if (m) {
+            mouse_handle_interrupt(b);
+        } else {
+            if (!g_kbd_raw_read_ms || timer_ms - g_kbd_raw_read_ms > KBD_OWNER_MS)
+                keyboard_push_scancode(b);
+            kbd_raw_queue_push(b);
+        }
+    }
+}
+
+/* The timer's device work, under the kernel lock: virtio-gpu
+   housekeeping (pending cursor update, TSC calibration, re-sending frame
+   areas a stalled host missed), the network every millisecond (on the
+   10 ms tick alone, every exchange -- a TLS handshake step, an ACK, a DNS
+   answer -- waited up to 10 ms for its packet; an empty RX ring is one
+   index compare; virtio-net has no RX interrupt of its own), the sound
+   card every 10 ms, and the PS/2 bytes. */
+static uint64_t g_hda_last_tick;
+uint64_t g_dump_every_ms;          /* boot.cfg "dumpevery=N" (kernel/main.c) */
+static void timer_device_work(void)
+{
+    if (g_dump_every_ms) {
+        static uint64_t next_dump;
+        if (!next_dump) next_dump = timer_ms + g_dump_every_ms;
+        if (timer_ms >= next_dump) {
+            next_dump = timer_ms + g_dump_every_ms;
+            sched_dump_user_threads();
+        }
+    }
+    ps2_drain();
+    extern void virtio_gpu_tick(void);
+    virtio_gpu_tick();
+    extern void net_poll(void);
+    net_poll();
+    if (timer_ticks != g_hda_last_tick) {
+        g_hda_last_tick = timer_ticks;
+        extern void hda_tick(void);
+        hda_tick();                  /* silence what the sound card just played */
+    }
+}
+
+/* What a handler left because another core held the lock
+   (smp_run_deferred(), run by the holder). */
+void irq_deferred_work(void)
+{
+    timer_device_work();
+}
+
+/* An interrupt from user mode on a thread whose process is dead, or that
+   has SIGKILL pending: the thread dies right here (the interrupted
+   context is simply dropped). Signals are otherwise delivered only on the
+   way out of a syscall, so a thread busy in user code would outlive a
+   kill -9 or its process's exit_group(). */
+static void kill_check(InterruptRegisters *regs)
+{
+    if ((regs->cs & 3) != 3) return;
+    Thread *t = sched_current();
+    if (t && t->proc && t->proc->pid != 0 &&
+        (t->proc->exited || (t->sig_pending & (1ULL << 9)))) {
+        extern void process_mark_exited(struct Process *p, int wait_status);
+        extern void thread_exit(void);
+        process_mark_exited(t->proc, 9); /* no-op if already dead */
+        thread_exit();                    /* never returns */
+    }
+}
+
+/* time accounting: whose tick, user or kernel (no lock: statistics) */
+static void tick_account(InterruptRegisters *regs)
+{
+    Thread *at = sched_current();
+    if (at && at->proc && at->proc->pid != 0) {
+        /* atomic: threads of one process tick on several cores at once */
+        if ((regs->cs & 3) == 3) __atomic_add_fetch(&at->proc->st_user_ticks, 1, __ATOMIC_RELAXED);
+        else __atomic_add_fetch(&at->proc->st_kernel_ticks, 1, __ATOMIC_RELAXED);
+    }
+}
+
+/* The kernel lock in an interrupt handler (include/wynland/smp.h): taken
+   only when free. `took` from kernel mode means the core was idle (in its
+   hlt, without the lock): do the work, give it back, switch nothing --
+   the idle loop schedules right after. */
+static void irq_leave(int took, InterruptRegisters *regs)
+{
+    if (took == 1 && (regs->cs & 3) != 3) bkl_release_mine();
+}
+
+static void lapic_irq(InterruptRegisters *regs)
+{
+    if (regs->int_no == VEC_IPI_TLB) {
+        smp_tlb_poll();
+        lapic_eoi();
+        return;
+    }
+    lapic_eoi();
+    if (regs->int_no != VEC_LAPIC_TIMER) return;      /* a wake-up: the hlt is over */
+
+    /* an AP's 1 kHz tick: preemption */
+    tick_account(regs);
+    int took = bkl_irq_enter();
+    if (took < 0) return;
+    kill_check(regs);
+    if (took == 0 || (regs->cs & 3) == 3) sched_preempt_tick();
+    irq_leave(took, regs);
+}
+
 void irq_handler(InterruptRegisters *regs)
 {
+    if ((regs->cs & 3) == 3) {   /* the frame must be on the running thread's kernel stack */
+        Thread *ct = sched_current();
+        uint64_t a = (uint64_t)(uintptr_t)regs;
+        if (ct && ct->stack_orig && (a < (uint64_t)(uintptr_t)ct->stack_orig ||
+                                     a >= (uint64_t)(uintptr_t)ct->stack_orig + THREAD_STACK_SIZE)) {
+            extern void uint_to_str(uint64_t v, char *b);
+            char b[24];
+            serial_write_string("SMP: interrupt frame off its thread's kernel stack: cpu ");
+            uint_to_str(this_cpu()->id, b); serial_write_string(b);
+            serial_write_string(" tid "); uint_to_str(ct->id, b); serial_write_string(b);
+            serial_write_string("\r\n");
+        }
+    }
+    if (regs->int_no >= 0x40) {
+        lapic_irq(regs);
+        return;
+    }
     uint64_t irq = regs->int_no - 32;
 
     if (irq == 0) {
-        /* Timer interrupt (1 kHz) */
+        /* Timer interrupt (1 kHz) on the boot core */
         timer_ms++;
-        {   /* time accounting: whose tick, user or kernel */
-            Thread *at = sched_current();
-            if (at && at->proc && at->proc->pid != 0) {
-                if ((regs->cs & 3) == 3) at->proc->st_user_ticks++;
-                else at->proc->st_kernel_ticks++;
-            }
-        }
+        bool ten = (timer_ms % TIMER_MS_PER_TICK) == 0;
+        if (ten) timer_ticks++;
+        tick_account(regs);
         /* Send End of Interrupt (EOI) to PIC before yielding */
         outb(PIC1_COMMAND, PIC_EOI);
 
-        /* Signals are otherwise delivered only on the way out of a
-           syscall, so a thread busy in user code would outlive a kill -9
-           or its process's exit_group(). Interrupted user code of a
-           thread whose process is dead, or that has SIGKILL pending,
-           dies right here (the interrupted context is simply dropped). */
-        if ((regs->cs & 3) == 3) {
-            Thread *t = sched_current();
-            if (t && t->proc && t->proc->pid != 0 &&
-                (t->proc->exited || (t->sig_pending & (1ULL << 9)))) {
-                extern void process_mark_exited(struct Process *p, int wait_status);
-                extern void thread_exit(void);
-                process_mark_exited(t->proc, 9); /* no-op if already dead */
-                thread_exit();                    /* never returns */
-            }
-        }
-
-        /* virtio-gpu housekeeping: pending cursor update, TSC
-           calibration, re-sending frame areas a stalled host missed. */
-        extern void virtio_gpu_tick(void);
-        virtio_gpu_tick();
-
-        /* the network every millisecond: on the 10 ms tick alone, every
-           exchange (a TLS handshake step, an ACK, a DNS answer) waited up
-           to 10 ms for its packet; an empty RX ring is one index compare */
-        extern void net_poll(void);
-        net_poll();
-
-        if ((timer_ms % TIMER_MS_PER_TICK) != 0) {
-            /* 1ms preemption: sched_schedule()'s deadline pass is also
-               what wakes millisecond sleepers (sched_sleep_ms()). */
-            sched_preempt_tick();
+        int took = bkl_irq_enter();
+        if (took < 0) {
+            __atomic_store_n(&g_deferred_due, 1, __ATOMIC_RELEASE);
             return;
         }
-        timer_ticks++;
-        /* Phase 22d: virtio-net has no RX interrupt of its own (confirmed:
-           no IRQ/MSI-X registration anywhere in drivers/net/) -- net_poll()
-           draining the RX virtqueue used to happen only as a side effect of
-           tcp_recv/tcp_send/udp_recv's own busy-spin loops. Now that those
-           block instead of spinning, something has to keep driving RX
-           regardless of whether any thread is actively waiting on a
-           socket, or a blocked reader would never wake up. Runs BEFORE
-           sched_preempt_tick() so it fires on literally every tick
-           unconditionally, not only on ticks where this particular thread
-           happens to get rescheduled back after a preemption. */
-        extern void hda_tick(void);
-        hda_tick();                  /* silence what the sound card just played */
-        {   /* Latency report: timer ticks more than 100 ms apart mean the
-               kernel ran that long with interrupts off. The first tick
-               after it lands on the culprit: its syscall and process. */
+        kill_check(regs);
+        __atomic_store_n(&g_deferred_due, 0, __ATOMIC_RELAXED);
+        timer_device_work();
+
+        if (ten) {   /* Latency report: timer ticks more than 100 ms apart mean the
+               kernel ran that long with interrupts off (or held the kernel
+               lock). The first tick after it lands on the culprit: its
+               syscall and process. */
             static uint64_t last_tsc;
             uint32_t lo, hi;
             __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
@@ -266,19 +374,25 @@ void irq_handler(InterruptRegisters *regs)
             }
             last_tsc = now;
         }
-        sched_preempt_tick();
+        /* 1ms preemption: sched_schedule()'s deadline pass is also
+           what wakes millisecond sleepers (sched_sleep_ms()). */
+        if (took == 0 || (regs->cs & 3) == 3) sched_preempt_tick();
+        irq_leave(took, regs);
         return;
-    } else if (irq == 1) {
-        /* Keyboard interrupt */
-        uint8_t scancode = inb(0x60);
-        if (!g_kbd_raw_read_ms || timer_ms - g_kbd_raw_read_ms > KBD_OWNER_MS)
-            keyboard_push_scancode(scancode);
-        kbd_raw_queue_push(scancode);
-    } else if (irq == 12) {
-        /* Mouse interrupt */
-        uint8_t data = inb(0x60);
-        extern void mouse_handle_interrupt(uint8_t data);
-        mouse_handle_interrupt(data);
+    } else if (irq == 1 || irq == 12) {
+        /* Keyboard / mouse: the byte now (the controller holds one),
+           the rest under the lock */
+        ps2_push(inb(0x60), irq == 12);
+        if (regs->int_no >= 40) outb(PIC2_COMMAND, PIC_EOI);
+        outb(PIC1_COMMAND, PIC_EOI);
+        int took = bkl_irq_enter();
+        if (took < 0) {
+            __atomic_store_n(&g_deferred_due, 1, __ATOMIC_RELEASE);
+            return;
+        }
+        ps2_drain();
+        irq_leave(took, regs);
+        return;
     }
 
     /* Send End of Interrupt (EOI) to PIC */

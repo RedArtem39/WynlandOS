@@ -36,6 +36,8 @@ typedef struct PACKED {
 
 /* Function to initialize IDT */
 void idt_init(BootInfo *boot_info);
+/* Load the IDT on this core (idt_init() does it for the boot core) */
+void idt_load(void);
 
 /* C handler for all exceptions and interrupts */
 void exception_handler(InterruptRegisters *regs);

@@ -1,6 +1,7 @@
 global gdt_flush
-extern current_fx_user
+extern bkl_release_mine
 %include "fpu.inc"
+%include "percpu.inc"
 
 section .text
 gdt_flush:
@@ -28,9 +29,17 @@ thread_enter_user_mode:
     ; RDI = user_entry
     ; RSI = user_stack
     cli
-    mov rcx, [rel current_fx_user]   ; fresh program: default user FPU state
+    push rdi
+    push rsi
+    sub rsp, 8                       ; aligned for the call
+    call bkl_release_mine            ; leaving the kernel: its lock goes back
+    add rsp, 8
+    pop rsi
+    pop rdi
+    mov rcx, [gs:CPU_FX_USER]        ; fresh program: default user FPU state
     FPU_RESTORE rcx
-    
+    swapgs                           ; the user's GS base (before GS is reloaded below)
+
     ; Reload data segment registers with User Data selector (0x18 | RPL 3 = 0x1B)
     ; This is required to satisfy hardware virtualization checks (DPL must match CPL) on WHPX/VT-x.
     mov ax, 0x1B
@@ -50,8 +59,12 @@ global thread_enter_user_mode_clone
 thread_enter_user_mode_clone:
     ; RDI = pointer to SyscallRegs structure
     cli
-    mov rcx, [rel current_fx_user]   ; the new thread's user FPU state (creator's copy)
+    push rdi                         ; also aligns the stack for the call
+    call bkl_release_mine            ; leaving the kernel: its lock goes back
+    pop rdi
+    mov rcx, [gs:CPU_FX_USER]        ; the new thread's user FPU state (creator's copy)
     FPU_RESTORE rcx
+    swapgs                           ; the user's GS base (before GS is reloaded below)
     mov rbx, rdi ; Save pointer to regs in rbx (which is callee-saved, so wrmsr won't touch it!)
 
     mov ax, 0x1B

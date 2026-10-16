@@ -9,10 +9,10 @@
 #include <wynland/usercopy.h>
 #include <wynland/vma.h>
 #include <wynland/vmm.h>
+#include <wynland/smp.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 
-uint8_t *current_fx_user = NULL;
 uint8_t g_fpu_xsave = 0;
 
 extern void serial_write_string(const char *str);
@@ -57,79 +57,71 @@ extern void uint_to_str(uint64_t val, char *buf);
 
 
 static Thread *thread_list = NULL;
-static Thread *current_thread = NULL;
 static uint64_t next_thread_id = 1;
-static Thread *idle_thread = NULL;
+/* Round robin over every core: the thread the last pick landed on */
+static Thread *g_rr = NULL;
+
+/* The thread running on this core (include/wynland/smp.h: each core
+   runs its own; GS finds the core's data) */
+#define current_thread (this_cpu()->current)
 
 static void disable_interrupts(void) {
     __asm__ volatile("cli");
 }
 
-/* Runs whenever every real thread is BLOCKED (Phase 22a). The 100Hz timer
-   IRQ preempts this thread like any other (it is RUNNING while executing),
-   and each preemption's sched_yield() re-enters sched_schedule(), whose
-   deadline pass converts expired futex waits back to READY -- so hlt sleeps
-   here cost at most one tick of wake latency. */
+/* Back from the idle hlt: the kernel lock again -- spinning a moment
+   (it is usually held only briefly), else sleeping until the next
+   interrupt (this core's tick, a wake-up IPI) and trying again. */
+static void idle_relock(void)
+{
+    bkl_lock();   /* spins a moment, then sleeps until the holder lets go */
+}
+
+/* Each core's idle thread: runs whenever no thread is ready for this core
+   (Phase 22a). It schedules (holding the kernel lock, interrupts off),
+   and when nothing is runnable gives the lock back and sleeps in hlt
+   until an interrupt -- the 1 kHz tick, a wake-up IPI -- then looks
+   again; each look's deadline pass also converts expired futex waits back
+   to READY, so hlt sleeps cost at most one tick of wake latency. Never on
+   the thread list: no other core may pick it. */
 static void idle_loop(void *arg) {
     (void)arg;
     for (;;) {
-        __asm__ volatile("sti; hlt");
+        sched_schedule();
+        bkl_release_mine();
+        __asm__ volatile("sti; hlt; cli" ::: "memory");
+        idle_relock();
     }
 }
 
-void sched_init(void) {
-    serial_write_string("Sched: Initializing scheduler...\r\n");
+/* An AP's start (kernel/smp.c ap_main()): it already runs on its idle
+   thread's stack, without the lock */
+void sched_idle_loop_ap(void) __attribute__((noreturn));
+void sched_idle_loop_ap(void)
+{
+    __asm__ volatile("cli");
+    idle_relock();
+    idle_loop(NULL);
+    for (;;) __asm__ volatile("hlt");
+}
 
-    // Create the main thread structure representing the current running kernel main
-    current_thread = (Thread *)kmalloc(sizeof(Thread));
-    /* Zero everything first: fields nobody sets explicitly (tls_base,
-       clear_tid, ...) were heap garbage. tls_base goes straight into
-       IA32_FS_BASE on every switch -- a non-canonical value is a #GP on
-       real hardware / KVM (TCG never checked, so it went unnoticed). */
-    memset(current_thread, 0, sizeof(Thread));
-    thread_fx_default(thread_fx_user(current_thread));
-    current_fx_user = thread_fx_user(current_thread);
-    current_thread->id = 0;
-    current_thread->rsp = 0; // Will be set on context switch
-    current_thread->stack_orig = NULL; // Main stack is not dynamically allocated by us
-    current_thread->state = THREAD_STATE_RUNNING;
-    current_thread->proc = NULL; // Wired up by process_init(), called right after sched_init()
-    current_thread->next = current_thread; // Circular linked list
-    thread_list = current_thread;
-    current_thread->wq = NULL;
-    current_thread->wq_next = NULL;
-    current_thread->wq_head = NULL;
-    current_thread->wake_deadline = SCHED_NO_DEADLINE;
-    current_thread->wake_result = 0;
-
-    /* Phase 22a: the idle thread. Without it, "all threads blocked" used to
-       be a permanent cli;hlt halt inside sched_schedule() -- correct when
-       nothing could ever unblock, fatal once real blocking exists (the
-       waker needs a CPU to run on, and only the timer can provide one by
-       preempting whoever is actually executing).
-
-       Built by hand instead of via thread_create(): sched_init() runs
-       BEFORE irq_init() (main.c boot order), and thread_create()'s trailing
-       `sti` would enable interrupts before any IDT/PIC exists. Same trampoline
-       stack layout as thread_create_ex_tls(), minus the interrupt flag flip. */
-    {
-        disable_interrupts();
-        Thread *t = (Thread *)kmalloc(sizeof(Thread));
-        memset(t, 0, sizeof(Thread));
-        thread_fx_default(thread_fx_area(t));
-        thread_fx_default(thread_fx_user(t));
-        t->id = next_thread_id++;
-        t->state = THREAD_STATE_READY;
-        t->tls_base = 0;
-        t->proc = NULL;
-        t->wq = NULL;
-        t->wq_next = NULL;
-        t->wq_head = NULL;
-        t->wake_deadline = SCHED_NO_DEADLINE;
-        t->wake_result = 0;
-
-        t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
-        t->stack_orig[0] = KSTACK_GUARD;
+/* An idle thread. fresh: it starts through thread_trampoline at its first
+   switch (the boot core's); otherwise the core is already running on its
+   stack (an AP). */
+static Thread *make_idle_thread(bool fresh)
+{
+    Thread *t = (Thread *)kmalloc(sizeof(Thread));
+    if (!t) return NULL;
+    memset(t, 0, sizeof(Thread));
+    thread_fx_default(thread_fx_area(t));
+    thread_fx_default(thread_fx_user(t));
+    t->id = next_thread_id++;
+    t->state = fresh ? THREAD_STATE_READY : THREAD_STATE_RUNNING;
+    t->wake_deadline = SCHED_NO_DEADLINE;
+    t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
+    if (!t->stack_orig) { kfree(t); return NULL; }
+    t->stack_orig[0] = KSTACK_GUARD;
+    if (fresh) {
         uint64_t *stack_top = t->stack_orig + (THREAD_STACK_SIZE / 8);
         stack_top = (uint64_t *)((uintptr_t)stack_top & ~0xF);
         *(--stack_top) = (uint64_t)thread_trampoline; // Return address
@@ -140,12 +132,52 @@ void sched_init(void) {
         *(--stack_top) = 0;                          // R14
         *(--stack_top) = 0;                          // R15
         t->rsp = (uint64_t)stack_top;
-
-        t->next = current_thread->next;
-        current_thread->next = t;
-        idle_thread = t;
-        /* leave interrupts exactly as the caller had them */
     }
+    t->next = t;    /* not on the thread list */
+    return t;
+}
+
+Thread *sched_new_ap_idle(void)
+{
+    return make_idle_thread(false);
+}
+
+void sched_init(void) {
+    serial_write_string("Sched: Initializing scheduler...\r\n");
+    Cpu *cpu = this_cpu();
+
+    // Create the main thread structure representing the current running kernel main
+    Thread *t0 = (Thread *)kmalloc(sizeof(Thread));
+    /* Zero everything first: fields nobody sets explicitly (tls_base,
+       clear_tid, ...) were heap garbage. tls_base goes straight into
+       IA32_FS_BASE on every switch -- a non-canonical value is a #GP on
+       real hardware / KVM (TCG never checked, so it went unnoticed). */
+    memset(t0, 0, sizeof(Thread));
+    thread_fx_default(thread_fx_user(t0));
+    t0->id = 0;
+    t0->rsp = 0; // Will be set on context switch
+    t0->stack_orig = NULL; // Main stack is not dynamically allocated by us
+    t0->state = THREAD_STATE_RUNNING;
+    t0->proc = NULL; // Wired up by process_init(), called right after sched_init()
+    t0->next = t0; // Circular linked list
+    t0->wake_deadline = SCHED_NO_DEADLINE;
+    t0->on_cpu = cpu->id + 1;
+    thread_list = t0;
+    g_rr = t0;
+    cpu->current = t0;
+    cpu->fx_user = thread_fx_user(t0);
+
+    /* Phase 22a: the idle thread. Without it, "all threads blocked" used to
+       be a permanent cli;hlt halt inside sched_schedule() -- correct when
+       nothing could ever unblock, fatal once real blocking exists (the
+       waker needs a CPU to run on, and only the timer can provide one by
+       preempting whoever is actually executing).
+
+       Built by hand instead of via thread_create(): sched_init() runs
+       BEFORE irq_init() (main.c boot order), and thread_create()'s trailing
+       `sti` would enable interrupts before any IDT/PIC exists. Every other
+       core gets its own (kernel/smp.c). */
+    cpu->idle = make_idle_thread(true);
 
     serial_write_string("Sched: Scheduler initialized successfully.\r\n");
 }
@@ -227,9 +259,10 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
 
     t->rsp = (uint64_t)stack_top;
 
-    // Insert into circular linked list after current_thread
-    t->next = current_thread->next;
-    current_thread->next = t;
+    // Insert into the circular list (after its head: the creator may be
+    // an idle thread, which is on no list)
+    t->next = thread_list->next;
+    thread_list->next = t;
 
     /* Back to the CALLER's interrupt state -- never an unconditional sti.
        Syscalls run with IF=0 (SFMASK), and fork()/clone() call this from
@@ -295,17 +328,101 @@ void thread_exit(void) {
     }
 }
 
-void sched_schedule(void) {
+/* ---- dead processes: torn down by a thread of their own ----------------
+   process_teardown() closes the process's files and sockets -- a TCP close
+   waits for its FIN to go out, a disk flush for the disk -- and the
+   scheduler must never sleep: a teardown that blocked inside
+   schedule_core() switched threads from within the switch, and the
+   interrupted scheduler later went on with the list pointers and the core
+   it had before (on SMP, the wrong core's data: another core's kernel
+   stack in this one's TSS). The scheduler queues the process; the reaper
+   thread tears it down where sleeping is fine. */
+#define REAP_MAX 256
+static struct Process *g_reap[REAP_MAX];
+static uint32_t g_reap_head, g_reap_tail;
+static Thread *g_reaper;
+
+static void reap_queue(struct Process *p)
+{
+    uint32_t next = (g_reap_head + 1) % REAP_MAX;
+    if (next == g_reap_tail) {              /* full: hold on to it a while */
+        serial_write_string("Sched: reaper queue full, a process leaks\r\n");
+        return;
+    }
+    g_reap[g_reap_head] = p;
+    g_reap_head = next;
+    /* only from its own wait: asleep inside a teardown (a socket close)
+       it is on another queue, and goes on with this one afterwards */
+    if (g_reaper && g_reaper->state == THREAD_STATE_BLOCKED && g_reaper->wq == (void *)g_reap) {
+        g_reaper->wake_result = 0;
+        g_reaper->state = THREAD_STATE_READY;
+        g_reaper->wq = NULL;
+    }
+}
+
+static void reaper_thread(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        __asm__ volatile("cli");
+        while (g_reap_tail != g_reap_head) {
+            struct Process *p = g_reap[g_reap_tail];
+            g_reap_tail = (g_reap_tail + 1) % REAP_MAX;
+            process_teardown(p);
+        }
+        sched_block(&g_reap, SCHED_NO_DEADLINE);   /* reap_queue() wakes it */
+    }
+}
+
+void sched_start_reaper(void)
+{
+    g_reaper = thread_create(reaper_thread, NULL);
+}
+
+/* Pick the next thread for this core and switch to it. Kernel lock held,
+   interrupts off. Returns whether it switched (and came back). Never
+   sleeps (see the reaper above). */
+static bool schedule_core(void) {
+    Cpu *cpu = this_cpu();
+    if (g_bkl_owner != (int32_t)cpu->id) {
+        static int said;
+        if (said++ < 3) {
+            extern void uint_to_hex(uint64_t val, char *buf);
+            extern void uint_to_str(uint64_t val, char *buf);
+            char b[32];
+            serial_write_string("SCHED: switching without the kernel lock: cpu ");
+            uint_to_str(cpu->id, b); serial_write_string(b);
+            serial_write_string(" owner "); uint_to_str((uint64_t)(int64_t)g_bkl_owner, b); serial_write_string(b);
+            serial_write_string(" tid "); uint_to_str(cpu->current ? cpu->current->id : 0, b); serial_write_string(b);
+            serial_write_string(cpu->current == cpu->idle ? " (idle)" : "");
+            serial_write_string(" from "); uint_to_hex((uint64_t)__builtin_return_address(0), b); serial_write_string(b);
+            serial_write_string(" stack:");
+            extern char __text_end[];
+            uint64_t *sp;
+            __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+            for (int i = 0, shown = 0; i < 1024 && shown < 16; i++) {
+                if (sp[i] >= 0x100000 && sp[i] < (uint64_t)(uintptr_t)__text_end) {
+                    serial_write_string(" ");
+                    uint_to_hex(sp[i], b); serial_write_string(b);
+                    shown++;
+                }
+            }
+            serial_write_string("\r\n");
+        }
+    }
     // Free all terminated threads (except the current one we are running on)
     if (thread_list) {
         Thread *prev = thread_list;
         Thread *curr = thread_list->next;
         do {
-            if (curr->state == THREAD_STATE_TERMINATED && curr != current_thread) {
+            /* not while a core still runs on it (its last moments in
+               thread_exit(), or killed while running elsewhere) */
+            if (curr->state == THREAD_STATE_TERMINATED && !curr->on_cpu) {
                 prev->next = curr->next;
                 if (curr == thread_list) {
                     thread_list = curr->next;
                 }
+                if (curr == g_rr) g_rr = prev;
                 Thread *to_free = curr;
                 curr = curr->next;
                 /* killed while blocked (signal_kill_process(), a fatal
@@ -338,7 +455,7 @@ void sched_schedule(void) {
                 if (to_free->proc) {
                     to_free->proc->thread_count--;
                     if (to_free->proc->exited && to_free->proc->thread_count <= 0) {
-                        process_teardown(to_free->proc);
+                        reap_queue(to_free->proc);
                     }
                 }
 
@@ -379,43 +496,36 @@ void sched_schedule(void) {
         }
     }
 
-    Thread *prev_thread = current_thread;
-    Thread *next_thread = current_thread->next;
+    Thread *prev_thread = cpu->current;
+    Thread *next_thread = NULL;
 
-    // Find the next READY thread
-    while (next_thread != current_thread) {
-        if (next_thread->state == THREAD_STATE_READY) {
-            break;
-        }
-        next_thread = next_thread->next;
+    /* The next READY thread no core is running, round robin over the
+       whole list from the last pick (shared by all cores) */
+    if (g_rr) {
+        Thread *t = g_rr->next;
+        Thread *stop = t;
+        do {
+            if (t->state == THREAD_STATE_READY && !t->on_cpu) { next_thread = t; break; }
+            t = t->next;
+        } while (t != stop);
     }
 
-    // If no other ready thread, and current thread is still running/ready, continue
-    if (next_thread->state != THREAD_STATE_READY) {
-        if (current_thread->state == THREAD_STATE_RUNNING || current_thread->state == THREAD_STATE_READY) {
-            current_thread->state = THREAD_STATE_RUNNING;
-            return;
+    if (!next_thread) {
+        /* nothing else: the current thread goes on if it can */
+        if (prev_thread != cpu->idle &&
+            (prev_thread->state == THREAD_STATE_RUNNING || prev_thread->state == THREAD_STATE_READY)) {
+            prev_thread->state = THREAD_STATE_RUNNING;
+            return false;
         }
-
-        /* Phase 22a: everything real is BLOCKED. Hand the CPU to the idle
-           thread instead of halting forever -- its hlt loop sleeps until the
-           next tick, and the tick's own preempt-yield re-runs this scan so
-           expired deadlines/wakes get picked up. The blocked thread we came
+        /* Phase 22a: everything real is BLOCKED. Hand the core to its idle
+           thread instead of halting forever. The blocked thread we came
            from keeps its parked state untouched; it resumes inside its own
            sched_block() frame whenever something marks it READY. */
-        if (idle_thread && idle_thread != current_thread &&
-            idle_thread->state == THREAD_STATE_READY) {
-            next_thread = idle_thread;
-        } else if (idle_thread && idle_thread == current_thread) {
-            /* already the idle context resuming after hlt: just go back to it */
-            current_thread->state = THREAD_STATE_RUNNING;
-            return;
-        } else {
-            serial_write_string("Sched: No ready threads! System halted.\r\n");
-            while (1) {
-                __asm__ volatile("cli; hlt");
-            }
+        if (prev_thread == cpu->idle) {
+            prev_thread->state = THREAD_STATE_RUNNING;
+            return false;
         }
+        next_thread = cpu->idle;
     }
 
     // Switch to next_thread
@@ -423,7 +533,15 @@ void sched_schedule(void) {
         prev_thread->state = THREAD_STATE_READY;
     }
     next_thread->state = THREAD_STATE_RUNNING;
-    current_thread = next_thread;
+    if (next_thread->on_cpu) {
+        serial_write_string("SCHED: picked a thread another core runs\r\n");
+    }
+    /* No other core can take prev_thread before this switch is done: they
+       all need the kernel lock this core holds until then. */
+    prev_thread->on_cpu = 0;
+    next_thread->on_cpu = cpu->id + 1;
+    cpu->current = next_thread;
+    if (next_thread != cpu->idle) g_rr = next_thread;
 
     // Context switch the Thread-Local Storage (TLS) FS Base
     {
@@ -457,14 +575,17 @@ void sched_schedule(void) {
         gdt_update_tss_rsp0(next_rsp0);
     }
 
-    // Switch address space if the new thread belongs to a different
-    // process. Pointer comparison avoids needless CR3 reloads/TLB
-    // flushes for same-process thread switches (e.g. the common case
-    // today: everything still shares Process 0, the kernel process,
-    // until process_spawn() creates real isolated processes).
-    if (next_thread->proc != prev_thread->proc && next_thread->proc) {
-        uint64_t new_cr3 = (uint64_t)(uintptr_t)next_thread->proc->pml4;
-        __asm__ volatile("mov %0, %%cr3" :: "r"(new_cr3) : "memory");
+    /* The new thread's address space (a kernel thread, an idle thread:
+       the kernel's own tables -- a dead process's must not stay loaded on
+       some core while its pages are freed). Only on a change: a reload
+       flushes the TLB. */
+    {
+        PageTable *want = (next_thread->proc && next_thread->proc->pml4)
+                          ? next_thread->proc->pml4 : vmm_get_kernel_pml4();
+        if (cpu->cr3 != (uint64_t)(uintptr_t)want) {
+            cpu->cr3 = (uint64_t)(uintptr_t)want;
+            __asm__ volatile("mov %0, %%cr3" :: "r"(cpu->cr3) : "memory");
+        }
     }
 
     /* Per-thread x87/SSE state at the switch point (kernel code uses SSE
@@ -476,16 +597,27 @@ void sched_schedule(void) {
     if (prev_thread != next_thread) {
         fpu_save(thread_fx_area(prev_thread));
         fpu_restore(thread_fx_area(next_thread));
-        current_fx_user = thread_fx_user(next_thread);
+        cpu->fx_user = thread_fx_user(next_thread);
     }
     context_switch(&prev_thread->rsp, next_thread->rsp);
+    return true;
 }
+
+void sched_schedule(void) {
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    schedule_core();
+    if (rflags & 0x200) __asm__ volatile("sti");
+}
+
 
 void sched_yield(void) {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
-    sched_schedule();
+    /* Nothing else to run here: other cores may be waiting for the kernel
+       lock (the very thread this one waits for, perhaps) */
+    if (!schedule_core()) bkl_relax();
 
     if (rflags & 0x200) {
         __asm__ volatile("sti");
@@ -499,8 +631,15 @@ volatile int g_sched_no_preempt;
 
 void sched_preempt_tick(void) {
     if (g_sched_no_preempt) return;
-    if (current_thread && current_thread->state == THREAD_STATE_RUNNING) {
-        sched_yield();
+    Cpu *cpu = this_cpu();
+    Thread *t = cpu->current;
+    if (!t || t == cpu->idle) return;
+    /* TERMINATED: killed by another core while running here -- off it */
+    if (t->state == THREAD_STATE_RUNNING || t->state == THREAD_STATE_TERMINATED) {
+        uint64_t rflags;
+        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+        schedule_core();
+        if (rflags & 0x200) __asm__ volatile("sti");
     }
 }
 
@@ -515,6 +654,16 @@ static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
     Thread *t = current_thread;
+    /* Its process is dying (exit_group(), a fatal signal, killed by
+       another core while this thread ran there): do not park. Its killer
+       woke the threads that were blocked then; one running on another
+       core that blocks only now would sleep for good -- the process never
+       torn down, its pipes and files never closed. And BLOCKED would
+       bring a TERMINATED thread back to life. */
+    if (sched_dying()) {
+        if (rflags & 0x200) __asm__ volatile("sti");
+        return -4; /* -EINTR */
+    }
     t->wq = wq;
     t->wake_deadline = wake_deadline;
     t->wake_deadline_ms = wake_deadline_ms;
@@ -562,6 +711,7 @@ void sched_unblock(Thread *t, int64_t result) {
         t->wake_result = result;
         t->state = THREAD_STATE_READY;
         t->wq = NULL;
+        smp_kick_idle();     /* an idle core may run it right away */
     }
 
     if (rflags & 0x200) {
@@ -656,6 +806,18 @@ void sched_dump_user_threads(void)
     Thread *t = thread_list;
     int guard = 0;
     if (t) do {
+        if (t->stack_orig && t->state != THREAD_STATE_TERMINATED && (!t->proc || t->proc->pid == 0)) {
+            /* a kernel thread: what it waits on */
+            char buf[32];
+            serial_write_string("kernel tid ");
+            uint_to_str(t->id, buf); serial_write_string(buf);
+            serial_write_string(t == g_reaper ? " (reaper, " : " (");
+            uint_to_str((g_reap_head + REAP_MAX - g_reap_tail) % REAP_MAX, buf); serial_write_string(buf);
+            serial_write_string(" queued) ");
+            serial_write_string(states[t->state <= THREAD_STATE_TERMINATED ? t->state : 0]);
+            serial_write_string(t->wq == (void *)g_reap ? " on its queue\r\n"
+                                : (t->wq ? " on a wait queue\r\n" : "\r\n"));
+        }
         if (t->proc && t->proc->pid != 0 && t->state != THREAD_STATE_TERMINATED && t->stack_orig) {
             char buf[32];
             serial_write_string("tid ");
@@ -712,6 +874,10 @@ void sched_dump_user_threads(void)
         }
         t = t->next;
     } while (t != thread_list && ++guard < 10000);
+    extern void process_dump_unreaped(void);
+    process_dump_unreaped();
+    extern void bkl_profile_dump(void);
+    bkl_profile_dump();
     serial_write_string("==== end ====\r\n");
     if (rflags & 0x200) __asm__ volatile("sti");
 }
@@ -720,7 +886,8 @@ bool sched_dying(void)
 {
     Thread *t = current_thread;
     return t && t->proc && t->proc->pid != 0 &&
-           ((t->sig_pending & (1ULL << 9)) || t->proc->exited);
+           ((t->sig_pending & (1ULL << 9)) || t->proc->exited ||
+            t->state == THREAD_STATE_TERMINATED);
 }
 
 Thread *sched_get_thread_list(void) {

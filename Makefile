@@ -206,7 +206,7 @@ $(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.cpp
 	@echo "  CXX(KERN)  $<"
 	@$(CXX_KERNEL) $(CXXFLAGS_KERNEL) -c $< -o $@
 
-$(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.asm $(SRC_KERNEL)/fpu.inc
+$(BUILD_KERNEL)/%.o: $(SRC_KERNEL)/%.asm $(SRC_KERNEL)/fpu.inc $(SRC_KERNEL)/percpu.inc
 	@mkdir -p $(dir $@)
 	@echo "  AS(KERN)   $<"
 	@$(AS) $(ASFLAGS) $< -o $@
@@ -446,6 +446,8 @@ QEMU_EXTRA ?=
 # RAM of the run-gl VM (a browser on YouTube wants a few GB; 4096M and up
 # can starve WSL's own VM, which has half the host's RAM by default)
 MEM ?= 3072M
+# CPU cores of the run-gl VM (user code runs on all of them at once)
+SMP ?= 4
 # Sound: an Intel HDA card with an output codec. AUDIO=pa plays through
 # PulseAudio (WSLg's server when there is one: the Windows speakers),
 # AUDIO=wav records into AUDIO_WAV (for checking it without ears),
@@ -555,6 +557,7 @@ run-gl: all
 		-machine q35,accel=kvm                            \
 		-cpu host                                         \
 		-m $(MEM)                                         \
+		-smp $(SMP)                                       \
 		-vga none                                         \
 		-bios $(OVMF_FW)                                  \
 		-drive file=$(DISK_IMAGE),format=raw              \

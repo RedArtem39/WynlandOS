@@ -9,8 +9,9 @@ global context_switch
 global thread_trampoline
 global fork_child_entry
 extern thread_exit
-extern current_fx_user
+extern bkl_release_mine
 %include "fpu.inc"
+%include "percpu.inc"
 
 ; void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 ; System V ABI: RDI = old_rsp, RSI = new_rsp
@@ -83,9 +84,13 @@ thread_trampoline:
 ; r11=32,r10=40,r9=48,r8=56,rdx=64,rsi=72,rdi=80,rbx=88,rbp=96,rip=104,
 ; rflags=112,rsp=120.
 fork_child_entry:
-    ; the child's user x87/SSE state (a copy of the parent's, see
-    ; thread_create_ex_tls()) before going back to user mode
-    mov rcx, [rel current_fx_user]
+    ; the kernel lock goes back (on the way to user mode), then the
+    ; child's user x87/SSE state (a copy of the parent's, see
+    ; thread_create_ex_tls())
+    push rdi                 ; also aligns the stack for the call
+    call bkl_release_mine
+    pop rdi
+    mov rcx, [gs:CPU_FX_USER]
     FPU_RESTORE rcx
     mov rax, rdi             ; rax = base pointer to the copied SyscallRegs
 
@@ -108,4 +113,5 @@ fork_child_entry:
     mov rsp, [rax + 120]     ; saved user RSP -- child's own copy, same virtual address as the parent's
     mov r12, [rax + 24]      ; now safe: rax (the base pointer) is no longer needed after this
     xor eax, eax              ; RAX = 0: this is fork()'s return value in the child
+    swapgs                    ; the user's GS base
     o64 sysret

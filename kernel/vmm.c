@@ -5,6 +5,7 @@
 #include <wynland/vmm.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
+#include <wynland/smp.h>
 
 extern uint8_t __kernel_end[];
 extern void *memset(void *s, int c, size_t n);
@@ -33,6 +34,71 @@ static PageTable *vmm_alloc_table(void)
 PageTable *vmm_get_kernel_pml4(void)
 {
     return g_kernel_pml4;
+}
+
+void vmm_load_cr3(PageTable *pml4)
+{
+    this_cpu()->cr3 = (uint64_t)(uintptr_t)pml4;
+    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)pml4) : "memory");
+}
+
+/* ---- the other cores' TLBs (include/wynland/smp.h) ----------------------
+   A page-table entry that was present changed: the local invlpg is not
+   enough when other cores run the same address space (threads of one
+   process) or the change is in the kernel part every process shares --
+   they may still hold the old translation and write through it, into a
+   frame already freed. tlb_shootdown() makes them flush first.
+
+   Batches (munmap, mprotect, fork's COW marking): one shootdown at the
+   end instead of an IPI round trip per page. The frames such a batch
+   frees wait for it too (vmm_free_page_after_flush()): until the other
+   cores have flushed, a stale translation could still write into them. */
+static uint32_t g_tlb_batch;
+static bool g_tlb_dirty, g_tlb_all;
+static PageTable *g_tlb_target;
+#define TLB_DEFER_MAX 256
+static void *g_tlb_defer[TLB_DEFER_MAX];
+static uint32_t g_tlb_defer_n;
+
+static void tlb_batch_flush(void)
+{
+    if (g_tlb_dirty) tlb_shootdown(g_tlb_all ? NULL : g_tlb_target);
+    g_tlb_dirty = g_tlb_all = false;
+    g_tlb_target = NULL;
+    for (uint32_t i = 0; i < g_tlb_defer_n; i++) pmm_free_page(g_tlb_defer[i]);
+    g_tlb_defer_n = 0;
+}
+
+static void tlb_remote(PageTable *pml4, uint64_t virt)
+{
+    if (g_cpu_count <= 1) return;
+    uint64_t i4 = PML4_INDEX(virt);
+    bool shared = pml4 == g_kernel_pml4 ||
+                  (g_kernel_pml4 && pml4->entries[i4] == g_kernel_pml4->entries[i4]);
+    if (!g_tlb_batch) {
+        tlb_shootdown(shared ? NULL : pml4);
+        return;
+    }
+    if (shared || (g_tlb_dirty && g_tlb_target != pml4)) g_tlb_all = true;
+    g_tlb_target = pml4;
+    g_tlb_dirty = true;
+}
+
+void vmm_tlb_batch_begin(void)
+{
+    g_tlb_batch++;
+}
+
+void vmm_tlb_batch_end(void)
+{
+    if (g_tlb_batch && --g_tlb_batch == 0) tlb_batch_flush();
+}
+
+void vmm_free_page_after_flush(void *frame)
+{
+    if (!g_tlb_batch || g_cpu_count <= 1) { pmm_free_page(frame); return; }
+    if (g_tlb_defer_n == TLB_DEFER_MAX) tlb_batch_flush();
+    g_tlb_defer[g_tlb_defer_n++] = frame;
 }
 
 PageTable *vmm_new_process_pml4(void)
@@ -133,6 +199,7 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
        end up pointing at the SAME frame, read-only, with PAGE_COW set. The
        actual duplication (or outright reclaim, if this faulter turns out to
        be the last owner) happens lazily in the page fault handler. */
+    vmm_tlb_batch_begin();   /* the parent's other threads: one flush at the end */
     for (uint64_t i4 = 0; i4 < 512; i4++) {
         if (!(parent_pml4->entries[i4] & PAGE_PRESENT)) continue;
         PageTable *pdpt = (PageTable *)(uintptr_t)(parent_pml4->entries[i4] & PAGE_ADDR_MASK);
@@ -187,12 +254,14 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
 
                     pt->entries[i1] = phys | new_flags | PAGE_PRESENT;
                     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+                    tlb_remote(parent_pml4, virt);
 
                     vmm_map_page(child_pml4, virt, phys, new_flags);
                 }
             }
         }
     }
+    vmm_tlb_batch_end();
     return true;
 }
 
@@ -242,6 +311,10 @@ void vmm_free_user_mappings(PageTable *pml4)
         pmm_free_page(pdpt);
         pml4->entries[i4] = 0;
     }
+    /* Another core still running these tables (a thread of the process
+       an execve() replaces) must not keep using them. Nothing reuses the
+       freed frames before this returns. */
+    if (g_cpu_count > 1) tlb_shootdown(pml4);
 }
 
 void vmm_destroy_process_pml4(PageTable *pml4)
@@ -296,6 +369,7 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     }
 
     /* 4. Map the physical address in the Page Table */
+    bool was_present = (pt->entries[pt_idx] & PAGE_PRESENT) != 0;
     pt->entries[pt_idx] = phys | flags | PAGE_PRESENT;
 
     // if (virt >= 0x700000000000ULL) {
@@ -309,8 +383,10 @@ void vmm_map_page(PageTable *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     //     uint_to_str(pt_idx, buf); serial_write_string(buf); serial_write_string(")\r\n");
     // }
 
-    /* 5. Invalidate TLB for this virtual address */
+    /* 5. Invalidate TLB for this virtual address (other cores too, when
+       it replaced a mapping: nothing caches a not-present entry) */
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    if (was_present) tlb_remote(pml4, virt);
 
     if (rflags & 0x200) {
         __asm__ volatile("sti\n\tnop" ::: "memory");
@@ -342,10 +418,12 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
     PageTable *pt = (PageTable *)(uintptr_t)(*pd_entry & PAGE_ADDR_MASK);
     
     /* Clear entry */
+    bool was_present = (pt->entries[pt_idx] & PAGE_PRESENT) != 0;
     pt->entries[pt_idx] = 0;
 
-    /* Invalidate TLB */
+    /* Invalidate TLB (here and on the other cores) */
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    if (was_present) tlb_remote(pml4, virt);
 
 cleanup:
     if (rflags & 0x200) {
@@ -383,6 +461,7 @@ bool vmm_protect_page(PageTable *pml4, uint64_t virt, uint64_t flags)
     uint64_t phys = *pt_entry & PAGE_ADDR_MASK;
     *pt_entry = phys | flags | PAGE_PRESENT;
     __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    tlb_remote(pml4, virt);
     ok = true;
 
 cleanup:
@@ -658,8 +737,7 @@ void vmm_init(BootInfo *boot_info)
     g_kernel_pml4 = pml4;
 
     /* 4. Switch to our new PML4 page table by loading it into CR3 */
-    uint64_t pml4_phys = (uint64_t)(uintptr_t)pml4;
-    __asm__ volatile("mov %0, %%cr3" :: "r"(pml4_phys) : "memory");
+    vmm_load_cr3(pml4);
 
     serial_write_string("VMM: Switched to new page tables successfully!\r\n");
 }

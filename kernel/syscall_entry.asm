@@ -1,18 +1,17 @@
 global syscall_entry
 extern syscall_dispatcher
-extern current_kernel_stack
 extern signal_deliver_check
-extern current_fx_user
+extern bkl_lock
+extern bkl_release_mine
 %include "fpu.inc"
-
-section .data
-user_stack_temp: dq 0
+%include "percpu.inc"
 
 section .text
 syscall_entry:
-    ; 1. Save user stack and switch to kernel stack
-    mov [rel user_stack_temp], rsp
-    mov rsp, [rel current_kernel_stack]
+    ; 1. This core's data (GS), save user stack and switch to kernel stack
+    swapgs
+    mov [gs:CPU_USER_RSP], rsp
+    mov rsp, [gs:CPU_KSTACK]
 
     ; ABI-alignment pad: 16 GPR pushes + 1 "push rsp" (7th arg) below is an
     ; ODD number of qword pushes, which leaves RSP at (16-aligned - 8) right
@@ -24,7 +23,7 @@ syscall_entry:
     sub rsp, 8
 
     ; 2. Push user state (RIP, RFLAGS, RSP) onto the kernel stack
-    push qword [rel user_stack_temp] ; User RSP
+    push qword [gs:CPU_USER_RSP]     ; User RSP
     push r11                         ; User RFLAGS
     push rcx                         ; User RIP
     
@@ -46,12 +45,25 @@ syscall_entry:
     ; 2b. Save the caller's x87/SSE state: kernel C code uses SSE registers
     ; too, and user code (glibc) relies on them surviving a syscall. RBX was
     ; saved above and is free here; RAX (the syscall number) is untouched.
-    mov rbx, [rel current_fx_user]
+    mov rbx, [gs:CPU_FX_USER]
     push rax
     push rdx
     FPU_SAVE rbx
     pop rdx
     pop rax
+
+    ; 2c. The kernel lock (include/wynland/smp.h): other cores may be in
+    ; the kernel. The call clobbers the argument registers: back from the
+    ; saved frame (r10 at +40, r9 +48, r8 +56, rdx +64, rsi +72, rdi +80).
+    push rax                 ; also aligns the stack for the call
+    call bkl_lock
+    pop rax
+    mov r10, [rsp + 40]
+    mov r9,  [rsp + 48]
+    mov r8,  [rsp + 56]
+    mov rdx, [rsp + 64]
+    mov rsi, [rsp + 72]
+    mov rdi, [rsp + 80]
 
     ; 3. Setup arguments for syscall_dispatcher(num, a1, a2, a3, a4, a5)
     mov r9, r8         ; a5 (User R8 -> R9)
@@ -86,10 +98,14 @@ syscall_entry:
     ; CPL 0) -- corrupting live user data. sysret reloads RFLAGS from R11.
     cli
 
-    ; 3c. The user's x87/SSE state back (possibly replaced by rt_sigreturn or
-    ; reset by execve). RDI is restored from the stack below.
+    ; 3c. The kernel lock goes back (before the FPU state: C code may use
+    ; SSE), then the user's x87/SSE state (possibly replaced by
+    ; rt_sigreturn or reset by execve). RDI is restored from the stack below.
     mov rbx, rax
-    mov rdi, [rel current_fx_user]
+    sub rsp, 8
+    call bkl_release_mine
+    add rsp, 8
+    mov rdi, [gs:CPU_FX_USER]
     FPU_RESTORE rdi
     mov rax, rbx
 
@@ -110,7 +126,7 @@ syscall_entry:
 
     ; Note: no compensating `add rsp,8` is needed for the alignment pad
     ; pushed above -- the kernel stack pointer is unconditionally
-    ; re-initialized from current_kernel_stack on the next syscall entry
+    ; re-initialized from the core's kstack on the next syscall entry
     ; (see top of this function), and `pop rsp` below immediately switches
     ; RSP back to the user stack anyway, so the pad qword is simply
     ; abandoned along with the rest of this frame.
@@ -119,6 +135,7 @@ syscall_entry:
     pop rcx                          ; Restore User RIP
     pop r11                          ; Restore User RFLAGS
     pop rsp                          ; Restore User RSP
-    
-    ; 6. Return to User Mode (Ring 3)
+
+    ; 6. Return to User Mode (Ring 3), with the user's GS base
+    swapgs
     o64 sysret

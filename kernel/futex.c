@@ -299,19 +299,25 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
 
         uint64_t rflags;
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-        volatile int32_t *a2p = (volatile int32_t *)uaddr2;
-        int32_t old = *a2p, nv;
-        switch (opc) {
-        case 0: nv = oparg; break;           /* SET */
-        case 1: nv = old + oparg; break;     /* ADD */
-        case 2: nv = old | oparg; break;     /* OR */
-        case 3: nv = old & ~oparg; break;    /* ANDN */
-        case 4: nv = old ^ oparg; break;     /* XOR */
-        default:
+        /* A real atomic update (lock cmpxchg): the process's threads on
+           other cores change this word with atomics of their own at the
+           same time -- a plain load and store lost their update (a
+           semaphore post, a condvar sequence), and a waiter slept on. */
+        if (opc > 4) {
             if (rflags & 0x200) __asm__ volatile("sti");
             return -38;
         }
-        *a2p = nv;
+        int32_t *a2p = (int32_t *)uaddr2;
+        int32_t old = __atomic_load_n(a2p, __ATOMIC_RELAXED), nv;
+        do {
+            switch (opc) {
+            case 0:  nv = oparg; break;           /* SET */
+            case 1:  nv = old + oparg; break;     /* ADD */
+            case 2:  nv = old | oparg; break;     /* OR */
+            case 3:  nv = old & ~oparg; break;    /* ANDN */
+            default: nv = old ^ oparg; break;     /* XOR */
+            }
+        } while (!__atomic_compare_exchange_n(a2p, &old, nv, false, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));
         bool cond;
         switch (cmp) {
         case 0: cond = old == cmparg; break;

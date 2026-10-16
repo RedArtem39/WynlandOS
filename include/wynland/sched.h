@@ -99,6 +99,10 @@ typedef struct Thread {
     uint32_t in_syscall;      /* syscall_dispatcher() depth: >0 inside one (its own
                                  nested calls -- clone's fork -- are not filtered again) */
     char     comm[16];        /* prctl(PR_SET_NAME) */
+    uint32_t on_cpu;          /* 1 + the core running it (include/wynland/smp.h), 0: none.
+                                 RUNNING alone is not enough: a thread switched
+                                 away keeps being "on" its core until the switch
+                                 is done, and a killed one may still run there. */
     uint8_t fx_raw[FPU_AREA_MAX + 64];
     uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;
@@ -134,15 +138,17 @@ static inline void fpu_restore(uint8_t *area)
     else             __asm__ volatile("fxrstor64 (%0)" :: "r"(area) : "memory");
 }
 
-/* The running thread's fx_user image: the syscall/interrupt entry stubs
-   save into it on entry from user mode and restore from it on return. */
-extern uint8_t *current_fx_user;
+/* The running thread's fx_user image is its core's Cpu.fx_user
+   (include/wynland/smp.h): the syscall/interrupt entry stubs save into it
+   on entry from user mode and restore from it on return. */
 
 /* Power-on-like user FPU state: x87 control word 0x37F, MXCSR 0x1F80
    (all exceptions masked), everything else zero. */
 void thread_fx_default(uint8_t *area);
 
 void sched_init(void);
+/* The thread that tears down dead processes (after process_init()) */
+void sched_start_reaper(void);
 
 /* The current thread is to die (SIGKILL pending, or its process exited):
    a blocking wait gives up -- the syscall returns -EINTR through its normal

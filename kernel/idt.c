@@ -190,7 +190,20 @@ void idt_init(BootInfo *boot_info)
     idt_set_gate(46, (uint64_t)irq14, 0x08, 0x8E);
     idt_set_gate(47, (uint64_t)irq15, 0x08, 0x8E);
 
+    /* The local APIC's vectors (include/wynland/smp.h) */
+    extern void irqlapic_timer(), irqipi_wake(), irqipi_tlb(), irq_spurious();
+    idt_set_gate(0x40, (uint64_t)irqlapic_timer, 0x08, 0x8E);
+    idt_set_gate(0x41, (uint64_t)irqipi_wake,    0x08, 0x8E);
+    idt_set_gate(0x42, (uint64_t)irqipi_tlb,     0x08, 0x8E);
+    idt_set_gate(0xFF, (uint64_t)irq_spurious,   0x08, 0x8E);
+
     /* Load IDT register */
+    idt_load();
+}
+
+/* The same IDT on every core */
+void idt_load(void)
+{
     __asm__ volatile("lidt %0" :: "m"(idt_ptr));
 }
 
@@ -267,6 +280,19 @@ void exception_handler(InterruptRegisters *regs)
     if ((regs->cs & 0x03) == 3) {
         serial_write_string("\r\n======================================\r\n");
         serial_write_string("!!! USER MODE PROCESS CRASHED !!!\r\n");
+        {
+            extern void uint_to_str(uint64_t val, char *buf);
+            char b[24];
+            uint32_t cpu_id;
+            __asm__ volatile("mov %%gs:32, %0" : "=r"(cpu_id));
+            Thread *ct = sched_current();
+            serial_write_string("CPU "); uint_to_str(cpu_id, b); serial_write_string(b);
+            if (ct) {
+                serial_write_string(", thread "); uint_to_str(ct->id, b); serial_write_string(b);
+                if (ct->proc) { serial_write_string(" of "); serial_write_string(ct->proc->exe_path); }
+            }
+            serial_write_string("\r\n");
+        }
         serial_write_string("Exception: ");
         if (regs->int_no < 32) {
             serial_write_string(exception_messages[regs->int_no]);
@@ -390,6 +416,36 @@ void exception_handler(InterruptRegisters *regs)
         serial_write_string("\r\n");
     } else {
         serial_write_string("Type: Unknown Interrupt\r\n");
+    }
+    {   /* where: the core, its thread and process, the kernel lock, and
+           the kernel stack's code addresses (probable return addresses) */
+        extern void uint_to_str(uint64_t val, char *buf);
+        extern volatile int32_t g_bkl_owner;
+        char b[32];
+        Thread *pt = sched_current();
+        uint32_t cpu_id;
+        __asm__ volatile("mov %%gs:32, %0" : "=r"(cpu_id));
+        serial_write_string("CPU "); uint_to_str(cpu_id, b); serial_write_string(b);
+        serial_write_string(", lock held by "); uint_to_str((uint64_t)(int64_t)g_bkl_owner, b); serial_write_string(b);
+        if (pt) {
+            serial_write_string(", thread "); uint_to_str(pt->id, b); serial_write_string(b);
+            if (pt->proc) { serial_write_string(" of "); serial_write_string(pt->proc->exe_path); }
+        }
+        serial_write_string("\r\nkernel stack:");
+        extern char __text_end[];
+        uint64_t *sp = (uint64_t *)(uintptr_t)regs->rsp;
+        for (int i = 0, shown = 0; i < 512 && shown < 24 && (regs->cs & 3) == 0 &&
+                                     regs->rsp >= 0x100000 && regs->rsp < 0x100000000ULL; i++) {
+            uint64_t w = sp[i];
+            if (w >= 0x100000 && w < (uint64_t)(uintptr_t)__text_end) {
+                extern void uint_to_hex(uint64_t val, char *buf);
+                uint_to_hex(w, b);
+                serial_write_string(" ");
+                serial_write_string(b);
+                shown++;
+            }
+        }
+        serial_write_string("\r\n");
     }
     serial_write_string("======================================\r\n");
 

@@ -5,6 +5,7 @@
 #include <wynland/random.h>
 #include <wynland/hda.h>
 #include <wynland/vmm.h>
+#include <wynland/smp.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/heap.h>
@@ -367,8 +368,8 @@ extern void kfree(void *ptr);
 /* ---- process lifecycle helpers (wait4/waitid/kill/exit_group) ---- */
 
 /* Set by the clone() process path right before it runs the fork code for a
-   vfork (CLONE_VM|CLONE_VFORK); consumed there. Syscalls run with
-   interrupts off on one CPU, so nothing can observe it in between. */
+   vfork (CLONE_VM|CLONE_VFORK); consumed there. Syscalls run under the kernel
+   lock with interrupts off, so nothing can observe it in between. */
 static bool g_fork_share_mm = false;
 /* the process the last fork made (clone() looks at it: its pid as the
    caller sees it can be another number) */
@@ -480,7 +481,7 @@ static void user_unmap_page(PageTable *pml4, uint64_t va)
     if (!(pte & PAGE_USER)) return;
     vmm_unmap_page(pml4, va);
     if (!(pte & PAGE_SHARED_MAP) || (pte & PAGE_SHARED_REF))
-        pmm_free_page((void *)(uintptr_t)(pte & PAGE_ADDR_MASK));
+        vmm_free_page_after_flush((void *)(uintptr_t)(pte & PAGE_ADDR_MASK));
 }
 
 /* The part of the address space a process may map, unmap and protect
@@ -503,9 +504,11 @@ static bool user_map_range_ok(uint64_t addr, uint64_t len)
    parts of the page tables whole. Caller checked the range. */
 static void user_unmap_range(PageTable *pml4, uint64_t addr, uint64_t end)
 {
+    vmm_tlb_batch_begin();      /* other cores running this process: one flush */
     for (uint64_t a = vmm_next_mapped(pml4, addr, end); a < end;
          a = vmm_next_mapped(pml4, a + PAGE_SIZE, end))
         user_unmap_page(pml4, a);
+    vmm_tlb_batch_end();
 }
 
 /* Does [addr, end) contain a page that isn't the process's own? The
@@ -955,13 +958,20 @@ static const char *proc_sys_text(const char *path) {
     return NULL;
 }
 
-/* /proc/meminfo, cpuinfo, stat, uptime, loadavg: made when opened (what
-   fastfetch, top and the Boehm GC in w3m read). One CPU. */
+/* /proc/meminfo, cpuinfo, stat, uptime, loadavg and the CPU lists in
+   /sys/devices/system/cpu: made when opened (what fastfetch, top and the
+   Boehm GC in w3m read; glibc's get_nprocs(), which sizes the thread pools
+   of Qt, WebKit, GStreamer and make -j, counts the cores here). */
 typedef struct { char *b; uint32_t n, cap; } PText;
 static void pt_s(PText *t, const char *s) { while (*s && t->n + 1 < t->cap) t->b[t->n++] = *s++; }
 static void pt_u(PText *t, uint64_t v) { char d[24]; uint_to_str(v, d); pt_s(t, d); }
 static void pt_kv(PText *t, const char *k, uint64_t kb) { pt_s(t, k); pt_u(t, kb); pt_s(t, " kB\n"); }
 static void pt_cs(PText *t, uint64_t cs) { pt_u(t, cs / 100); pt_s(t, cs % 100 < 10 ? ".0" : "."); pt_u(t, cs % 100); }
+
+static bool path_is_under(const char *path, const char *dir) {
+    while (*dir) if (*path++ != *dir++) return false;
+    return true;
+}
 
 static void cpuid4(uint32_t leaf, uint32_t r[4]) {
     __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0));
@@ -1001,12 +1011,18 @@ static bool proc_info_text(const char *path, PText *t) {
         uint32_t ebx7 = 0;
         cpuid4(0, v);
         if (v[0] >= 7) { cpuid4(7, v); ebx7 = v[1]; }
-        pt_s(t, "processor\t: 0\nvendor_id\t: "); pt_s(t, vendor);
+        for (uint32_t cpu = 0; cpu < g_cpu_count; cpu++) {
+        pt_s(t, "processor\t: "); pt_u(t, cpu);
+        pt_s(t, "\nvendor_id\t: "); pt_s(t, vendor);
         pt_s(t, "\ncpu family\t: "); pt_u(t, fam);
         pt_s(t, "\nmodel\t\t: "); pt_u(t, model);
         pt_s(t, "\nmodel name\t: "); pt_s(t, *name ? name : "unknown");
         pt_s(t, "\nstepping\t: "); pt_u(t, step);
-        pt_s(t, "\nphysical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\nflags\t\t:");
+        pt_s(t, "\nphysical id\t: 0\nsiblings\t: "); pt_u(t, g_cpu_count);
+        pt_s(t, "\ncore id\t\t: "); pt_u(t, cpu);
+        pt_s(t, "\ncpu cores\t: "); pt_u(t, g_cpu_count);
+        pt_s(t, "\napicid\t\t: "); pt_u(t, g_cpus[cpu].apic_id);
+        pt_s(t, "\nflags\t\t:");
         static const struct { uint8_t reg, bit; const char *n; } fl[] = {
             { 0, 0, "fpu" }, { 0, 4, "tsc" }, { 0, 15, "cmov" }, { 0, 23, "mmx" }, { 0, 25, "sse" },
             { 0, 26, "sse2" }, { 1, 0, "pni" }, { 1, 9, "ssse3" }, { 1, 12, "fma" }, { 1, 19, "sse4_1" },
@@ -1018,14 +1034,25 @@ static bool proc_info_text(const char *path, PText *t) {
             if (reg & (1u << fl[i].bit)) { pt_s(t, " "); pt_s(t, fl[i].n); }
         }
         pt_s(t, "\n\n");
+        }
         return true;
     }
     if (str_compare(path, "/proc/stat") == 0) {
         /* user nice system idle ...: all of it as idle, which nobody measures */
-        pt_s(t, "cpu  0 0 0 "); pt_u(t, cs); pt_s(t, " 0 0 0 0 0 0\n");
-        pt_s(t, "cpu0 0 0 0 "); pt_u(t, cs); pt_s(t, " 0 0 0 0 0 0\n");
+        pt_s(t, "cpu  0 0 0 "); pt_u(t, cs * g_cpu_count); pt_s(t, " 0 0 0 0 0 0\n");
+        for (uint32_t cpu = 0; cpu < g_cpu_count; cpu++) {
+            pt_s(t, "cpu"); pt_u(t, cpu); pt_s(t, " 0 0 0 "); pt_u(t, cs); pt_s(t, " 0 0 0 0 0 0\n");
+        }
         pt_s(t, "intr 0\nctxt 0\nbtime "); pt_u(t, rtc_get_unix_time() - ms / 1000);
         pt_s(t, "\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n");
+        return true;
+    }
+    if (str_compare(path, "/sys/devices/system/cpu/online") == 0 ||
+        str_compare(path, "/sys/devices/system/cpu/possible") == 0 ||
+        str_compare(path, "/sys/devices/system/cpu/present") == 0) {
+        pt_s(t, "0");
+        if (g_cpu_count > 1) { pt_s(t, "-"); pt_u(t, g_cpu_count - 1); }
+        pt_s(t, "\n");
         return true;
     }
     if (str_compare(path, "/proc/uptime") == 0) {
@@ -1967,6 +1994,16 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
        (clone runs fork, vfork runs clone, setreuid runs setresuid) are
        parts of the call that was allowed */
     Thread *gate = sched_current();
+    if (!gate->in_syscall && gate->stack_orig &&
+        ((uint64_t)(uintptr_t)regs < (uint64_t)(uintptr_t)gate->stack_orig ||
+         (uint64_t)(uintptr_t)regs >= (uint64_t)(uintptr_t)gate->stack_orig + THREAD_STACK_SIZE)) {
+        /* include/wynland/smp.h: this core's kernel stack is not its thread's */
+        serial_write_string("SMP: syscall frame off its thread's kernel stack, thread ");
+        char b[24];
+        uint_to_str(gate->id, b);
+        serial_write_string(b);
+        serial_write_string("\r\n");
+    }
     if (!gate->in_syscall) {
         Process *sp = gate->proc;
         if (sp && sp->seccomp_mode) {
@@ -3168,6 +3205,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
 
                 PageTable *pml4 = vmm_get_current_pml4();
+                vmm_tlb_batch_begin();   /* other cores running this process: one flush */
                 for (uint64_t a = addr; a < end; a += PAGE_SIZE) {
                     uint64_t old_flags = vmm_get_page_flags(pml4, a);
                     if (!(old_flags & PAGE_PRESENT)) continue; /* shouldn't happen under the eager-allocation model, but don't fault the kernel over it */
@@ -3195,6 +3233,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                     vmm_protect_page(pml4, a, pte_flags);
                 }
+                vmm_tlb_batch_end();
                 return 0;
             }
 
@@ -3319,13 +3358,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                        inside keeps whatever live sub-page data it holds. */
                     uint64_t new_ceiling = (requested + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
                     uint64_t old_ceiling = (proc->brk_current + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+                    vmm_tlb_batch_begin();
                     for (uint64_t addr = new_ceiling; addr < old_ceiling; addr += PAGE_SIZE) {
                         uint64_t phys = vmm_get_phys(pml4, addr);
                         if (phys) {
                             vmm_unmap_page(pml4, addr);
-                            pmm_free_page((void *)(uintptr_t)phys); /* refcount-aware -- correct even if this page is still COW-shared post-fork() */
+                            vmm_free_page_after_flush((void *)(uintptr_t)phys); /* refcount-aware -- correct even if this page is still COW-shared post-fork() */
                         }
                     }
+                    vmm_tlb_batch_end();
                     if (new_ceiling < old_ceiling) vma_unmap_range(proc, new_ceiling, old_ceiling);
                     proc->brk_current = requested;
                 }
@@ -3735,7 +3776,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     exec_proc->pml4 = own;
                     exec_proc->vfork_shared = false;
                     pml4 = own;
-                    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)(uintptr_t)own) : "memory");
+                    vmm_load_cr3(own);
                     /* the parent may run again: we no longer use its memory */
                     exec_proc->vfork_released = true;
                     waitqueue_wake_all(&exec_proc->vfork_wq);
@@ -5004,8 +5045,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     sys_text = comm;
                 }
                 char *info = NULL;
-                if (!sys_text && path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c' && path[5] == '/' && (info = (char *)kmalloc(2048))) {
-                    PText pt = { info, 0, 2048 };
+                if (!sys_text && ((path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c' && path[5] == '/') ||
+                                  path_is_under(path, "/sys/devices/system/cpu/")) &&
+                    (info = (char *)kmalloc(8192))) {
+                    PText pt = { info, 0, 8192 };
                     if (proc_info_text(path, &pt)) { info[pt.n] = 0; sys_text = info; }
                     else { kfree(info); info = NULL; }
                 }
@@ -5246,14 +5289,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
-        case 204: // SYS_sched_getaffinity(pid, size, mask): one CPU
+        case 204: // SYS_sched_getaffinity(pid, size, mask): every core
             {
                 if (a2 < 8) return (uint64_t)-22;                   /* -EINVAL */
-                uint64_t mask = 1;
+                uint64_t mask = g_cpu_count >= 64 ? ~0ULL : (1ULL << g_cpu_count) - 1;
                 if (!a3 || copy_to_user((void *)a3, &mask, 8) != 0) return (uint64_t)-14;
                 return 8;
             }
-        case 203: // SYS_sched_setaffinity: CPU 0 is all there is
+        case 203: // SYS_sched_setaffinity: accepted, threads still run on any core
             return 0;
 
         case 319: // SYS_memfd_create(name, flags) -- anonymous resizable
@@ -5286,7 +5329,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return (uint64_t)fd;
             }
 
-        case 324: // SYS_membarrier -- not implemented (single CPU anyway)
+        case 324: // SYS_membarrier -- not implemented: callers (liburcu, runtimes) fall back to their own fences
             return (uint64_t)-38; /* -ENOSYS */
 
         case 77: // SYS_ftruncate(fd, length)
@@ -7039,6 +7082,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             return (uint64_t)-38; /* -ENOSYS instead of -1 for proper error reporting */
     }
+}
+
+/* The syscall MSRs on this core (every core: kernel/smp.c ap_main()) */
+void syscall_init_cpu(void) {
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);   /* SCE */
+    wrmsr(MSR_STAR, ((uint64_t)0x13 << 48) | ((uint64_t)0x08 << 32));
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_SFMASK, 0x300);
 }
 
 void syscall_init(void) {

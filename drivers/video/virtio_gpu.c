@@ -411,7 +411,8 @@ static void vq_free_desc(Virtqueue *vq, uint16_t idx)
  * after the head is reused.
  *
  * Callers run with interrupts off (syscall context, or irq_save()); the
- * timer tick also reaps. Uniprocessor: interrupts-off IS the lock. */
+ * timer tick also reaps. Interrupts off plus the kernel lock
+ * (include/wynland/smp.h) are the lock. */
 
 #define CTRLQ_MAX_SEGS 72 /* 256 KB command buffer in 4 KB pages + hdr + resp */
 

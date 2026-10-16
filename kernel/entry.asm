@@ -125,9 +125,11 @@ kernel_stack_top:
 ; ============================================================
 section .text
 
-extern current_fx_user
 %include "fpu.inc"
+%include "percpu.inc"
 extern exception_handler
+extern bkl_lock
+extern bkl_release_mine
 
 isr_common_stub:
     ; Save all general purpose registers (r15-r8, rbp, rdi, rsi, rdx, rcx, rbx, rax)
@@ -149,10 +151,13 @@ isr_common_stub:
 
     ; Interrupted USER code: save its x87/SSE state (kernel C code uses
     ; SSE). CS sits after 15 saved GPRs + vector + error code + RIP.
+    ; From user mode also: this core's data (GS) and the kernel lock.
     test qword [rsp + 144], 3
     jz .exception_handler_nosave
-    mov rbx, [rel current_fx_user]
+    swapgs
+    mov rbx, [gs:CPU_FX_USER]
     FPU_SAVE rbx
+    call bkl_lock
 .exception_handler_nosave:
 
     ; First argument to System V ABI is RDI (pointer to registers on stack)
@@ -161,12 +166,14 @@ isr_common_stub:
     ; Call the C exception handler
     call exception_handler
 
-    ; back to user code: its x87/SSE state (current_fx_user is this
+    ; back to user code: its x87/SSE state (the core's fx_user is this
     ; thread's again even if we were switched away meanwhile)
     test qword [rsp + 144], 3
     jz .exception_handler_norestore
-    mov rbx, [rel current_fx_user]
+    call bkl_release_mine
+    mov rbx, [gs:CPU_FX_USER]
     FPU_RESTORE rbx
+    swapgs
 .exception_handler_norestore:
 
     ; Restore all registers
@@ -268,9 +275,12 @@ irq_common_stub:
 
     ; Interrupted USER code: save its x87/SSE state (kernel C code uses
     ; SSE). CS sits after 15 saved GPRs + vector + error code + RIP.
+    ; From user mode also this core's data (GS). The kernel lock is the C
+    ; handler's business: it never waits for it (include/wynland/smp.h).
     test qword [rsp + 144], 3
     jz .irq_handler_nosave
-    mov rbx, [rel current_fx_user]
+    swapgs
+    mov rbx, [gs:CPU_FX_USER]
     FPU_SAVE rbx
 .irq_handler_nosave:
 
@@ -280,12 +290,14 @@ irq_common_stub:
     ; Call the C IRQ handler
     call irq_handler
 
-    ; back to user code: its x87/SSE state (current_fx_user is this
+    ; back to user code: its x87/SSE state (the core's fx_user is this
     ; thread's again even if we were switched away meanwhile)
     test qword [rsp + 144], 3
     jz .irq_handler_norestore
-    mov rbx, [rel current_fx_user]
+    call bkl_release_mine    ; if the handler took it (and kept it: it switched threads)
+    mov rbx, [gs:CPU_FX_USER]
     FPU_RESTORE rbx
+    swapgs
 .irq_handler_norestore:
 
     ; Restore all registers
@@ -336,3 +348,14 @@ IRQ_STUB 12, 44
 IRQ_STUB 13, 45
 IRQ_STUB 14, 46
 IRQ_STUB 15, 47
+
+; The local APIC's vectors (include/wynland/smp.h): the APs' timer and the
+; inter-processor interrupts, through the same path as the legacy IRQs.
+IRQ_STUB lapic_timer, 0x40
+IRQ_STUB ipi_wake,    0x41
+IRQ_STUB ipi_tlb,     0x42
+
+; The APIC's spurious vector: no handler, no EOI.
+global irq_spurious
+irq_spurious:
+    iretq
