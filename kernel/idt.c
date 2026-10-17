@@ -321,6 +321,33 @@ static void exception_handler_main(InterruptRegisters *regs)
         }
     }
 
+    /* A fault the page tables allow by now: this core's TLB still had the
+       page's old, narrower entry -- another core's thread of the process
+       resolved the COW, brought the page in, or mprotect() widened it (an
+       upgrade sends no shootdown). The fault dropped that entry; the
+       access runs again. A few times in a row at one address is no stale
+       entry: the fatal path. */
+    if (regs->int_no == 14 && (regs->err_code & 0x1) &&
+        ((regs->cs & 0x03) == 3 || pf_cr2 < 0x0000800000000000ULL)) {
+        uint64_t f = vmm_get_page_flags(vmm_get_current_pml4(), pf_cr2);
+        bool allowed = (f & PAGE_PRESENT) && !(f & PAGE_COW);
+        if ((regs->err_code & 0x2) && !(f & PAGE_WRITE)) allowed = false;
+        if ((regs->err_code & 0x4) && !(f & PAGE_USER)) allowed = false;
+        if ((regs->err_code & 0x10) && PAGE_NX && (f & PAGE_NX)) allowed = false;
+        if (regs->err_code & 0x8) allowed = false;          /* reserved bits: a real fault */
+        Thread *ft = sched_current();
+        if (allowed && ft) {
+            uint64_t pg = pf_cr2 & ~0xFFFULL, now = __builtin_ia32_rdtsc();
+            if (ft->spurious_addr == pg && now - ft->spurious_tsc < 100000000ULL) ft->spurious_n++;
+            else { ft->spurious_addr = pg; ft->spurious_n = 1; }
+            ft->spurious_tsc = now;
+            if (ft->spurious_n <= 4) {
+                __asm__ volatile("invlpg (%0)" :: "r"(pf_cr2) : "memory");
+                return;
+            }
+        }
+    }
+
     if (uaccess_fault_fixup(regs)) return;   /* a lock-free copy: -EFAULT */
 
     /* Check if the exception happened in user mode (Ring 3) */

@@ -131,6 +131,11 @@ typedef struct Thread {
        its own (data through a kernel buffer): a disk command gives the big
        lock back while it waits (drivers/fs/ahci.c) */
     bool     fs_unlocked;
+    /* the last page fault the page tables already allowed (kernel/idt.c):
+       where, when (TSC), and how many times in a row */
+    uint64_t spurious_addr;
+    uint64_t spurious_tsc;
+    uint32_t spurious_n;
     uint8_t fx_raw[FPU_AREA_MAX + 64];
     uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;
