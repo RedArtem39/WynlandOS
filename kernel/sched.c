@@ -58,8 +58,6 @@ extern void uint_to_str(uint64_t val, char *buf);
 
 static Thread *thread_list = NULL;
 static uint64_t next_thread_id = 1;
-/* Round robin over every core: the thread the last pick landed on */
-static Thread *g_rr = NULL;
 
 /* The thread running on this core (include/wynland/smp.h: each core
    runs its own; GS finds the core's data) */
@@ -67,6 +65,286 @@ static Thread *g_rr = NULL;
 
 static void disable_interrupts(void) {
     __asm__ volatile("cli");
+}
+
+/* ==== EEVDF: Earliest Eligible Virtual Deadline First ===================
+   (Stoica & Abdel-Wahab 1995; Linux's fair scheduler since 6.6.)
+
+   Every thread accrues virtual run time: its time on a core scaled by
+   1024/weight (the weight follows nice: 1024 at 0, x1.25 per step down),
+   so a heavier thread's clock runs slower and it gets more of the cores.
+   V is the weighted average of the vruntimes of all runnable threads (the
+   queued ones and those on a core). A thread with vruntime <= V has been
+   served no more than its share: it is *eligible*. Each thread asks for a
+   slice; its virtual deadline is vruntime + slice x 1024/weight. The pick
+   is the eligible thread with the earliest deadline: short slices come
+   round soon, nobody runs ahead of its share for long.
+
+   A thread that sleeps keeps its lag (V - vruntime) and comes back at
+   V - lag: sleeping neither earns credit nor costs it. A new thread
+   starts at V with half a slice (it runs soon, without jumping ahead).
+
+   Data: READY threads waiting for a core are on one run queue (all cores
+   pick from it); BLOCKED threads with a timeout on a timer list sorted by
+   wake-up time. Neither is the full thread list: a pick costs the number
+   of runnable threads, not of all threads. All of it under the kernel
+   lock with interrupts off. */
+
+#define NICE_0_WEIGHT   1024
+#define SCHED_SLICE_NS  3000000ULL      /* each request: 3 ms of a core */
+
+/* Linux's table: weight(nice) = 1024 / 1.25^nice */
+static const uint32_t g_nice_weight[40] = {
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
+     9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
+     1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
+      110,    87,    70,    56,    45,    36,    29,    23,    18,    15,
+};
+
+static Thread *g_rq;                 /* the run queue (doubly linked) */
+static uint32_t g_rq_count;
+static Thread *g_timers;             /* BLOCKED with a deadline, soonest first */
+static uint64_t g_v_last;            /* V when last computed: for wake-ups into an empty system */
+static volatile uint32_t g_dead;     /* TERMINATED threads not yet freed */
+
+/* ---- the clock ---- */
+static uint64_t g_tsc0, g_ms0, g_tsc_per_ms;
+
+static inline uint64_t rdtsc_now(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* The TSC's rate against the 1 kHz timer: 50 ms of it, from a tick edge,
+   with interrupts on (kernel/smp.c, at boot) -- the millisecond count
+   falls behind while interrupts are off, so it is no clock for this
+   anywhere else. Until then the clock is the millisecond count. */
+void sched_clock_calibrate(void)
+{
+    extern uint64_t timer_get_ms(void);
+    uint64_t m0 = timer_get_ms();
+    while (timer_get_ms() == m0) __builtin_ia32_pause();
+    uint64_t t0 = rdtsc_now(), ms0 = timer_get_ms();
+    while (timer_get_ms() - ms0 < 50) __builtin_ia32_pause();
+    uint64_t per = (rdtsc_now() - t0) / (timer_get_ms() - ms0);
+    if (!per) return;
+    g_tsc0 = t0;
+    g_ms0 = ms0;
+    g_tsc_per_ms = per;
+}
+
+uint64_t sched_clock_ns(void)
+{
+    extern uint64_t timer_get_ms(void);
+    if (!g_tsc_per_ms) return timer_get_ms() * 1000000ULL;
+    uint64_t d = rdtsc_now() - g_tsc0;
+    return g_ms0 * 1000000ULL + d / g_tsc_per_ms * 1000000ULL +
+           d % g_tsc_per_ms * 1000000ULL / g_tsc_per_ms;
+}
+
+static inline uint64_t vslice_of(const Thread *t)
+{
+    return SCHED_SLICE_NS * NICE_0_WEIGHT / t->weight;
+}
+
+/* a before b in virtual time (wrap-safe) */
+static inline bool vbefore(uint64_t a, uint64_t b)
+{
+    return (int64_t)(a - b) < 0;
+}
+
+static inline bool is_idle(const Thread *t)
+{
+    for (uint32_t i = 0; i < g_cpu_count; i++)
+        if (g_cpus[i].idle == t) return true;
+    return false;
+}
+
+/* t's time on its core since it was last accounted: into vruntime; a new
+   slice (deadline) once the current one is used up -- returns whether it
+   was (time to pick again). */
+static bool account(Thread *t, uint64_t now)
+{
+    if (!t || is_idle(t) || !t->weight) return false;
+    uint64_t delta = now > t->exec_start ? now - t->exec_start : 0;
+    t->exec_start = now;
+    t->sum_exec += delta;
+    t->vruntime += delta * NICE_0_WEIGHT / t->weight;
+    if (!vbefore(t->vruntime, t->vdeadline)) {
+        t->vdeadline = t->vruntime + vslice_of(t);
+        return true;
+    }
+    return false;
+}
+
+/* V: the weighted average vruntime of the runnable threads -- queued, and
+   running on some core */
+static uint64_t avg_vruntime(void)
+{
+    uint64_t base = 0;
+    bool have = false;
+    int64_t sum = 0;
+    uint64_t w = 0;
+    for (Thread *t = g_rq; t; t = t->rq_next) {
+        if (!have) { base = t->vruntime; have = true; }
+        int64_t d = (int64_t)(t->vruntime - base);
+        if (d > (1LL << 40)) d = 1LL << 40;
+        if (d < -(1LL << 40)) d = -(1LL << 40);
+        sum += d * (int64_t)t->weight;
+        w += t->weight;
+    }
+    for (uint32_t i = 0; i < g_cpu_count; i++) {
+        Thread *t = g_cpus[i].current;
+        if (!t || t == g_cpus[i].idle || t->state != THREAD_STATE_RUNNING || !t->weight) continue;
+        if (!have) { base = t->vruntime; have = true; }
+        int64_t d = (int64_t)(t->vruntime - base);
+        if (d > (1LL << 40)) d = 1LL << 40;
+        if (d < -(1LL << 40)) d = -(1LL << 40);
+        sum += d * (int64_t)t->weight;
+        w += t->weight;
+    }
+    if (!w) return g_v_last;
+    g_v_last = base + (uint64_t)(sum / (int64_t)w);
+    return g_v_last;
+}
+
+static void rq_add(Thread *t)
+{
+    if (t->on_rq) return;
+    t->rq_prev = NULL;
+    t->rq_next = g_rq;
+    if (g_rq) g_rq->rq_prev = t;
+    g_rq = t;
+    t->on_rq = true;
+    g_rq_count++;
+}
+
+static void rq_del(Thread *t)
+{
+    if (!t->on_rq) return;
+    if (t->rq_prev) t->rq_prev->rq_next = t->rq_next;
+    else g_rq = t->rq_next;
+    if (t->rq_next) t->rq_next->rq_prev = t->rq_prev;
+    t->rq_next = t->rq_prev = NULL;
+    t->on_rq = false;
+    g_rq_count--;
+}
+
+static void timer_add(Thread *t, uint64_t ms)
+{
+    t->timer_ms = ms;
+    Thread **pp = &g_timers;
+    while (*pp && (*pp)->timer_ms <= ms) pp = &(*pp)->tm_next;
+    t->tm_next = *pp;
+    *pp = t;
+    t->on_timer = true;
+}
+
+static void timer_del(Thread *t)
+{
+    if (!t->on_timer) return;
+    for (Thread **pp = &g_timers; *pp; pp = &(*pp)->tm_next)
+        if (*pp == t) { *pp = t->tm_next; break; }
+    t->tm_next = NULL;
+    t->on_timer = false;
+}
+
+/* A thread joins the run queue: where it stands in virtual time.
+   fresh: a new thread (no history: at V, half a slice). */
+static void place(Thread *t, bool fresh)
+{
+    uint64_t V = avg_vruntime();
+    uint64_t vs = vslice_of(t);
+    if (fresh) {
+        t->vruntime = V;
+        t->vdeadline = V + vs / 2;
+    } else {
+        t->vruntime = V - (uint64_t)t->vlag;
+        t->vdeadline = t->vruntime + vs;
+    }
+    t->vlag = 0;
+}
+
+/* BLOCKED (or new) -> READY, on the run queue */
+static void make_ready(Thread *t, bool fresh)
+{
+    timer_del(t);
+    place(t, fresh);
+    t->state = THREAD_STATE_READY;
+    rq_add(t);
+}
+
+/* Threads whose timed wait ran out: READY with -ETIMEDOUT */
+static void timers_expire(void)
+{
+    extern uint64_t timer_get_ms(void);
+    uint64_t now = timer_get_ms();
+    while (g_timers && g_timers->timer_ms <= now) {
+        Thread *t = g_timers;
+        g_timers = t->tm_next;
+        t->tm_next = NULL;
+        t->on_timer = false;
+        if (t->state == THREAD_STATE_BLOCKED) {
+            t->wake_result = -110; /* -ETIMEDOUT */
+            make_ready(t, false);
+        }
+    }
+}
+
+/* The eligible queued thread with the earliest deadline (or, if none is
+   eligible, the one furthest behind). Dead ones leave the queue here. */
+static Thread *pick_next(Thread *self, Thread *avoid)
+{
+    uint64_t V = avg_vruntime();
+    Thread *best = NULL, *behind = NULL;
+    bool avoided = false;
+    for (Thread *t = g_rq, *nx; t; t = nx) {
+        nx = t->rq_next;
+        if (t->state != THREAD_STATE_READY) { rq_del(t); continue; }
+        if (t->on_cpu && t != self) continue;
+        if (t == avoid) { avoided = true; continue; }
+        if (!vbefore(V, t->vruntime) && (!best || vbefore(t->vdeadline, best->vdeadline))) best = t;
+        if (!behind || vbefore(t->vruntime, behind->vruntime)) behind = t;
+    }
+    if (best) return best;
+    if (behind) return behind;
+    return avoided ? avoid : NULL;
+}
+
+void sched_terminate(Thread *t)
+{
+    if (!t || t->state == THREAD_STATE_TERMINATED) return;
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f));
+    rq_del(t);
+    timer_del(t);
+    t->state = THREAD_STATE_TERMINATED;
+    g_dead++;
+    if (f & 0x200) __asm__ volatile("sti");
+}
+
+void sched_set_nice(Thread *t, int nice)
+{
+    if (nice < -20) nice = -20;
+    if (nice > 19) nice = 19;
+    uint64_t f;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f));
+    if (t->state == THREAD_STATE_RUNNING) account(t, sched_clock_ns());
+    /* keep its place in virtual time; the slice ahead is in the new weight */
+    t->nice = (int8_t)nice;
+    t->weight = g_nice_weight[nice + 20];
+    t->vdeadline = t->vruntime + vslice_of(t);
+    if (f & 0x200) __asm__ volatile("sti");
+}
+
+/* A thread starts its scheduling life (nice from its creator) */
+static void sched_entity_init(Thread *t, const Thread *creator)
+{
+    int nice = creator && !is_idle(creator) ? creator->nice : 0;
+    t->nice = (int8_t)nice;
+    t->weight = g_nice_weight[nice + 20];
 }
 
 /* Back from the idle hlt: the kernel lock again -- spinning a moment
@@ -162,8 +440,8 @@ void sched_init(void) {
     t0->next = t0; // Circular linked list
     t0->wake_deadline = SCHED_NO_DEADLINE;
     t0->on_cpu = cpu->id + 1;
+    sched_entity_init(t0, NULL);
     thread_list = t0;
-    g_rr = t0;
     cpu->current = t0;
     cpu->fx_user = thread_fx_user(t0);
 
@@ -233,7 +511,7 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     else
         thread_fx_default(thread_fx_user(t));
     t->id = next_thread_id++;
-    t->state = THREAD_STATE_READY;
+    t->state = THREAD_STATE_BLOCKED;   /* READY below, once it is complete */
     t->tls_base = tls_base;
     t->clear_tid = NULL;
     t->sig_pending = 0;
@@ -263,6 +541,9 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     // an idle thread, which is on no list)
     t->next = thread_list->next;
     thread_list->next = t;
+
+    sched_entity_init(t, current_thread);
+    make_ready(t, true);
 
     /* Back to the CALLER's interrupt state -- never an unconditional sti.
        Syscalls run with IF=0 (SFMASK), and fork()/clone() call this from
@@ -303,7 +584,7 @@ void thread_exit(void) {
         current_thread->clear_tid = NULL;
     }
 
-    current_thread->state = THREAD_STATE_TERMINATED;
+    sched_terminate(current_thread);
     /* Phase 18: mark the owning Process dead here -- but ONLY when the
        process's own main thread exits. The original unconditional
        version let ANY helper thread's death kill the whole process
@@ -355,8 +636,8 @@ static void reap_queue(struct Process *p)
        it is on another queue, and goes on with this one afterwards */
     if (g_reaper && g_reaper->state == THREAD_STATE_BLOCKED && g_reaper->wq == (void *)g_reap) {
         g_reaper->wake_result = 0;
-        g_reaper->state = THREAD_STATE_READY;
         g_reaper->wq = NULL;
+        make_ready(g_reaper, false);
     }
 }
 
@@ -382,7 +663,12 @@ void sched_start_reaper(void)
 /* Pick the next thread for this core and switch to it. Kernel lock held,
    interrupts off. Returns whether it switched (and came back). Never
    sleeps (see the reaper above). */
-static bool schedule_core(void) {
+/* yielding: the current thread goes on only if no other one can (kernel
+   code spins on sched_yield() waiting for another thread -- that one must
+   get the core even when it is not eligible yet) */
+static bool schedule_core_ex(bool yielding);
+static bool schedule_core(void) { return schedule_core_ex(false); }
+static bool schedule_core_ex(bool yielding) {
     Cpu *cpu = this_cpu();
     if (g_bkl_owner != (int32_t)cpu->id) {
         static int said;
@@ -410,8 +696,9 @@ static bool schedule_core(void) {
             serial_write_string("\r\n");
         }
     }
-    // Free all terminated threads (except the current one we are running on)
-    if (thread_list) {
+    /* Free the terminated threads no core runs any more (only when there
+       are some: sched_terminate() counts them) */
+    if (g_dead && thread_list) {
         Thread *prev = thread_list;
         Thread *curr = thread_list->next;
         do {
@@ -422,8 +709,8 @@ static bool schedule_core(void) {
                 if (curr == thread_list) {
                     thread_list = curr->next;
                 }
-                if (curr == g_rr) g_rr = prev;
                 Thread *to_free = curr;
+                g_dead--;
                 curr = curr->next;
                 /* killed while blocked (signal_kill_process(), a fatal
                    signal): it never ran its own unlink, so its wait queue
@@ -470,53 +757,32 @@ static bool schedule_core(void) {
         } while (curr != thread_list);
     }
 
-    /* Phase 22a: deadline pass -- a BLOCKED thread whose futex timeout has
-       expired becomes READY with an -ETIMEDOUT wake result. Runs on every
-       schedule point (timer preemptions, yields, wakes), which is what
-       makes timed waits work without any dedicated timer-wheel machinery:
-       worst-case latency is one 10ms tick. */
-    {
-        extern uint64_t timer_get_ticks(void);
-        extern uint64_t timer_get_ms(void);
-        uint64_t now = timer_get_ticks();
-        uint64_t now_ms = timer_get_ms();
-        Thread *t = thread_list;
-        if (t) {
-            do {
-                if (t->state == THREAD_STATE_BLOCKED &&
-                    ((t->wake_deadline != SCHED_NO_DEADLINE &&
-                      now >= t->wake_deadline) ||
-                     (t->wake_deadline_ms != SCHED_NO_DEADLINE &&
-                      now_ms >= t->wake_deadline_ms))) {
-                    t->wake_result = -110; /* -ETIMEDOUT */
-                    t->state = THREAD_STATE_READY;
-                }
-                t = t->next;
-            } while (t != thread_list);
-        }
-    }
+    /* timed waits that ran out: READY with -ETIMEDOUT (the timer list is
+       sorted: only the expired ones are looked at) */
+    timers_expire();
 
     Thread *prev_thread = cpu->current;
     Thread *next_thread = NULL;
+    uint64_t now = sched_clock_ns();
 
-    /* The next READY thread no core is running, round robin over the
-       whole list from the last pick (shared by all cores) */
-    if (g_rr) {
-        Thread *t = g_rr->next;
-        Thread *stop = t;
-        do {
-            if (t->state == THREAD_STATE_READY && !t->on_cpu) { next_thread = t; break; }
-            t = t->next;
-        } while (t != stop);
+    /* The thread leaving the core, if it can go on, competes like the
+       others: back on the run queue with its vruntime so far */
+    bool prev_runnable = prev_thread != cpu->idle &&
+        (prev_thread->state == THREAD_STATE_RUNNING || prev_thread->state == THREAD_STATE_READY);
+    if (prev_thread != cpu->idle) account(prev_thread, now);
+    if (prev_runnable) {
+        prev_thread->state = THREAD_STATE_READY;
+        rq_add(prev_thread);
     }
 
+    next_thread = pick_next(prev_thread, yielding ? prev_thread : NULL);
+    if (next_thread) rq_del(next_thread);
+
+    if (next_thread == prev_thread) {
+        prev_thread->state = THREAD_STATE_RUNNING;   /* it goes on */
+        return false;
+    }
     if (!next_thread) {
-        /* nothing else: the current thread goes on if it can */
-        if (prev_thread != cpu->idle &&
-            (prev_thread->state == THREAD_STATE_RUNNING || prev_thread->state == THREAD_STATE_READY)) {
-            prev_thread->state = THREAD_STATE_RUNNING;
-            return false;
-        }
         /* Phase 22a: everything real is BLOCKED. Hand the core to its idle
            thread instead of halting forever. The blocked thread we came
            from keeps its parked state untouched; it resumes inside its own
@@ -529,10 +795,8 @@ static bool schedule_core(void) {
     }
 
     // Switch to next_thread
-    if (prev_thread->state == THREAD_STATE_RUNNING) {
-        prev_thread->state = THREAD_STATE_READY;
-    }
     next_thread->state = THREAD_STATE_RUNNING;
+    next_thread->exec_start = now;
     if (next_thread->on_cpu) {
         serial_write_string("SCHED: picked a thread another core runs\r\n");
     }
@@ -541,7 +805,6 @@ static bool schedule_core(void) {
     prev_thread->on_cpu = 0;
     next_thread->on_cpu = cpu->id + 1;
     cpu->current = next_thread;
-    if (next_thread != cpu->idle) g_rr = next_thread;
 
     // Context switch the Thread-Local Storage (TLS) FS Base
     {
@@ -615,9 +878,16 @@ void sched_yield(void) {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
+    /* EEVDF's yield: the rest of this slice goes to whoever else is
+       eligible -- the thread's deadline moves one slice on */
+    Thread *me = current_thread;
+    if (me != this_cpu()->idle && me->weight) {
+        account(me, sched_clock_ns());
+        me->vdeadline += vslice_of(me);
+    }
     /* Nothing else to run here: other cores may be waiting for the kernel
        lock (the very thread this one waits for, perhaps) */
-    if (!schedule_core()) bkl_relax();
+    if (!schedule_core_ex(true)) bkl_relax();
 
     if (rflags & 0x200) {
         __asm__ volatile("sti");
@@ -629,18 +899,32 @@ void sched_yield(void) {
    hold interrupts off for long either -- a disk command it waits for. */
 volatile int g_sched_no_preempt;
 
+/* Each core's 1 kHz tick: the running thread is accounted, and the core
+   picks again when its slice is used up, or when a queued thread is
+   eligible with an earlier deadline (one that just woke up) */
 void sched_preempt_tick(void) {
     if (g_sched_no_preempt) return;
     Cpu *cpu = this_cpu();
     Thread *t = cpu->current;
     if (!t || t == cpu->idle) return;
-    /* TERMINATED: killed by another core while running here -- off it */
-    if (t->state == THREAD_STATE_RUNNING || t->state == THREAD_STATE_TERMINATED) {
-        uint64_t rflags;
-        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-        schedule_core();
-        if (rflags & 0x200) __asm__ volatile("sti");
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    bool again = false;
+    if (t->state == THREAD_STATE_TERMINATED) {
+        again = true;             /* killed by another core while running here */
+    } else if (t->state == THREAD_STATE_RUNNING) {
+        if (account(t, sched_clock_ns())) again = true;      /* slice used up */
+        else if (g_rq) {
+            Thread *n = pick_next(NULL, NULL);
+            if (n && vbefore(n->vdeadline, t->vdeadline)) again = true;
+        }
+        if (g_timers) {
+            extern uint64_t timer_get_ms(void);
+            if (g_timers->timer_ms <= timer_get_ms()) again = true;   /* a timed wait ran out */
+        }
     }
+    if (again) schedule_core();
+    if (rflags & 0x200) __asm__ volatile("sti");
 }
 
 Thread *sched_current(void) {
@@ -667,6 +951,30 @@ static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake
     t->wq = wq;
     t->wake_deadline = wake_deadline;
     t->wake_deadline_ms = wake_deadline_ms;
+    /* how far behind (or ahead of) the others it was: it comes back there */
+    if (t->weight) {
+        account(t, sched_clock_ns());
+        int64_t lag = (int64_t)(avg_vruntime() - t->vruntime);
+        int64_t lim = (int64_t)(2 * vslice_of(t));
+        if (lag > lim) lag = lim;
+        if (lag < -lim) lag = -lim;
+        t->vlag = lag;
+    }
+    /* a timeout: on the timer list, by the 1 kHz clock (wake_deadline
+       counts the 100 Hz ticks) */
+    {
+        extern uint64_t timer_get_ticks(void);
+        extern uint64_t timer_get_ms(void);
+        uint64_t now_ms = timer_get_ms();
+        uint64_t when = SCHED_NO_DEADLINE;
+        if (wake_deadline != SCHED_NO_DEADLINE) {
+            uint64_t now_t = timer_get_ticks();
+            when = now_ms + (wake_deadline > now_t ? (wake_deadline - now_t) * 10 : 0);
+        }
+        if (wake_deadline_ms != SCHED_NO_DEADLINE && (when == SCHED_NO_DEADLINE || wake_deadline_ms < when))
+            when = wake_deadline_ms;
+        if (when != SCHED_NO_DEADLINE) timer_add(t, when);
+    }
     /* wake_result is written by sched_unblock()/the deadline pass BEFORE
        this thread is marked READY, so no initialization race exists: we
        cannot be scheduled until state leaves BLOCKED. */
@@ -709,8 +1017,8 @@ void sched_unblock(Thread *t, int64_t result) {
 
     if (t && t->state == THREAD_STATE_BLOCKED) {
         t->wake_result = result;
-        t->state = THREAD_STATE_READY;
         t->wq = NULL;
+        make_ready(t, false);
         smp_kick_idle();     /* an idle core may run it right away */
     }
 
@@ -905,7 +1213,7 @@ bool sched_kill_thread(uint64_t id) {
     if (t) {
         do {
             if (t->id == id) {
-                t->state = THREAD_STATE_TERMINATED;
+                sched_terminate(t);
                 found = true;
                 break;
             }
@@ -918,3 +1226,4 @@ bool sched_kill_thread(uint64_t id) {
     }
     return found;
 }
+

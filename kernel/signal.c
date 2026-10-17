@@ -99,7 +99,7 @@ void signal_kill_process(Process *p, int sig) {
         int guard = 0;
         do {
             if (it->proc == p && it->state != THREAD_STATE_TERMINATED)
-                it->state = THREAD_STATE_TERMINATED;
+                sched_terminate(it);
             it = it->next;
         } while (it != sched_get_thread_list() && ++guard < 4096);
     }
@@ -188,7 +188,7 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
     /* never sysret to a non-user RIP (sigaction checks it too) */
     if (act->handler >= SIG_USER_LIMIT || act->restorer >= SIG_USER_LIMIT) {
         process_mark_exited(t->proc, 11);
-        t->state = THREAD_STATE_TERMINATED;
+        sched_terminate(t);
         sched_schedule();
         while (1) __asm__ volatile("cli; hlt");
     }
@@ -239,7 +239,7 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
         t->sig_frame = kf->prev;
         kfree(kf);
         process_mark_exited(t->proc, 11);
-        t->state = THREAD_STATE_TERMINATED;
+        sched_terminate(t);
         sched_schedule();
         while (1) __asm__ volatile("cli; hlt");
     }
@@ -373,7 +373,7 @@ uint64_t signal_rt_return(void *regs_v) {
         /* rt_sigreturn with no frame: the program jumped somewhere hostile.
            Treat like a fatal signal -- terminate rather than corrupt. */
         process_mark_exited(t->proc, 11 /* as if SIGSEGV */);
-        t->state = THREAD_STATE_TERMINATED;
+        sched_terminate(t);
         serial_write_string("[signal] rt_sigreturn without frame\r\n");
         sched_schedule();
         while (1) __asm__ volatile("cli; hlt");
@@ -390,7 +390,7 @@ uint64_t signal_rt_return(void *regs_v) {
             g[16] >= SIG_USER_LIMIT || g[15] >= SIG_USER_LIMIT) {
             kfree(f);
             process_mark_exited(t->proc, 11);
-            t->state = THREAD_STATE_TERMINATED;
+            sched_terminate(t);
             serial_write_string("[signal] rt_sigreturn: bad ucontext\r\n");
             sched_schedule();
             while (1) __asm__ volatile("cli; hlt");

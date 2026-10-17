@@ -18,6 +18,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/sysinfo.h>
@@ -88,6 +89,19 @@ static void *futex_waiter(void *arg)
     struct timespec ts = { 5, 0 };
     long r = syscall(SYS_futex, &g_fwords[i], 128 /* FUTEX_WAIT_PRIVATE */, 0, &ts, NULL, 0);
     g_fres[i] = r < 0 ? -errno : r;
+    return NULL;
+}
+
+/* EEVDF: busy threads, twice as many as cores, half of them at nice 10:
+   the nice-0 ones must get several times the work done (weights 1024 vs
+   110: ~9x) */
+static volatile int g_spin_stop;
+struct spinner { int nice; volatile unsigned long count; };
+static void *spinner(void *arg)
+{
+    struct spinner *s = arg;
+    setpriority(PRIO_PROCESS, 0, s->nice);   /* this thread (who 0) */
+    while (!g_spin_stop) s->count++;
     return NULL;
 }
 
@@ -577,6 +591,31 @@ int main(int argc, char **argv)
             check(syscall(413, "evil", 0) != 0 && syscall(414) == 0, "a user cannot set the first root password");
             check(access("/etc/shadow", R_OK) != 0, "/etc/shadow unreadable for users");
             check(syscall(409, "evil") != 0 && getuid() != 0, "and so cannot elevate");
+        }
+        {
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu < 1) ncpu = 1;
+            if (ncpu > 8) ncpu = 8;
+            int n = (int)(2 * ncpu);
+            struct spinner sp[16];
+            pthread_t th[16];
+            g_spin_stop = 0;
+            for (int i = 0; i < n; i++) {
+                sp[i].nice = (i & 1) ? 10 : 0;
+                sp[i].count = 0;
+                pthread_create(&th[i], NULL, spinner, &sp[i]);
+            }
+            struct timespec d = { 2, 0 };
+            nanosleep(&d, NULL);
+            g_spin_stop = 1;
+            unsigned long hi = 0, lo = 0;
+            for (int i = 0; i < n; i++) {
+                pthread_join(th[i], NULL);
+                if (i & 1) lo += sp[i].count; else hi += sp[i].count;
+            }
+            fprintf(stderr, "[forktest] eevdf: nice 0 %lu, nice 10 %lu (x%lu)\n", hi, lo, lo ? hi / lo : 0);
+            check(lo > 0 && hi > 3 * lo, "scheduler: nice 0 gets several times the CPU of nice 10");
+            check(getpriority(PRIO_PROCESS, 0) == 0, "getpriority: the main thread still at nice 0");
         }
         /* real network: DNS (musl resolver -> /etc/resolv.conf), TCP, TLS */
         rc = run_capture("/usr/bin/curl", "-sI", "https://example.com/", out, sizeof(out));

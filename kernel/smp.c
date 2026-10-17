@@ -519,6 +519,7 @@ static void log_num(const char *a, uint64_t v, const char *b)
 
 void smp_init(BootInfo *bi)
 {
+    sched_clock_calibrate();      /* the scheduler's clock (kernel/sched.c) */
     uint64_t apic_base = rdmsr(MSR_APIC_BASE);
     g_x2apic = (apic_base & (1u << 10)) != 0;
     if (!g_x2apic) {

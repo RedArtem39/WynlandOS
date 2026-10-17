@@ -3497,6 +3497,42 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             sched_yield();
             return 0;
 
+        case 140: // SYS_getpriority(which, who): 20 - nice (the raw syscall's form)
+        case 141: // SYS_setpriority(which, who, nice)
+            {
+                /* PRIO_PROCESS only; who 0 = the calling thread, else a
+                   process (all its threads) */
+                if (a1 != 0) return (uint64_t)-LNX_EINVAL;
+                Process *p = a2 ? process_find_by_pid(pid_from_ns(a2, proc)) : proc;
+                if (!p || p->reaped || (a2 && !pid_from_ns(a2, proc))) return (uint64_t)-LNX_ESRCH;
+                Thread *me = sched_current();
+                Thread *first = NULL;
+                Thread *list = sched_get_thread_list();
+                if (!a2) first = me;
+                else if (list) {
+                    Thread *it = list;
+                    do { if (it->proc == p && it->state != THREAD_STATE_TERMINATED) { first = it; break; } it = it->next; } while (it != list);
+                }
+                if (!first) return (uint64_t)-LNX_ESRCH;
+                if (num == 140) return (uint64_t)(20 - first->nice);
+                int nice = (int)(int64_t)a3;
+                if (nice < -20) nice = -20;
+                if (nice > 19) nice = 19;
+                /* another user's process: no; a higher priority than now
+                   (lower nice): CAP_SYS_NICE (23) */
+                if (p != proc && p->uid != proc->uid && !sandbox_capable_host(proc, 23))
+                    return (uint64_t)-LNX_EPERM;
+                if (nice < first->nice && !sandbox_capable_host(proc, 23))
+                    return (uint64_t)-13; /* -EACCES */
+                if (!a2) { sched_set_nice(me, nice); return 0; }
+                Thread *it = list;
+                do {
+                    if (it->proc == p && it->state != THREAD_STATE_TERMINATED) sched_set_nice(it, nice);
+                    it = it->next;
+                } while (it != list);
+                return 0;
+            }
+
         case 1000: // WynlandOS debugging: dump every user thread to the serial log
             sched_dump_user_threads();
             return 0;

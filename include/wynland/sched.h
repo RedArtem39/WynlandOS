@@ -103,6 +103,20 @@ typedef struct Thread {
                                  RUNNING alone is not enough: a thread switched
                                  away keeps being "on" its core until the switch
                                  is done, and a killed one may still run there. */
+    /* ---- EEVDF (kernel/sched.c) ---- */
+    int8_t   nice;            /* -20..19 (setpriority()); its weight below */
+    bool     on_rq;           /* in the run queue: READY, waiting for a core */
+    bool     on_timer;        /* in the timer list: BLOCKED with a deadline */
+    uint32_t weight;          /* 1024 at nice 0, x1.25 per step */
+    uint64_t vruntime;        /* time on a core in ns, x 1024/weight */
+    uint64_t vdeadline;       /* vruntime by which its current slice is due */
+    int64_t  vlag;            /* how far behind the queue it was when it
+                                 blocked (V - vruntime): kept across a sleep */
+    uint64_t exec_start;      /* sched_clock_ns() when it was last accounted */
+    uint64_t sum_exec;        /* ns on a core in total */
+    uint64_t timer_ms;        /* wake-up time while on the timer list */
+    struct Thread *rq_next, *rq_prev;
+    struct Thread *tm_next;
     uint8_t fx_raw[FPU_AREA_MAX + 64];
     uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;
@@ -178,6 +192,15 @@ extern volatile int g_sched_no_preempt;   /* > 0: no switching on the timer tick
 void sched_print_tasks(BootInfo *info, uint32_t bg_color);
 Thread *sched_get_thread_list(void);
 bool sched_kill_thread(uint64_t id);
+/* t is to die: TERMINATED, freed by the scheduler once no core runs it.
+   The only way a thread becomes TERMINATED. */
+void sched_terminate(Thread *t);
+/* nanoseconds since boot (TSC, calibrated against the 1 kHz timer) */
+uint64_t sched_clock_ns(void);
+/* once, at boot, interrupts on (kernel/smp.c) */
+void sched_clock_calibrate(void);
+/* setpriority(): t's nice value (-20..19) and so its share of the cores */
+void sched_set_nice(Thread *t, int nice);
 
 /* Phase 22a blocking primitives. sched_block() parks the CURRENT thread on
    the opaque wait queue `wq` until sched_wake_* targets it (returns

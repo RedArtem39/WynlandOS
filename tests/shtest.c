@@ -211,6 +211,8 @@ static const struct sh_case CASES[] = {
       "2999997 pong kid\n" },
     { "/bin/sh", "not PIE (linked at 0x400000), dynamic and static; the kernel's memory unreadable",
       "/nopietest.elf; /nopietest-static.elf", "nopie ok\nnopie ok\n" },
+    { "/bin/sh", "nice: setpriority/getpriority (EEVDF weights), inherited by children",
+      "nice -n 5 sh -c 'nice; nice -n 3 nice'", "5\n8\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
     { "/bin/sh", "man: groff's pipeline",
