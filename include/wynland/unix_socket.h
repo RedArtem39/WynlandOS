@@ -1,11 +1,11 @@
 /*
  * WynlandOS - AF_UNIX sockets, memfd and timerfd objects.
  *
- * All entry points take kernel-side data (user memory is validated and
- * copied by the syscall glue in kernel/syscall.c) and return >= 0 on
- * success or a negative errno. Like everything else reached from a
- * syscall they run with interrupts off; blocking waits go through
- * waitqueue_wait_ms(), never a spin.
+ * Entry points return >= 0 on success or a negative errno. The data calls
+ * (usock_send/usock_recv) take the user's iovecs and copy them themselves
+ * (copy_from_user/copy_to_user): they run outside the big kernel lock,
+ * under the sockets' own spinlock (kernel/unix_socket.c). Blocking waits
+ * go through the wait queues, never a spin.
  */
 #pragma once
 
@@ -36,12 +36,12 @@
 #define UMSG_CMSG_CLOEXEC 0x40000000
 
 typedef struct {
-    const uint8_t *base;   /* user pointer, already validated for reading */
+    const uint8_t *base;   /* user pointer (copied with copy_from_user) */
     uint64_t len;
 } UIoVecR;
 
 typedef struct {
-    uint8_t *base;         /* user pointer, already prepared for writing */
+    uint8_t *base;         /* user pointer (copied with copy_to_user) */
     uint64_t len;
 } UIoVecW;
 

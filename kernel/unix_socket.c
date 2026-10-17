@@ -17,10 +17,19 @@
  * (Linux does the same, so each fd batch arrives with the byte it was
  * sent with). Seqpacket/datagram reads return exactly one message.
  *
- * Everything runs with interrupts off (syscall context, SFMASK), so the
- * only points where another thread can run are the waitqueue_wait_ms()
- * calls. Every blocking entry point holds its own temporary reference so
- * a concurrent close() of the fd from another thread can't free the slot
+ * Locking: every socket's state is under g_usock_lock (one lock for all:
+ * a send touches two sockets). Sends and receives run outside the big
+ * kernel lock (kernel/syscall.c), so nothing under g_usock_lock touches
+ * user memory (a copy may fault and sleep): a send fills its message
+ * before taking the lock, a receive copies out of the queue into a kernel
+ * buffer and on to the user after letting go. Blocking waits let go of
+ * the lock once parked (waitqueue_wait_locked()). What needs the big lock
+ * -- closing an fd still in flight, a socket file's inode -- is collected
+ * under g_usock_lock and done after it (Reap), taking the big lock then.
+ * Order: g_usock_lock -> wait queues -> scheduler; -> heap -> pmm.
+ *
+ * Every blocking entry point holds its own temporary reference so a
+ * concurrent close() of the fd from another thread can't free the slot
  * out from under the sleeper.
  *
  * Wake-ups: each socket has ONE wait queue, woken for anything that can
@@ -37,6 +46,9 @@
 #include <wynland/unix_socket.h>
 #include <wynland/sandbox.h>
 #include <wynland/vfs.h>
+#include <wynland/spinlock.h>
+#include <wynland/smp.h>
+#include <wynland/usercopy.h>
 
 extern uint64_t timer_get_ms(void);
 
@@ -50,6 +62,10 @@ extern uint64_t timer_get_ms(void);
    UMSG_MIN_CAP of kernel heap) used to be unbounded and could exhaust the
    kernel heap for the whole system. */
 #define USOCK_MAX_MSGS  1024
+/* a stream send is copied in from the user this much at a time */
+#define USOCK_STAGE     (64 * 1024)
+/* the most one receive copies out (a whole datagram fits: > USOCK_RCVBUF) */
+#define USOCK_RECV_MAX  (256 * 1024)
 
 #define EAGAIN      11
 #define ENOMEM      12
@@ -106,9 +122,51 @@ typedef struct USock {
     struct UCred cred;       /* creator's */
     struct UCred peer_cred;  /* peer's, captured at connect/socketpair time */
     WaitQueue wq;
+    struct USock *reap_next; /* on a Reap list, freed after the lock */
 } USock;
 
 static USock *g_usock[USOCK_SLOTS];
+static Spinlock g_usock_lock = SPINLOCK_INIT("unix sockets");
+
+static inline uint64_t ulock(void) { return spin_lock_irqsave(&g_usock_lock); }
+static inline void uunlock(uint64_t f) { spin_unlock_irqrestore(&g_usock_lock, f); }
+
+/* ---- what is freed after the lock ------------------------------------- */
+
+typedef struct Reap {
+    UMsg    *msgs;                       /* dropped messages (their fds closed) */
+    USock   *socks;                      /* destroyed sockets */
+    VfsFile *fds[USOCK_MAX_MSG_FDS];     /* fds received with nowhere to go */
+    uint32_t nfds;
+} Reap;
+
+static void reap_msg(Reap *r, UMsg *m) { m->next = r->msgs; r->msgs = m; }
+
+/* g_usock_lock NOT held. Closing an fd (any kind of file) and an inode
+   are the big lock's: taken first when there is any of that. */
+static void reap_finish(Reap *r) {
+    bool big = r->nfds > 0;
+    for (UMsg *m = r->msgs; m && !big; m = m->next) if (m->nfds) big = true;
+    for (USock *s = r->socks; s && !big; s = s->reap_next) if (s->pinned) big = true;
+    if (big) bkl_lock();   /* kept until the syscall ends */
+    for (uint32_t i = 0; i < r->nfds; i++) kfile_close(r->fds[i]);
+    r->nfds = 0;
+    while (r->msgs) {
+        UMsg *m = r->msgs;
+        r->msgs = m->next;
+        for (uint32_t i = 0; i < m->nfds; i++) if (m->fds[i]) kfile_close(m->fds[i]);
+        kfree(m);
+    }
+    while (r->socks) {
+        USock *s = r->socks;
+        r->socks = s->reap_next;
+        if (s->pinned) {
+            extern void ext2_unpin_inode(uint32_t inum);
+            ext2_unpin_inode(s->scope);
+        }
+        kfree(s);
+    }
+}
 
 /* ---------------------------------------------------------------- */
 
@@ -128,7 +186,8 @@ static USock *slot(int idx) {
     return g_usock[idx];
 }
 
-static USock *usock_alloc(int type) {
+/* g_usock_lock held (the heap's lock nests inside it) */
+static USock *usock_alloc(int type, struct UCred cred) {
     for (int i = 0; i < USOCK_SLOTS; i++) {
         if (g_usock[i]) continue;
         USock *s = (USock *)kmalloc(sizeof(USock));
@@ -137,18 +196,11 @@ static USock *usock_alloc(int type) {
         s->idx = i;
         s->type = type;
         s->state = US_UNCONNECTED;
-        s->cred = current_cred();
+        s->cred = cred;
         g_usock[i] = s;
         return s;
     }
     return NULL;
-}
-
-static void msg_free(UMsg *m) {
-    for (uint32_t i = 0; i < m->nfds; i++) {
-        if (m->fds[i]) kfile_close(m->fds[i]);
-    }
-    kfree(m);
 }
 
 WaitQueue g_poll_any_wq;
@@ -157,8 +209,6 @@ static void wake(USock *s) {
     if (s) waitqueue_wake_all(&s->wq);
     waitqueue_wake_all(&g_poll_any_wq);
 }
-
-static void usock_destroy(USock *s);
 
 /* Detach s from its peer: the peer sees EOF / EPIPE from now on. */
 static void disconnect(USock *s) {
@@ -172,12 +222,17 @@ static void disconnect(USock *s) {
     }
 }
 
-static void usock_destroy(USock *s) {
+static void drop_queue(USock *s, Reap *r) {
+    UMsg *m = s->rx_head;
+    s->rx_head = s->rx_tail = NULL;
+    s->rx_msgs = 0;
+    s->rx_bytes = 0;
+    while (m) { UMsg *n = m->next; reap_msg(r, m); m = n; }
+}
+
+/* g_usock_lock held; the memory (and its fds, its inode) goes in r */
+static void usock_destroy(USock *s, Reap *r) {
     g_usock[s->idx] = NULL;
-    if (s->pinned) {
-        extern void ext2_unpin_inode(uint32_t inum);
-        ext2_unpin_inode(s->scope);
-    }
     disconnect(s);
     /* A datagram socket connect()ed to s points at it one-directionally
        (s->peer doesn't point back): clear those too. */
@@ -193,42 +248,55 @@ static void usock_destroy(USock *s) {
     for (int i = 0; i < s->npend; i++) {
         USock *c = s->pend[i];
         disconnect(c);
-        UMsg *m = c->rx_head;
-        while (m) { UMsg *n = m->next; msg_free(m); m = n; }
+        drop_queue(c, r);
         g_usock[c->idx] = NULL;
-        kfree(c);
+        c->pinned = false;
+        c->reap_next = r->socks;
+        r->socks = c;
     }
     s->npend = 0;
-    UMsg *m = s->rx_head;
-    s->rx_head = s->rx_tail = NULL;
-    s->rx_msgs = 0;
-    while (m) { UMsg *n = m->next; msg_free(m); m = n; }
+    drop_queue(s, r);
     wake(s); /* anyone still parked here holds a ref -- can't happen, but harmless */
-    kfree(s);
+    s->reap_next = r->socks;
+    r->socks = s;
+}
+
+static void unref_locked(USock *s, Reap *r) {
+    if (--s->refs <= 0) usock_destroy(s, r);
 }
 
 void usock_ref(int idx) {
+    uint64_t f = ulock();
     USock *s = slot(idx);
     if (s) s->refs++;
+    uunlock(f);
 }
 
 void usock_unref(int idx) {
+    Reap r = {0};
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    if (!s) return;
-    if (--s->refs <= 0) usock_destroy(s);
+    if (s) unref_locked(s, &r);
+    uunlock(f);
+    reap_finish(&r);
 }
 
 int usock_type(int idx) {
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    return s ? s->type : -1;
+    int t = s ? s->type : -1;
+    uunlock(f);
+    return t;
 }
 
 int usock_create(int type) {
     if (type != USOCK_STREAM && type != USOCK_SEQPACKET && type != USOCK_DGRAM) return -EINVAL;
-    USock *s = usock_alloc(type);
-    if (!s) return -ENFILE;
-    s->refs = 1;
-    return s->idx;
+    struct UCred c = current_cred();
+    uint64_t f = ulock();
+    USock *s = usock_alloc(type, c);
+    if (s) s->refs = 1;
+    uunlock(f);
+    return s ? s->idx : -ENFILE;
 }
 
 static void link_pair(USock *a, USock *b) {
@@ -244,7 +312,9 @@ int usock_pair(int type, int out[2]) {
     if (a < 0) return a;
     int b = usock_create(type);
     if (b < 0) { usock_unref(a); return b; }
+    uint64_t f = ulock();
     link_pair(g_usock[a], g_usock[b]);
+    uunlock(f);
     out[0] = a; out[1] = b;
     return 0;
 }
@@ -260,10 +330,12 @@ static bool name_eq(const USock *s, const char *name, uint32_t len) {
 /* What a name means, as on Linux: a filesystem name is its socket file --
    the inode the path leads to from the caller (its chroot, its mounts: a
    socket bound into a sandbox by a bind mount is the same socket); an
-   abstract name belongs to the network namespace. */
+   abstract name belongs to the network namespace. Looks at the
+   filesystem: without g_usock_lock, in the big lock. */
 #define SCOPE_ABSTRACT 0x80000000u
 #define SCOPE_NONE     0xFFFFFFFFu
 static uint32_t name_scope(const char *name, uint32_t len) {
+    bkl_lock();
     if (len && name[0] == '\0') return SCOPE_ABSTRACT | sandbox_netns(sched_current()->proc);
     char path[USOCK_NAME_MAX + 1];
     uint32_t n = len < USOCK_NAME_MAX ? len : USOCK_NAME_MAX;
@@ -275,8 +347,8 @@ static uint32_t name_scope(const char *name, uint32_t len) {
     return st.first_cluster;
 }
 
-static USock *find_bound(const char *name, uint32_t len) {
-    uint32_t scope = name_scope(name, len);
+/* g_usock_lock held; scope from name_scope() */
+static USock *find_bound(uint32_t scope, const char *name, uint32_t len) {
     if (scope == SCOPE_NONE) return NULL;
     bool abstract = (scope & SCOPE_ABSTRACT) != 0;
     for (int i = 0; i < USOCK_SLOTS; i++) {
@@ -297,72 +369,96 @@ static uint32_t norm_name_len(const char *name, uint32_t len) {
 }
 
 int64_t usock_bind(int idx, const char *name, uint32_t len) {
-    USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
     len = norm_name_len(name, len);
     if (len == 0) return -EINVAL; /* autobind isn't implemented */
-    if (s->bound) return -EINVAL;
-    if (find_bound(name, len)) return -EADDRINUSE;
     /* a filesystem name: its file was made just before (SYS_bind) */
     uint32_t scope = name_scope(name, len);
-    if (scope == SCOPE_NONE) return -ENOENT;
-    kmemcpy(s->name, name, len);
-    s->name_len = (uint16_t)len;
-    s->scope = scope;
-    s->bound = true;
-    /* its file's inode stays while it is bound (unlinked, an orphan): the
-       number must not come back as another socket's name */
-    if (!(scope & SCOPE_ABSTRACT)) {
-        extern bool ext2_pin_inode(uint32_t inum);
-        s->pinned = ext2_pin_inode(scope);
+    uint64_t f = ulock();
+    USock *s = slot(idx);
+    int64_t ret = 0;
+    if (!s) ret = -ENOTSOCK;
+    else if (s->bound) ret = -EINVAL;
+    else if (find_bound(scope, name, len)) ret = -EADDRINUSE;
+    else if (scope == SCOPE_NONE) ret = -ENOENT;
+    else {
+        kmemcpy(s->name, name, len);
+        s->name_len = (uint16_t)len;
+        s->scope = scope;
+        s->bound = true;
+        s->refs++;   /* for the pin below, out of the lock */
     }
-    return 0;
+    uunlock(f);
+    if (ret == 0) {
+        /* its file's inode stays while it is bound (unlinked, an orphan):
+           the number must not come back as another socket's name */
+        if (!(scope & SCOPE_ABSTRACT)) {
+            extern bool ext2_pin_inode(uint32_t inum);
+            bool pinned = ext2_pin_inode(scope);
+            f = ulock();
+            s->pinned = pinned;
+            uunlock(f);
+        }
+        usock_unref(idx);
+    }
+    return ret;
 }
 
 int64_t usock_listen(int idx, int backlog) {
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
-    if (s->type == USOCK_DGRAM) return -EOPNOTSUPP;
-    if (s->state == US_CONNECTED) return -EINVAL;
-    if (!s->bound) return -EINVAL; /* no autobind */
-    if (backlog <= 0 || backlog > USOCK_BACKLOG) backlog = USOCK_BACKLOG;
-    s->backlog = backlog;
-    s->state = US_LISTENING;
-    return 0;
+    int64_t ret = 0;
+    if (!s) ret = -ENOTSOCK;
+    else if (s->type == USOCK_DGRAM) ret = -EOPNOTSUPP;
+    else if (s->state == US_CONNECTED) ret = -EINVAL;
+    else if (!s->bound) ret = -EINVAL; /* no autobind */
+    else {
+        if (backlog <= 0 || backlog > USOCK_BACKLOG) backlog = USOCK_BACKLOG;
+        s->backlog = backlog;
+        s->state = US_LISTENING;
+    }
+    uunlock(f);
+    return ret;
 }
 
 int64_t usock_connect(int idx, const char *name, uint32_t len, bool nonblock) {
-    USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
     len = norm_name_len(name, len);
     if (len == 0) return -EINVAL;
+    uint32_t scope = name_scope(name, len);
+    /* SO_PEERCRED gives the server whoever connects, as on Linux, not
+       whoever made the socket (it may have been passed on) */
+    struct UCred me = current_cred();
+    Reap rp = {0};
+    uint64_t f = ulock();
+    USock *s = slot(idx);
+    if (!s) { uunlock(f); return -ENOTSOCK; }
 
     if (s->type == USOCK_DGRAM) {
         /* Datagram "connect" just fixes the default destination. */
-        USock *t = find_bound(name, len);
-        if (!t || t->type != USOCK_DGRAM) return t ? -ECONNREFUSED : -ENOENT;
-        s->peer = t;          /* one-directional: t->peer is untouched */
-        s->state = US_CONNECTED;
-        s->peer_cred = t->cred;
-        return 0;
+        USock *t = find_bound(scope, name, len);
+        int64_t ret = 0;
+        if (!t || t->type != USOCK_DGRAM) ret = t ? -ECONNREFUSED : -ENOENT;
+        else {
+            s->peer = t;          /* one-directional: t->peer is untouched */
+            s->state = US_CONNECTED;
+            s->peer_cred = t->cred;
+        }
+        uunlock(f);
+        return ret;
     }
 
-    if (s->state == US_CONNECTED) return -EISCONN;
-    if (s->state == US_LISTENING) return -EINVAL;
+    if (s->state == US_CONNECTED) { uunlock(f); return -EISCONN; }
+    if (s->state == US_LISTENING) { uunlock(f); return -EINVAL; }
 
-    /* SO_PEERCRED gives the server whoever connects, as on Linux, not
-       whoever made the socket (it may have been passed on) */
-    s->cred = current_cred();
+    s->cred = me;
     s->refs++; /* held across the wait below */
     int64_t ret;
     for (;;) {
-        USock *l = find_bound(name, len);
+        USock *l = find_bound(scope, name, len);
         if (!l) { ret = name[0] ? -ENOENT : -ECONNREFUSED; break; }
         if (l->state != US_LISTENING || l->type != s->type) { ret = -ECONNREFUSED; break; }
         if (l->npend < l->backlog) {
-            USock *srv = usock_alloc(s->type);
+            USock *srv = usock_alloc(s->type, l->cred);   /* server end belongs to the listener's owner */
             if (!srv) { ret = -ENFILE; break; }
-            srv->cred = l->cred;           /* server end belongs to the listener's owner */
             kmemcpy(srv->name, l->name, l->name_len);
             srv->name_len = l->name_len;   /* getsockname() on the accepted fd */
             srv->scope = l->scope;
@@ -376,17 +472,22 @@ int64_t usock_connect(int idx, const char *name, uint32_t len, bool nonblock) {
         if (nonblock) { ret = -EAGAIN; break; }
         if (sched_dying()) { ret = -4; break; }   /* -EINTR */
         l->refs++;
-        waitqueue_wait_ms(&l->wq, SCHED_NO_DEADLINE);
-        usock_unref(l->idx);
+        waitqueue_wait_locked(&l->wq, SCHED_NO_DEADLINE, &g_usock_lock);
+        spin_lock(&g_usock_lock);
+        unref_locked(l, &rp);
     }
-    usock_unref(idx);
+    unref_locked(s, &rp);
+    uunlock(f);
+    reap_finish(&rp);
     return ret;
 }
 
 int64_t usock_accept(int idx, bool nonblock) {
+    Reap rp = {0};
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
-    if (s->state != US_LISTENING) return -EINVAL;
+    if (!s) { uunlock(f); return -ENOTSOCK; }
+    if (s->state != US_LISTENING) { uunlock(f); return -EINVAL; }
     s->refs++;
     int64_t ret;
     for (;;) {
@@ -401,10 +502,13 @@ int64_t usock_accept(int idx, bool nonblock) {
         }
         if (nonblock) { ret = -EAGAIN; break; }
         if (sched_dying()) { ret = -4; break; }   /* -EINTR */
-        waitqueue_wait_ms(&s->wq, SCHED_NO_DEADLINE);
+        waitqueue_wait_locked(&s->wq, SCHED_NO_DEADLINE, &g_usock_lock);
+        spin_lock(&g_usock_lock);
         if (!g_usock[idx]) { ret = -EINVAL; break; } /* can't happen: we hold a ref */
     }
-    usock_unref(idx);
+    unref_locked(s, &rp);
+    uunlock(f);
+    reap_finish(&rp);
     return ret;
 }
 
@@ -416,15 +520,27 @@ static uint64_t iov_total_r(const UIoVecR *iov, int n) {
     return t;
 }
 
-/* Copy `len` bytes starting at logical offset `skip` of the iovec list. */
-static void iov_gather(uint8_t *dst, const UIoVecR *iov, int n, uint64_t skip, uint64_t len) {
+/* Copy `len` bytes starting at logical offset `skip` of the (user) iovec
+   list. No lock held: it may fault. */
+static int iov_gather(uint8_t *dst, const UIoVecR *iov, int n, uint64_t skip, uint64_t len) {
     for (int i = 0; i < n && len > 0; i++) {
         if (skip >= iov[i].len) { skip -= iov[i].len; continue; }
         uint64_t take = iov[i].len - skip;
         if (take > len) take = len;
-        kmemcpy(dst, iov[i].base + skip, take);
+        if (copy_from_user(dst, iov[i].base + skip, take) != 0) return -EFAULT;
         dst += take; len -= take; skip = 0;
     }
+    return 0;
+}
+
+/* The kernel buffer's `len` bytes out to the (user) iovec list. No lock. */
+static int iov_scatter(const UIoVecW *iov, int n, const uint8_t *src, uint64_t len) {
+    for (int i = 0; i < n && len > 0; i++) {
+        uint64_t take = iov[i].len < len ? iov[i].len : len;
+        if (take && copy_to_user(iov[i].base, src, take) != 0) return -EFAULT;
+        src += take; len -= take;
+    }
+    return 0;
 }
 
 static void enqueue(USock *r, UMsg *m) {
@@ -456,24 +572,52 @@ static int64_t epipe(int flags) {
 
 int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint32_t nfds,
                    int flags, bool nonblock, const char *dest, uint32_t dest_len) {
-    USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
     if (flags & UMSG_DONTWAIT) nonblock = true;
     uint64_t total = iov_total_r(iov, iovcnt);
     if (nfds > USOCK_MAX_MSG_FDS) return -EINVAL;
 
-    s->refs++;
+    uint32_t dl = 0, dscope = SCOPE_NONE;
+    if (dest) { dl = norm_name_len(dest, dest_len); dscope = name_scope(dest, dl); }
+
+    /* What goes out is copied in first, without the lock: a seqpacket/
+       datagram message whole, a stream in stages of USOCK_STAGE */
     int64_t ret = 0;
     uint64_t sent = 0;
     bool fds_sent = false;
+    UMsg *stage = NULL;          /* stream: bytes [sent, sent + len - off) of the data */
+    bool is_stream;
+    {
+        uint64_t f = ulock();
+        USock *s0 = slot(idx);
+        int type = s0 ? s0->type : -1;
+        uunlock(f);
+        if (type < 0) return -ENOTSOCK;
+        is_stream = type == USOCK_STREAM;
+    }
+    if (!is_stream) {
+        if (total > USOCK_RCVBUF) ret = -EMSGSIZE;
+        else if (!(stage = msg_new((uint32_t)total))) ret = -ENOMEM;
+        else if (iov_gather(stage->data, iov, iovcnt, 0, total) != 0) ret = -EFAULT;
+        else stage->len = (uint32_t)total;
+        if (ret) {
+            if (stage) kfree(stage);
+            if (nfds) { bkl_lock(); for (uint32_t i = 0; i < nfds; i++) if (fds[i]) kfile_close(fds[i]); }
+            return ret;
+        }
+    }
+
+    Reap rp = {0};
+    uint64_t f = ulock();
+    USock *s = slot(idx);
+    if (!s) { ret = -ENOTSOCK; goto out_nosock; }
+    s->refs++;
 
     for (;;) {
         if (s->wr_shut) { ret = epipe(flags); break; }
 
         USock *r;
         if (s->type == USOCK_DGRAM && dest) {
-            uint32_t dl = norm_name_len(dest, dest_len);
-            r = find_bound(dest, dl);
+            r = find_bound(dscope, dest, dl);
             if (!r || r->type != USOCK_DGRAM) { ret = r ? -ECONNREFUSED : -ENOENT; break; }
         } else {
             r = s->peer;
@@ -491,22 +635,43 @@ int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint3
         if (s->type == USOCK_STREAM) {
             uint64_t left = total - sent;
             if (left == 0 && (fds_sent || nfds == 0)) { ret = (int64_t)sent; break; }
-            uint32_t chunk = (uint32_t)(left < room ? left : room);
+            uint32_t ready = stage ? stage->len - stage->off : 0;
+            if (left > 0 && ready == 0) {
+                /* the next stage of the user's data, out of the lock */
+                uunlock(f);
+                if (stage) kfree(stage);
+                uint32_t n = (uint32_t)(left < USOCK_STAGE ? left : USOCK_STAGE);
+                stage = msg_new(n < UMSG_MIN_CAP ? UMSG_MIN_CAP : n);
+                int bad = !stage ? -ENOMEM : iov_gather(stage->data, iov, iovcnt, sent, n);
+                f = ulock();
+                if (bad) { ret = sent ? (int64_t)sent : bad; break; }
+                stage->len = n;
+                continue;   /* the socket may have changed meanwhile */
+            }
+            uint32_t chunk = ready < room ? ready : room;
             bool with_fds = !fds_sent && nfds > 0;
             UMsg *tail = r->rx_tail;
             bool append = !with_fds && tail && tail->nfds == 0 && tail->cap - tail->len >= chunk && chunk > 0;
             /* a new message needs a free queue slot; without one, wait */
-            if ((room > 0 || (left == 0 && !fds_sent)) && (append || msg_room)) {
+            if ((chunk > 0 || (left == 0 && with_fds)) && (append || msg_room)) {
                 if (append) {
-                    iov_gather(tail->data + tail->len, iov, iovcnt, sent, chunk);
+                    kmemcpy(tail->data + tail->len, stage->data + stage->off, chunk);
                     tail->len += chunk;
                     r->rx_bytes += chunk;
+                    stage->off += chunk;
                 } else {
-                    uint32_t cap = chunk < UMSG_MIN_CAP ? UMSG_MIN_CAP : chunk;
-                    UMsg *m = msg_new(cap);
-                    if (!m) { ret = sent ? (int64_t)sent : -ENOMEM; break; }
-                    iov_gather(m->data, iov, iovcnt, sent, chunk);
-                    m->len = chunk;
+                    UMsg *m;
+                    if (stage && stage->off == 0 && chunk == stage->len) {
+                        m = stage;            /* the whole stage goes as it is */
+                        stage = NULL;
+                    } else {
+                        m = msg_new(chunk < UMSG_MIN_CAP ? UMSG_MIN_CAP : chunk);
+                        if (!m) { ret = sent ? (int64_t)sent : -ENOMEM; break; }
+                        if (chunk) kmemcpy(m->data, stage->data + stage->off, chunk);
+                        m->len = chunk;
+                        if (stage) stage->off += chunk;
+                    }
+                    m->off = 0;
                     if (with_fds) {
                         for (uint32_t i = 0; i < nfds; i++) m->fds[i] = fds[i];
                         m->nfds = nfds;
@@ -521,12 +686,9 @@ int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint3
             if (nonblock) { ret = sent ? (int64_t)sent : -EAGAIN; break; }
         } else {
             /* seqpacket / datagram: one atomic message */
-            if (total > USOCK_RCVBUF) { ret = -EMSGSIZE; break; }
             if (msg_room && (room >= total || r->rx_head == NULL)) {
-                UMsg *m = msg_new((uint32_t)total);
-                if (!m) { ret = -ENOMEM; break; }
-                iov_gather(m->data, iov, iovcnt, 0, total);
-                m->len = (uint32_t)total;
+                UMsg *m = stage;
+                stage = NULL;
                 for (uint32_t i = 0; i < nfds; i++) m->fds[i] = fds[i];
                 m->nfds = nfds;
                 fds_sent = true;
@@ -546,23 +708,27 @@ int64_t usock_send(int idx, const UIoVecR *iov, int iovcnt, VfsFile **fds, uint3
         USock *wq_owner = (r->peer == s) ? s : r;
         wq_owner->refs++;
         r->refs++;
-        waitqueue_wait_ms(&wq_owner->wq, SCHED_NO_DEADLINE);
-        usock_unref(r->idx);
-        usock_unref(wq_owner->idx);
+        waitqueue_wait_locked(&wq_owner->wq, SCHED_NO_DEADLINE, &g_usock_lock);
+        spin_lock(&g_usock_lock);
+        unref_locked(r, &rp);
+        unref_locked(wq_owner, &rp);
     }
-
+    unref_locked(s, &rp);
+out_nosock:
+    uunlock(f);
+    if (stage) kfree(stage);
     /* fds the caller handed us are ours now: close any we didn't queue */
     if (!fds_sent) {
-        for (uint32_t i = 0; i < nfds; i++) if (fds[i]) kfile_close(fds[i]);
+        for (uint32_t i = 0; i < nfds && rp.nfds < USOCK_MAX_MSG_FDS; i++) if (fds[i]) rp.fds[rp.nfds++] = fds[i];
     }
-    usock_unref(idx);
+    reap_finish(&rp);
     return ret;
 }
 
-static void deliver_fds(UMsg *m, VfsFile **fds_out, uint32_t cap, uint32_t *nout, int *mflags) {
+static void deliver_fds(UMsg *m, VfsFile **fds_out, uint32_t cap, uint32_t *nout, int *mflags, Reap *r) {
     for (uint32_t i = 0; i < m->nfds; i++) {
         if (*nout < cap) fds_out[(*nout)++] = m->fds[i];
-        else { kfile_close(m->fds[i]); *mflags |= UMSG_CTRUNC; }
+        else { if (r->nfds < USOCK_MAX_MSG_FDS) r->fds[r->nfds++] = m->fds[i]; *mflags |= UMSG_CTRUNC; }
         m->fds[i] = NULL;
     }
     m->nfds = 0;
@@ -578,8 +744,6 @@ static void consumed(USock *s, uint32_t bytes) {
 int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonblock,
                    VfsFile **fds_out, uint32_t fds_cap, uint32_t *nfds_out, int *msg_flags,
                    char *src_name, uint32_t *src_len) {
-    USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
     if (flags & UMSG_DONTWAIT) nonblock = true;
     *nfds_out = 0;
     *msg_flags = 0;
@@ -588,8 +752,23 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
     for (int i = 0; i < iovcnt; i++) want += iov[i].len;
     bool peek = (flags & UMSG_PEEK) != 0;
 
-    s->refs++;
+    /* what is taken from the queue lands here first (the lock is held
+       then), and goes on to the user after */
+    uint64_t cap = want < USOCK_RECV_MAX ? want : USOCK_RECV_MAX;
+    uint8_t small[2048];
+    uint8_t *kb = small;
+    if (cap > sizeof(small)) {
+        kb = (uint8_t *)kmalloc(cap);
+        if (!kb) return -ENOMEM;
+    }
+
+    Reap rp = {0};
+    uint64_t got = 0;
     int64_t ret;
+    uint64_t f = ulock();
+    USock *s = slot(idx);
+    if (!s) { uunlock(f); if (kb != small) kfree(kb); return -ENOTSOCK; }
+    s->refs++;
     for (;;) {
         if (s->rx_head) break;
         if (s->type != USOCK_DGRAM) {
@@ -601,27 +780,22 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
         }
         if (nonblock) { ret = -EAGAIN; goto out; }
         if (sched_dying()) { ret = -4; goto out; }   /* -EINTR */
-        waitqueue_wait_ms(&s->wq, SCHED_NO_DEADLINE);
+        waitqueue_wait_locked(&s->wq, SCHED_NO_DEADLINE, &g_usock_lock);
+        spin_lock(&g_usock_lock);
     }
 
     if (s->type == USOCK_STREAM) {
-        uint64_t got = 0;
-        int vi = 0; uint64_t voff = 0;
         UMsg *m = s->rx_head;
         uint32_t peek_off = 0;
-        while (m && got < want) {
+        while (m && got < cap) {
             if (m->nfds > 0 && got > 0) break; /* fds start a new read */
-            if (m->nfds > 0 && !peek) deliver_fds(m, fds_out, fds_cap, nfds_out, msg_flags);
+            if (m->nfds > 0 && !peek) deliver_fds(m, fds_out, fds_cap, nfds_out, msg_flags, &rp);
             uint32_t start = peek ? m->off + peek_off : m->off;
             uint32_t avail = m->len - start;
-            while (avail > 0 && got < want) {
-                while (vi < iovcnt && voff >= iov[vi].len) { vi++; voff = 0; }
-                if (vi >= iovcnt) break;
-                uint64_t take = iov[vi].len - voff;
-                if (take > avail) take = avail;
-                kmemcpy(iov[vi].base + voff, m->data + start, take);
-                voff += take; got += take; start += (uint32_t)take; avail -= (uint32_t)take;
-            }
+            uint64_t take = cap - got;
+            if (take > avail) take = avail;
+            kmemcpy(kb + got, m->data + start, take);
+            got += take; start += (uint32_t)take; avail -= (uint32_t)take;
             if (peek) {
                 if (avail > 0) break;
                 m = m->next; peek_off = 0;
@@ -633,7 +807,7 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
             if (m->off >= m->len) {
                 s->rx_head = m->next;
                 if (!s->rx_head) s->rx_tail = NULL;
-                msg_free(m);
+                reap_msg(&rp, m);
                 dequeued(s);
                 m = s->rx_head;
             } else {
@@ -643,71 +817,80 @@ int64_t usock_recv(int idx, const UIoVecW *iov, int iovcnt, int flags, bool nonb
         ret = (int64_t)got;
     } else {
         UMsg *m = s->rx_head;
-        uint64_t n = m->len < want ? m->len : want;
-        uint64_t done = 0;
-        for (int i = 0; i < iovcnt && done < n; i++) {
-            uint64_t take = iov[i].len;
-            if (take > n - done) take = n - done;
-            kmemcpy(iov[i].base, m->data + done, take);
-            done += take;
-        }
+        got = m->len < cap ? m->len : cap;
+        kmemcpy(kb, m->data, got);
         if (m->len > want) *msg_flags |= UMSG_TRUNC;
         if (src_name && src_len && m->src_len) {
             kmemcpy(src_name, m->src, m->src_len);
             *src_len = m->src_len;
         }
-        ret = (flags & UMSG_TRUNC) ? (int64_t)m->len : (int64_t)n;
+        ret = (flags & UMSG_TRUNC) ? (int64_t)m->len : (int64_t)got;
         if (!peek) {
-            deliver_fds(m, fds_out, fds_cap, nfds_out, msg_flags);
+            deliver_fds(m, fds_out, fds_cap, nfds_out, msg_flags, &rp);
             s->rx_head = m->next;
             if (!s->rx_head) s->rx_tail = NULL;
             uint32_t len = m->len;
-            msg_free(m);
+            reap_msg(&rp, m);
             dequeued(s);
             consumed(s, len);
         }
     }
 out:
-    usock_unref(idx);
+    unref_locked(s, &rp);
+    uunlock(f);
+    /* taken from the queue already: a bad buffer loses it, as on Linux */
+    if (ret >= 0 && got && iov_scatter(iov, iovcnt, kb, got) != 0) ret = -EFAULT;
+    if (kb != small) kfree(kb);
+    reap_finish(&rp);
     return ret;
 }
 
 int64_t usock_shutdown(int idx, int how) {
-    USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
     if (how < 0 || how > 2) return -EINVAL;
-    if (s->state != US_CONNECTED && s->type != USOCK_DGRAM) return -ENOTCONN;
-    if (how == 0 || how == 2) s->rd_shut = true;
-    if (how == 1 || how == 2) {
-        s->wr_shut = true;
-        if (s->peer && s->peer->peer == s) { s->peer->peer_wr_shut = true; wake(s->peer); }
+    uint64_t f = ulock();
+    USock *s = slot(idx);
+    int64_t ret = 0;
+    if (!s) ret = -ENOTSOCK;
+    else if (s->state != US_CONNECTED && s->type != USOCK_DGRAM) ret = -ENOTCONN;
+    else {
+        if (how == 0 || how == 2) s->rd_shut = true;
+        if (how == 1 || how == 2) {
+            s->wr_shut = true;
+            if (s->peer && s->peer->peer == s) { s->peer->peer_wr_shut = true; wake(s->peer); }
+        }
+        wake(s);
     }
-    wake(s);
-    return 0;
+    uunlock(f);
+    return ret;
 }
 
 int64_t usock_getname(int idx, bool peer, char *name, uint32_t *len) {
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
+    int64_t ret = 0;
     USock *t = s;
-    if (peer) {
-        t = s->peer;
-        if (!t) return -ENOTCONN;
+    if (!s) ret = -ENOTSOCK;
+    else if (peer && !(t = s->peer)) ret = -ENOTCONN;
+    else {
+        kmemcpy(name, t->name, t->name_len);
+        *len = t->name_len;
     }
-    kmemcpy(name, t->name, t->name_len);
-    *len = t->name_len;
-    return 0;
+    uunlock(f);
+    return ret;
 }
 
 int64_t usock_peercred(int idx, struct UCred *out) {
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    if (!s) return -ENOTSOCK;
-    if (!s->was_connected && s->state != US_CONNECTED) {
+    int64_t ret = 0;
+    if (!s) ret = -ENOTSOCK;
+    else if (!s->was_connected && s->state != US_CONNECTED) {
         out->pid = 0; out->uid = (uint32_t)-1; out->gid = (uint32_t)-1;
-        return 0;
+    } else {
+        *out = s->peer_cred;
     }
-    *out = s->peer_cred;
-    return 0;
+    uunlock(f);
+    return ret;
 }
 
 int64_t usock_sock_error(int idx) {
@@ -716,12 +899,14 @@ int64_t usock_sock_error(int idx) {
 }
 
 uint32_t usock_poll(int idx, uint32_t events, WaitQueue **wq) {
+    uint64_t f = ulock();
     USock *s = slot(idx);
-    if (!s) return UPOLLERR | UPOLLHUP;
-    *wq = &s->wq;
     uint32_t rev = 0;
+    if (!s) { uunlock(f); return UPOLLERR | UPOLLHUP; }
+    *wq = &s->wq;
     if (s->state == US_LISTENING) {
         if (s->npend > 0) rev |= UPOLLIN;
+        uunlock(f);
         return rev & (events | UPOLLERR | UPOLLHUP);
     }
     if (s->rx_head) rev |= UPOLLIN;
@@ -735,5 +920,6 @@ uint32_t usock_poll(int idx, uint32_t events, WaitQueue **wq) {
         USock *r = s->peer;
         if (!r || (r->rx_bytes < USOCK_RCVBUF && r->rx_msgs < USOCK_MAX_MSGS)) rev |= UPOLLOUT;
     }
+    uunlock(f);
     return rev & (events | UPOLLERR | UPOLLHUP);
 }

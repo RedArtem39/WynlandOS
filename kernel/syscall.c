@@ -2188,6 +2188,211 @@ struct linux_cmsghdr { uint64_t cmsg_len; int32_t cmsg_level; int32_t cmsg_type;
 #define SOL_SOCKET_LVL  1
 #define MSG_CTRL_MAX    4096
 
+/* ---- Unix sockets outside the big kernel lock ---------------------------
+   send/recv on a Unix socket (kernel/unix_socket.c has its own lock) run
+   without the big lock: the fd is looked up and the socket held under
+   g_fdtab_lock (see pipe_fast()), and the socket code copies user memory
+   itself. What needs the fd table -- passing fds (SCM_RIGHTS) both ways --
+   or the filesystem -- a destination name -- takes the big lock there. */
+
+/* fd's Unix socket, held (usock_ref()); false: no such fd or not one */
+static bool usock_fd_take(uint64_t fd, int *idx, uint32_t *oflags) {
+    Process *proc = sched_current()->proc;
+    if (!proc || fd >= MAX_OPEN_FILES) return false;
+    uint64_t f = spin_lock_irqsave(&g_fdtab_lock);
+    VfsFile *vf = proc->fd_table[fd];
+    bool ok = vf && vf->node.first_cluster == USOCK_FD;
+    if (ok) {
+        *idx = (int)vf->current_cluster;
+        *oflags = proc->fd_oflags[fd];
+        usock_ref(*idx);
+    }
+    spin_unlock_irqrestore(&g_fdtab_lock, f);
+    return ok;
+}
+
+/* received fds with nowhere to go (a plain read): closed, in the big lock */
+static void usock_drop_fds(VfsFile **fds, uint32_t n) {
+    if (!n) return;
+    bkl_lock();
+    for (uint32_t i = 0; i < n; i++) kfile_close(fds[i]);
+}
+
+/* read()/write()/sendto() without an address/recvfrom() on a Unix socket */
+static int64_t usock_rw(int idx, uint32_t oflags, bool is_write, uint64_t ubuf, uint64_t len,
+                        int flags, uint64_t src_addr, uint64_t src_lenp) {
+    bool nonblock = (oflags & LINUX_O_NONBLOCK) != 0;
+    if (is_write) {
+        UIoVecR v = { (const uint8_t *)ubuf, len };
+        return usock_send(idx, &v, 1, NULL, 0, flags, nonblock, NULL, 0);
+    }
+    UIoVecW v = { (uint8_t *)ubuf, len };
+    VfsFile *fds[USOCK_MAX_MSG_FDS];
+    uint32_t nfds = 0; int mflags = 0;
+    char src[108]; uint32_t srclen = 0;
+    int64_t n = usock_recv(idx, &v, 1, flags, nonblock, fds, USOCK_MAX_MSG_FDS, &nfds, &mflags, src, &srclen);
+    usock_drop_fds(fds, nfds);   /* no cmsg buffer: discarded, as on Linux */
+    if (n >= 0 && src_addr) {
+        int64_t r = sun_to_user(src_addr, src_lenp, src, srclen);
+        if (r < 0) return r;
+    }
+    return n;
+}
+
+static int64_t usock_sendmsg(int idx, uint32_t oflags, uint64_t umh, int flags) {
+    Process *proc = sched_current()->proc;
+    struct linux_msghdr mh;
+    if (!umh || copy_from_user(&mh, (const void *)umh, sizeof(mh)) != 0) return -14;
+    if (mh.msg_iovlen > IOV_MAX_LOCAL) return -22; // EINVAL
+
+    struct { uint64_t base, len; } kiov[IOV_MAX_LOCAL];
+    int iovcnt = (int)mh.msg_iovlen;
+    if (iovcnt > 0 && copy_from_user(kiov, (const void *)mh.msg_iov, (uint64_t)iovcnt * sizeof(kiov[0])) != 0)
+        return -14;
+    UIoVecR v[IOV_MAX_LOCAL];
+    for (int i = 0; i < iovcnt; i++) {
+        v[i].base = (const uint8_t *)kiov[i].base;   /* copied by the socket code */
+        v[i].len = kiov[i].len;
+    }
+
+    /* SCM_RIGHTS: each passed fd becomes an in-flight copy of its
+       wrapper (holding its own object reference) until the receiver
+       installs it or the message is dropped. The fd table: in the big lock. */
+    VfsFile *fds[USOCK_MAX_MSG_FDS];
+    uint32_t nfds = 0;
+    if (mh.msg_control && mh.msg_controllen >= sizeof(struct linux_cmsghdr)) {
+        if (mh.msg_controllen > MSG_CTRL_MAX) return -105; // ENOBUFS
+        uint8_t ctrl[MSG_CTRL_MAX];
+        if (copy_from_user(ctrl, (const void *)mh.msg_control, mh.msg_controllen) != 0) return -14;
+        uint64_t off = 0;
+        while (off + sizeof(struct linux_cmsghdr) <= mh.msg_controllen) {
+            struct linux_cmsghdr ch;
+            memcpy(&ch, ctrl + off, sizeof(ch));
+            if (ch.cmsg_len < sizeof(ch) || off + ch.cmsg_len > mh.msg_controllen) break;
+            if (ch.cmsg_level == SOL_SOCKET_LVL && ch.cmsg_type == SCM_RIGHTS_TYPE) {
+                bkl_lock();
+                uint64_t n = (ch.cmsg_len - sizeof(ch)) / sizeof(int);
+                for (uint64_t k = 0; k < n; k++) {
+                    int pfd;
+                    memcpy(&pfd, ctrl + off + sizeof(ch) + k * sizeof(int), sizeof(int));
+                    VfsFile *copy = NULL;
+                    int64_t err = 0;
+                    if (nfds >= USOCK_MAX_MSG_FDS) err = -22;           /* EINVAL (SCM_MAX_FD) */
+                    else if (pfd < 0 || pfd >= MAX_OPEN_FILES || !proc->fd_table[pfd]) err = -9; /* EBADF */
+                    else if (!(copy = kfile_dup(proc->fd_table[pfd]))) err = -12; /* ENOMEM */
+                    if (err) {
+                        for (uint32_t j = 0; j < nfds; j++) kfile_close(fds[j]);
+                        return err;
+                    }
+                    fds[nfds++] = copy;
+                }
+            }
+            /* SCM_CREDENTIALS and others: accepted and ignored */
+            off += CMSG_ALIGN8(ch.cmsg_len);
+        }
+    }
+
+    char name[108]; uint32_t nlen = 0;
+    if (mh.msg_name && mh.msg_namelen) {
+        bkl_lock();   /* the name is the filesystem's (and the cwd's) */
+        int64_t r = sun_from_user(mh.msg_name, mh.msg_namelen, name, &nlen);
+        if (r < 0) { for (uint32_t j = 0; j < nfds; j++) kfile_close(fds[j]); return r; }
+    }
+    return usock_send(idx, v, iovcnt, fds, nfds, flags, (oflags & LINUX_O_NONBLOCK) != 0,
+                      nlen ? name : NULL, nlen);
+}
+
+static int64_t usock_recvmsg(int idx, uint32_t oflags, uint64_t umh, int flags) {
+    Process *proc = sched_current()->proc;
+    struct linux_msghdr mh;
+    if (!umh || copy_from_user(&mh, (const void *)umh, sizeof(mh)) != 0) return -14;
+    if (mh.msg_iovlen > IOV_MAX_LOCAL) return -22; // EINVAL
+
+    struct { uint64_t base, len; } kiov[IOV_MAX_LOCAL];
+    int iovcnt = (int)mh.msg_iovlen;
+    if (iovcnt > 0 && copy_from_user(kiov, (const void *)mh.msg_iov, (uint64_t)iovcnt * sizeof(kiov[0])) != 0)
+        return -14;
+    UIoVecW v[IOV_MAX_LOCAL];
+    for (int i = 0; i < iovcnt; i++) {
+        v[i].base = (uint8_t *)kiov[i].base;         /* copied by the socket code */
+        v[i].len = kiov[i].len;
+    }
+    /* How many fds fit in the caller's control buffer: the rest are
+       closed by usock_recv() and MSG_CTRUNC is reported. */
+    uint32_t fd_cap = 0;
+    if (mh.msg_control && mh.msg_controllen >= sizeof(struct linux_cmsghdr) + sizeof(int)) {
+        fd_cap = (uint32_t)((mh.msg_controllen - sizeof(struct linux_cmsghdr)) / sizeof(int));
+        if (fd_cap > USOCK_MAX_MSG_FDS) fd_cap = USOCK_MAX_MSG_FDS;
+    }
+    VfsFile *fds[USOCK_MAX_MSG_FDS];
+    uint32_t nfds = 0; int mflags = 0;
+    char src[108]; uint32_t srclen = 0;
+    int64_t n = usock_recv(idx, v, iovcnt, flags, (oflags & LINUX_O_NONBLOCK) != 0,
+                           fds, fd_cap, &nfds, &mflags, src, &srclen);
+    if (n < 0) return n;
+
+    /* Install received fds into this process's table: in the big lock. */
+    int newfds[USOCK_MAX_MSG_FDS];
+    uint32_t ninst = 0;
+    if (nfds) bkl_lock();
+    for (uint32_t i = 0; i < nfds; i++) {
+        int nfd = get_free_fd(proc->fd_table);
+        if (nfd < 0) { kfile_close(fds[i]); mflags |= UMSG_CTRUNC; continue; }
+        proc->fd_table[nfd] = fds[i];
+        proc->fd_flags[nfd]  = ((uint32_t)flags & UMSG_CMSG_CLOEXEC) ? FD_CLOEXEC : 0;
+        proc->fd_oflags[nfd] = LINUX_O_RDWR;
+        newfds[ninst++] = nfd;
+    }
+    uint64_t ctl_used = 0;
+    if (ninst > 0) {
+        uint8_t cb[sizeof(struct linux_cmsghdr) + USOCK_MAX_MSG_FDS * sizeof(int)];
+        struct linux_cmsghdr ch;
+        ch.cmsg_len = sizeof(ch) + ninst * sizeof(int);
+        ch.cmsg_level = SOL_SOCKET_LVL;
+        ch.cmsg_type = SCM_RIGHTS_TYPE;
+        memcpy(cb, &ch, sizeof(ch));
+        memcpy(cb + sizeof(ch), newfds, ninst * sizeof(int));
+        if (copy_to_user((void *)mh.msg_control, cb, ch.cmsg_len) != 0) return -14;
+        ctl_used = CMSG_ALIGN8(ch.cmsg_len);
+        if (ctl_used > mh.msg_controllen) ctl_used = mh.msg_controllen;
+    }
+    mh.msg_controllen = ctl_used;
+    mh.msg_flags = mflags;
+    if (mh.msg_name && mh.msg_namelen) {
+        uint32_t real = srclen ? 2 + srclen + (src[0] ? 1 : 0) : 0;
+        if (real) {
+            uint8_t sa[2 + 108 + 1];
+            memset(sa, 0, sizeof(sa));
+            sa[0] = 1;
+            memcpy(sa + 2, src, srclen);
+            uint32_t c = real < mh.msg_namelen ? real : mh.msg_namelen;
+            if (copy_to_user((void *)mh.msg_name, sa, c) != 0) return -14;
+        }
+        mh.msg_namelen = real;
+    }
+    if (copy_to_user((void *)umh, &mh, sizeof(mh)) != 0) return -14;
+    return n;
+}
+
+/* syscall_dispatch()'s first look: a Unix socket's send/recv here, outside
+   the big lock. false: not one (the caller takes the big lock). */
+static bool usock_fast(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                       uint64_t a5, SyscallRegs *regs, int64_t *out) {
+    int idx; uint32_t of;
+    if (num == 44 && a5) return false;               /* sendto() with an address: the big lock */
+    if (!usock_fd_take(a1, &idx, &of)) return false;
+    switch (num) {
+    case 0:  *out = usock_rw(idx, of, false, a2, a3, 0, 0, 0); break;
+    case 1:  *out = usock_rw(idx, of, true, a2, a3, 0, 0, 0); break;
+    case 44: *out = usock_rw(idx, of, true, a2, a3, (int)a4, 0, 0); break;
+    case 45: *out = usock_rw(idx, of, false, a2, a3, (int)a4, a5, regs->r9); break;
+    case 46: *out = usock_sendmsg(idx, of, a2, (int)a3); break;
+    default: *out = usock_recvmsg(idx, of, a2, (int)a3); break;   /* 47 */
+    }
+    usock_unref(idx);
+    return true;
+}
+
 void process_teardown(Process *proc) {
     if (!proc || proc->pid == 0) return; /* never tear down the kernel process */
     sandbox_teardown(proc);
@@ -2290,8 +2495,12 @@ static void lockfree_init(void)
         96,   /* gettimeofday */
         201,  /* time */
         202,  /* futex (its own lock: kernel/futex.c) */
-        0,    /* read, write: on a pipe or an eventfd (pipe_fast()); */
-        1,    /*   anything else takes the big lock there */
+        0,    /* read, write: on a pipe or an eventfd (pipe_fast()) */
+        1,    /*   or a Unix socket (usock_fast()); anything else takes */
+        44,   /*   the big lock there -- so do sendto, recvfrom, sendmsg, */
+        45,   /*   recvmsg on other sockets */
+        46,
+        47,
         228,  /* clock_gettime */
         229,  /* clock_getres */
         230,  /* clock_nanosleep */
@@ -2392,6 +2601,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {   /* a pipe or an eventfd: outside the big lock */
                 int64_t pr;
                 if (pipe_fast(false, a1, a2, a3, &pr)) return (uint64_t)pr;
+                if (usock_fast(0, a1, a2, a3, 0, 0, regs, &pr)) return (uint64_t)pr;
                 bkl_lock();
             }
             if (a3 != 0 && !user_prepare_write(a2, a3)) {
@@ -2549,6 +2759,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {   /* a pipe or an eventfd: outside the big lock */
                 int64_t pr;
                 if (pipe_fast(true, a1, a2, a3, &pr)) return (uint64_t)pr;
+                if (usock_fast(1, a1, a2, a3, 0, 0, regs, &pr)) return (uint64_t)pr;
                 bkl_lock();
             }
             if (a3 != 0 && !user_check_read(a2, a3)) {
@@ -6312,6 +6523,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
         case 44: // SYS_sendto(fd, buf, len, flags, dest_addr, addrlen) -- dest_addr is a5
             {
+                {   /* a Unix socket: outside the big lock */
+                    int64_t ur;
+                    if (usock_fast(44, a1, a2, a3, a4, a5, regs, &ur)) return (uint64_t)ur;
+                    bkl_lock();
+                }
                 int fd = (int)a1;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
                 if (a3 != 0 && !user_check_read(a2, a3)) return -14; // EFAULT
@@ -6359,6 +6575,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
         case 45: // SYS_recvfrom(fd, buf, len, flags, src_addr, addrlen) -- src_addr is a5, addrlen* is r9
             {
+                {   /* a Unix socket: outside the big lock */
+                    int64_t ur;
+                    if (usock_fast(45, a1, a2, a3, a4, a5, regs, &ur)) return (uint64_t)ur;
+                    bkl_lock();
+                }
                 int fd = (int)a1;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return -9; // EBADF
                 if (a3 != 0 && !user_prepare_write(a2, a3)) return -14; // EFAULT
@@ -6434,6 +6655,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
         case 46: // SYS_sendmsg(fd, const struct msghdr *, flags)
             {
+                {   /* a Unix socket: outside the big lock */
+                    int64_t ur;
+                    if (usock_fast(46, a1, a2, a3, a4, a5, regs, &ur)) return (uint64_t)ur;
+                    bkl_lock();
+                }
                 int fd = (int)a1;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return (uint64_t)-9; // EBADF
                 struct linux_msghdr mh;
@@ -6447,66 +6673,17 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     /* TCP/pipes etc.: no ancillary data here -- gather write */
                     return syscall_dispatcher(20, a1, mh.msg_iov, mh.msg_iovlen, 0, 0, regs);
                 }
-
-                struct { uint64_t base, len; } kiov[IOV_MAX_LOCAL];
-                int iovcnt = (int)mh.msg_iovlen;
-                if (iovcnt > 0 && copy_from_user(kiov, (const void *)mh.msg_iov, (uint64_t)iovcnt * sizeof(kiov[0])) != 0)
-                    return (uint64_t)-14;
-                UIoVecR v[IOV_MAX_LOCAL];
-                for (int i = 0; i < iovcnt; i++) {
-                    if (kiov[i].len && !user_check_read(kiov[i].base, kiov[i].len)) return (uint64_t)-14;
-                    v[i].base = (const uint8_t *)kiov[i].base;
-                    v[i].len = kiov[i].len;
-                }
-
-                /* SCM_RIGHTS: each passed fd becomes an in-flight copy of its
-                   wrapper (holding its own object reference) until the
-                   receiver installs it or the message is dropped. */
-                VfsFile *fds[USOCK_MAX_MSG_FDS];
-                uint32_t nfds = 0;
-                if (mh.msg_control && mh.msg_controllen >= sizeof(struct linux_cmsghdr)) {
-                    if (mh.msg_controllen > MSG_CTRL_MAX) return (uint64_t)-105; // ENOBUFS
-                    uint8_t ctrl[MSG_CTRL_MAX];
-                    if (copy_from_user(ctrl, (const void *)mh.msg_control, mh.msg_controllen) != 0) return (uint64_t)-14;
-                    uint64_t off = 0;
-                    while (off + sizeof(struct linux_cmsghdr) <= mh.msg_controllen) {
-                        struct linux_cmsghdr ch;
-                        memcpy(&ch, ctrl + off, sizeof(ch));
-                        if (ch.cmsg_len < sizeof(ch) || off + ch.cmsg_len > mh.msg_controllen) break;
-                        if (ch.cmsg_level == SOL_SOCKET_LVL && ch.cmsg_type == SCM_RIGHTS_TYPE) {
-                            uint64_t n = (ch.cmsg_len - sizeof(ch)) / sizeof(int);
-                            for (uint64_t k = 0; k < n; k++) {
-                                int pfd;
-                                memcpy(&pfd, ctrl + off + sizeof(ch) + k * sizeof(int), sizeof(int));
-                                VfsFile *copy = NULL;
-                                int64_t err = 0;
-                                if (nfds >= USOCK_MAX_MSG_FDS) err = -22;           /* EINVAL (SCM_MAX_FD) */
-                                else if (pfd < 0 || pfd >= MAX_OPEN_FILES || !fd_table[pfd]) err = -9; /* EBADF */
-                                else if (!(copy = kfile_dup(fd_table[pfd]))) err = -12; /* ENOMEM */
-                                if (err) {
-                                    for (uint32_t j = 0; j < nfds; j++) kfile_close(fds[j]);
-                                    return (uint64_t)err;
-                                }
-                                fds[nfds++] = copy;
-                            }
-                        }
-                        /* SCM_CREDENTIALS and others: accepted and ignored */
-                        off += CMSG_ALIGN8(ch.cmsg_len);
-                    }
-                }
-
-                char name[108]; uint32_t nlen = 0;
-                if (mh.msg_name && mh.msg_namelen) {
-                    int64_t r = sun_from_user(mh.msg_name, mh.msg_namelen, name, &nlen);
-                    if (r < 0) { for (uint32_t j = 0; j < nfds; j++) kfile_close(fds[j]); return (uint64_t)r; }
-                }
-                return (uint64_t)usock_send((int)fd_table[fd]->current_cluster, v, iovcnt, fds, nfds, (int)a3,
-                                            (fd_oflags[fd] & LINUX_O_NONBLOCK) != 0,
-                                            nlen ? name : NULL, nlen);
+                /* (a Unix socket was usock_fast()'s: one closed meanwhile) */
+                return (uint64_t)-9;
             }
 
         case 47: // SYS_recvmsg(fd, struct msghdr *, flags)
             {
+                {   /* a Unix socket: outside the big lock */
+                    int64_t ur;
+                    if (usock_fast(47, a1, a2, a3, a4, a5, regs, &ur)) return (uint64_t)ur;
+                    bkl_lock();
+                }
                 int fd = (int)a1;
                 if (fd < 0 || fd >= MAX_OPEN_FILES || fd_table[fd] == NULL) return (uint64_t)-9; // EBADF
                 struct linux_msghdr mh;
@@ -6528,70 +6705,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)n;
                 }
 
-                struct { uint64_t base, len; } kiov[IOV_MAX_LOCAL];
-                int iovcnt = (int)mh.msg_iovlen;
-                if (iovcnt > 0 && copy_from_user(kiov, (const void *)mh.msg_iov, (uint64_t)iovcnt * sizeof(kiov[0])) != 0)
-                    return (uint64_t)-14;
-                UIoVecW v[IOV_MAX_LOCAL];
-                for (int i = 0; i < iovcnt; i++) {
-                    if (kiov[i].len && !user_prepare_write(kiov[i].base, kiov[i].len)) return (uint64_t)-14;
-                    v[i].base = (uint8_t *)kiov[i].base;
-                    v[i].len = kiov[i].len;
-                }
-                /* How many fds fit in the caller's control buffer: the rest
-                   are closed by usock_recv() and MSG_CTRUNC is reported. */
-                uint32_t fd_cap = 0;
-                if (mh.msg_control && mh.msg_controllen >= sizeof(struct linux_cmsghdr) + sizeof(int)) {
-                    if (!user_prepare_write(mh.msg_control, mh.msg_controllen)) return (uint64_t)-14;
-                    fd_cap = (uint32_t)((mh.msg_controllen - sizeof(struct linux_cmsghdr)) / sizeof(int));
-                    if (fd_cap > USOCK_MAX_MSG_FDS) fd_cap = USOCK_MAX_MSG_FDS;
-                }
-                VfsFile *fds[USOCK_MAX_MSG_FDS];
-                uint32_t nfds = 0; int mflags = 0;
-                char src[108]; uint32_t srclen = 0;
-                int64_t n = usock_recv((int)fd_table[fd]->current_cluster, v, iovcnt, (int)a3,
-                                       (fd_oflags[fd] & LINUX_O_NONBLOCK) != 0,
-                                       fds, fd_cap, &nfds, &mflags, src, &srclen);
-                if (n < 0) return (uint64_t)n;
-
-                /* Install received fds into this process's table. */
-                int newfds[USOCK_MAX_MSG_FDS];
-                uint32_t ninst = 0;
-                for (uint32_t i = 0; i < nfds; i++) {
-                    int nfd = get_free_fd(fd_table);
-                    if (nfd < 0) { kfile_close(fds[i]); mflags |= UMSG_CTRUNC; continue; }
-                    fd_table[nfd] = fds[i];
-                    fd_flags[nfd]  = ((uint32_t)a3 & UMSG_CMSG_CLOEXEC) ? FD_CLOEXEC : 0;
-                    fd_oflags[nfd] = LINUX_O_RDWR;
-                    newfds[ninst++] = nfd;
-                }
-                uint64_t ctl_used = 0;
-                if (ninst > 0) {
-                    struct linux_cmsghdr ch;
-                    ch.cmsg_len = sizeof(ch) + ninst * sizeof(int);
-                    ch.cmsg_level = SOL_SOCKET_LVL;
-                    ch.cmsg_type = SCM_RIGHTS_TYPE;
-                    memcpy((void *)mh.msg_control, &ch, sizeof(ch));
-                    memcpy((uint8_t *)mh.msg_control + sizeof(ch), newfds, ninst * sizeof(int));
-                    ctl_used = CMSG_ALIGN8(ch.cmsg_len);
-                    if (ctl_used > mh.msg_controllen) ctl_used = mh.msg_controllen;
-                }
-                mh.msg_controllen = ctl_used;
-                mh.msg_flags = mflags;
-                if (mh.msg_name && mh.msg_namelen) {
-                    uint32_t real = srclen ? 2 + srclen + (src[0] ? 1 : 0) : 0;
-                    if (real) {
-                        uint8_t sa[2 + 108 + 1];
-                        memset(sa, 0, sizeof(sa));
-                        sa[0] = 1;
-                        memcpy(sa + 2, src, srclen);
-                        uint32_t c = real < mh.msg_namelen ? real : mh.msg_namelen;
-                        if (copy_to_user((void *)mh.msg_name, sa, c) != 0) return (uint64_t)-14;
-                    }
-                    mh.msg_namelen = real;
-                }
-                if (copy_to_user((void *)a2, &mh, sizeof(mh)) != 0) return (uint64_t)-14;
-                return (uint64_t)n;
+                /* (a Unix socket was usock_fast()'s: one closed meanwhile) */
+                return (uint64_t)-9;
             }
 
         case 49: // SYS_bind

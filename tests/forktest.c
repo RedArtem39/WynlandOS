@@ -208,6 +208,47 @@ static void *poll_feeder(void *arg)
     return NULL;
 }
 
+/* Unix sockets outside the big lock */
+static int g_sp_fd;
+static void *seq_sender(void *arg)
+{
+    unsigned char rec[PW_LEN];
+    memset(rec, (int)(long)arg, sizeof rec);
+    for (int i = 0; i < PW_RECORDS; i++)
+        if (send(g_sp_fd, rec, sizeof rec, 0) != (ssize_t)sizeof rec) return (void *)1L;
+    return NULL;
+}
+static int g_fdpass_sock;
+static void *fd_passer(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 200; i++) {
+        int efd = eventfd((unsigned)i + 1, 0);
+        char b = 'f';
+        struct iovec io = { &b, 1 };
+        union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+        struct msghdr mh = { 0 };
+        mh.msg_iov = &io; mh.msg_iovlen = 1;
+        mh.msg_control = u.buf; mh.msg_controllen = sizeof u.buf;
+        struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &efd, sizeof(int));
+        ssize_t r = sendmsg(g_fdpass_sock, &mh, 0);
+        close(efd);
+        if (r != 1) return (void *)1L;
+    }
+    return NULL;
+}
+static int g_us_close_fd;
+static void *us_late_closer(void *arg)
+{
+    (void)arg;
+    struct timespec n = { 0, 100000000 };
+    nanosleep(&n, NULL);
+    close(g_us_close_fd);
+    return NULL;
+}
+
 static void *report_tid(void *out)
 {
     *(pid_t *)out = (pid_t)syscall(SYS_gettid);
@@ -393,6 +434,70 @@ int main(int argc, char **argv)
         }
         if (ok) { pthread_join(th, NULL); close(fd[0]); close(fd[1]); }
         check(got == 2000 && stalls == 0, "poll: a pipe written by another thread, no wake-up lost");
+    }
+    {   /* a seqpacket socket fed by 4 threads: every message whole */
+        int sv[2];
+        int ok = socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0;
+        pthread_t th[PW_THREADS];
+        g_sp_fd = ok ? sv[0] : -1;
+        for (long i = 0; ok && i < PW_THREADS; i++) pthread_create(&th[i], NULL, seq_sender, (void *)(i + 1));
+        long got = 0, torn = 0, per[PW_THREADS + 1] = {0};
+        while (ok && got < (long)PW_THREADS * PW_RECORDS) {
+            unsigned char rec[PW_LEN * 2];
+            ssize_t r = recv(sv[1], rec, sizeof rec, 0);
+            if (r <= 0) break;
+            if (r != PW_LEN) { torn++; continue; }
+            int v = rec[0];
+            for (int k = 1; k < PW_LEN; k++) if (rec[k] != v) { torn++; break; }
+            if (v >= 1 && v <= PW_THREADS) per[v]++;
+            got++;
+        }
+        long bad = 0;
+        for (int i = 0; ok && i < PW_THREADS; i++) { void *rv; pthread_join(th[i], &rv); if (rv) bad++; }
+        for (int i = 1; i <= PW_THREADS; i++) if (per[i] != PW_RECORDS) bad++;
+        if (ok) { close(sv[0]); close(sv[1]); }
+        fprintf(stderr, "[forktest] seqpacket: %ld messages, %ld torn, %ld bad\n", got, torn, bad);
+        check(ok && got == (long)PW_THREADS * PW_RECORDS && torn == 0 && bad == 0,
+              "unix seqpacket: 4 sender threads, every message whole");
+    }
+    {   /* SCM_RIGHTS from another thread, 200 times: each fd arrives and works */
+        int sv[2];
+        int ok = socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0;
+        pthread_t th;
+        g_fdpass_sock = ok ? sv[0] : -1;
+        if (ok) pthread_create(&th, NULL, fd_passer, NULL);
+        int good = 0;
+        for (int i = 0; ok && i < 200; i++) {
+            char b;
+            struct iovec io = { &b, 1 };
+            union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+            struct msghdr mh = { 0 };
+            mh.msg_iov = &io; mh.msg_iovlen = 1;
+            mh.msg_control = u.buf; mh.msg_controllen = sizeof u.buf;
+            if (recvmsg(sv[1], &mh, 0) != 1) break;
+            struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+            if (!c || c->cmsg_type != SCM_RIGHTS) break;
+            int rfd;
+            memcpy(&rfd, CMSG_DATA(c), sizeof(int));
+            uint64_t v = 0;
+            if (read(rfd, &v, 8) == 8 && v == (uint64_t)i + 1) good++;
+            close(rfd);
+        }
+        if (ok) { pthread_join(th, NULL); close(sv[0]); close(sv[1]); }
+        check(good == 200, "unix: 200 fds passed from another thread, each one works");
+    }
+    {   /* a recv asleep on a stream socket ends (EOF) when the peer is closed */
+        int sv[2];
+        pthread_t th;
+        int ok = socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0;
+        g_us_close_fd = ok ? sv[0] : -1;
+        if (ok) pthread_create(&th, NULL, us_late_closer, NULL);
+        char c;
+        long t0 = now_ms();
+        ssize_t r = ok ? recv(sv[1], &c, 1, 0) : -1;
+        long dt = now_ms() - t0;
+        if (ok) { pthread_join(th, NULL); close(sv[1]); }
+        check(r == 0 && dt < 1500, "unix: closing the peer wakes a sleeping recv (EOF)");
     }
     {   /* the clock: monotonic, finer than a millisecond */
         struct timespec a, b;
