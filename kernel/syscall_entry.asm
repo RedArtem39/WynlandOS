@@ -1,7 +1,7 @@
 global syscall_entry
 extern syscall_dispatcher
 extern signal_deliver_check
-extern bkl_lock
+extern syscall_lock
 extern bkl_release_mine
 %include "fpu.inc"
 %include "percpu.inc"
@@ -53,10 +53,12 @@ syscall_entry:
     pop rax
 
     ; 2c. The kernel lock (include/wynland/smp.h): other cores may be in
-    ; the kernel. The call clobbers the argument registers: back from the
-    ; saved frame (r10 at +40, r9 +48, r8 +56, rdx +64, rsi +72, rdi +80).
+    ; the kernel -- for most syscalls (kernel/syscall.c syscall_lock()).
+    ; The call clobbers the argument registers: back from the saved frame
+    ; (r10 at +40, r9 +48, r8 +56, rdx +64, rsi +72, rdi +80).
     push rax                 ; also aligns the stack for the call
-    call bkl_lock
+    mov rdi, rax
+    call syscall_lock
     pop rax
     mov r10, [rsp + 40]
     mov r9,  [rsp + 48]

@@ -9,6 +9,8 @@
 #include <wynland/pci.h>
 #include <wynland/pmm.h>
 #include <wynland/vmm.h>
+#include <wynland/spinlock.h>
+#include <wynland/smp.h>
 
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
@@ -406,9 +408,10 @@ static void vq_free_desc(Virtqueue *vq, uint16_t idx)
  * that head -- monotonic, so "done_seq[head] >= my seq" stays true even
  * after the head is reused.
  *
- * Callers run with interrupts off (syscall context, or irq_save()); the
- * timer tick also reaps. Interrupts off plus the kernel lock
- * (include/wynland/smp.h) are the lock. */
+ * The rings and the bookkeeping below are under g_ctrlq_lock: a
+ * framebuffer flush waits for the host outside the big kernel lock
+ * (SYS_fb_flush), while DRM ioctls and the timer tick submit and reap
+ * under it. */
 
 #define CTRLQ_MAX_SEGS 72 /* 256 KB command buffer in 4 KB pages + hdr + resp */
 
@@ -427,11 +430,11 @@ static uint8_t  ctrl_chain_len[VQ_MAX_SIZE];
 
 static uint64_t irq_save(void);
 static void irq_restore(uint64_t rflags);
+static Spinlock g_ctrlq_lock = SPINLOCK_INIT("virtio-gpu ctrlq");
 
-/* Retire every chain the device has returned. */
-static void ctrlq_reap(void)
+/* Retire every chain the device has returned (g_ctrlq_lock held). */
+static void ctrlq_reap_locked(void)
 {
-    uint64_t fl = irq_save();
     while (VQ_USED_IDX(ctrl_q) != ctrl_q.last_used) {
         __asm__ volatile("" ::: "memory"); /* ring entry valid once idx says so */
         uint16_t slot = ctrl_q.last_used % ctrl_q.size;
@@ -445,27 +448,23 @@ static void ctrlq_reap(void)
         ctrl_done_seq[head] = ctrl_inflight_seq[head];
         ctrl_q.last_used++;
     }
-    irq_restore(fl);
+}
+
+static void ctrlq_reap(void)
+{
+    uint64_t fl = spin_lock_irqsave(&g_ctrlq_lock);
+    ctrlq_reap_locked();
+    spin_unlock_irqrestore(&g_ctrlq_lock, fl);
 }
 
 static bool ctrlq_done(CtrlTicket t)
 {
-    return ctrl_done_seq[t.head] >= t.seq;
+    return __atomic_load_n(&ctrl_done_seq[t.head], __ATOMIC_ACQUIRE) >= t.seq;
 }
 
-/* Queue one request. Returns false (nothing queued) if the ring doesn't
-   have enough free descriptors even after reaping. */
-static bool ctrlq_submit(const CtrlSeg *segs, int n, CtrlTicket *out)
+/* Queue one request (g_ctrlq_lock held, room checked). */
+static void ctrlq_submit_locked(const CtrlSeg *segs, int n, CtrlTicket *out)
 {
-    if (n <= 0 || n > CTRLQ_MAX_SEGS) return false;
-    uint64_t fl = irq_save();
-    if (ctrl_q.num_free < n) {
-        irq_restore(fl);
-        ctrlq_reap();
-        fl = irq_save();
-        if (ctrl_q.num_free < n) { irq_restore(fl); return false; }
-    }
-
     uint16_t d[CTRLQ_MAX_SEGS];
     for (int i = 0; i < n; i++) d[i] = vq_alloc_desc(&ctrl_q);
     for (int i = 0; i < n; i++) {
@@ -488,8 +487,27 @@ static bool ctrlq_submit(const CtrlSeg *segs, int n, CtrlTicket *out)
 
     out->head = head;
     out->seq = ctrl_seq;
-    irq_restore(fl);
+}
+
+/* Queue one request, and a second one right behind it if n2 > 0 (both or
+   neither). Returns false (nothing queued) if the ring doesn't have enough
+   free descriptors even after reaping. */
+static bool ctrlq_submit2(const CtrlSeg *segs, int n, CtrlTicket *out,
+                          const CtrlSeg *segs2, int n2, CtrlTicket *out2)
+{
+    if (n <= 0 || n > CTRLQ_MAX_SEGS || n2 < 0 || n2 > CTRLQ_MAX_SEGS) return false;
+    uint64_t fl = spin_lock_irqsave(&g_ctrlq_lock);
+    if (ctrl_q.num_free < n + n2) ctrlq_reap_locked();
+    if (ctrl_q.num_free < n + n2) { spin_unlock_irqrestore(&g_ctrlq_lock, fl); return false; }
+    ctrlq_submit_locked(segs, n, out);
+    if (n2) ctrlq_submit_locked(segs2, n2, out2);
+    spin_unlock_irqrestore(&g_ctrlq_lock, fl);
     return true;
+}
+
+static bool ctrlq_submit(const CtrlSeg *segs, int n, CtrlTicket *out)
+{
+    return ctrlq_submit2(segs, n, out, NULL, 0, NULL);
 }
 
 /* Append the pages backing kernel buffer [buf, buf+len) as segments --
@@ -525,7 +543,9 @@ static inline uint64_t rdtsc(void)
 
 #define CTRLQ_SPIN_FALLBACK 2000000 /* iterations per ms-equivalent until calibrated */
 
-/* Spin (interrupts off) until the ticket completes or `ms` pass. */
+/* Spin (interrupts off) until the ticket completes or `ms` pass. TLB
+   flush requests are answered meanwhile: the core holding the big lock may
+   be waiting for this one's. */
 static bool ctrlq_wait_spin(CtrlTicket t, uint32_t ms)
 {
     uint64_t t0 = rdtsc();
@@ -536,6 +556,7 @@ static bool ctrlq_wait_spin(CtrlTicket t, uint32_t ms)
         if (tsc_per_ms ? (rdtsc() - t0 >= limit) : (i >= (uint64_t)CTRLQ_SPIN_FALLBACK * ms / 20))
             return false;
         __asm__ volatile("pause" ::: "memory");
+        smp_tlb_poll();
     }
 }
 
@@ -1209,7 +1230,9 @@ bool virtio_gpu_init(void)
 
 
 /* Serializes framebuffer flushes: the TRANSFER/FLUSH command buffers
-   below are shared statics, and a caller can be preempted mid-wait. */
+   below are shared statics, and a caller can be preempted mid-wait. Also
+   what the flush state below is under: virtio_gpu_flush() runs outside the
+   big kernel lock. */
 static volatile int flush_busy = 0;
 
 /* A flush whose completion hasn't been collected yet: one that timed
@@ -1341,12 +1364,9 @@ static bool flush_submit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, CtrlTic
         { phys_cmd_flush,  sizeof(cmd_flush),  false },
         { phys_resp_flush, sizeof(resp_flush), true  },
     };
-    /* Both or neither: reserve room for four descriptors first. */
-    ctrlq_reap();
-    if (ctrl_q.num_free < 4) return false;
+    /* Both or neither */
     CtrlTicket tt;
-    if (!ctrlq_submit(tseg, 2, &tt)) return false;
-    return ctrlq_submit(fseg, 2, flush_t);
+    return ctrlq_submit2(tseg, 2, &tt, fseg, 2, flush_t);
 }
 
 void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h)

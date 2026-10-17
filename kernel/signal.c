@@ -9,6 +9,7 @@
 #include <wynland/vma.h>
 #include <wynland/process.h>
 #include <wynland/usercopy.h>
+#include <wynland/smp.h>
 
 /* first non-user address: canonical low half ends here */
 #define SIG_USER_LIMIT 0x0000800000000000ULL
@@ -135,6 +136,13 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
 
     Thread *t = sched_current();
     if (!t || !t->proc) return 0;
+    /* after a syscall outside the big kernel lock: into it only when there
+       is something to do here */
+    if (g_bkl_owner != (int32_t)this_cpu()->id) {
+        if (t->state != THREAD_STATE_TERMINATED && !t->sig_restore_mask &&
+            !(__atomic_load_n(&t->sig_pending, __ATOMIC_RELAXED) & ~t->sig_mask)) return 0;
+        bkl_lock();
+    }
     /* killed (signal_kill_process()) while it ran on another core: it was
        in the middle of this syscall then -- it ends here, not in user mode */
     if (t->state == THREAD_STATE_TERMINATED && t->proc->pid != 0) {
@@ -416,7 +424,7 @@ uint64_t signal_rt_return(void *regs_v) {
 void signal_raise_current(int sig) {
     if (sig <= 0 || sig >= 65) return;
     Thread *t = sched_current();
-    t->sig_pending |= (1ULL << sig);
+    __atomic_or_fetch(&t->sig_pending, 1ULL << sig, __ATOMIC_SEQ_CST);
 }
 
 bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig) {
@@ -433,7 +441,13 @@ bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig) {
             if (tgid != 0 && (!t->proc || t->proc->pid != tgid)) {
                 return false; /* real tgkill(2): ESRCH if tid isn't in thread group tgid */
             }
-            t->sig_pending |= (1ULL << sig);
+            /* a full barrier: the caller looks at t->state next, and a
+               thread going to sleep outside the big lock looks at
+               sig_pending (kernel/sched.c sched_sleep_ms_intr()) */
+            __atomic_or_fetch(&t->sig_pending, 1ULL << sig, __ATOMIC_SEQ_CST);
+            /* asleep (nanosleep, a futex, a read): the signal ends the
+               wait now -- tgkill() used to leave it to the sleep's end */
+            if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, sig)) sched_unblock(t, -4 /* EINTR */);
             return true;
         }
         t = t->next;

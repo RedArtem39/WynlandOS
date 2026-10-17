@@ -9,6 +9,7 @@ global context_switch
 global thread_trampoline
 global fork_child_entry
 extern thread_exit
+extern sched_thread_start
 extern bkl_release_mine
 %include "fpu.inc"
 %include "percpu.inc"
@@ -44,6 +45,9 @@ context_switch:
 ; R12 = thread entry point function
 ; R13 = argument to pass to thread entry point
 thread_trampoline:
+    ; the scheduler's lock goes (held across the switch that got here),
+    ; the big kernel lock comes (kernel/sched.c sched_finish())
+    call sched_thread_start
     ; Align stack and call entry function (arg in RDI)
     mov rdi, r13
     call r12

@@ -19,6 +19,8 @@ void rtc_init(void);
    ticks since. This is what SYS_clock_gettime(CLOCK_REALTIME) returns. */
 uint64_t rtc_get_unix_time(void);
 uint64_t rtc_get_unix_time_ms(void);
+/* the same in nanoseconds, on the TSC clock (kernel/sched.c) */
+uint64_t rtc_get_unix_time_ns(void);
 
 /* Best-effort: fetches the caller's current UTC offset from a plain-HTTP
    IP-geolocation service (no hardcoded location anywhere in this

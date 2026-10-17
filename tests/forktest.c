@@ -105,6 +105,62 @@ static void *spinner(void *arg)
     return NULL;
 }
 
+/* syscalls outside the big kernel lock (futex, clocks, sleeping): many
+   threads on several cores at once must still add up */
+#define HAMMER_THREADS 8
+#define HAMMER_ROUNDS  20000
+static pthread_mutex_t g_hammer_mx = PTHREAD_MUTEX_INITIALIZER;
+static volatile long g_hammer_count;
+static void *hammer(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < HAMMER_ROUNDS; i++) {
+        pthread_mutex_lock(&g_hammer_mx);
+        long c = g_hammer_count;
+        if ((i & 63) == 0) sched_yield();   /* contention: holders get preempted */
+        g_hammer_count = c + 1;
+        pthread_mutex_unlock(&g_hammer_mx);
+    }
+    return NULL;
+}
+
+/* two threads hand a token back and forth through a condition variable */
+static pthread_mutex_t g_pp_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
+static int g_pp_turn, g_pp_left;
+static void *pingpong(void *arg)
+{
+    int me = (int)(long)arg;
+    pthread_mutex_lock(&g_pp_mx);
+    while (g_pp_left > 0) {
+        while (g_pp_turn != me && g_pp_left > 0) pthread_cond_wait(&g_pp_cv, &g_pp_mx);
+        if (g_pp_left <= 0) break;
+        g_pp_left--;
+        g_pp_turn = !me;
+        pthread_cond_broadcast(&g_pp_cv);
+    }
+    pthread_mutex_unlock(&g_pp_mx);
+    return NULL;
+}
+
+/* a long sleep cut short by a signal from another thread */
+static void on_usr1(int sig) { (void)sig; }
+static volatile int g_sleep_ready;
+static void *long_sleeper(void *out)
+{
+    struct timespec ts = { 5, 0 };
+    long t0 = now_ms();
+    /* no syscall between this and the sleep: a signal sent now stays
+       pending (delivered on the way out of the kernel) and nanosleep sees it */
+    g_sleep_ready = 1;
+    int r = nanosleep(&ts, NULL);
+    int e = errno;
+    long dt = now_ms() - t0;
+    if (!(r < 0 && e == EINTR)) fprintf(stderr, "[forktest] nanosleep: %d errno %d after %ld ms\n", r, e, dt);
+    *(long *)out = (r < 0 && e == EINTR) ? dt : -1;
+    return NULL;
+}
+
 static void *report_tid(void *out)
 {
     *(pid_t *)out = (pid_t)syscall(SYS_gettid);
@@ -172,6 +228,87 @@ int main(int argc, char **argv)
         }
         if (bad) fprintf(stderr, "[forktest] %d futex waits failed (first: %ld)\n", bad, g_fres[0]);
         check(started == FUTEX_THREADS && bad == 0, "120 futex waiters at once");
+    }
+    {   /* a mutex hammered by 8 threads (futex outside the big lock) */
+        pthread_t th[HAMMER_THREADS];
+        long t0 = now_ms();
+        for (long i = 0; i < HAMMER_THREADS; i++) pthread_create(&th[i], NULL, hammer, NULL);
+        for (int i = 0; i < HAMMER_THREADS; i++) pthread_join(th[i], NULL);
+        fprintf(stderr, "[forktest] mutex: %ld increments in %ld ms\n", g_hammer_count, now_ms() - t0);
+        check(g_hammer_count == (long)HAMMER_THREADS * HAMMER_ROUNDS, "mutex: 8 threads, no increment lost");
+    }
+    {   /* condvar ping-pong: every wake reaches its waiter */
+        pthread_t a, b;
+        g_pp_left = 4000;
+        long t0 = now_ms();
+        pthread_create(&a, NULL, pingpong, (void *)0L);
+        pthread_create(&b, NULL, pingpong, (void *)1L);
+        pthread_join(a, NULL);
+        pthread_join(b, NULL);
+        long dt = now_ms() - t0;
+        fprintf(stderr, "[forktest] condvar: 4000 hand-offs in %ld ms\n", dt);
+        check(g_pp_left == 0 && dt < 20000, "condvar: 4000 hand-offs, none lost");
+    }
+    {   /* bad pointers into syscalls outside the big lock: -EFAULT, not a
+           kernel crash -- unmapped, the kernel half, a read-only page */
+        long r1 = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, (void *)8);
+        int e1 = errno;
+        long r2 = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, (void *)0xFFFF800000001000UL);
+        int e2 = errno;
+        void *ro = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        long r3 = syscall(SYS_clock_gettime, CLOCK_MONOTONIC, ro);
+        int e3 = errno;
+        long r4 = syscall(SYS_futex, (int *)16, 128 /* FUTEX_WAIT_PRIVATE */, 0, NULL, NULL, 0);
+        int e4 = errno;
+        struct timespec *bad = (struct timespec *)(uintptr_t)24;
+        long r5 = syscall(SYS_nanosleep, bad, NULL);
+        int e5 = errno;
+        check(r1 == -1 && e1 == EFAULT && r2 == -1 && e2 == EFAULT && r3 == -1 && e3 == EFAULT,
+              "clock_gettime: bad, kernel and read-only pointers are EFAULT");
+        check(r4 == -1 && e4 == EFAULT && r5 == -1 && e5 == EFAULT, "futex/nanosleep: bad pointers are EFAULT");
+        /* a fresh lazy page: the copy faults it in */
+        struct timespec *lazy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        check(lazy != MAP_FAILED && syscall(SYS_clock_gettime, CLOCK_MONOTONIC, lazy) == 0 && lazy->tv_sec >= 0,
+              "clock_gettime into an untouched page");
+        if (ro != MAP_FAILED) munmap(ro, 4096);
+        if (lazy != MAP_FAILED) munmap(lazy, 4096);
+    }
+    {   /* the clock: monotonic, finer than a millisecond */
+        struct timespec a, b;
+        int fine = 0, back = 0;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        for (int i = 0; i < 20000; i++) {
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            if (b.tv_sec < a.tv_sec || (b.tv_sec == a.tv_sec && b.tv_nsec < a.tv_nsec)) back++;
+            if (b.tv_nsec % 1000000 != 0) fine++;
+            a = b;
+        }
+        check(back == 0, "clock_gettime: monotonic");
+        check(fine > 0, "clock_gettime: sub-millisecond resolution");
+    }
+    {   /* a signal from another thread ends a 5 s nanosleep at once, also
+           when sent the moment the sleeper starts (no wake-up lost) */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &sa, NULL);
+        int ok = 1;
+        for (int i = 0; i < 20 && ok; i++) {
+            pthread_t th;
+            long took = -2;
+            g_sleep_ready = 0;
+            pthread_create(&th, NULL, long_sleeper, &took);
+            while (!g_sleep_ready) sched_yield();
+            if (i & 1) { struct timespec n = { 0, 20000000 }; nanosleep(&n, NULL); }
+            pthread_kill(th, SIGUSR1);
+            pthread_join(th, NULL);
+            if (took < 0 || took > 2000) {
+                fprintf(stderr, "[forktest] sleep %d: %ld ms\n", i, took);
+                ok = 0;
+            }
+        }
+        signal(SIGUSR1, SIG_DFL);
+        check(ok, "nanosleep: a signal from another thread wakes it (20 times)");
     }
     /* re-exec'd by the posix_spawn test */
     if (argc > 1 && strcmp(argv[1], "child5") == 0) return 5;

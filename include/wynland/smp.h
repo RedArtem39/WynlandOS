@@ -10,9 +10,12 @@
  * its idle hlt. While one core is in the kernel the others keep running
  * user code; one that needs the kernel too waits for the lock.
  *
- * The lock travels with the core, not the thread: a thread that blocks
- * or is preempted inside the kernel leaves the lock with the core, which
- * goes on to run the next thread (or its idle loop, which releases it).
+ * The lock belongs to the thread in the kernel (Thread.bkl): one that
+ * blocks or is preempted there gives it back while it is switched away and
+ * takes it again before it goes on (the scheduler does both). The
+ * scheduler itself runs without it, under its own spinlock
+ * (include/wynland/spinlock.h), so a core switches threads while another
+ * core is in the kernel.
  *
  * Interrupt handlers never wait for the lock: they take it if it is free
  * (or already theirs) and otherwise leave their work to whoever holds it
@@ -50,6 +53,7 @@ typedef struct Cpu {
     uint64_t cr3;                /* the page tables loaded here */
     volatile uint32_t tlb_flush; /* set by tlb_shootdown(), cleared once flushed */
     volatile bool online;
+    bool prof_exc;               /* the big lock held for an exception from user code (its profile) */
 } Cpu;
 
 extern Cpu g_cpus[MAX_CPUS];
@@ -74,6 +78,16 @@ void smp_set_gs(Cpu *c);
 void bkl_lock(void);
 void bkl_release_mine(void);
 int  bkl_irq_enter(void);
+/* A long wait inside a syscall that needs none of the big lock's data
+   (its own lock guards what it touches): out of the lock for it, and back.
+   bkl_drop() returns whether this core held it. */
+bool bkl_drop(void);
+void bkl_retake(bool had);
+/* the handler's way out after bkl_irq_enter() returned 1 */
+void bkl_irq_leave(void);
+/* the scheduler, switching away from a thread: the lock goes back if this
+   core holds it (the thread's Thread.bkl stays: it takes it again) */
+void bkl_switch_out(void);
 /* sched_yield() found nothing else to run: let a core waiting for the
    lock have it for a moment (a lock holder spinning on yield would
    otherwise keep everyone out, the one it waits for included). */

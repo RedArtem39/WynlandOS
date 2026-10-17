@@ -25,3 +25,8 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                       uint64_t timeout_arg, uint64_t uaddr2, uint32_t val3);
 
 void futex_init(void);
+
+/* The futex table's lock (kernel/futex.c): the reaper unlinks a killed
+   thread from the queue it slept on under it */
+uint64_t futex_lock_irqsave(void);
+void futex_unlock_irqrestore(uint64_t flags);

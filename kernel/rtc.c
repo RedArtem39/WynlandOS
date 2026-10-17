@@ -157,6 +157,13 @@ uint64_t rtc_get_unix_time_ms(void) {
     return g_boot_unix_time * 1000 + elapsed_ms;
 }
 
+uint64_t rtc_get_unix_time_ns(void) {
+    extern uint64_t sched_clock_ns(void);
+    uint64_t base = g_boot_tick_baseline * 10 * 1000000ULL;   /* the 1 kHz count at the RTC read, in ns */
+    uint64_t now = sched_clock_ns();
+    return g_boot_unix_time * 1000000000ULL + (now > base ? now - base : 0);
+}
+
 /* ---------------- timezone auto-detection ---------------- */
 
 /* Last boot's zone (/etc/timezone, written by tz_auto_detect()) as the

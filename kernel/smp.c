@@ -106,6 +106,7 @@ static inline void bkl_account(void)
     Cpu *c = this_cpu();
     Thread *t = c->current;
     uint32_t k = (!t || t == c->idle || t->last_syscall >= 512) ? 512 : (uint32_t)t->last_syscall;
+    if (c->prof_exc) { k = 511; c->prof_exc = false; }
     g_hold_cyc[k] += dt;
     g_hold_n[k]++;
     if (dt > g_hold_max[k]) g_hold_max[k] = dt;
@@ -130,8 +131,8 @@ void bkl_profile_dump(void)
         for (int k = 0; k < BKL_PROF_KEYS; k++)
             if (g_hold_cyc[k] && (best < 0 || g_hold_cyc[k] > g_hold_cyc[best])) best = k;
         if (best < 0) break;
-        serial_write_string(best == 512 ? "  idle/interrupt" : "  syscall ");
-        if (best != 512) { uint_to_str((uint64_t)best, b); serial_write_string(b); }
+        serial_write_string(best == 512 ? "  idle/interrupt" : best == 511 ? "  exception (page fault)" : "  syscall ");
+        if (best < 511) { uint_to_str((uint64_t)best, b); serial_write_string(b); }
         serial_write_string(": ");
         uint_to_str(g_hold_cyc[best] / per_ms, b); serial_write_string(b);
         serial_write_string(" ms in ");
@@ -179,6 +180,7 @@ void bkl_lock(void)
 {
     Cpu *c = this_cpu();
     int32_t me = (int32_t)c->id;
+    if (c->current && c->current != c->idle) c->current->bkl = true;
     if (g_bkl_owner == me) return;
     __atomic_add_fetch(&g_bkl_waiters, 1, __ATOMIC_RELAXED);
     uint32_t spins = 0;
@@ -204,6 +206,7 @@ void bkl_lock(void)
 
 void bkl_release_mine(void)
 {
+    if (this_cpu()->current) this_cpu()->current->bkl = false;
     if (g_bkl_owner != (int32_t)this_cpu()->id) return;
     {   /* the running thread ran off the bottom of its kernel stack */
         Thread *t = this_cpu()->current;
@@ -219,6 +222,33 @@ void bkl_release_mine(void)
     }
     if (g_deferred_due) smp_run_deferred();
     bkl_release_raw();
+}
+
+void bkl_irq_leave(void)
+{
+    if (g_bkl_owner != (int32_t)this_cpu()->id) return;
+    if (g_deferred_due) smp_run_deferred();
+    bkl_release_raw();
+}
+
+bool bkl_drop(void)
+{
+    Cpu *c = this_cpu();
+    if (g_bkl_owner != (int32_t)c->id) return false;
+    if (c->current) c->current->bkl = false;
+    if (g_deferred_due) smp_run_deferred();
+    bkl_release_raw();
+    return true;
+}
+
+void bkl_retake(bool had)
+{
+    if (had) bkl_lock();
+}
+
+void bkl_switch_out(void)
+{
+    if (g_bkl_owner == (int32_t)this_cpu()->id) bkl_release_raw();
 }
 
 int bkl_irq_enter(void)
@@ -363,6 +393,10 @@ void tlb_shootdown(void *pml4)
     Cpu *me = this_cpu();
     uint64_t f = irq_save();
     uint32_t pending = 0;
+    /* the page table writes before the look at which tables each core has
+       loaded: a core that loads them after this (the scheduler switches
+       without the kernel lock) reads the new entries */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     for (uint32_t i = 0; i < g_cpu_count; i++) {
         Cpu *c = &g_cpus[i];
         if (c == me || !c->online) continue;

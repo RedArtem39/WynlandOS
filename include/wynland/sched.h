@@ -117,6 +117,10 @@ typedef struct Thread {
     uint64_t timer_ms;        /* wake-up time while on the timer list */
     struct Thread *rq_next, *rq_prev;
     struct Thread *tm_next;
+    /* in a big-kernel-lock section (include/wynland/smp.h): the lock is
+       given back while the thread is switched away and taken again before
+       it goes on */
+    bool     bkl;
     uint8_t fx_raw[FPU_AREA_MAX + 64];
     uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;
@@ -192,7 +196,7 @@ extern volatile int g_sched_no_preempt;   /* > 0: no switching on the timer tick
 void sched_print_tasks(BootInfo *info, uint32_t bg_color);
 Thread *sched_get_thread_list(void);
 bool sched_kill_thread(uint64_t id);
-/* t is to die: TERMINATED, freed by the scheduler once no core runs it.
+/* t is to die: TERMINATED, freed by the reaper once no core runs it.
    The only way a thread becomes TERMINATED. */
 void sched_terminate(Thread *t);
 /* nanoseconds since boot (TSC, calibrated against the 1 kHz timer) */
@@ -216,3 +220,14 @@ int64_t sched_block_ms(void *wq, uint64_t wake_deadline_ms);
 /* Park the current thread for `ms` milliseconds of the 1 kHz clock
    (0 = plain yield). Not a spin: the CPU is free for the whole sleep. */
 void sched_sleep_ms(uint64_t ms);
+/* Same, but not at all (or no longer) once a signal that will be
+   delivered is pending: -EINTR then. Race-free against the sender, so a
+   sleep outside the big kernel lock does not miss it. */
+int64_t sched_sleep_ms_intr(uint64_t ms);
+/* sched_block() for a wait queue under a spinlock of its own: called with
+   `l` held (interrupts off), which is let go once the thread is parked --
+   no wake-up between the caller's last look and the sleep is lost. Not at
+   all when a signal that will be delivered is pending (-EINTR), like
+   sched_sleep_ms_intr(). */
+struct Spinlock;
+int64_t sched_block_unlock(void *wq, uint64_t wake_deadline, struct Spinlock *l);

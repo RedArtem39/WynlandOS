@@ -132,6 +132,7 @@ extern bkl_lock
 extern bkl_release_mine
 
 isr_common_stub:
+    cld                      ; kernel code assumes the direction flag clear
     ; Save all general purpose registers (r15-r8, rbp, rdi, rsi, rdx, rcx, rbx, rax)
     push rax
     push rbx
@@ -256,6 +257,7 @@ ISR_NOERRCODE 31
 extern irq_handler
 
 irq_common_stub:
+    cld                      ; kernel code assumes the direction flag clear
     ; Save all general purpose registers
     push rax
     push rbx

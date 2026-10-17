@@ -15,8 +15,10 @@
 #include <wynland/sched.h>
 #include <wynland/process.h>
 #include <wynland/vma.h>
+#include <wynland/smp.h>
 
 extern void *memcpy(void *dest, const void *src, size_t n);
+extern int uaccess_copy(void *dst, const void *src, uint64_t len);   /* kernel/uaccess.asm */
 
 /* Highest exclusive address this kernel ever treats as a legitimate
    user address: bit 47 and above must be zero (the canonical lower
@@ -24,9 +26,26 @@ extern void *memcpy(void *dest, const void *src, size_t n);
    The PAGE_USER check below rejects anything else not the process's. */
 #define USER_ADDR_LIMIT 0x0000800000000000ULL
 
+/* A syscall outside the big kernel lock (kernel/syscall.c) may not walk
+   the page tables (another core may be changing them): its copies go
+   straight at the user address, and a fault the handler cannot resolve
+   is -EFAULT (kernel/uaccess.asm). The kernel half is never reachable:
+   the range is checked first, and the user's pages are all PAGE_USER. */
+static inline bool outside_bkl(void)
+{
+    return g_bkl_owner != (int32_t)this_cpu()->id;
+}
+
+static inline bool user_span_ok(uint64_t addr, uint64_t len)
+{
+    uint64_t end = addr + len;
+    return end >= addr && end <= USER_ADDR_LIMIT;
+}
+
 bool user_range_valid(PageTable *pml4, uint64_t addr, uint64_t len, uint32_t required_access)
 {
     if (len == 0) return true;
+    bkl_lock();   /* the page tables are the big lock's: a lock-free syscall joins it here */
 
     uint64_t end = addr + len; /* exclusive */
     if (end < addr) return false;              /* addr+len overflow */
@@ -76,6 +95,10 @@ bool user_prepare_write(uint64_t addr, uint64_t len)
 
 int copy_from_user(void *kdst, const void *usrc, uint64_t len)
 {
+    if (outside_bkl()) {
+        if (!user_span_ok((uint64_t)(uintptr_t)usrc, len)) return -14;
+        return len ? uaccess_copy(kdst, usrc, len) : 0;
+    }
     PageTable *pml4 = vmm_get_current_pml4();
     if (!user_range_valid(pml4, (uint64_t)(uintptr_t)usrc, len, UACCESS_READ)) {
         return -14; /* -EFAULT */
@@ -92,6 +115,10 @@ int copy_to_user(void *udst, const void *ksrc, uint64_t len)
        silently corrupt the sibling process (if CR0.WP is clear) or take a
        kernel-mode #PF that the page-fault handler's ring-3-only COW fast
        path (kernel/idt.c) does NOT resolve. */
+    if (outside_bkl()) {   /* kernel-mode write faults resolve COW now (CR0.WP) */
+        if (!user_span_ok((uint64_t)(uintptr_t)udst, len)) return -14;
+        return len ? uaccess_copy(udst, ksrc, len) : 0;
+    }
     if (!user_prepare_write((uint64_t)(uintptr_t)udst, len)) {
         return -14; /* -EFAULT */
     }

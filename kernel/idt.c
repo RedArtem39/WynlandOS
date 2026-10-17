@@ -10,6 +10,7 @@
 #include <wynland/process.h>
 #include <wynland/vma.h>
 #include <wynland/signal.h>
+#include <wynland/smp.h>
 
 extern void *memcpy(void *dest, const void *src, size_t n);
 
@@ -225,7 +226,51 @@ static void print_reg(BootInfo *info, const char *name, uint64_t val)
     serial_write_string("\r\n");
 }
 
+static void exception_handler_main(InterruptRegisters *regs);
+
+/* A page fault in the kernel on a user address, from code outside the big
+   kernel lock (a lock-free syscall's copy, kernel/usercopy.c): resolving
+   it changes page tables, which are the lock's -- taken for the handling,
+   given back after. A fault the handler cannot resolve on the copy
+   instruction of kernel/uaccess.asm returns -EFAULT from the copy. */
 void exception_handler(InterruptRegisters *regs)
+{
+    bool took = false;
+    extern char uaccess_nofault_insn[], uaccess_nofault_fixup[];
+    if (regs->int_no == 14 && (regs->cs & 3) != 3 &&
+        regs->rip == (uint64_t)(uintptr_t)uaccess_nofault_insn) {
+        regs->rip = (uint64_t)(uintptr_t)uaccess_nofault_fixup;   /* no resolving at all */
+        return;
+    }
+    if (regs->int_no == 14 && (regs->cs & 3) != 3) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        Cpu *c = this_cpu();
+        if (cr2 < 0x0000800000000000ULL && c->current && c->current != c->idle &&
+            g_bkl_owner != (int32_t)c->id) {
+            bkl_lock();
+            took = true;
+        }
+    }
+    /* the big lock's profile (kernel/smp.c): this hold is an exception's,
+       not the thread's last syscall's */
+    if ((regs->cs & 3) == 3) this_cpu()->prof_exc = true;
+    exception_handler_main(regs);
+    if (took) bkl_drop();
+}
+
+/* exception_handler_main() on the copy instruction: the fatal path below
+   sends it to the fixup instead of crashing the kernel */
+static bool uaccess_fault_fixup(InterruptRegisters *regs)
+{
+    extern char uaccess_copy_insn[], uaccess_fixup[];
+    if (regs->int_no != 14 || (regs->cs & 3) == 3) return false;
+    if (regs->rip != (uint64_t)(uintptr_t)uaccess_copy_insn) return false;
+    regs->rip = (uint64_t)(uintptr_t)uaccess_fixup;
+    return true;
+}
+
+static void exception_handler_main(InterruptRegisters *regs)
 {
     /* Phase 22c: COW resolution. A write fault (err_code: PRESENT|WRITE
        both set) to a leaf tagged PAGE_COW (see vmm_cow_clone_user_pages())
@@ -275,6 +320,8 @@ void exception_handler(InterruptRegisters *regs)
             }
         }
     }
+
+    if (uaccess_fault_fixup(regs)) return;   /* a lock-free copy: -EFAULT */
 
     /* Check if the exception happened in user mode (Ring 3) */
     if ((regs->cs & 0x03) == 3) {

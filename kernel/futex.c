@@ -8,10 +8,14 @@
  * implements the queue table keyed by (address space, uaddr) and the
  * Linux futex op semantics on top of it.
  *
- * Concurrency model: every entry point runs its check+enqueue+block
- * sequence and every wake path its walk+dequeue+wake sequence inside a
- * cli/sti window. There is no SMP here; interrupts-off IS the lock, the
- * same convention the rest of this kernel uses.
+ * Concurrency: the queue table is under g_futex_lock, not the big kernel
+ * lock -- futex() runs outside it (kernel/syscall.c syscall_lock()). A wait
+ * checks the word and parks itself with the lock held, and lets go only
+ * once it is BLOCKED (sched_block_unlock()), so a wake between the two is
+ * never lost. The word is read without faulting under the lock (a page
+ * fault may need the big lock, or sleep); when that fails the lock goes,
+ * the word is touched normally, and the wait starts over. Keying a
+ * non-private futex reads page tables: that takes the big lock.
  */
 
 #include <wynland/futex.h>
@@ -23,6 +27,8 @@
 #include <wynland/process.h>
 #include <wynland/usercopy.h>
 #include <wynland/signal.h>
+#include <wynland/spinlock.h>
+#include <wynland/smp.h>
 
 extern void serial_write_string(const char *str);
 
@@ -53,9 +59,54 @@ typedef struct FutexQueue {
 } FutexQueue;
 
 static FutexQueue *g_buckets[FUTEX_BUCKETS];
+static Spinlock g_futex_lock = SPINLOCK_INIT("futex");
+
+/* The queues come from a pool, not the kernel heap (its allocator is the
+   big lock's): one per futex word that has waiters right now */
+#define FUTEX_QUEUES 8192
+static FutexQueue g_pool[FUTEX_QUEUES];
+static FutexQueue *g_pool_free;
+
+static bool g_pool_ready;
+
+/* the pool's free list, on first use (g_futex_lock held) */
+static void pool_init(void) {
+    g_pool_free = NULL;
+    for (int i = FUTEX_QUEUES - 1; i >= 0; i--) {
+        g_pool[i].next = g_pool_free;
+        g_pool_free = &g_pool[i];
+    }
+    g_pool_ready = true;
+}
 
 void futex_init(void) {
-    for (int i = 0; i < FUTEX_BUCKETS; i++) g_buckets[i] = NULL;
+    /* statics start zeroed: nothing to do (the pool fills on first use) */
+}
+
+uint64_t futex_lock_irqsave(void) { return spin_lock_irqsave(&g_futex_lock); }
+void futex_unlock_irqrestore(uint64_t f) { spin_unlock_irqrestore(&g_futex_lock, f); }
+
+extern int uaccess_read32_nofault(const uint32_t *uaddr, uint32_t *out);   /* kernel/uaccess.asm */
+
+/* The futex word, with g_futex_lock held: 0, or -EFAULT when it cannot be
+   read without a page fault (or is no user address at all) */
+static int word_nofault(uint64_t uaddr, uint32_t *v) {
+    if (uaddr >= 0x0000800000000000ULL - 4) return -14;
+    return uaccess_read32_nofault((const uint32_t *)uaddr, v);
+}
+
+/* g_futex_lock, and the word under it. A word that is not there yet (a
+   lazy page, swapped-out never happens here): the lock goes, the word is
+   faulted in by a normal copy, and again. -EFAULT for a bad address. */
+static int lock_and_read(uint64_t uaddr, uint32_t *v, uint64_t *flags) {
+    for (int tries = 0; tries < 8; tries++) {
+        *flags = spin_lock_irqsave(&g_futex_lock);
+        if (word_nofault(uaddr, v) == 0) return 0;
+        spin_unlock_irqrestore(&g_futex_lock, *flags);
+        uint32_t probe;
+        if (copy_from_user(&probe, (const void *)uaddr, sizeof probe) != 0) return -14;
+    }
+    return -14;
 }
 
 static unsigned bucket_of(uint64_t key_pml4, uint64_t key_uaddr) {
@@ -82,14 +133,16 @@ static void queue_prune(FutexQueue *q) {
     }
 }
 
-/* Callers hold interrupts off (the table is only touched that way). */
+/* Callers hold g_futex_lock. */
 static FutexQueue *queue_lookup(uint64_t key_pml4, uint64_t key_uaddr, bool create) {
     unsigned b = bucket_of(key_pml4, key_uaddr);
     for (FutexQueue *q = g_buckets[b]; q; q = q->next)
         if (q->key_pml4 == key_pml4 && q->key_uaddr == key_uaddr) return q;
     if (!create) return NULL;
-    FutexQueue *q = (FutexQueue *)kmalloc(sizeof(FutexQueue));
+    if (!g_pool_ready) pool_init();
+    FutexQueue *q = g_pool_free;
     if (!q) return NULL;
+    g_pool_free = q->next;
     q->key_pml4 = key_pml4;
     q->key_uaddr = key_uaddr;
     q->head = NULL;
@@ -106,7 +159,8 @@ static void queue_release_if_empty(FutexQueue *q) {
     FutexQueue **pp = &g_buckets[bucket_of(q->key_pml4, q->key_uaddr)];
     while (*pp && *pp != q) pp = &(*pp)->next;
     if (*pp) *pp = q->next;
-    kfree(q);
+    q->next = g_pool_free;
+    g_pool_free = q;
 }
 
 static void queue_push(FutexQueue *q, Thread *t) {
@@ -159,6 +213,7 @@ static void futex_key(uint64_t uaddr, bool priv, uint64_t *kp, uint64_t *ka) {
     *ka = uaddr;
     Thread *t = sched_current();
     if (priv || !t || !t->proc || !t->proc->pml4) return;
+    bkl_lock();   /* the page tables are the big lock's (held until the syscall ends) */
     uint64_t pte = vmm_get_pte(t->proc->pml4, uaddr & ~0xFFFULL);
     if (!(pte & PAGE_PRESENT)) {                 /* not touched yet: fault it in */
         uint32_t probe;                          /* a bad address just stays unkeyed */
@@ -182,9 +237,9 @@ static void futex_key(uint64_t uaddr, bool priv, uint64_t *kp, uint64_t *ka) {
    seconds of uptime -- hit live by this phase's own regression test) must
    read as "already expired", not wrap into an astronomical future deadline
    once cast through unsigned math. */
-static uint64_t abs_deadline_from_timespec(uint64_t ts_ptr, bool realtime) {
+static bool abs_deadline_from_timespec(uint64_t ts_ptr, bool realtime, uint64_t *out) {
     struct { int64_t sec; int64_t nsec; } ts;
-    memcpy(&ts, (const void *)ts_ptr, sizeof(ts));
+    if (copy_from_user(&ts, (const void *)ts_ptr, sizeof(ts)) != 0) return false;
 
     const int64_t NS_PER_TICK = 10000000LL; /* 100Hz */
     uint64_t now_ticks = timer_get_ticks();
@@ -199,9 +254,10 @@ static uint64_t abs_deadline_from_timespec(uint64_t ts_ptr, bool realtime) {
         now_ns = (int64_t)(now_ticks * (uint64_t)NS_PER_TICK);
     }
 
-    if (target_ns <= now_ns) return now_ticks; /* already expired */
+    if (target_ns <= now_ns) { *out = now_ticks; return true; } /* already expired */
     int64_t delta_ns = target_ns - now_ns;
-    return now_ticks + (uint64_t)(delta_ns / NS_PER_TICK) + 1;
+    *out = now_ticks + (uint64_t)(delta_ns / NS_PER_TICK) + 1;
+    return true;
 }
 
 /* A signal that would do something (run a handler, kill) waits for the
@@ -222,58 +278,60 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
     uint32_t op = op_raw & ~FUTEX_OP_MASK;
     bool realtime = (op_raw & 256u) != 0;
     const bool priv = (op_raw & 128u) != 0;
+    if (uaddr & 3) return -22; /* -EINVAL: futex words are aligned */
     uint64_t key, kaddr;
     futex_key(uaddr, priv, &key, &kaddr);
 
     switch (op) {
     case FUTEX_WAIT:
     case FUTEX_WAIT_BITSET: {
-        volatile uint32_t *addr = (volatile uint32_t *)uaddr;
-
         uint64_t deadline = SCHED_NO_DEADLINE;
         if (op == FUTEX_WAIT_BITSET && timeout_arg != 0) {
-            deadline = abs_deadline_from_timespec(timeout_arg, realtime);
+            if (!abs_deadline_from_timespec(timeout_arg, realtime, &deadline)) return -14; /* -EFAULT */
         } else if (op == FUTEX_WAIT && timeout_arg != 0) {
             /* plain FUTEX_WAIT: a RELATIVE timespec. It used to be ignored,
                so every timed wait (QWaitCondition::wait(ms), QMutex::
                tryLock(ms), ...) could block forever. */
             struct { int64_t sec; int64_t nsec; } ts;
-            memcpy(&ts, (const void *)timeout_arg, sizeof(ts));
+            if (copy_from_user(&ts, (const void *)timeout_arg, sizeof(ts)) != 0) return -14; /* -EFAULT */
             if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000LL) return -22; /* -EINVAL */
             uint64_t ms = (uint64_t)ts.sec * 1000 + (uint64_t)(ts.nsec + 999999) / 1000000;
             deadline = timer_get_ticks() + ms / 10 + 1; /* ticks are 10 ms */
         }
 
         /* The canonical futex contract: verify the caller's expected value
-           atomically-with blocking. Under cli there is no window between
-           this compare and parking ourselves on the queue. */
+           atomically-with blocking. Under g_futex_lock there is no window
+           between this compare and parking ourselves on the queue (a waker
+           needs the lock to find us). */
         uint64_t rflags;
-        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+        uint32_t cur;
+        if (lock_and_read(uaddr, &cur, &rflags) != 0) return -14; /* -EFAULT */
 
-        if (*addr != val) {
-            if (rflags & 0x200) __asm__ volatile("sti");
+        if (cur != val) {
+            spin_unlock_irqrestore(&g_futex_lock, rflags);
             return -11; /* -EAGAIN: value changed before we could sleep */
         }
         if (wake_signal_pending()) {
-            if (rflags & 0x200) __asm__ volatile("sti");
+            spin_unlock_irqrestore(&g_futex_lock, rflags);
             return -4;  /* -EINTR */
         }
 
         FutexQueue *q = queue_lookup(key, kaddr, true);
         if (!q) {
-            if (rflags & 0x200) __asm__ volatile("sti");
+            spin_unlock_irqrestore(&g_futex_lock, rflags);
             return -12; /* -ENOMEM: queue table exhausted */
         }
 
         Thread *self = sched_current();
         queue_push(q, self);
-        int64_t r = sched_block((void *)q, deadline);
+        int64_t r = sched_block_unlock((void *)q, deadline, &g_futex_lock);
         /* Resumed: by a WAKE (already unlinked by it) or by the deadline
-           pass (still linked, maybe requeued). Either way make sure we are
-           off the list. `q` may be gone by now -- not used again. */
-        __asm__ volatile("cli");
+           pass (still linked, maybe requeued) -- or it never slept (a
+           signal). Either way make sure we are off the list. `q` may be
+           gone by now -- not used again. */
+        spin_lock(&g_futex_lock);
         futex_unlink_self(self);
-        if (rflags & 0x200) __asm__ volatile("sti");
+        spin_unlock_irqrestore(&g_futex_lock, rflags);
         return r;
     }
 
@@ -282,8 +340,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         /* WAIT_BITSET's uaddr2 carries a wake-bitset we deliberately ignore
            (wake any matcher): nothing on this OS uses bitset-selective
            wakes yet, documented v1 simplification. */
-        uint64_t rflags;
-        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+        uint64_t rflags = spin_lock_irqsave(&g_futex_lock);
         FutexQueue *q = queue_lookup(key, kaddr, false);
         uint32_t woken = 0;
         if (q) {
@@ -298,7 +355,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             }
             queue_release_if_empty(q);
         }
-        if (rflags & 0x200) __asm__ volatile("sti");
+        spin_unlock_irqrestore(&g_futex_lock, rflags);
         return (int64_t)woken;
     }
 
@@ -313,18 +370,18 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         if (oparg & 0x800) oparg |= (int32_t)0xFFFFF000;   /* sign-extend 12 bits */
         if (cmparg & 0x800) cmparg |= (int32_t)0xFFFFF000;
         if (opc & 8) { opc &= 7; oparg = (int32_t)(1u << (oparg & 31)); } /* FUTEX_OP_OPARG_SHIFT */
+        /* (user_prepare_write() takes the big lock: the page stays mapped
+           and writable while it is held) */
         if ((uaddr2 & 3) || !user_prepare_write(uaddr2, 4)) return -14; /* -EFAULT */
+        if (opc > 4) return -38;
+        uint64_t key2, kaddr2;
+        futex_key(uaddr2, priv, &key2, &kaddr2);
 
-        uint64_t rflags;
-        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+        uint64_t rflags = spin_lock_irqsave(&g_futex_lock);
         /* A real atomic update (lock cmpxchg): the process's threads on
            other cores change this word with atomics of their own at the
            same time -- a plain load and store lost their update (a
            semaphore post, a condvar sequence), and a waiter slept on. */
-        if (opc > 4) {
-            if (rflags & 0x200) __asm__ volatile("sti");
-            return -38;
-        }
         int32_t *a2p = (int32_t *)uaddr2;
         int32_t old = __atomic_load_n(a2p, __ATOMIC_RELAXED), nv;
         do {
@@ -347,8 +404,6 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         default: cond = false; break;
         }
         uint32_t woken = 0;
-        uint64_t key2, kaddr2;
-        futex_key(uaddr2, priv, &key2, &kaddr2);
         for (int pass = 0; pass < 2; pass++) {
             if (pass == 1 && !cond) break;
             FutexQueue *q = pass ? queue_lookup(key2, kaddr2, false) : queue_lookup(key, kaddr, false);
@@ -366,29 +421,32 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             woken += n;
             queue_release_if_empty(q);
         }
-        if (rflags & 0x200) __asm__ volatile("sti");
+        spin_unlock_irqrestore(&g_futex_lock, rflags);
         return (int64_t)woken;
     }
 
     case FUTEX_REQUEUE:
     case FUTEX_CMP_REQUEUE: {
-        volatile uint32_t *addr = (volatile uint32_t *)uaddr;
         uint32_t nr_requeue = (uint32_t)timeout_arg; /* arg4 = val2 */
         uint64_t key2, uaddr2_key_addr;
+        if (uaddr2 & 3) return -22;
         futex_key(uaddr2, priv, &key2, &uaddr2_key_addr);
 
         uint64_t rflags;
-        __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-
-        /* plain REQUEUE has no expected-value check */
-        if (op == FUTEX_CMP_REQUEUE && *addr != val3) {
-            if (rflags & 0x200) __asm__ volatile("sti");
-            return -11; /* -EAGAIN */
+        if (op == FUTEX_CMP_REQUEUE) {
+            uint32_t cur;
+            if (lock_and_read(uaddr, &cur, &rflags) != 0) return -14; /* -EFAULT */
+            if (cur != val3) {
+                spin_unlock_irqrestore(&g_futex_lock, rflags);
+                return -11; /* -EAGAIN */
+            }
+        } else {
+            rflags = spin_lock_irqsave(&g_futex_lock);   /* plain REQUEUE has no expected-value check */
         }
 
         FutexQueue *q = queue_lookup(key, kaddr, false);
         if (!q) {
-            if (rflags & 0x200) __asm__ volatile("sti");
+            spin_unlock_irqrestore(&g_futex_lock, rflags);
             return 0;
         }
         queue_prune(q);
@@ -421,7 +479,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         }
         queue_release_if_empty(q);
 
-        if (rflags & 0x200) __asm__ volatile("sti");
+        spin_unlock_irqrestore(&g_futex_lock, rflags);
         return (int64_t)(woken + moved);
     }
 
@@ -440,8 +498,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
 void futex_wake_user(uint64_t uaddr, uint32_t n) {
     uint64_t key, kaddr;
     futex_key(uaddr, false, &key, &kaddr);   /* as Linux: a shared key where the memory is shared */
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_futex_lock);
     FutexQueue *q = queue_lookup(key, kaddr, false);
     uint32_t woken = 0;
     if (q) {
@@ -456,5 +513,5 @@ void futex_wake_user(uint64_t uaddr, uint32_t n) {
         }
         queue_release_if_empty(q);
     }
-    if (rflags & 0x200) __asm__ volatile("sti");
+    spin_unlock_irqrestore(&g_futex_lock, rflags);
 }

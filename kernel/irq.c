@@ -289,7 +289,16 @@ static void tick_account(InterruptRegisters *regs)
    the idle loop schedules right after. */
 static void irq_leave(int took, InterruptRegisters *regs)
 {
-    if (took == 1 && (regs->cs & 3) != 3) bkl_release_mine();
+    if (took == 1 && (regs->cs & 3) != 3) bkl_irq_leave();
+}
+
+/* Preemption needs no big lock (the scheduler has its own): from user
+   code always; in the kernel only a thread inside the big lock that this
+   core holds (took 0) -- kernel code outside it runs with interrupts off,
+   or is this core waiting for the lock. */
+static inline bool may_preempt(int took, InterruptRegisters *regs)
+{
+    return (regs->cs & 3) == 3 || took == 0;
 }
 
 static void lapic_irq(InterruptRegisters *regs)
@@ -305,9 +314,8 @@ static void lapic_irq(InterruptRegisters *regs)
     /* an AP's 1 kHz tick: preemption */
     tick_account(regs);
     int took = bkl_irq_enter();
-    if (took < 0) return;
-    kill_check(regs);
-    if (took == 0 || (regs->cs & 3) == 3) sched_preempt_tick();
+    if (took >= 0) kill_check(regs);
+    if (may_preempt(took, regs)) sched_preempt_tick();
     irq_leave(took, regs);
 }
 
@@ -343,7 +351,10 @@ void irq_handler(InterruptRegisters *regs)
 
         int took = bkl_irq_enter();
         if (took < 0) {
+            /* the device work to the lock holder; the thread here may
+               still be preempted */
             __atomic_store_n(&g_deferred_due, 1, __ATOMIC_RELEASE);
+            if ((regs->cs & 3) == 3) sched_preempt_tick();
             return;
         }
         kill_check(regs);
@@ -376,7 +387,7 @@ void irq_handler(InterruptRegisters *regs)
         }
         /* 1ms preemption: sched_schedule()'s deadline pass is also
            what wakes millisecond sleepers (sched_sleep_ms()). */
-        if (took == 0 || (regs->cs & 3) == 3) sched_preempt_tick();
+        if (may_preempt(took, regs)) sched_preempt_tick();
         irq_leave(took, regs);
         return;
     } else if (irq == 1 || irq == 12) {

@@ -155,6 +155,10 @@ typedef struct {
 #define MSR_STAR       0xC0000081
 #define MSR_LSTAR      0xC0000082
 #define MSR_SFMASK     0xC0000084
+/* RFLAGS bits cleared on syscall entry (Linux's set): TF, IF, DF (kernel
+   code -- rep movs, memcpy -- assumes the direction flag clear; user code
+   may leave it set), IOPL, NT, AC. The user's come back with sysret. */
+#define SYSCALL_RFLAGS_MASK 0x47700ULL
 
 #ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
@@ -2102,6 +2106,42 @@ static void strace_line(uint64_t pid, uint64_t num, uint64_t a1, uint64_t a2, ui
     else uint_to_hex(r, b);
     serial_write_string(b);
     serial_write_string("\r\n");
+}
+
+/* ---- syscalls outside the big kernel lock -------------------------------
+   kernel/syscall_entry.asm calls syscall_lock() before the dispatch: the
+   big lock (include/wynland/smp.h), except for the calls below, which touch
+   nothing of its: the clocks, sleeping, yielding. Their user memory goes
+   through copies that do not look at page tables (kernel/usercopy.c); a
+   helper that needs the lock after all takes it (and the thread keeps it
+   until it leaves the kernel). A process under seccomp always takes it
+   (the filter may kill it), and so does the first syscall of all (the
+   strace setting is read from a file). */
+static bool g_lockfree[512];
+
+static void lockfree_init(void)
+{
+    static const uint16_t nrs[] = {
+        24,   /* sched_yield */
+        35,   /* nanosleep */
+        96,   /* gettimeofday */
+        201,  /* time */
+        202,  /* futex (its own lock: kernel/futex.c) */
+        228,  /* clock_gettime */
+        229,  /* clock_getres */
+        230,  /* clock_nanosleep */
+    };
+    for (uint32_t i = 0; i < sizeof(nrs) / sizeof(nrs[0]); i++) g_lockfree[nrs[i]] = true;
+}
+
+void syscall_lock(uint64_t num)
+{
+    Thread *t = sched_current();
+    if (num < 512 && g_lockfree[num] && g_strace_state && !t->in_syscall &&
+        t->proc && !t->proc->seccomp_mode)
+        return;
+    bkl_lock();
+    if (!g_strace_state) lockfree_init();   /* once, in the lock (before strace_config()) */
 }
 
 /* syscall_entry calls this: the dispatch, counted (Process.st_*) */
@@ -4057,7 +4097,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (it) do {
                     if (it->proc == proc && it != sched_current() &&
                         it->state != THREAD_STATE_TERMINATED) {
-                        it->sig_pending |= 1ULL << 9;
+                        __atomic_or_fetch(&it->sig_pending, 1ULL << 9, __ATOMIC_SEQ_CST);
                         if (it->state == THREAD_STATE_BLOCKED) sched_unblock(it, -LNX_EINTR);
                     }
                     it = it->next;
@@ -4166,7 +4206,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 extern bool virtio_gpu_is_active(void);
                 extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
                 if (virtio_gpu_is_active()) {
+                    /* up to 20 ms waiting for the host: not in the big
+                       lock (the driver has its own) */
+                    bool had = bkl_drop();
                     virtio_gpu_flush((uint32_t)a1, (uint32_t)a2, (uint32_t)a3, (uint32_t)a4);
+                    bkl_retake(had);
                 }
                 return 0;
             }
@@ -5059,22 +5103,19 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     int64_t tv_sec;
                     int64_t tv_nsec;
                 };
-                struct timespec *tp = (struct timespec *)a2;
-                if (tp) {
-                    if (!user_prepare_write(a2, sizeof(*tp))) return (uint64_t)-14; /* -EFAULT */
-                    /* 1 kHz clock: millisecond-resolution timestamps, so
-                       frame pacing / animation code sees real deltas
-                       instead of 10ms steps. */
-                    extern uint64_t timer_get_ms(void);
-                    uint64_t ms = timer_get_ms();
-                    /* CLOCK_REALTIME (0) -- real wall-clock UTC, from the
-                       CMOS RTC read at boot (see kernel/rtc.c). Everything
-                       else (CLOCK_MONOTONIC=1, etc.) stays uptime-based,
-                       matching real Linux semantics: monotonic clocks are
-                       never supposed to jump with wall-clock adjustments. */
-                    if ((int)a1 == 0) ms = rtc_get_unix_time_ms();
-                    tp->tv_sec = (int64_t)(ms / 1000);
-                    tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
+                if (a2) {
+                    /* the TSC clock (nanoseconds; kernel/sched.c).
+                       CLOCK_REALTIME (0), its _COARSE (5) and TAI (11):
+                       wall-clock UTC from the CMOS RTC read at boot (see
+                       kernel/rtc.c). Everything else (CLOCK_MONOTONIC=1,
+                       etc.) is uptime, matching Linux: monotonic clocks
+                       never jump with wall-clock adjustments. Outside the
+                       big kernel lock (syscall_lock()). */
+                    int clk = (int)a1;
+                    uint64_t ns = (clk == 0 || clk == 5 || clk == 11) ? rtc_get_unix_time_ns()
+                                                                      : sched_clock_ns();
+                    struct timespec ts = { (int64_t)(ns / 1000000000ULL), (int64_t)(ns % 1000000000ULL) };
+                    if (copy_to_user((void *)a2, &ts, sizeof(ts)) != 0) return (uint64_t)-14; /* -EFAULT */
                 }
                 return 0;
             }
@@ -5082,11 +5123,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    // instead of clock_gettime) -- real wall-clock UTC.
             {
                 int64_t now = (int64_t)rtc_get_unix_time();
-                int64_t *tloc = (int64_t *)a1;
-                if (tloc) {
-                    if (!user_prepare_write(a1, sizeof(*tloc))) return (uint64_t)-14; /* -EFAULT */
-                    *tloc = now;
-                }
+                if (a1 && copy_to_user((void *)a1, &now, sizeof(now)) != 0) return (uint64_t)-14; /* -EFAULT */
                 return (uint64_t)now;
             }
         case 217: // SYS_getdents64 (Linux standard)
@@ -5546,9 +5583,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             {
                 if (a1) {
                     struct { int64_t sec, usec; } tv;
-                    uint64_t ms = rtc_get_unix_time_ms();
-                    tv.sec = (int64_t)(ms / 1000);
-                    tv.usec = (int64_t)((ms % 1000) * 1000);
+                    uint64_t us = rtc_get_unix_time_ns() / 1000;
+                    tv.sec = (int64_t)(us / 1000000);
+                    tv.usec = (int64_t)(us % 1000000);
                     if (copy_to_user((void *)a1, &tv, sizeof(tv)) != 0) return (uint64_t)-14;
                 }
                 if (a2) {
@@ -6804,9 +6841,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     int64_t tv_sec;
                     int64_t tv_nsec;
                 };
-                struct timespec *req = (struct timespec *)a1;
-                if (req) {
-                    if (!user_check_read(a1, sizeof(*req))) return (uint64_t)-14; /* -EFAULT */
+                struct timespec reqv, *req = &reqv;
+                if (a1) {
+                    if (copy_from_user(&reqv, (const void *)a1, sizeof(reqv)) != 0) return (uint64_t)-14; /* -EFAULT */
                     if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000) {
                         return (uint64_t)-22; /* -EINVAL */
                     }
@@ -6827,7 +6864,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                        acted on now instead of after the whole sleep. */
                     while (ms > 0 && timer_get_ms() < end_ms) {
                         if (sleep_interrupted()) return sleep_eintr(a2, end_ms);
-                        sched_sleep_ms(end_ms - timer_get_ms());
+                        sched_sleep_ms_intr(end_ms - timer_get_ms());
                     }
                 }
                 return 0;
@@ -6859,7 +6896,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 while (timer_get_ms() < end) {
                     if (sleep_interrupted())
                         return sleep_eintr((a2 & 1) ? 0 : a4, end); /* no rem with TIMER_ABSTIME */
-                    sched_sleep_ms(end - timer_get_ms());
+                    sched_sleep_ms_intr(end - timer_get_ms());
                 }
                 return 0;
             }
@@ -7285,7 +7322,7 @@ void syscall_init_cpu(void) {
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);   /* SCE */
     wrmsr(MSR_STAR, ((uint64_t)0x13 << 48) | ((uint64_t)0x08 << 32));
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
-    wrmsr(MSR_SFMASK, 0x300);
+    wrmsr(MSR_SFMASK, SYSCALL_RFLAGS_MASK);
 }
 
 void syscall_init(void) {
@@ -7304,9 +7341,8 @@ void syscall_init(void) {
     // 3. Setup LSTAR MSR (Assembly entry point address)
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
 
-    // 4. Setup SFMASK MSR (Disable Interrupts and Clear Trap Flag on entry)
-    // Mask IF (0x200), TF (0x100)
-    wrmsr(MSR_SFMASK, 0x300);
+    // 4. Setup SFMASK MSR: what the kernel runs without
+    wrmsr(MSR_SFMASK, SYSCALL_RFLAGS_MASK);
 
     serial_write_string("Syscalls: Enabled successfully.\r\n");
 }

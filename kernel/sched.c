@@ -10,6 +10,8 @@
 #include <wynland/vma.h>
 #include <wynland/vmm.h>
 #include <wynland/smp.h>
+#include <wynland/spinlock.h>
+#include <wynland/futex.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 
@@ -87,8 +89,15 @@ static void disable_interrupts(void) {
    Data: READY threads waiting for a core are on one run queue (all cores
    pick from it); BLOCKED threads with a timeout on a timer list sorted by
    wake-up time. Neither is the full thread list: a pick costs the number
-   of runnable threads, not of all threads. All of it under the kernel
-   lock with interrupts off. */
+   of runnable threads, not of all threads. All of it under g_sched_lock
+   (interrupts off), not the big kernel lock: a core switches threads, and
+   wakes them, while another one is in the kernel.
+
+   The lock is held across a switch: the thread leaving the core is back
+   on the run queue before its registers are saved, so no other core may
+   pick it until the switch is done -- the thread switched TO lets go
+   (sched_finish(): after context_switch(), or in thread_trampoline for a
+   new one), then takes the big lock again if it was inside it. */
 
 #define NICE_0_WEIGHT   1024
 #define SCHED_SLICE_NS  3000000ULL      /* each request: 3 ms of a core */
@@ -106,6 +115,8 @@ static uint32_t g_rq_count;
 static Thread *g_timers;             /* BLOCKED with a deadline, soonest first */
 static uint64_t g_v_last;            /* V when last computed: for wake-ups into an empty system */
 static volatile uint32_t g_dead;     /* TERMINATED threads not yet freed */
+static Spinlock g_sched_lock = SPINLOCK_INIT("sched");
+static void reaper_kick(void);
 
 /* ---- the clock ---- */
 static uint64_t g_tsc0, g_ms0, g_tsc_per_ms;
@@ -315,28 +326,29 @@ static Thread *pick_next(Thread *self, Thread *avoid)
 
 void sched_terminate(Thread *t)
 {
-    if (!t || t->state == THREAD_STATE_TERMINATED) return;
-    uint64_t f;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f));
-    rq_del(t);
-    timer_del(t);
-    t->state = THREAD_STATE_TERMINATED;
-    g_dead++;
-    if (f & 0x200) __asm__ volatile("sti");
+    if (!t) return;
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
+    if (t->state != THREAD_STATE_TERMINATED) {
+        rq_del(t);
+        timer_del(t);
+        t->state = THREAD_STATE_TERMINATED;
+        g_dead++;
+        reaper_kick();
+    }
+    spin_unlock_irqrestore(&g_sched_lock, f);
 }
 
 void sched_set_nice(Thread *t, int nice)
 {
     if (nice < -20) nice = -20;
     if (nice > 19) nice = 19;
-    uint64_t f;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f));
+    uint64_t f = spin_lock_irqsave(&g_sched_lock);
     if (t->state == THREAD_STATE_RUNNING) account(t, sched_clock_ns());
     /* keep its place in virtual time; the slice ahead is in the new weight */
     t->nice = (int8_t)nice;
     t->weight = g_nice_weight[nice + 20];
     t->vdeadline = t->vruntime + vslice_of(t);
-    if (f & 0x200) __asm__ volatile("sti");
+    spin_unlock_irqrestore(&g_sched_lock, f);
 }
 
 /* A thread starts its scheduling life (nice from its creator) */
@@ -347,28 +359,18 @@ static void sched_entity_init(Thread *t, const Thread *creator)
     t->weight = g_nice_weight[nice + 20];
 }
 
-/* Back from the idle hlt: the kernel lock again -- spinning a moment
-   (it is usually held only briefly), else sleeping until the next
-   interrupt (this core's tick, a wake-up IPI) and trying again. */
-static void idle_relock(void)
-{
-    bkl_lock();   /* spins a moment, then sleeps until the holder lets go */
-}
-
 /* Each core's idle thread: runs whenever no thread is ready for this core
-   (Phase 22a). It schedules (holding the kernel lock, interrupts off),
-   and when nothing is runnable gives the lock back and sleeps in hlt
-   until an interrupt -- the 1 kHz tick, a wake-up IPI -- then looks
-   again; each look's deadline pass also converts expired futex waits back
-   to READY, so hlt sleeps cost at most one tick of wake latency. Never on
-   the thread list: no other core may pick it. */
+   (Phase 22a). It schedules (interrupts off; never in the big kernel
+   lock), and when nothing is runnable sleeps in hlt until an interrupt --
+   the 1 kHz tick, a wake-up IPI -- then looks again; each look's deadline
+   pass also converts expired timed waits back to READY, so hlt sleeps
+   cost at most one tick of wake latency. Never on the thread list: no
+   other core may pick it. */
 static void idle_loop(void *arg) {
     (void)arg;
     for (;;) {
         sched_schedule();
-        bkl_release_mine();
         __asm__ volatile("sti; hlt; cli" ::: "memory");
-        idle_relock();
     }
 }
 
@@ -378,7 +380,6 @@ void sched_idle_loop_ap(void) __attribute__((noreturn));
 void sched_idle_loop_ap(void)
 {
     __asm__ volatile("cli");
-    idle_relock();
     idle_loop(NULL);
     for (;;) __asm__ volatile("hlt");
 }
@@ -440,6 +441,7 @@ void sched_init(void) {
     t0->next = t0; // Circular linked list
     t0->wake_deadline = SCHED_NO_DEADLINE;
     t0->on_cpu = cpu->id + 1;
+    t0->bkl = true;              /* the boot core holds the big lock from the start */
     sched_entity_init(t0, NULL);
     thread_list = t0;
     cpu->current = t0;
@@ -519,6 +521,9 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     t->sig_frame = NULL;
     t->sig_restore_mask = false;
     t->proc = proc ? proc : current_thread->proc;
+    /* starts inside the big kernel lock, like its creator: it gives it
+       back on its way to user mode (sched_finish() takes it first) */
+    t->bkl = true;
 
     // Allocate stack
     t->stack_orig = (uint64_t *)kmalloc(THREAD_STACK_SIZE);
@@ -542,8 +547,12 @@ Thread *thread_create_ex_tls(void (*entry)(void*), void *arg, struct Process *pr
     t->next = thread_list->next;
     thread_list->next = t;
 
-    sched_entity_init(t, current_thread);
-    make_ready(t, true);
+    {
+        spin_lock(&g_sched_lock);
+        sched_entity_init(t, current_thread);
+        make_ready(t, true);
+        spin_unlock(&g_sched_lock);
+    }
 
     /* Back to the CALLER's interrupt state -- never an unconditional sti.
        Syscalls run with IF=0 (SFMASK), and fork()/clone() call this from
@@ -632,8 +641,13 @@ static void reap_queue(struct Process *p)
     }
     g_reap[g_reap_head] = p;
     g_reap_head = next;
-    /* only from its own wait: asleep inside a teardown (a socket close)
-       it is on another queue, and goes on with this one afterwards */
+}
+
+/* A thread died (g_sched_lock held): the reaper frees it. Only from its
+   own wait: asleep inside a teardown (a socket close) it is on another
+   queue, and looks again afterwards. */
+static void reaper_kick(void)
+{
     if (g_reaper && g_reaper->state == THREAD_STATE_BLOCKED && g_reaper->wq == (void *)g_reap) {
         g_reaper->wake_result = 0;
         g_reaper->wq = NULL;
@@ -641,17 +655,85 @@ static void reap_queue(struct Process *p)
     }
 }
 
+/* Free the terminated threads no core runs any more (the big lock held:
+   the thread list is its). on_cpu is read under the scheduler's lock: a
+   thread switched away is off its stack only once the switch is done. */
+static void sweep_dead(void)
+{
+    if (!g_dead || !thread_list) return;
+    Thread *prev = thread_list;
+    Thread *curr = thread_list->next;
+    do {
+        bool gone = false;
+        if (curr->state == THREAD_STATE_TERMINATED) {
+            spin_lock(&g_sched_lock);
+            gone = !curr->on_cpu;
+            spin_unlock(&g_sched_lock);
+        }
+        if (gone) {
+            prev->next = curr->next;
+            if (curr == thread_list) {
+                thread_list = curr->next;
+            }
+            Thread *to_free = curr;
+            __atomic_sub_fetch(&g_dead, 1, __ATOMIC_RELAXED);
+            curr = curr->next;
+            /* killed while blocked (signal_kill_process(), a fatal
+               signal): it never ran its own unlink, so its wait queue
+               would keep pointing at the freed Thread */
+            if (to_free->wq_head) {
+                /* a futex queue is under the futex lock (a wait queue
+                   under the big lock, held here too) */
+                uint64_t ff = futex_lock_irqsave();
+                Thread **pp = to_free->wq_head;
+                while (*pp) {
+                    if (*pp == to_free) { *pp = to_free->wq_next; break; }
+                    pp = &(*pp)->wq_next;
+                }
+                to_free->wq_head = NULL;
+                futex_unlock_irqrestore(ff);
+            }
+
+            /* The address space goes once every thread sharing this
+               process (SYS_clone pthreads included, see kernel/syscall.c)
+               has terminated and left its core -- no core still walks its
+               page tables, and no surviving pthread sibling is left
+               running on a freed address space. process_teardown() itself
+               refuses to touch the kernel process (pid 0). */
+            if (to_free->proc) {
+                to_free->proc->thread_count--;
+                if (to_free->proc->exited && to_free->proc->thread_count <= 0) {
+                    reap_queue(to_free->proc);
+                }
+            }
+
+            if (to_free->stack_orig) {
+                kfree(to_free->stack_orig);
+            }
+            kfree(to_free);
+        } else {
+            prev = curr;
+            curr = curr->next;
+        }
+    } while (curr != thread_list);
+}
+
 static void reaper_thread(void *arg)
 {
     (void)arg;
+    extern uint64_t timer_get_ms(void);
     for (;;) {
         __asm__ volatile("cli");
+        sweep_dead();
         while (g_reap_tail != g_reap_head) {
             struct Process *p = g_reap[g_reap_tail];
             g_reap_tail = (g_reap_tail + 1) % REAP_MAX;
             process_teardown(p);
         }
-        sched_block(&g_reap, SCHED_NO_DEADLINE);   /* reap_queue() wakes it */
+        /* a dead thread still on its core (its last moments in
+           thread_exit()): looked at again shortly */
+        if (g_dead) sched_block_ms(&g_reap, timer_get_ms() + 5);
+        else sched_block(&g_reap, SCHED_NO_DEADLINE);   /* sched_terminate() wakes it */
     }
 }
 
@@ -660,103 +742,30 @@ void sched_start_reaper(void)
     g_reaper = thread_create(reaper_thread, NULL);
 }
 
-/* Pick the next thread for this core and switch to it. Kernel lock held,
-   interrupts off. Returns whether it switched (and came back). Never
-   sleeps (see the reaper above). */
-/* yielding: the current thread goes on only if no other one can (kernel
-   code spins on sched_yield() waiting for another thread -- that one must
-   get the core even when it is not eligible yet) */
-static bool schedule_core_ex(bool yielding);
-static bool schedule_core(void) { return schedule_core_ex(false); }
-static bool schedule_core_ex(bool yielding) {
+/* After a switch, in the thread switched to (or with none, in the one
+   that goes on): the scheduler's lock goes, and the big kernel lock comes
+   back if the thread was inside it. Interrupts still off. */
+static void sched_finish(void)
+{
+    spin_unlock(&g_sched_lock);
+    Thread *t = current_thread;
+    if (t->bkl && g_bkl_owner != (int32_t)this_cpu()->id) bkl_lock();
+}
+
+/* A new thread's first instructions (kernel/sched_switch.asm) */
+void sched_thread_start(void)
+{
+    sched_finish();
+}
+
+/* Pick the next thread for this core and switch to it. g_sched_lock held
+   (interrupts off), released on the way out (sched_finish()). Returns
+   whether it switched (and came back). Never sleeps (see the reaper
+   above). yielding: the current thread goes on only if no other one can
+   (kernel code spins on sched_yield() waiting for another thread -- that
+   one must get the core even when it is not eligible yet). */
+static bool schedule_locked(bool yielding) {
     Cpu *cpu = this_cpu();
-    if (g_bkl_owner != (int32_t)cpu->id) {
-        static int said;
-        if (said++ < 3) {
-            extern void uint_to_hex(uint64_t val, char *buf);
-            extern void uint_to_str(uint64_t val, char *buf);
-            char b[32];
-            serial_write_string("SCHED: switching without the kernel lock: cpu ");
-            uint_to_str(cpu->id, b); serial_write_string(b);
-            serial_write_string(" owner "); uint_to_str((uint64_t)(int64_t)g_bkl_owner, b); serial_write_string(b);
-            serial_write_string(" tid "); uint_to_str(cpu->current ? cpu->current->id : 0, b); serial_write_string(b);
-            serial_write_string(cpu->current == cpu->idle ? " (idle)" : "");
-            serial_write_string(" from "); uint_to_hex((uint64_t)__builtin_return_address(0), b); serial_write_string(b);
-            serial_write_string(" stack:");
-            extern char __text_end[];
-            uint64_t *sp;
-            __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
-            for (int i = 0, shown = 0; i < 1024 && shown < 16; i++) {
-                if (sp[i] >= KERNEL_VMA + KERNEL_PHYS && sp[i] < (uint64_t)(uintptr_t)__text_end) {
-                    serial_write_string(" ");
-                    uint_to_hex(sp[i], b); serial_write_string(b);
-                    shown++;
-                }
-            }
-            serial_write_string("\r\n");
-        }
-    }
-    /* Free the terminated threads no core runs any more (only when there
-       are some: sched_terminate() counts them) */
-    if (g_dead && thread_list) {
-        Thread *prev = thread_list;
-        Thread *curr = thread_list->next;
-        do {
-            /* not while a core still runs on it (its last moments in
-               thread_exit(), or killed while running elsewhere) */
-            if (curr->state == THREAD_STATE_TERMINATED && !curr->on_cpu) {
-                prev->next = curr->next;
-                if (curr == thread_list) {
-                    thread_list = curr->next;
-                }
-                Thread *to_free = curr;
-                g_dead--;
-                curr = curr->next;
-                /* killed while blocked (signal_kill_process(), a fatal
-                   signal): it never ran its own unlink, so its wait queue
-                   would keep pointing at the freed Thread */
-                if (to_free->wq_head) {
-                    Thread **pp = to_free->wq_head;
-                    while (*pp) {
-                        if (*pp == to_free) { *pp = to_free->wq_next; break; }
-                        pp = &(*pp)->wq_next;
-                    }
-                    to_free->wq_head = NULL;
-                }
-
-                /* Real address-space teardown, deferred to exactly here:
-                   thread_exit() (above) can't do it itself -- it's still
-                   running ON this thread/process's own CR3 at that point,
-                   and freeing a process's page tables while the CPU could
-                   still walk them for an ordinary kernel-code TLB miss is
-                   not safe. By the time a terminated thread reaches this
-                   loop from a LATER sched_schedule() call, current_thread
-                   (and CR3) has long since moved on -- same reasoning that
-                   already made it safe to kfree() the Thread struct itself
-                   here instead of in thread_exit(). Only tears down once
-                   every thread sharing this process (SYS_clone pthreads
-                   included, see kernel/syscall.c) has actually terminated,
-                   so a surviving pthread sibling is never left running on
-                   a freed address space. process_teardown() itself refuses
-                   to touch the kernel process (pid 0). */
-                if (to_free->proc) {
-                    to_free->proc->thread_count--;
-                    if (to_free->proc->exited && to_free->proc->thread_count <= 0) {
-                        reap_queue(to_free->proc);
-                    }
-                }
-
-                if (to_free->stack_orig) {
-                    kfree(to_free->stack_orig);
-                }
-                kfree(to_free);
-            } else {
-                prev = curr;
-                curr = curr->next;
-            }
-        } while (curr != thread_list);
-    }
-
     /* timed waits that ran out: READY with -ETIMEDOUT (the timer list is
        sorted: only the expired ones are looked at) */
     timers_expire();
@@ -780,6 +789,7 @@ static bool schedule_core_ex(bool yielding) {
 
     if (next_thread == prev_thread) {
         prev_thread->state = THREAD_STATE_RUNNING;   /* it goes on */
+        sched_finish();
         return false;
     }
     if (!next_thread) {
@@ -789,10 +799,15 @@ static bool schedule_core_ex(bool yielding) {
            sched_block() frame whenever something marks it READY. */
         if (prev_thread == cpu->idle) {
             prev_thread->state = THREAD_STATE_RUNNING;
+            sched_finish();
             return false;
         }
         next_thread = cpu->idle;
     }
+
+    /* the big lock is not the next thread's: it goes back now (accounted
+       to the thread leaving) and the next one takes it if it needs it */
+    bkl_switch_out();
 
     // Switch to next_thread
     next_thread->state = THREAD_STATE_RUNNING;
@@ -801,7 +816,7 @@ static bool schedule_core_ex(bool yielding) {
         serial_write_string("SCHED: picked a thread another core runs\r\n");
     }
     /* No other core can take prev_thread before this switch is done: they
-       all need the kernel lock this core holds until then. */
+       all need g_sched_lock, held until the next thread runs. */
     prev_thread->on_cpu = 0;
     next_thread->on_cpu = cpu->id + 1;
     cpu->current = next_thread;
@@ -863,7 +878,22 @@ static bool schedule_core_ex(bool yielding) {
         cpu->fx_user = thread_fx_user(next_thread);
     }
     context_switch(&prev_thread->rsp, next_thread->rsp);
+    sched_finish();
     return true;
+}
+
+/* The big lock's deferred interrupt work first (it may wake threads: the
+   scheduler's lock is not held yet), then the scheduler's lock. */
+static void sched_lock_for_switch(void)
+{
+    if (g_deferred_due && g_bkl_owner == (int32_t)this_cpu()->id) smp_run_deferred();
+    spin_lock(&g_sched_lock);
+}
+
+static bool schedule_core(void)
+{
+    sched_lock_for_switch();
+    return schedule_locked(false);
 }
 
 void sched_schedule(void) {
@@ -881,13 +911,14 @@ void sched_yield(void) {
     /* EEVDF's yield: the rest of this slice goes to whoever else is
        eligible -- the thread's deadline moves one slice on */
     Thread *me = current_thread;
+    sched_lock_for_switch();
     if (me != this_cpu()->idle && me->weight) {
         account(me, sched_clock_ns());
         me->vdeadline += vslice_of(me);
     }
     /* Nothing else to run here: other cores may be waiting for the kernel
        lock (the very thread this one waits for, perhaps) */
-    if (!schedule_core_ex(true)) bkl_relax();
+    if (!schedule_locked(true)) bkl_relax();
 
     if (rflags & 0x200) {
         __asm__ volatile("sti");
@@ -909,6 +940,7 @@ void sched_preempt_tick(void) {
     if (!t || t == cpu->idle) return;
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    spin_lock(&g_sched_lock);
     bool again = false;
     if (t->state == THREAD_STATE_TERMINATED) {
         again = true;             /* killed by another core while running here */
@@ -923,7 +955,8 @@ void sched_preempt_tick(void) {
             if (g_timers->timer_ms <= timer_get_ms()) again = true;   /* a timed wait ran out */
         }
     }
-    if (again) schedule_core();
+    if (again) schedule_locked(false);
+    else spin_unlock(&g_sched_lock);
     if (rflags & 0x200) __asm__ volatile("sti");
 }
 
@@ -933,7 +966,20 @@ Thread *sched_current(void) {
 
 /* ---- Phase 22a: real blocking primitives ---- */
 
-static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake_deadline_ms) {
+/* A signal that will be delivered (unblocked, or SIGKILL) is pending */
+static inline bool signal_waiting(const Thread *t)
+{
+    return (__atomic_load_n(&t->sig_pending, __ATOMIC_RELAXED) & (~t->sig_mask | (1ULL << 9))) != 0;
+}
+
+/* intr: not at all when a signal is waiting -- looked at under the lock, so
+   a sender (which sets sig_pending, then looks at the state) either sees
+   the thread BLOCKED and wakes it, or the thread sees the signal */
+/* drop: a spinlock the caller holds (with its wait queue): let go once the
+   thread is BLOCKED -- a waker that takes it after that finds the thread
+   asleep (and waits for the scheduler's lock until the switch is done) */
+static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake_deadline_ms, bool intr,
+                                 Spinlock *drop) {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
@@ -945,6 +991,14 @@ static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake
        torn down, its pipes and files never closed. And BLOCKED would
        bring a TERMINATED thread back to life. */
     if (sched_dying()) {
+        if (drop) spin_unlock(drop);
+        if (rflags & 0x200) __asm__ volatile("sti");
+        return -4; /* -EINTR */
+    }
+    sched_lock_for_switch();
+    if (t->state == THREAD_STATE_TERMINATED || (intr && signal_waiting(t))) {   /* killed meanwhile (another core) */
+        spin_unlock(&g_sched_lock);
+        if (drop) spin_unlock(drop);
         if (rflags & 0x200) __asm__ volatile("sti");
         return -4; /* -EINTR */
     }
@@ -979,8 +1033,9 @@ static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake
        this thread is marked READY, so no initialization race exists: we
        cannot be scheduled until state leaves BLOCKED. */
     t->state = THREAD_STATE_BLOCKED;
+    if (drop) spin_unlock(drop);
 
-    sched_schedule();
+    schedule_locked(false);
     /* Resumed: either a waker or the deadline pass set our result and made
        us READY. Restore the caller's interrupt flag exactly like
        sched_yield() does. */
@@ -991,11 +1046,11 @@ static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake
 }
 
 int64_t sched_block(void *wq, uint64_t wake_deadline) {
-    return sched_block_until(wq, wake_deadline, SCHED_NO_DEADLINE);
+    return sched_block_until(wq, wake_deadline, SCHED_NO_DEADLINE, false, NULL);
 }
 
 int64_t sched_block_ms(void *wq, uint64_t wake_deadline_ms) {
-    return sched_block_until(wq, SCHED_NO_DEADLINE, wake_deadline_ms);
+    return sched_block_until(wq, SCHED_NO_DEADLINE, wake_deadline_ms, false, NULL);
 }
 
 /* Genuine millisecond sleep: parks the thread (the idle thread's hlt gets
@@ -1008,23 +1063,32 @@ void sched_sleep_ms(uint64_t ms) {
         sched_yield();
         return;
     }
-    sched_block_until(NULL, SCHED_NO_DEADLINE, timer_get_ms() + ms);
+    sched_block_until(NULL, SCHED_NO_DEADLINE, timer_get_ms() + ms, false, NULL);
+}
+
+int64_t sched_block_unlock(void *wq, uint64_t wake_deadline, Spinlock *l) {
+    return sched_block_until(wq, wake_deadline, SCHED_NO_DEADLINE, true, l);
+}
+
+int64_t sched_sleep_ms_intr(uint64_t ms) {
+    extern uint64_t timer_get_ms(void);
+    if (ms == 0) {
+        sched_yield();
+        return 0;
+    }
+    return sched_block_until(NULL, SCHED_NO_DEADLINE, timer_get_ms() + ms, true, NULL);
 }
 
 void sched_unblock(Thread *t, int64_t result) {
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
-
-    if (t && t->state == THREAD_STATE_BLOCKED) {
+    if (!t) return;
+    uint64_t rflags = spin_lock_irqsave(&g_sched_lock);
+    if (t->state == THREAD_STATE_BLOCKED) {
         t->wake_result = result;
         t->wq = NULL;
         make_ready(t, false);
         smp_kick_idle();     /* an idle core may run it right away */
     }
-
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
+    spin_unlock_irqrestore(&g_sched_lock, rflags);
 }
 
 static uint32_t local_strlen(const char *s) {
