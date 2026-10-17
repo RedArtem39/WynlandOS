@@ -2,6 +2,8 @@
  * WynlandOS - AHCI SATA Driver Implementation
  */
 
+#include <wynland/smp.h>
+#include <wynland/sched.h>
 #include <wynland/sched.h>
 #include <wynland/ahci.h>
 #include <wynland/pci.h>
@@ -173,22 +175,37 @@ static uint8_t *bounce(void)
 
 /* Every caller waits for its command with interrupts on -- the clock,
    sound and network keep going while the disk is slow (a write to an
-   image on a Windows drive can take seconds) -- but the scheduler
-   switches nothing, so no other thread can start a command or step into
-   the filesystem meanwhile. (The timer's kill-a-dead-thread path only
-   acts on interrupted user code, never on a kernel wait like this.) */
+   image on a Windows drive can take seconds). One command at a time: the
+   callers hold the filesystem's mutex (drivers/fs/ext2.c g_fs_mutex).
+   A thread whose filesystem work touches nothing of the big kernel lock's
+   (Thread.fs_unlocked) gives the big lock back for the wait: the other
+   cores go on meanwhile. Any other waits in the big lock, and is not
+   switched away on its core (Thread.no_preempt) -- it may hold pointers
+   into what the big lock guards. (The timer's kill-a-dead-thread path
+   only acts on interrupted user code, never on a kernel wait like this.) */
 static volatile bool g_ahci_irq_ok;
-static void ahci_wait_begin(uint64_t rflags)
+/* time in disk commands, for the big lock's profile (kernel/smp.c) */
+volatile uint64_t g_disk_cyc, g_disk_cmds;
+static uint64_t g_disk_t0;
+
+/* returns whether the big lock was given back (ahci_wait_end() retakes it) */
+static bool ahci_wait_begin(void)
 {
-    (void)rflags;
-    g_sched_no_preempt++;
+    Thread *t = sched_current();
+    g_disk_t0 = __builtin_ia32_rdtsc();
     g_ahci_irq_ok = true;
+    if (t && t->fs_unlocked && bkl_drop()) return true;
+    if (t) t->no_preempt++;
+    return false;
 }
-static void ahci_wait_end(uint64_t rflags)
+static void ahci_wait_end(bool dropped)
 {
-    (void)rflags;
+    Thread *t = sched_current();
+    g_disk_cyc += __builtin_ia32_rdtsc() - g_disk_t0;
+    g_disk_cmds++;
     g_ahci_irq_ok = false;
-    g_sched_no_preempt--;
+    if (dropped) bkl_retake(true);
+    else if (t) t->no_preempt--;
 }
 static inline void ahci_wait_step(void)
 {
@@ -202,7 +219,7 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
        back damaged. Interrupts stay off for the whole command. */
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-    ahci_wait_begin(rflags);
+    bool dropped = ahci_wait_begin();
     bool ok = true;
     if (dma_contiguous(buf, count * 512)) {
         ok = ahci_read_hw(lba, count, buf);
@@ -217,7 +234,7 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
             done += n;
         }
     }
-    ahci_wait_end(rflags);
+    ahci_wait_end(dropped);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return ok;
 }
@@ -324,7 +341,7 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf);
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
     uint64_t rflags;   /* see ahci_read(): one command at a time, contiguous DMA */
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-    ahci_wait_begin(rflags);
+    bool dropped = ahci_wait_begin();
     bool ok = true;
     if (dma_contiguous(buf, count * 512)) {
         ok = ahci_write_hw(lba, count, buf);
@@ -339,7 +356,7 @@ bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
             done += n;
         }
     }
-    ahci_wait_end(rflags);
+    ahci_wait_end(dropped);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return ok;
 }

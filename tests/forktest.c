@@ -433,6 +433,7 @@ int main(int argc, char **argv)
             got += r;
         }
         if (ok) { pthread_join(th, NULL); close(fd[0]); close(fd[1]); }
+        if (got != 2000 || stalls) fprintf(stderr, "[forktest] poll: %ld bytes, %ld polls over 1 s\n", got, stalls);
         check(got == 2000 && stalls == 0, "poll: a pipe written by another thread, no wake-up lost");
     }
     {   /* a seqpacket socket fed by 4 threads: every message whole */
@@ -752,6 +753,19 @@ int main(int argc, char **argv)
                     big[0] = 1; big[(1UL << 30) - 1] = 2;   /* two pages touched */
                     sysinfo(&si1);
                     long used = (long)(si0.freeram - si1.freeram);
+                    /* the free RAM is the whole system's: other programs
+                       starting on other cores meanwhile count too -- the
+                       smallest of a few tries is this mapping's */
+                    for (int k = 0; k < 4 && used >= 4L * 1024 * 1024; k++) {
+                        char *b2 = mmap(NULL, 1UL << 30, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        if (b2 == MAP_FAILED) break;
+                        sysinfo(&si0);
+                        b2[0] = 1; b2[(1UL << 30) - 1] = 2;
+                        sysinfo(&si1);
+                        long u2 = (long)(si0.freeram - si1.freeram);
+                        if (u2 < used) used = u2;
+                        munmap(b2, 1UL << 30);
+                    }
                     fprintf(stderr, "[forktest] 1 GB mapping, 2 pages touched: %ld KB used\n", used / 1024);
                     check(used < 4L * 1024 * 1024, "untouched pages cost no RAM");
                     check(big[12345] == 0 && big[1UL << 29] == 0, "fresh pages read as zero");

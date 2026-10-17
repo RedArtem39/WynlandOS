@@ -566,8 +566,45 @@ static void serial_write_char(char c)
     outb(PORT_COM1, c);
 }
 
+/* The serial port and the text console are written by several cores at
+   once (kernel messages, console writes outside the big kernel lock): one
+   string, one console write, at a time. A plain test-and-set (not a
+   kernel/spinlock.c lock, whose reports are serial output themselves);
+   the core holding it may come back in (an exception while printing) and
+   just goes on. Before this core's GS is set (early boot), no lock. */
+static volatile uint32_t g_console_locked;
+static volatile int32_t  g_console_owner = -1;
+static bool g_console_lock_ready;
+
+static bool console_lock(uint64_t *flags)
+{
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(*flags) :: "memory");
+    if (!g_console_lock_ready) return false;
+    int32_t me = (int32_t)this_cpu()->id;
+    if (g_console_owner == me) return false;          /* nested: already ours */
+    while (__atomic_exchange_n(&g_console_locked, 1, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&g_console_locked, __ATOMIC_RELAXED)) {
+            __builtin_ia32_pause();
+            smp_tlb_poll();
+        }
+    }
+    g_console_owner = me;
+    return true;
+}
+
+static void console_unlock(bool took, uint64_t flags)
+{
+    if (took) {
+        g_console_owner = -1;
+        __atomic_store_n(&g_console_locked, 0, __ATOMIC_RELEASE);
+    }
+    if (flags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
 void serial_write_string(const char *str)
 {
+    uint64_t f;
+    bool took = console_lock(&f);
     while (*str) {
         if (*str == '\n') {
             serial_write_char('\r');
@@ -575,6 +612,7 @@ void serial_write_string(const char *str)
         serial_write_char(*str);
         str++;
     }
+    console_unlock(took, f);
 }
 
 bool serial_received(void)
@@ -625,13 +663,47 @@ static void console_scroll(BootInfo *info)
    minutes per line; real KVM/hardware is unaffected. Set only around
    the boot-time app regression hook. */
 bool g_quiet_console = false;
+void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg);
+extern BootInfo *g_boot_info;   /* kernel/idt.c */
+
+/* A program's write() to the console (stdout/stderr unredirected,
+   /dev/tty): to the screen's text console when there is one -- which
+   mirrors every character to the serial port -- else to the serial port.
+   It went to the serial port twice (the logs came out doubled). Under the
+   console's own lock, outside the big kernel lock. */
+void console_write(const char *buf, uint64_t len)
+{
+    uint64_t f;
+    bool took = console_lock(&f);
+    for (uint64_t i = 0; i < len; i++) {
+        char ch = buf[i];
+        if (g_boot_info && !g_quiet_console) {
+            console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
+        } else {
+            if (ch == '\n') serial_write_char('\r');
+            serial_write_char(ch);
+        }
+    }
+    console_unlock(took, f);
+}
 
 static bool disable_serial_mirror = false;
 
 static int g_utf8_state = 0;
 static uint32_t g_utf8_code = 0;
 
+static void console_print_char_raw(BootInfo *info, char c, uint32_t fg, uint32_t bg);
+
+/* under the console's lock (cursor, UTF-8 state, the screen) */
 void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
+{
+    uint64_t f;
+    bool took = console_lock(&f);
+    console_print_char_raw(info, c, fg, bg);
+    console_unlock(took, f);
+}
+
+static void console_print_char_raw(BootInfo *info, char c, uint32_t fg, uint32_t bg)
 {
     uint8_t b = (uint8_t)c;
     uint16_t decoded_c = 0;
@@ -782,6 +854,7 @@ void kernel_main(BootInfo *boot_info_loader)
        scheduler's current thread, the entry stubs' kernel stack ---- */
     g_cpus[0].id = 0;
     smp_set_gs(&g_cpus[0]);
+    g_console_lock_ready = true;
 
     /* ---- Enable SSE on CPU ---- */
     {

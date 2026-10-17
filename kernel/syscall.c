@@ -7,6 +7,7 @@
 #include <wynland/vmm.h>
 #include <wynland/smp.h>
 #include <wynland/spinlock.h>
+#include <wynland/kmutex.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/heap.h>
@@ -572,7 +573,7 @@ static int64_t signal_process(Process *p, int sig)
     Thread *t = p->main_thread;
     if (!t || t->state == THREAD_STATE_TERMINATED) return 0;
     signal_raise_thread(t->id, p->pid, sig);
-    if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, sig)) sched_unblock(t, -LNX_EINTR);
+    if (signal_wants_wake(t, sig)) sched_unblock(t, -LNX_EINTR);
     return 0;
 }
 
@@ -591,7 +592,7 @@ void itimer_thread(void *arg)
             Thread *t = p->main_thread;
             if (!t || t->state == THREAD_STATE_TERMINATED) continue;
             signal_raise_thread(t->id, p->pid, 14 /* SIGALRM */);
-            if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, 14)) sched_unblock(t, -LNX_EINTR);
+            if (signal_wants_wake(t, 14)) sched_unblock(t, -LNX_EINTR);
         }
     }
 }
@@ -2374,6 +2375,85 @@ static int64_t usock_recvmsg(int idx, uint32_t oflags, uint64_t umh, int flags) 
     return n;
 }
 
+/* read()/write() on an ext2 file: through a kernel buffer, in the
+   filesystem's mutex for the whole call (a concurrent close() of the fd
+   waits in vfs_close(): the wrapper stays), so the disk commands may give
+   the big lock back (Thread.fs_unlocked): the filesystem then touches no
+   user memory, nothing else of the big lock's. The copies to and from the
+   user are made in the big lock. */
+#define FILE_RW_CHUNK (128 * 1024)
+static int64_t file_rw(VfsFile *f, bool is_write, uint64_t ubuf, uint64_t len) {
+    extern KMutex g_fs_mutex;
+    if (len == 0) return is_write ? vfs_write(f, (const void *)ubuf, 0) : 0;
+    uint64_t cap = len < FILE_RW_CHUNK ? len : FILE_RW_CHUNK;
+    uint8_t *kb = (uint8_t *)kmalloc(cap);
+    if (!kb) return -12;
+    Thread *t = sched_current();
+    kmutex_lock(&g_fs_mutex);
+    int64_t total = 0;
+    while ((uint64_t)total < len) {
+        uint32_t n = (uint32_t)(len - (uint64_t)total < cap ? len - (uint64_t)total : cap);
+        int r;
+        if (is_write) {
+            if (copy_from_user(kb, (const void *)(ubuf + (uint64_t)total), n) != 0) { if (!total) total = -14; break; }
+            t->fs_unlocked = true;
+            r = vfs_write(f, kb, n);
+            t->fs_unlocked = false;
+        } else {
+            t->fs_unlocked = true;
+            r = vfs_read(f, kb, n);
+            t->fs_unlocked = false;
+            if (r > 0 && copy_to_user((void *)(ubuf + (uint64_t)total), kb, (uint64_t)r) != 0) { if (!total) total = -14; break; }
+        }
+        if (r < 0) { if (!total) total = r; break; }
+        total += r;
+        if ((uint32_t)r < n) break;
+    }
+    kmutex_unlock(&g_fs_mutex);
+    kfree(kb);
+    return total;
+}
+
+/* for the big lock's profile: what a read()/write() is on (Thread.prof_sub) */
+static bool std_console(Process *p, uint64_t fd);
+static uint8_t rw_kind(Process *p, uint64_t fd) {
+    if (fd <= 2 && std_console(p, fd)) return 1;
+    if (fd >= MAX_OPEN_FILES || !p->fd_table[fd]) return 5;
+    uint32_t fc = p->fd_table[fd]->node.first_cluster;
+    if (fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) return 3;
+    if (fc == SOCK_FD_TCP || fc == SOCK_FD_UDP) return 4;
+    if (fc < 0xFFFFFF00u) return 2;
+    return 5;
+}
+
+/* write() to the console -- stdout/stderr not redirected, or /dev/tty --
+   outside the big lock: the console has its own (kernel/main.c
+   console_write()). false: not the console. */
+static bool console_fast(uint64_t fd, uint64_t ubuf, uint64_t len, int64_t *out) {
+    Process *p = sched_current()->proc;
+    if (!p || fd >= MAX_OPEN_FILES) return false;
+    bool cons;
+    uint64_t f = spin_lock_irqsave(&g_fdtab_lock);
+    VfsFile *vf = p->fd_table[fd];
+    cons = vf ? vf->node.first_cluster == DEV_TTY : std_console(p, fd);
+    spin_unlock_irqrestore(&g_fdtab_lock, f);
+    if (!cons) return false;
+    extern void console_write(const char *buf, uint64_t len);
+    char kb[256];
+    uint64_t done = 0;
+    while (done < len) {
+        uint64_t n = len - done < sizeof(kb) ? len - done : sizeof(kb);
+        if (copy_from_user(kb, (const void *)(ubuf + done), n) != 0) {
+            *out = done ? (int64_t)done : -14;
+            return true;
+        }
+        console_write(kb, n);
+        done += n;
+    }
+    *out = (int64_t)len;
+    return true;
+}
+
 /* syscall_dispatch()'s first look: a Unix socket's send/recv here, outside
    the big lock. false: not one (the caller takes the big lock). */
 static bool usock_fast(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
@@ -2511,10 +2591,12 @@ static void lockfree_init(void)
 void syscall_lock(uint64_t num)
 {
     Thread *t = sched_current();
+    t->prof_sub = 0;
     if (num < 512 && g_lockfree[num] && g_strace_state && !t->in_syscall &&
         t->proc && !t->proc->seccomp_mode)
         return;
     bkl_lock();
+    if (num < 512 && g_lockfree[num] && t->proc && t->proc->seccomp_mode) t->prof_sub = 6;   /* profile: a sandboxed one */
     if (!g_strace_state) lockfree_init();   /* once, in the lock (before strace_config()) */
 }
 
@@ -2603,6 +2685,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (pipe_fast(false, a1, a2, a3, &pr)) return (uint64_t)pr;
                 if (usock_fast(0, a1, a2, a3, 0, 0, regs, &pr)) return (uint64_t)pr;
                 bkl_lock();
+                sched_current()->prof_sub = rw_kind(proc, a1);
             }
             if (a3 != 0 && !user_prepare_write(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
@@ -2747,6 +2830,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                           fd_table[a1]->node.first_cluster == PTY_FD_MASTER,
                                           (void *)a2, (uint32_t)a3, (fd_oflags[a1] & LINUX_O_NONBLOCK) != 0);
             }
+            if (fd_table[a1]->node.first_cluster < 0xFFFFFF00u)   /* an ext2 file */
+                return (uint64_t)file_rw(fd_table[a1], false, a2, a3);
             return vfs_read(fd_table[a1], (void *)a2, (uint32_t)a3);
             
         case 1: // SYS_write (Linux standard)
@@ -2756,11 +2841,13 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* Mirrors SYS_read's guard above: every branch below reads at
                most a3 bytes FROM a2 (console/serial, pipe_write/tcp_send/
                udp_socket_sendto/pty_ring_write, vfs_write() fallback). */
-            {   /* a pipe or an eventfd: outside the big lock */
+            {   /* a pipe or an eventfd, a Unix socket, the console: outside the big lock */
                 int64_t pr;
+                if (console_fast(a1, a2, a3, &pr)) return (uint64_t)pr;
                 if (pipe_fast(true, a1, a2, a3, &pr)) return (uint64_t)pr;
                 if (usock_fast(1, a1, a2, a3, 0, 0, regs, &pr)) return (uint64_t)pr;
                 bkl_lock();
+                sched_current()->prof_sub = rw_kind(proc, a1);
             }
             if (a3 != 0 && !user_check_read(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
@@ -2828,6 +2915,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                            fd_table[a1]->node.first_cluster == PTY_FD_MASTER,
                                            (const void *)a2, (uint32_t)a3, (fd_oflags[a1] & LINUX_O_NONBLOCK) != 0);
             }
+            if (fd_table[a1]->node.first_cluster < 0xFFFFFF00u)   /* an ext2 file */
+                return (uint64_t)file_rw(fd_table[a1], true, a2, a3);
             return vfs_write(fd_table[a1], (const void *)a2, (uint32_t)a3);
 
         case 20: // SYS_writev (Linux standard)
@@ -4440,7 +4529,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (it->proc == proc && it != sched_current() &&
                         it->state != THREAD_STATE_TERMINATED) {
                         __atomic_or_fetch(&it->sig_pending, 1ULL << 9, __ATOMIC_SEQ_CST);
-                        if (it->state == THREAD_STATE_BLOCKED) sched_unblock(it, -LNX_EINTR);
+                        sched_unblock(it, -LNX_EINTR);
                     }
                     it = it->next;
                 } while (it != start && ++guard < 100000);
@@ -7053,7 +7142,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* the write-back cache, all of it, on the disk now (one
                    filesystem: fsync of one file flushes everything) */
                 extern bool ext2_flush(void);
-                return ext2_flush() ? 0 : (uint64_t)-5;   /* -EIO: not all of it reached the disk */
+                sched_current()->fs_unlocked = true;    /* the block cache only */
+                bool ok = ext2_flush();
+                sched_current()->fs_unlocked = false;
+                return ok ? 0 : (uint64_t)-5;   /* -EIO: not all of it reached the disk */
             }
 
         case 28: // SYS_madvise(addr, len, advice)

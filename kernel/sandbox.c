@@ -1486,7 +1486,7 @@ static void send_sig(Process *q, int sig) {
     do {
         if (t->proc == q && t->state != THREAD_STATE_TERMINATED) {
             t->sig_pending |= 1ULL << sig;
-            if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, sig)) sched_unblock(t, -4 /* EINTR */);
+            if (signal_wants_wake(t, sig)) sched_unblock(t, -4 /* EINTR */);
         }
         t = t->next;
     } while (t != start && ++guard < 100000);
@@ -1512,8 +1512,8 @@ void sandbox_on_exit(Process *p) {
         if (q && q != p && !q->exited && t->state != THREAD_STATE_TERMINATED) {
             for (PidNs *n = q->pidns; n; n = n->parent) {
                 if (n != ns) continue;
-                t->sig_pending |= 1ULL << 9;
-                if (t->state == THREAD_STATE_BLOCKED) sched_unblock(t, -4 /* EINTR */);
+                __atomic_or_fetch(&t->sig_pending, 1ULL << 9, __ATOMIC_SEQ_CST);
+                sched_unblock(t, -4 /* EINTR */);
                 break;
             }
         }

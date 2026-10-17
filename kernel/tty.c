@@ -129,7 +129,7 @@ static void signal_pgrp(uint64_t pgrp, int sig) {
         Thread *t = q->main_thread;
         if (!t || t->state == THREAD_STATE_TERMINATED) continue;
         signal_raise_thread(t->id, q->pid, sig);
-        if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, sig)) sched_unblock(t, -4);
+        if (signal_wants_wake(t, sig)) sched_unblock(t, -4);
     }
 }
 

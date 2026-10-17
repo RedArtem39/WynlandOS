@@ -174,7 +174,7 @@ static const struct sh_case CASES[] = {
       "bob\ndrwx------ bob bob\nsecret\n-rw-r----- root wheel\npasswd: the password of bob is changed\n bob\n"
       "ary: incorrect password\nbob-gone\ntester\n" },
     { "/bin/sh", "leaf: update (InRelease checked by gpgv)",
-      "echo wyn | ary -S leaf update > /tmp/leaf-update.log 2>&1; echo $?; ls /var/lib/leaf/lists | wc -l", "0\n6\n" },
+      "echo wyn | ary -S leaf update > /tmp/leaf-update.log 2>&1; r=$?; [ $r = 0 ] || tail -6 /tmp/leaf-update.log; echo $r; ls /var/lib/leaf/lists | wc -l", "0\n6\n" },
     { "/bin/sh", "leaf: install tree + jq from Ubuntu",
       "echo wyn | ary -S leaf install tree jq > /tmp/leaf-install.log 2>&1; r=$?; [ $r = 0 ] || tail -4 /tmp/leaf-install.log; echo $r; tree -d /etc/leaf | tail -1; echo '{\"a\":[1,2]}' | jq -c '.a|add'",
       "0\n0 directories\n3\n" },

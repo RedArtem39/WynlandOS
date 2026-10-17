@@ -121,6 +121,16 @@ typedef struct Thread {
        given back while the thread is switched away and taken again before
        it goes on */
     bool     bkl;
+    /* the big lock's profile (kernel/smp.c): what this read()/write() is
+       on -- 1 console, 2 file, 3 pty, 4 tcp/udp, 5 other; 0 by syscall */
+    uint8_t  prof_sub;
+    /* > 0: the timer does not switch this thread away (a disk command it
+       waits for in the big lock: drivers/fs/ahci.c) */
+    uint32_t no_preempt;
+    /* the filesystem work under way touches nothing of the big lock's but
+       its own (data through a kernel buffer): a disk command gives the big
+       lock back while it waits (drivers/fs/ahci.c) */
+    bool     fs_unlocked;
     uint8_t fx_raw[FPU_AREA_MAX + 64];
     uint8_t fx_user_raw[FPU_AREA_MAX + 64];
 } Thread;
@@ -192,7 +202,8 @@ void sched_yield(void);
 void sched_schedule(void);
 Thread *sched_current(void);
 void sched_preempt_tick(void);
-extern volatile int g_sched_no_preempt;   /* > 0: no switching on the timer tick */
+extern volatile int g_sched_no_preempt;   /* > 0: no switching on the timer tick (any core);
+                                             one thread's own: Thread.no_preempt */
 void sched_print_tasks(BootInfo *info, uint32_t bg_color);
 Thread *sched_get_thread_list(void);
 bool sched_kill_thread(uint64_t id);

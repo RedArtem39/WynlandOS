@@ -90,7 +90,7 @@ static inline bool bkl_try(int32_t me)
 /* ---- who holds the lock how long (the thread dump prints it) ----------
    By the syscall the holding thread is in (its last one), 512: an idle
    core or an interrupt. Plus how long cores waited for it. */
-#define BKL_PROF_KEYS 513
+#define BKL_PROF_KEYS 520   /* syscalls, 511 exception, 512 idle, 513+ read/write by kind */
 static uint64_t g_bkl_t0;
 static uint64_t g_hold_cyc[BKL_PROF_KEYS], g_hold_n[BKL_PROF_KEYS], g_hold_max[BKL_PROF_KEYS];
 static volatile uint64_t g_wait_cyc;
@@ -107,6 +107,7 @@ static inline void bkl_account(void)
     Thread *t = c->current;
     uint32_t k = (!t || t == c->idle || t->last_syscall >= 512) ? 512 : (uint32_t)t->last_syscall;
     if (c->prof_exc) { k = 511; c->prof_exc = false; }
+    else if (t && t != c->idle && t->prof_sub && t->prof_sub < 7) k = 512 + t->prof_sub;
     g_hold_cyc[k] += dt;
     g_hold_n[k]++;
     if (dt > g_hold_max[k]) g_hold_max[k] = dt;
@@ -125,13 +126,23 @@ void bkl_profile_dump(void)
     uint_to_str(total / per_ms, b); serial_write_string(b);
     serial_write_string(" ms, waited for ");
     uint_to_str(g_wait_cyc / per_ms, b); serial_write_string(b);
-    serial_write_string(" ms (all cores); longest holders:\r\n");
+    serial_write_string(" ms (all cores); disk commands ");
+    {
+        extern volatile uint64_t g_disk_cyc, g_disk_cmds;
+        uint_to_str(g_disk_cyc / per_ms, b); serial_write_string(b);
+        serial_write_string(" ms in ");
+        uint_to_str(g_disk_cmds, b); serial_write_string(b);
+        g_disk_cyc = g_disk_cmds = 0;
+    }
+    serial_write_string("; longest holders:\r\n");
     for (int shown = 0; shown < 10; shown++) {
         int best = -1;
         for (int k = 0; k < BKL_PROF_KEYS; k++)
             if (g_hold_cyc[k] && (best < 0 || g_hold_cyc[k] > g_hold_cyc[best])) best = k;
         if (best < 0) break;
-        serial_write_string(best == 512 ? "  idle/interrupt" : best == 511 ? "  exception (page fault)" : "  syscall ");
+        static const char *const subs[] = { "", "console", "file", "pty", "tcp/udp", "other", "seccomp process" };
+        if (best > 512) { serial_write_string(best == 518 ? "  lock-free syscall of a " : "  read/write on "); serial_write_string(subs[best - 512]); }
+        else serial_write_string(best == 512 ? "  idle/interrupt" : best == 511 ? "  exception (page fault)" : "  syscall ");
         if (best < 511) { uint_to_str((uint64_t)best, b); serial_write_string(b); }
         serial_write_string(": ");
         uint_to_str(g_hold_cyc[best] / per_ms, b); serial_write_string(b);

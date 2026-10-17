@@ -940,7 +940,7 @@ void sched_preempt_tick(void) {
     if (g_sched_no_preempt) return;
     Cpu *cpu = this_cpu();
     Thread *t = cpu->current;
-    if (!t || t == cpu->idle) return;
+    if (!t || t == cpu->idle || t->no_preempt) return;
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
     spin_lock(&g_sched_lock);

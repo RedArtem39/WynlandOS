@@ -48,6 +48,20 @@
 
 extern void serial_write_string(const char *str);
 extern void serial_write_char(char c);
+
+/* ---- the filesystem's lock ------------------------------------------------
+   Everything below -- the block cache, bitmaps, inodes, directories, the
+   disk itself (one AHCI command slot) -- is under g_fs_mutex, a sleeping
+   recursive mutex (include/wynland/kmutex.h): every entry point takes it
+   (FS_GUARD(), released on any return). A thread waiting for the disk may
+   then give back the big kernel lock (drivers/fs/ahci.c): another one that
+   wants the filesystem sleeps on the mutex, one that wants anything else
+   goes on. */
+#include <wynland/kmutex.h>
+KMutex g_fs_mutex = KMUTEX_INIT("filesystem");
+static inline int fs_guard_begin(void) { kmutex_lock(&g_fs_mutex); return 0; }
+static inline void fs_guard_end(int *x) { (void)x; kmutex_unlock(&g_fs_mutex); }
+#define FS_GUARD() int _fs_guard __attribute__((cleanup(fs_guard_end), unused)) = fs_guard_begin()
 extern void uint_to_str(uint64_t val, char *buf);
 extern void uint_to_hex(uint64_t val, char *buf);
 extern int sata_port_num;
@@ -469,22 +483,22 @@ static bool ext2_write_sb(void) {
    and written while the cache can change again: a block written meanwhile
    stays dirty, its generation tells), or from sync() in a syscall. */
 bool ext2_flush(void) {
+    FS_GUARD();
     uint8_t *tmp = (uint8_t *)kmalloc(g_block_size);
     if (!tmp) return false;
     bool all_ok = true;
     for (uint32_t i = 0; i < BCACHE_SLOTS && g_dirty_blocks; i++) {
         uint64_t rflags;
-        /* no thread switch from the snapshot to the end of its write: a
-           writer that ran in between could rewrite and fsync the block,
-           and this older snapshot would then land on the disk last */
-        g_sched_no_preempt++;
+        /* no writer from the snapshot to the end of its write (it would
+           rewrite and fsync the block, and this older snapshot land on the
+           disk last): they all need g_fs_mutex, held here */
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
         BCacheSlot *e = &g_bcache[i];
         bool todo = e->valid && e->dirty && e->data;
         uint32_t block = e->block, gen = e->gen;
         if (todo) memcpy(tmp, e->data, g_block_size);
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
-        if (!todo) { g_sched_no_preempt--; continue; }
+        if (!todo) continue;
 
         bool ok = ahci_write(mbr_root_partition_lba() + block * g_sectors_per_block,
                              g_sectors_per_block, tmp);
@@ -496,19 +510,16 @@ bool ext2_flush(void) {
         }
         if (!ok) all_ok = false;
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
-        g_sched_no_preempt--;
     }
     kfree(tmp);
     if (g_sb_dirty) {
         static Ext2Superblock sb_copy;
         uint64_t rflags;
-        g_sched_no_preempt++;   /* same reason as the blocks above */
         __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
         g_sb_dirty = false;
         memcpy(&sb_copy, &g_sb, sizeof(sb_copy));
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
         if (!ahci_write(mbr_root_partition_lba() + 2, 2, &sb_copy)) { g_sb_dirty = true; all_ok = false; }
-        g_sched_no_preempt--;
     }
     return all_ok && !g_dirty_blocks && !g_sb_dirty;
 }
@@ -525,8 +536,13 @@ void ext2_flusher_thread(void *arg) {
         sched_sleep_ms(1000);
         shmap_flush_unmapped();        /* before the orphans: it may let one go */
         sandbox_mnt_reap();            /* tmpfs directories nothing mounts any more */
-        ext2_reap_orphans();
-        if (ext2_has_dirty()) ext2_flush();
+        { FS_GUARD(); ext2_reap_orphans(); }
+        if (ext2_has_dirty()) {
+            Thread *me = sched_current();
+            me->fs_unlocked = true;    /* the block cache only: the disk waits out of the big lock */
+            ext2_flush();
+            me->fs_unlocked = false;
+        }
     }
 }
 
@@ -568,6 +584,7 @@ static void ext2_write_gdt(void) {
  * ============================================================ */
 
 bool ext2_init(void) {
+    FS_GUARD();
     if (mbr_root_partition_lba() == 0) {
         serial_write_string("ext2: no root partition located (mbr_init must run first)!\r\n");
         return false;
@@ -676,6 +693,7 @@ bool ext2_init(void) {
  * ============================================================ */
 
 bool ext2_read_inode(uint32_t inum, Ext2Inode *out) {
+    FS_GUARD();
     if (!g_group_desc || inum < EXT2_ROOT_INO || inum > g_sb.s_inodes_count) return false;
 
     uint32_t group = (inum - 1) / g_sb.s_inodes_per_group;
@@ -701,11 +719,13 @@ bool ext2_read_inode(uint32_t inum, Ext2Inode *out) {
 
 /* an inode's size now (-1: no such inode) -- MAP_SHARED writeback */
 int64_t ext2_inode_size(uint32_t inum) {
+    FS_GUARD();
     Ext2Inode inode;
     return ext2_read_inode(inum, &inode) ? (int64_t)inode.i_size : -1;
 }
 
 bool ext2_write_inode(uint32_t inum, const Ext2Inode *in) {
+    FS_GUARD();
     if (!g_group_desc || inum < EXT2_ROOT_INO || inum > g_sb.s_inodes_count) return false;
 
     uint32_t group = (inum - 1) / g_sb.s_inodes_per_group;
@@ -779,6 +799,7 @@ static int64_t bitmap_claim_first(uint32_t bitmap_block, uint32_t first, uint32_
 }
 
 uint32_t ext2_alloc_block(void) {
+    FS_GUARD();
     if (!g_group_desc) return 0;
 
     for (uint32_t g = 0; g < g_group_count; g++) {
@@ -811,6 +832,7 @@ uint32_t ext2_alloc_block(void) {
 }
 
 void ext2_free_block(uint32_t block) {
+    FS_GUARD();
     if (!g_group_desc || block == 0) return;
 
     /* canonical mapping, mirror of ext2_alloc_block's */
@@ -830,6 +852,7 @@ void ext2_free_block(uint32_t block) {
 }
 
 uint32_t ext2_alloc_inode(void) {
+    FS_GUARD();
     if (!g_group_desc) return 0;
 
     for (uint32_t g = 0; g < g_group_count; g++) {
@@ -855,6 +878,7 @@ uint32_t ext2_alloc_inode(void) {
 }
 
 void ext2_free_inode(uint32_t inum) {
+    FS_GUARD();
     if (!g_group_desc || inum < EXT2_ROOT_INO) return;
 
     uint32_t g = (inum - 1) / g_sb.s_inodes_per_group;
@@ -889,6 +913,7 @@ void ext2_free_inode(uint32_t inum) {
    NOTE: when allocation happens, the caller owns flushing the modified
    inode (the write path does exactly that via ext2_write_inode). */
 uint32_t ext2_resolve_block(Ext2Inode *inode, uint32_t logical, bool alloc) {
+    FS_GUARD();
     uint32_t ptrs_per_block = g_block_size / 4;
 
     /* direct blocks [0..11] */
@@ -1041,6 +1066,7 @@ static uint8_t *g_run_buf = NULL;
 static uint32_t g_run_cap = 0; /* bytes */
 
 uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t len, void *buf) {
+    FS_GUARD();
     if (!inode || !buf || len == 0) return 0;
     if (offset >= inode->i_size) return 0;
     if (offset + len > inode->i_size) len = inode->i_size - offset;
@@ -1147,6 +1173,7 @@ uint32_t ext2_read_file_data(const Ext2Inode *inode, uint32_t offset, uint32_t l
    content, so this hasn't mattered in practice; revisit if it ever
    does. */
 uint32_t ext2_write_file_data(uint32_t inum, Ext2Inode *inode, uint32_t offset, uint32_t len, const void *buf) {
+    FS_GUARD();
     pcache_drop_inode(inum);   /* mapped copies of the old contents (kernel/vma.c) */
     const uint8_t *in = (const uint8_t *)buf;
     uint32_t bytes_written = 0;
@@ -1195,6 +1222,7 @@ uint32_t ext2_write_file_data(uint32_t inum, Ext2Inode *inode, uint32_t offset, 
    distinguish "doesn't exist" from "exists". */
 bool ext2_dir_lookup(const Ext2Inode *dir, const char *name,
                      uint32_t *out_inum, uint8_t *out_type) {
+    FS_GUARD();
     if (!g_group_desc || !dir || !name || !out_inum) return false;
 
     uint32_t nlen = str_len_local(name);
@@ -1347,6 +1375,7 @@ static uint32_t ext2_rdev(const Ext2Inode *ip) {
 
 /* the name of inode `child` in directory `dir_inum` (mountinfo) */
 bool vfs_name_in_dir(uint32_t dir_inum, uint32_t child, char *name, uint32_t cap) {
+    FS_GUARD();
     Ext2Inode d;
     if (!ext2_read_inode(dir_inum, &d) || (d.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR) return false;
     return ext2_dir_name_of(&d, child, name, cap);
@@ -1359,6 +1388,7 @@ bool vfs_name_in_dir(uint32_t dir_inum, uint32_t child, char *name, uint32_t cap
    has no path (false) -- a descriptor kept from before a chroot() leads
    nowhere. */
 bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap) {
+    FS_GUARD();
     if (!g_group_desc || cap < 2) return false;
     char tmp[MAX_PATH];
     uint32_t pos = MAX_PATH - 1;      /* built backwards from the end */
@@ -1516,6 +1546,7 @@ static bool ext2_dir_add_entry_impl(uint32_t dir_inum, Ext2Inode *dir,
    (skipping that last one is precisely what e2fsck flags as
    "Directories count wrong for group #0"). */
 bool ext2_mkdir(uint32_t parent_inum, Ext2Inode *parent, const char *name) {
+    FS_GUARD();
     if (!g_group_desc || !parent || !name) return false;
     if (!may_write_dir(parent)) return false;
 
@@ -1647,6 +1678,7 @@ static int pin_find(uint32_t inum) {
 }
 
 bool ext2_pin_inode(uint32_t inum) {
+    FS_GUARD();
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
     int i = pin_find(inum);
@@ -1659,6 +1691,7 @@ bool ext2_pin_inode(uint32_t inum) {
 }
 
 void ext2_unpin_inode(uint32_t inum) {
+    FS_GUARD();
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
     int i = pin_find(inum);
@@ -1785,6 +1818,7 @@ static void ext2_destroy_inode(uint32_t found_inode, Ext2Inode *inode) {
    convention, not invented. Longer targets fall back to a normal
    single data block (this OS's own paths are always short). */
 bool ext2_create_symlink(uint32_t dir_inum, Ext2Inode *dir, const char *name, const char *target) {
+    FS_GUARD();
     if (!may_write_dir(dir)) return false;
     uint32_t target_len = 0;
     while (target[target_len]) target_len++;
@@ -1847,6 +1881,7 @@ bool ext2_create_symlink(uint32_t dir_inum, Ext2Inode *dir, const char *name, co
 /* Reads a symlink's target into buf (NUL-terminated). Returns the
    length copied, 0 on failure. */
 uint32_t ext2_read_symlink(const Ext2Inode *link, char *buf, uint32_t bufsize) {
+    FS_GUARD();
     if (!link || !buf || bufsize == 0) return 0;
 
     uint32_t len = link->i_size;
@@ -1899,6 +1934,7 @@ static bool ext2_lookup_path(const char *path, uint32_t *out_inum, Ext2Inode *ou
 /* the process's root as lookups start at it: the root inode, or what is
    mounted over it -- ".." at either stays there */
 bool at_root(uint32_t ino) {
+    FS_GUARD();
     uint32_t r = sandbox_lookup_root();
     if (ino == r) return true;
     const void *c = NULL;
@@ -2098,6 +2134,7 @@ static void fill_node_from_inode(VfsNode *node, uint32_t inum,
  * ============================================================ */
 
 bool vfs_init(void) {
+    FS_GUARD();
     ahci_init();
 
     if (sata_port_num == -1) {
@@ -2116,6 +2153,7 @@ bool vfs_init(void) {
  * ============================================================ */
 
 VfsFile *vfs_open(const char *path) {
+    FS_GUARD();
     return vfs_open_flags(path, VFS_O_READ);
 }
 
@@ -2145,6 +2183,7 @@ static VfsFile *alloc_device_file(const char *name, uint32_t size,
    Root's only (on the host): the login manager and init open them and
    hand the fds to the display server they start. */
 bool vfs_display_device_denied(const char *path) {
+    FS_GUARD();
     if (str_compare(path, "/dev/input/kbd") != 0 && str_compare(path, "/dev/input/mice") != 0 &&
         str_compare(path, "/dev/fb0") != 0) return false;
     Thread *t = sched_current();
@@ -2153,6 +2192,7 @@ bool vfs_display_device_denied(const char *path) {
 }
 
 VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
+    FS_GUARD();
     if (vfs_display_device_denied(path)) return NULL;
     /* Device nodes first -- exact or suffix match (handles relative
        paths), byte-identical behavior to the previous FAT32 driver. */
@@ -2301,6 +2341,12 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
 
 void vfs_close(VfsFile *file) {
     if (!file) return;
+    if (file->node.first_cluster < 0xFFFFFF00u) {
+        FS_GUARD();
+        if (file->flags & VFS_F_PINNED) ext2_unpin_inode(file->node.first_cluster);
+        kfree(file);
+        return;
+    }
     if ((file->flags & VFS_F_PINNED) && file->node.first_cluster < 0xFFFFFF00u)
         ext2_unpin_inode(file->node.first_cluster);
     kfree(file);
@@ -2447,6 +2493,7 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
         return 0;
     }
 
+    FS_GUARD();
     Ext2Inode inode;
     if (!ext2_read_inode(file->node.first_cluster, &inode)) return -1;
     uint32_t n = ext2_read_file_data(&inode, file->offset, size, buf);
@@ -2492,9 +2539,12 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
             const char *cbuf = (const char *)buf;
             for (uint32_t i = 0; i < size; i++) {
                 char ch = cbuf[i];
-                char single[2] = { ch, '\0' };
-                serial_write_string(single);
-                if (g_boot_info && !g_quiet_console) console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);
+                if (g_boot_info && !g_quiet_console) {
+                    console_print_char(g_boot_info, ch, 0x00FFFFFF, term_bg_color);   /* mirrors to serial */
+                } else {
+                    char single[2] = { ch, '\0' };
+                    serial_write_string(single);
+                }
             }
             return (int)size;
         }
@@ -2504,6 +2554,7 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     if (!(file->flags & VFS_O_WRITE)) return -1;
     if (size == 0) return 0;
 
+    FS_GUARD();
     Ext2Inode inode;
     if (!ext2_read_inode(file->node.first_cluster, &inode)) return -1;
     uint32_t n = ext2_write_file_data(file->node.first_cluster, &inode, file->offset, size, buf);
@@ -2517,6 +2568,7 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
  * ============================================================ */
 
 int vfs_seek(VfsFile *file, int32_t offset, int whence) {
+    FS_GUARD();
     if (!file) return -1;
     int64_t new_offset;
     switch (whence) {
@@ -2531,6 +2583,7 @@ int vfs_seek(VfsFile *file, int32_t offset, int whence) {
 }
 
 uint32_t vfs_tell(VfsFile *file) {
+    FS_GUARD();
     return file ? file->offset : 0;
 }
 
@@ -2541,11 +2594,13 @@ uint32_t vfs_tell(VfsFile *file) {
 static bool create_node(const char *path, uint16_t mode, uint8_t ft);
 
 bool vfs_create(const char *path) {
+    FS_GUARD();
     return create_node(path, EXT2_S_IFREG | 0644, EXT2_FT_REG);
 }
 
 /* the name of a bound AF_UNIX socket: an inode of its own type, as on Linux */
 bool vfs_mksock(const char *path) {
+    FS_GUARD();
     return create_node(path, EXT2_S_IFSOCK | 0755, EXT2_FT_SOCK);
 }
 
@@ -2604,6 +2659,7 @@ static bool create_node(const char *path, uint16_t mode, uint8_t ft) {
    everyone else, root always. A path that doesn't exist answers true: creating it is
    the directory's business (may_write_dir). */
 bool vfs_may_access(const char *path, uint32_t want) {
+    FS_GUARD();
     uint32_t uid = current_uid_or_root();
     if (uid == 0 || !want) return true;
     uint32_t inum;
@@ -2637,6 +2693,7 @@ static int chown_inode(uint32_t inum, Ext2Inode *inode, uint32_t uid, uint32_t g
 }
 
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
+    FS_GUARD();
     if (ro_path(path, !nofollow)) return -30;
     uint32_t inum;
     Ext2Inode inode;
@@ -2646,6 +2703,7 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
 }
 
 int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
+    FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -9;
     uint32_t inum = file->node.first_cluster;
@@ -2659,6 +2717,7 @@ int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
 
 /* chmod: the owner or root; only the permission bits change */
 bool vfs_chmod(const char *path, uint32_t mode) {
+    FS_GUARD();
     if (ro_path(path, true)) return false;
     uint32_t inum;
     Ext2Inode inode;
@@ -2730,6 +2789,7 @@ static void ext2_free_blocks_from(Ext2Inode *inode, uint32_t first)
    it (it was ENOSYS: those operations failed). 0 ok, -1 error. */
 int vfs_ftruncate(VfsFile *file, uint32_t len)
 {
+    FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -1;
     uint32_t inum = file->node.first_cluster;
@@ -2761,6 +2821,7 @@ int vfs_ftruncate(VfsFile *file, uint32_t len)
 /* fchmod(): the open file's inode, owner or root only. -1 not an ext2
    file, 0 not allowed, 1 done. */
 int vfs_fchmod(VfsFile *file, uint32_t mode) {
+    FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -1;
     uint32_t inum = file->node.first_cluster;
@@ -2776,6 +2837,7 @@ int vfs_fchmod(VfsFile *file, uint32_t mode) {
 }
 
 bool vfs_set_readonly(const char *path) {
+    FS_GUARD();
     if (ro_path(path, true)) return false;
     uint32_t inum;
     Ext2Inode inode;
@@ -2791,6 +2853,7 @@ bool vfs_set_readonly(const char *path) {
  * ============================================================ */
 
 bool vfs_mkdir(const char *path) {
+    FS_GUARD();
     if (ro_path(path, false)) return false;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     split_path(path, dirname, basename);
@@ -2805,6 +2868,7 @@ bool vfs_mkdir(const char *path) {
 }
 
 bool vfs_delete(const char *path) {
+    FS_GUARD();
     if (ro_path(path, false)) return false;
     if (!path || str_compare(path, "/") == 0) return false; /* never delete root */
 
@@ -2887,6 +2951,7 @@ bool vfs_delete(const char *path) {
 
 /* statfs(): the filesystem's size and what is free */
 void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *files, uint64_t *ffree) {
+    FS_GUARD();
     *bsize = g_block_size;
     *blocks = g_sb.s_blocks_count;
     *bfree = g_sb.s_free_blocks_count;
@@ -2900,6 +2965,7 @@ void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *fi
 static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t mtime);
 
 int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) {
+    FS_GUARD();
     if (ro_path(path, !nofollow)) return -30;
     uint32_t inum;
     Ext2Inode inode;
@@ -2910,6 +2976,7 @@ int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) 
 }
 
 int vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime) {
+    FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     Ext2Inode inode;
     if (!file || !ext2_read_inode(file->node.first_cluster, &inode)) return -9;   /* -EBADF */
@@ -2929,6 +2996,7 @@ static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t
 static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2Inode *ip);
 
 bool vfs_stat(const char *path, VfsStat *out) {
+    FS_GUARD();
     if (!out) return false;
     uint32_t inum;
     Ext2Inode inode;
@@ -2938,6 +3006,7 @@ bool vfs_stat(const char *path, VfsStat *out) {
 }
 
 bool vfs_lstat(const char *path, VfsStat *out) {
+    FS_GUARD();
     if (!out) return false;
     uint32_t inum;
     Ext2Inode inode;
@@ -2954,6 +3023,7 @@ bool vfs_lstat(const char *path, VfsStat *out) {
 }
 
 int vfs_readlink(const char *path, char *buf, uint32_t cap) {
+    FS_GUARD();
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return -1;
@@ -2962,6 +3032,7 @@ int vfs_readlink(const char *path, char *buf, uint32_t cap) {
 }
 
 bool vfs_symlink(const char *target, const char *linkpath) {
+    FS_GUARD();
     if (ro_path(linkpath, false)) return false;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
     if (!split_path(linkpath, dirname, basename) || !basename[0]) return false;
@@ -2975,6 +3046,7 @@ bool vfs_symlink(const char *target, const char *linkpath) {
 }
 
 int vfs_link(const char *oldpath, const char *newpath) {
+    FS_GUARD();
     if (ro_path(newpath, false) || ro_path(oldpath, false)) return -30;   /* -EROFS */
     if (dir_mount(oldpath) != dir_mount(newpath)) return -18;            /* -EXDEV: another mount */
     uint32_t inum, dinum, x;
@@ -3034,6 +3106,7 @@ static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2I
  * ============================================================ */
 
 bool vfs_readdir(const char *path, void (*callback)(VfsNode *node)) {
+    FS_GUARD();
     if (!callback) return false;
 
     uint32_t dir_inum;
@@ -3228,6 +3301,7 @@ static uint8_t ext2_ft_to_dt(uint8_t ft) {
  * contract the FAT32 implementation had.
  */
 int vfs_getdents(VfsFile *file, void *dirp, uint32_t count) {
+    FS_GUARD();
     if (!file || !file->node.is_dir || !dirp) return -1;
 
     /* Virtual DRM directory: /sys/dev/char/226:{0,128}/device/drm lists
@@ -3345,6 +3419,7 @@ uint32_t ext2_fs_root_sectors(void) { return mbr_root_partition_sectors(); }
    while one of them waited for the disk) */
 bool ext2_dir_add_entry(uint32_t dir_inum, Ext2Inode *dir,
                         const char *name, uint32_t child_inum, uint8_t child_type) {
+    FS_GUARD();
     dcache_invalidate();
     bool r = ext2_dir_add_entry_impl(dir_inum, dir, name, child_inum, child_type);
     dcache_invalidate();
@@ -3352,6 +3427,7 @@ bool ext2_dir_add_entry(uint32_t dir_inum, Ext2Inode *dir,
 }
 
 bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
+    FS_GUARD();
     dcache_invalidate();
     bool r = ext2_unlink_impl(dir_inum, dir, name);
     dcache_invalidate();
@@ -3359,6 +3435,7 @@ bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
 }
 
 bool vfs_rename(const char *oldpath, const char *newpath) {
+    FS_GUARD();
     dcache_invalidate();
     bool r = vfs_rename_impl(oldpath, newpath);
     dcache_invalidate();

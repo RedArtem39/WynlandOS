@@ -447,7 +447,7 @@ bool signal_raise_thread(uint64_t tid, uint64_t tgid, int sig) {
             __atomic_or_fetch(&t->sig_pending, 1ULL << sig, __ATOMIC_SEQ_CST);
             /* asleep (nanosleep, a futex, a read): the signal ends the
                wait now -- tgkill() used to leave it to the sleep's end */
-            if (t->state == THREAD_STATE_BLOCKED && signal_wants_wake(t, sig)) sched_unblock(t, -4 /* EINTR */);
+            if (signal_wants_wake(t, sig)) sched_unblock(t, -4 /* EINTR */);
             return true;
         }
         t = t->next;

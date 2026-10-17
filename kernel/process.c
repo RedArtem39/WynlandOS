@@ -93,7 +93,7 @@ void process_mark_exited(Process *p, int wait_status) {
             signal_raise_thread(pt->id, parent->pid, 17);
             /* a handler waits: a parent asleep in poll()/read() is woken
                (fish learns of its children this way) */
-            if (pt->state == THREAD_STATE_BLOCKED && signal_wants_wake(pt, 17))
+            if (signal_wants_wake(pt, 17))
                 sched_unblock(pt, -4 /* EINTR */);
         }
     }
