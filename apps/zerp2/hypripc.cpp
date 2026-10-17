@@ -1,5 +1,6 @@
 // WynlandOS - Zerp 2.0's Hyprland IPC (see hypripc.h)
 #include "hypripc.h"
+#include "zglobalshortcuts.h"
 #include "zerp2.h"
 
 #include <QtCore/QCoreApplication>
@@ -260,8 +261,18 @@ QByteArray HyprIpc::command(QByteArray cmd, bool json)
                     : QByteArray("Hyprland IPC of Zerp 2.0 (WynlandOS)\n");
     }
     if (name == "status") return out(QJsonDocument(QJsonObject{ { "configProvider", "hyprlang" } }));
+    if (name == "globalshortcuts") {
+        const QString l = ZGlobalShortcuts::instance() ? ZGlobalShortcuts::instance()->list() : QString();
+        if (!json) return l.toUtf8();
+        QJsonArray arr;
+        for (const QString &row : l.split(QChar('\n'), Qt::SkipEmptyParts)) {
+            const int dash = row.indexOf(QStringLiteral(" - "));
+            arr.append(QJsonObject{ { "name", row.left(dash) }, { "description", row.mid(dash + 3) } });
+        }
+        return out(QJsonDocument(arr));
+    }
     if (name == "layers" || name == "binds" || name == "workspacerules" || name == "descriptions" ||
-        name == "globalshortcuts" || name == "animations" || name == "layouts")
+        name == "animations" || name == "layouts")
         return json ? "[]" : "";
     if (name == "splash") return "Zerp\n";
     return "unknown request";

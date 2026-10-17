@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Foot
+GenericName=Terminal
+Comment=A fast, lightweight Wayland terminal
+Exec=foot
+Icon=foot
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;console;

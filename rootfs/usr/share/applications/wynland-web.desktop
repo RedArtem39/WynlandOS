@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Web
+GenericName=Web Browser
+Comment=Browse the web (WebKit)
+Exec=/usr/bin/web %u
+Icon=web-browser
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+Keywords=internet;browser;www;

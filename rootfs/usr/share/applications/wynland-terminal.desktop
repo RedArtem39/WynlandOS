@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Terminal
+GenericName=Terminal
+Comment=The WynlandOS terminal (fish)
+Exec=/usr/bin/term
+Icon=utilities-terminal
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;console;

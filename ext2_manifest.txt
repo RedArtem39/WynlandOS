@@ -22,6 +22,8 @@ D /plugins/platforms
 D /tmp
 D /home
 D /etc
+D /etc/zerp2
+F /etc/zerp2/keybinds.conf apps/zerp2/keybinds.conf
 D /etc/skel
 D /etc/skel/Documents
 D /etc/skel/Downloads
@@ -44,6 +46,13 @@ D /usr
 D /usr/bin
 D /usr/share
 D /usr/share/wynland
+D /usr/share/applications
+F /usr/share/applications/wynland-terminal.desktop rootfs/usr/share/applications/wynland-terminal.desktop
+F /usr/share/applications/wynland-web.desktop rootfs/usr/share/applications/wynland-web.desktop
+F /usr/share/applications/wynland-files.desktop rootfs/usr/share/applications/wynland-files.desktop
+F /usr/share/applications/foot.desktop rootfs/usr/share/applications/foot.desktop
+F /usr/share/applications/nano.desktop rootfs/usr/share/applications/nano.desktop
+F /usr/share/applications/fish.desktop rootfs/usr/share/applications/fish.desktop
 D /usr/share/wynland/wallpapers
 D /usr/share/glvnd
 D /usr/share/glvnd/egl_vendor.d

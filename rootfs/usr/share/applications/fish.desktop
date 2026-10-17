@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=fish
+GenericName=Shell
+Comment=The friendly interactive shell
+Exec=fish
+Terminal=true
+Icon=utilities-terminal
+Categories=System;Shell;

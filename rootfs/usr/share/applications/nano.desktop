@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=nano
+GenericName=Text Editor
+Comment=Edit text files in the terminal
+Exec=nano %F
+Terminal=true
+Icon=text-editor
+Categories=Utility;TextEditor;
+Keywords=text;editor;

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+GenericName=File Manager
+Comment=Browse the files
+Exec=/usr/bin/files
+Icon=system-file-manager
+Categories=System;FileManager;
+Keywords=folder;directory;explorer;

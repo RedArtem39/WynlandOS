@@ -55,10 +55,14 @@ Window {
             sizeFollowsWindow: true
             window: shell
             // the output's name for clients (xdg-output), the one the
-            // Hyprland IPC reports: shells pair screens and monitors by it
+            // Hyprland IPC reports: shells pair screens and monitors by it.
+            // Its logical geometry is the screen's size for Qt's clients
+            // (empty: a 0x0 screen -- Caelestia's launcher had no room)
             XdgOutputV1 {
                 name: outputName
                 description: "WynlandOS " + outputName
+                logicalPosition: Qt.point(0, 0)
+                logicalSize: Qt.size(shell.width, shell.height)
             }
         }
         XdgOutputManagerV1 { id: xdgOutputManager }
@@ -67,6 +71,9 @@ Window {
             id: layerShell
             outputSize: Qt.size(shell.width, shell.height)
         }
+        // Hyprland's global shortcuts: Caelestia's launcher and the rest,
+        // fired by the key bindings (keybinds.conf, `global` dispatcher)
+        GlobalShortcuts {}
         XdgShell {
             onToplevelCreated: (toplevel, xdgSurface) => zerp.addWayland(xdgSurface)
         }

@@ -32,7 +32,8 @@ CAVA_COMMIT=${CAVA_COMMIT:-}
 PKGS="libqalculate-dev libqalculate23 libcln-dev libcln6 libmpfr-dev libgmp-dev libcurl4-gnutls-dev libxml2-dev
  libaubio-dev libaubio5 libfftw3-dev libfftw3-double3 libfftw3-single3 libsensors-dev libsensors5
  libqt6sql6 libqt6sql6-sqlite libqt6concurrent6 qt6-base-dev
- qt6-image-formats-plugins libwebp7 libwebpdemux2 libwebpmux3 libsharpyuv0"
+ qt6-image-formats-plugins libwebp7 libwebpdemux2 libwebpmux3 libsharpyuv0
+ qt6-svg-plugins hicolor-icon-theme papirus-icon-theme"
 mkdir -p "$CACHE/debs"
 NEW=0
 for p in $PKGS; do
@@ -122,6 +123,26 @@ echo "  CAE        built M3Shapes"
 IMGF=usr/lib/x86_64-linux-gnu/qt6/plugins/imageformats
 mkdir -p "$CACHE/install/$IMGF"
 cp "$ROOT/$IMGF/libqwebp.so" "$CACHE/install/$IMGF/"
+# Qt's SQLite driver: the launcher's app list lives in a database (AppDb:
+# what is installed, how often it is run) -- without it the list is empty
+SQLD=usr/lib/x86_64-linux-gnu/qt6/plugins/sqldrivers
+mkdir -p "$CACHE/install/$SQLD"
+cp "$ROOT/$SQLD/libqsqlite.so" "$CACHE/install/$SQLD/"
+# the launcher's icons: Qt's SVG plugins, and from Papirus (GPL-3.0) only
+# the icons the image's .desktop files name, into hicolor (the fallback
+# theme, so no theme has to be chosen)
+QTP=usr/lib/x86_64-linux-gnu/qt6/plugins
+mkdir -p "$CACHE/install/$QTP/iconengines"
+cp "$ROOT/$QTP/imageformats/libqsvg.so" "$CACHE/install/$QTP/imageformats/"
+cp "$ROOT/$QTP/iconengines/libqsvgicon.so" "$CACHE/install/$QTP/iconengines/"
+HIC=$CACHE/install/usr/share/icons/hicolor
+mkdir -p "$HIC/scalable/apps" "$HIC/scalable/status"
+cp "$ROOT/usr/share/icons/hicolor/index.theme" "$HIC/"
+PAP=$ROOT/usr/share/icons/Papirus
+for i in $(sed -n 's/^Icon=//p' "$REPO"/rootfs/usr/share/applications/*.desktop | sort -u); do
+    cp -L "$PAP/64x64/apps/$i.svg" "$HIC/scalable/apps/" || echo "  CAE        (no icon $i)"
+done
+cp -L "$PAP/48x48/status/image-missing.svg" "$HIC/scalable/status/"
 
 # fonts: Material Symbols Rounded (Apache-2.0) and Rubik (OFL), from Google
 FONTS=$CACHE/fonts

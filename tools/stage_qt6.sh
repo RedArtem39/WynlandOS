@@ -122,12 +122,22 @@ gcc -O2 -fPIC -c -o "$B/wlr-layer-shell-protocol.o" "$B/wayland-wlr-layer-shell-
 wayland-scanner private-code apps/zerp2/protocols/xdg-shell.xml "$B/xdg-shell-protocol.c"
 gcc -O2 -fPIC -c -o "$B/xdg-shell-protocol.o" "$B/xdg-shell-protocol.c"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zlayershell.cpp" apps/zerp2/zlayershell.h
+# Hyprland's global shortcuts: the same, from hyprland-protocols' XML
+GS=apps/zerp2/protocols/hyprland-global-shortcuts-v1.xml
+wayland-scanner server-header "$GS" "$B/wayland-hyprland-global-shortcuts-v1-server-protocol.h"
+wayland-scanner private-code "$GS" "$B/wayland-hyprland-global-shortcuts-v1-protocol.c"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-header "$GS" > "$B/qwayland-server-hyprland-global-shortcuts-v1.h"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "$GS" > "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp"
+gcc -O2 -fPIC -c -o "$B/hyprland-global-shortcuts-protocol.o" "$B/wayland-hyprland-global-shortcuts-v1-protocol.c"
+"$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zglobalshortcuts.cpp" apps/zerp2/zglobalshortcuts.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
 gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
 # wlcompat's two libwayland-server functions must win over the library's
 # own, for every library that calls them
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
     apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp apps/zerp2/hypripc.cpp apps/zerp2/zlayershell.cpp     "$B/qwayland-server-wlr-layer-shell-unstable-v1.cpp" "$B/wlr-layer-shell-protocol.o" "$B/xdg-shell-protocol.o" -I"$B"     "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" "$B/moc_hypripc.cpp" "$B/moc_zlayershell.cpp" \
+    apps/zerp2/zglobalshortcuts.cpp apps/zerp2/keybinds.cpp "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp" \
+    "$B/hyprland-global-shortcuts-protocol.o" "$B/moc_zglobalshortcuts.cpp" \
     "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
     -Wl,--export-dynamic-symbol=mkstemp -Wl,--export-dynamic-symbol=wl_resource_create \
     "$LIB/libwayland-server.so.0" \

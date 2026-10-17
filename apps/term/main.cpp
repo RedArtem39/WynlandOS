@@ -57,6 +57,7 @@ static const uint8_t kPalette[16][3] = {
     { 88, 91, 112 }, { 243, 139, 168 }, { 166, 227, 161 }, { 249, 226, 175 },
     { 137, 180, 250 }, { 245, 194, 231 }, { 148, 226, 213 }, { 166, 173, 200 },
 };
+static char **g_cmd;   /* a command to run instead of the shell (main()) */
 static const int kPad = 10;
 static const int kScrollback = 2000;
 
@@ -156,6 +157,12 @@ public:
             setenv("COLORTERM", "truecolor", 1);
             const char *home = getenv("HOME");
             if (home && ::chdir(home) != 0) { }
+            // a command given (term -e CMD..., or term CMD... as foot
+            // takes it): that runs instead of the shell
+            if (g_cmd && g_cmd[0]) {
+                execvp(g_cmd[0], g_cmd);
+                _exit(127);
+            }
             const char *base = strrchr(shell, '/');
             // a login shell: "-fish"
             char argv0[64];
@@ -384,6 +391,11 @@ private:
 
 int main(int argc, char **argv)
 {
+    // what to run in it: after -e, or the arguments themselves (no options of ours)
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-e")) { g_cmd = argv + i + 1; break; }
+        if (argv[i][0] != '-') { g_cmd = argv + i; break; }
+    }
     zerp_qpa_capture_args(argc, argv);
     qputenv("QT_QPA_PLATFORM", "qwynlandfb");
     if (!qEnvironmentVariableIsSet("FONTCONFIG_FILE"))

@@ -34,10 +34,13 @@
 #include "greeter.h"
 #include "hypripc.h"
 #include "zlayershell.h"
+#include "zglobalshortcuts.h"
+#include "keybinds.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <fcntl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -81,6 +84,9 @@ static const char kUpper[59] = {
     '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\r',
     0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
     '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0 };
+
+// the demo's "snapat=key+N": run once by the first global shortcut pressed
+static std::function<void()> g_onGlobal;
 
 class InputPump : public QObject
 {
@@ -139,6 +145,49 @@ private:
         }
     }
 
+    // a configured binding's action (Hyprland's dispatchers that mean
+    // something here). Globals hear both the press and the release; the
+    // rest act on the press.
+    void run(const KeyBinds::Bind &b, bool pressed)
+    {
+        const QString &a = b.args;
+        if (b.dispatcher == QLatin1String("global")) {
+            if (ZGlobalShortcuts *g = ZGlobalShortcuts::instance()) g->fire(a, pressed);
+            if (pressed && g_onGlobal) { auto f = std::move(g_onGlobal); g_onGlobal = nullptr; f(); }
+            return;
+        }
+        if (!pressed) return;
+        const QString d = b.dispatcher;
+        if (d == QLatin1String("exec")) { m_srv->run(a); return; }
+        if (d == QLatin1String("killactive")) { m_srv->closeFocused(); return; }
+        if (d == QLatin1String("fullscreen")) { m_srv->toggleFullscreen(); return; }
+        if (d == QLatin1String("exit")) { QCoreApplication::quit(); return; }
+        if (d == QLatin1String("movefocus")) {
+            const QString w = a.trimmed().toLower();
+            if (w.startsWith('l')) m_srv->focusDirection(-1, 0);
+            else if (w.startsWith('r')) m_srv->focusDirection(1, 0);
+            else if (w.startsWith('u')) m_srv->focusDirection(0, -1);
+            else if (w.startsWith('d')) m_srv->focusDirection(0, 1);
+            return;
+        }
+        if (d == QLatin1String("workspace") || d == QLatin1String("movetoworkspace") ||
+            d == QLatin1String("movetoworkspacesilent")) {
+            // a number (1-10), or relative: +1, -1, e+1, r-1
+            QString w = a.trimmed();
+            if (w.startsWith('e') || w.startsWith('r') || w.startsWith('m')) w = w.mid(1);
+            int target;
+            bool ok = false;
+            if (w.startsWith('+') || w.startsWith('-')) target = m_srv->workspace() + w.toInt(&ok);
+            else target = w.toInt(&ok) - 1;
+            if (!ok) return;
+            target = qBound(0, target, 9);
+            if (d == QLatin1String("workspace")) m_srv->setWorkspace(target);
+            else m_srv->moveFocusedTo(target);
+            return;
+        }
+        fprintf(stderr, "[zerp2] binding (line %d): dispatcher %s is not supported\n", b.line, qPrintable(d));
+    }
+
     // WM bindings (mod = Alt or Super; Super is usually eaten by the host)
     bool binding(bool e0, int code)
     {
@@ -184,6 +233,15 @@ private:
         if (e0 && (code == 0x5B || code == 0x5C)) m_super = !release;
         if (!e0 && (code == 0x2A || code == 0x36)) m_shift = !release;
         const int kid = code + (e0 ? 128 : 0);
+        // the configured bindings (keybinds.h: Caelestia's, Hyprland style)
+        if (!m_greeter) {
+            if (!m_bindsLoaded) {
+                m_bindsLoaded = true;
+                m_binds.load();
+                m_binds.setRun([this](const KeyBinds::Bind &b, bool pressed) { run(b, pressed); });
+            }
+            if (m_binds.key(kid, release)) return;
+        }
         if (release && m_swallow[kid]) { m_swallow[kid] = false; return; }
         if (!m_greeter && !release && (m_alt || m_altR || m_super) && binding(e0, code)) {
             m_swallow[kid] = true;   // its release must not reach the client either
@@ -250,6 +308,8 @@ private:
     bool m_greeter = false;
     bool m_alt = false, m_altR = false, m_super = false, m_shift = false;
     bool m_swallow[256] = {};
+    KeyBinds m_binds;
+    bool m_bindsLoaded = false;
     QTimer m_timer;
     int m_kbd = -1;
     QPointF m_pos;
@@ -309,6 +369,7 @@ int main(int argc, char **argv)
     qmlRegisterType<ZSurface>("Zerp", 1, 0, "ZSurface");
     qmlRegisterUncreatableType<ZClient>("Zerp", 1, 0, "ZClient", QStringLiteral("made by the server"));
     qmlRegisterType<ZLayerShellQuickExtension>("Zerp", 1, 0, "LayerShell");
+    qmlRegisterType<ZGlobalShortcutsQuickExtension>("Zerp", 1, 0, "GlobalShortcuts");
     qmlRegisterUncreatableType<ZLayerSurface>("Zerp", 1, 0, "LayerSurface", QStringLiteral("made by the layer shell"));
     const QSize scr = app.primaryScreen() ? app.primaryScreen()->size() : QSize(1920, 1080);
     ZServer server(uint32_t(scr.width()) * uint32_t(scr.height()) * 4u);
@@ -384,7 +445,9 @@ int main(int argc, char **argv)
             if (df.open(QIODevice::ReadOnly) && df.readAll().trimmed() == "caelestia" &&
                 QFile::exists(QStringLiteral("/usr/bin/quickshell"))) {
                 QTimer::singleShot(1000, &server, [&server] {
-                    server.run(QStringLiteral("mkdir -p \"$HOME/.cache\"; QT_QUICK_BACKEND=opengl "
+                    // (its state directory: the launcher's app database is
+                    // there -- Caelestia's CLI makes it, not in the image)
+                    server.run(QStringLiteral("mkdir -p \"$HOME/.cache\" \"$HOME/.local/state/caelestia\"; QT_QUICK_BACKEND=opengl "
                                               "exec quickshell -c caelestia > \"$HOME/.cache/caelestia.log\" 2>&1"));
                 });
             }
@@ -463,12 +526,18 @@ int main(int argc, char **argv)
         QTimer::singleShot(82000, &server, [&server] { fprintf(stderr, "[zerp2] workspace 1\n"); server.setWorkspace(1); });
         QTimer::singleShot(86000, win, [fpsTick] { fpsTick->stop(); });
         // "snapat=N": the picture at N seconds (60 by default), also as
-        // /tmp/zerp2-snap.png at full size (the serial log can drop lines)
+        // /tmp/zerp2-snap.png at full size (the serial log can drop lines);
+        // "snapat=key+N": N seconds after the first global shortcut
         int snapAt = 60;
+        bool afterKey = false;
         const QByteArray cfg = bootCfg();
         const int at = cfg.indexOf("snapat=");
-        if (at >= 0) snapAt = qMax(5, cfg.mid(at + 7).split('\n').first().trimmed().toInt());
-        QTimer::singleShot(snapAt * 1000, win, [win, greeterMode, firstBoot] {
+        if (at >= 0) {
+            QByteArray v = cfg.mid(at + 7).split('\n').first().trimmed();
+            if (v.startsWith("key+")) { afterKey = true; v = v.mid(4); }
+            snapAt = afterKey ? qMax(1, v.toInt()) : qMax(5, v.toInt());
+        }
+        auto snapshot = [win, greeterMode, firstBoot] {
             ::syscall(1000);   /* WynlandOS: every process's time and threads, on the log */
             const QImage full = win->grabWindow();
             // the login screen (another account) keeps its own file
@@ -484,7 +553,11 @@ int main(int argc, char **argv)
             for (qsizetype i = 0; i < b64.size(); i += 1024)
                 fprintf(stderr, "ZSNAP %s\n", b64.mid(i, 1024).constData());
             fprintf(stderr, "ZSNAP-END %d\n", int(b64.size()));
-        });
+        };
+        if (afterKey)
+            g_onGlobal = [win, snapAt, snapshot] { QTimer::singleShot(snapAt * 1000, win, snapshot); };
+        else
+            QTimer::singleShot(snapAt * 1000, win, snapshot);
     }
     return app.exec();
 }
