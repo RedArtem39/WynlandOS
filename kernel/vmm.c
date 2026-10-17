@@ -3,6 +3,7 @@
  */
 
 #include <wynland/vmm.h>
+#include <wynland/swap.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/smp.h>
@@ -152,6 +153,15 @@ bool vmm_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
 
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
+                    if (pte_swapped(pte)) {
+                        /* in swap (kernel/swap.c): the child gets the same
+                           slot, one more reference -- whichever side
+                           touches it first reads it into a page of its own */
+                        uint64_t sv = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                        swap_dup(pte_swap_slot(pte));
+                        vmm_set_pte_raw(child_pml4, sv, pte);
+                        continue;
+                    }
                     if (!(pte & PAGE_PRESENT)) continue;
                     if (!(pte & PAGE_USER)) continue;
 
@@ -214,6 +224,15 @@ bool vmm_cow_clone_user_pages(PageTable *parent_pml4, PageTable *child_pml4)
 
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
+                    if (pte_swapped(pte)) {
+                        /* in swap (kernel/swap.c): the child gets the same
+                           slot, one more reference -- whichever side
+                           touches it first reads it into a page of its own */
+                        uint64_t sv = (i4 << 39) | (i3 << 30) | (i2 << 21) | (i1 << 12);
+                        swap_dup(pte_swap_slot(pte));
+                        vmm_set_pte_raw(child_pml4, sv, pte);
+                        continue;
+                    }
                     if (!(pte & PAGE_PRESENT)) continue;
                     if (!(pte & PAGE_USER)) continue;
 
@@ -293,6 +312,7 @@ void vmm_free_user_mappings(PageTable *pml4)
 
                 for (uint64_t i1 = 0; i1 < 512; i1++) {
                     uint64_t pte = pt->entries[i1];
+                    if (pte_swapped(pte)) { swap_free(pte_swap_slot(pte)); continue; }
                     if (!(pte & PAGE_PRESENT)) continue;
                     /* owned by its SHM/BO/fb object -- unless this mapping
                        holds its own reference (memfd), which it drops */
@@ -415,8 +435,9 @@ void vmm_unmap_page(PageTable *pml4, uint64_t virt)
 
     PageTable *pt = (PageTable *)P2V(*pd_entry & PAGE_ADDR_MASK);
     
-    /* Clear entry */
+    /* Clear entry (a page in swap: its slot goes) */
     bool was_present = (pt->entries[pt_idx] & PAGE_PRESENT) != 0;
+    if (pte_swapped(pt->entries[pt_idx])) swap_free(pte_swap_slot(pt->entries[pt_idx]));
     pt->entries[pt_idx] = 0;
 
     /* Invalidate TLB (here and on the other cores) */
@@ -532,6 +553,56 @@ uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt)
     return (e & PAGE_PRESENT) ? e : 0;
 }
 
+uint64_t vmm_get_pte_raw(PageTable *pml4, uint64_t virt)
+{
+    PageTableEntry e = pml4->entries[PML4_INDEX(virt)];
+    if (!(e & PAGE_PRESENT)) return 0;
+    PageTable *pdpt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
+    e = pdpt->entries[PDPT_INDEX(virt)];
+    if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return 0;
+    PageTable *pd = (PageTable *)P2V(e & PAGE_ADDR_MASK);
+    e = pd->entries[PD_INDEX(virt)];
+    if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return 0;
+    PageTable *pt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
+    return pt->entries[PT_INDEX(virt)];
+}
+
+PageTableEntry *vmm_pte_ptr(PageTable *pml4, uint64_t virt)
+{
+    PageTableEntry e = pml4->entries[PML4_INDEX(virt)];
+    if (!(e & PAGE_PRESENT)) return NULL;
+    PageTable *pdpt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
+    e = pdpt->entries[PDPT_INDEX(virt)];
+    if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return NULL;
+    PageTable *pd = (PageTable *)P2V(e & PAGE_ADDR_MASK);
+    e = pd->entries[PD_INDEX(virt)];
+    if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) return NULL;
+    PageTable *pt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
+    return &pt->entries[PT_INDEX(virt)];
+}
+
+void vmm_set_pte_raw(PageTable *pml4, uint64_t virt, uint64_t entry)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    virt &= ~(PAGE_SIZE - 1);
+    PageTableEntry *e = &pml4->entries[PML4_INDEX(virt)];
+    for (int level = 0; level < 3; level++) {
+        if (!(*e & PAGE_PRESENT)) {
+            PageTable *t = vmm_alloc_table();
+            *e = V2P(t) | PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        }
+        PageTable *t = (PageTable *)P2V(*e & PAGE_ADDR_MASK);
+        uint64_t idx = level == 0 ? PDPT_INDEX(virt) : level == 1 ? PD_INDEX(virt) : PT_INDEX(virt);
+        e = &t->entries[idx];
+    }
+    bool was_present = (*e & PAGE_PRESENT) != 0;
+    *e = entry;
+    __asm__ volatile("invlpg (%0)" :: "r"(virt) : "memory");
+    if (was_present) tlb_remote(pml4, virt);
+    if (rflags & 0x200) __asm__ volatile("sti\n\tnop" ::: "memory");
+}
+
 /* First address in [virt, end) that has a 4 KB leaf mapping, or end.
    Whole absent page-table levels are skipped in one step (512 GB, 1 GB,
    2 MB), so walking a huge, mostly empty range costs next to nothing --
@@ -550,7 +621,7 @@ uint64_t vmm_next_mapped(PageTable *pml4, uint64_t virt, uint64_t end)
         e = pd->entries[PD_INDEX(virt)];
         if (!(e & PAGE_PRESENT) || (e & PAGE_PS)) { step = 1ULL << 21; goto skip; }
         PageTable *pt = (PageTable *)P2V(e & PAGE_ADDR_MASK);
-        if (pt->entries[PT_INDEX(virt)] & PAGE_PRESENT) return virt;
+        if (pt->entries[PT_INDEX(virt)] & (PAGE_PRESENT | PAGE_SWAPPED)) return virt;
         step = PAGE_SIZE;
     skip:
         {

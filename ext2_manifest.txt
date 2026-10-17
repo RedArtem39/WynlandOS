@@ -79,6 +79,7 @@ Fo /jittest.elf         build/jittest.elf
 Fo /nopietest.elf       build/nopietest.elf
 Fo /nopietest-static.elf build/nopietest-static.elf
 Fo /sandboxtest.elf     build/sandboxtest.elf
+Fo /swaptest.elf        build/swaptest.elf
 
 # wynrc: init, rc tools, services, runlevels
 D /sbin
@@ -93,6 +94,7 @@ F  /etc/wynrc/services/forktest rootfs/etc/wynrc/services/forktest
 F  /etc/wynrc/services/sndtest rootfs/etc/wynrc/services/sndtest
 F  /etc/wynrc/services/jittest rootfs/etc/wynrc/services/jittest
 F  /etc/wynrc/services/sandboxtest rootfs/etc/wynrc/services/sandboxtest
+F  /etc/wynrc/services/swaptest rootfs/etc/wynrc/services/swaptest
 F  /etc/wynrc/services/gltest rootfs/etc/wynrc/services/gltest
 F  /etc/wynrc/services/kmstest rootfs/etc/wynrc/services/kmstest
 F  /etc/wynrc/services/zerp rootfs/etc/wynrc/services/zerp

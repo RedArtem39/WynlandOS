@@ -93,6 +93,13 @@ uint64_t vmm_get_phys(PageTable *pml4, uint64_t virt);
 /* Raw leaf PTE for a 4 KB mapping (flags + frame), 0 if not mapped or if
    it's part of a huge page. */
 uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt);
+/* The leaf entry as it is, present or not (a page in swap: include/
+   wynland/swap.h), 0 when no page table reaches it; its address, or NULL. */
+uint64_t vmm_get_pte_raw(PageTable *pml4, uint64_t virt);
+PageTableEntry *vmm_pte_ptr(PageTable *pml4, uint64_t virt);
+/* Write a leaf entry as given (not present: a swap entry), making the page
+   tables above it as needed. */
+void vmm_set_pte_raw(PageTable *pml4, uint64_t virt, uint64_t entry);
 
 /* First address in [virt, end) with a 4 KB leaf mapping, or end; skips
    absent page-table levels whole. */

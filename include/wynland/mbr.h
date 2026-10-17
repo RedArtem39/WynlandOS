@@ -21,3 +21,7 @@ uint32_t mbr_root_partition_lba(void);
 
 /* Size of the root partition in 512-byte sectors (0 if none). */
 uint32_t mbr_root_partition_sectors(void);
+
+/* the swap partition (type 0x82), 0 sectors when there is none */
+uint32_t mbr_swap_partition_lba(void);
+uint32_t mbr_swap_partition_sectors(void);

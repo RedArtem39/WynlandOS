@@ -8,6 +8,8 @@ the OS expects (mirrors real-Linux /boot/efi + / conventions):
     partition 1: FAT32 ESP   (type 0xEF) -- what UEFI firmware needs to
                                  load the kernel off its own FAT driver
     partition 2: ext2 root   (type 0x83) -- what drivers/fs/ext2.c mounts
+    partition 3: swap        (type 0x82) -- kernel/swap.c, after the root
+                                 one (optional: swap_mb 0 leaves it out)
 
 Everything is 1MiB-aligned so dd bs=1M assembly stays trivial and the
 WSL<->Windows I/O bridge doesn't crawl (per-phase-20 tooling lesson):
@@ -15,7 +17,8 @@ WSL<->Windows I/O bridge doesn't crawl (per-phase-20 tooling lesson):
     root start : LBA (1+ESP_MB)*2048 (= right after the ESP, 1MiB-aligned)
     root count : every sector left up to the end of the disk
 
-Usage: python3 make_mbr.py <output-sector-file> <total_image_mb> <esp_mb>
+Usage: python3 make_mbr.py <output-sector-file> <total_image_mb> <esp_mb> [swap_mb]
+(total_image_mb: up to the end of the root partition; the swap one follows)
 
 For the defaults (2048 MB disk, 64 MB ESP) this reproduces exactly the
 layout the Phase 20a checkpoint verified against live QEMU boots:
@@ -28,13 +31,14 @@ import sys
 
 
 def main() -> None:
-    if len(sys.argv) != 4:
+    if len(sys.argv) not in (4, 5):
         print(__doc__)
         sys.exit(1)
 
     out_path = sys.argv[1]
     total_mb = int(sys.argv[2])
     esp_mb = int(sys.argv[3])
+    swap_mb = int(sys.argv[4]) if len(sys.argv) == 5 else 0
 
     if esp_mb < 64:
         # Real OVMF firmware refuses FAT32 volumes below ~65525 clusters;
@@ -66,13 +70,16 @@ def main() -> None:
     # boots through the UEFI firmware loading the ESP's BOOTX64.EFI.
     entry(0x1BE, 0xEF, esp_start, esp_count)
     entry(0x1CE, 0x83, root_start, root_count)
+    if swap_mb > 0:
+        entry(0x1DE, 0x82, total_sectors, swap_mb * SECTORS_PER_MB)
     sector[0x1FE:0x200] = b"\x55\xAA"
 
     with open(out_path, "wb") as f:
         f.write(sector)
 
     print(f"  MBR        ESP: lba={esp_start} sectors={esp_count} | "
-          f"root: lba={root_start} sectors={root_count}")
+          f"root: lba={root_start} sectors={root_count}" +
+          (f" | swap: lba={total_sectors} sectors={swap_mb * SECTORS_PER_MB}" if swap_mb else ""))
 
 
 if __name__ == "__main__":

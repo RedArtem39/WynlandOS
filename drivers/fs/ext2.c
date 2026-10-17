@@ -2145,6 +2145,10 @@ bool vfs_init(void) {
     /* Find the root partition first (the disk is a real MBR-partitioned
        image: ESP + ext2 root), then mount ext2 inside it. */
     mbr_init();
+    {
+        extern void swap_init(uint32_t lba, uint32_t sectors);
+        if (mbr_swap_partition_sectors()) swap_init(mbr_swap_partition_lba(), mbr_swap_partition_sectors());
+    }
     return ext2_init();
 }
 

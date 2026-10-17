@@ -1,0 +1,5 @@
+description=swap check (more memory than the RAM)
+type=oneshot
+exec=/swaptest.elf
+when=autotest=swap
+after=display

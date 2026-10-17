@@ -7,6 +7,8 @@
 #include <wynland/pmm.h>
 #include <wynland/vmm.h>
 #include <wynland/vfs.h>
+#include <wynland/swap.h>
+#include <wynland/kmutex.h>
 
 extern void *memcpy(void *dest, const void *src, size_t n);
 _Static_assert(sizeof(VfsFile) <= sizeof(((VmaFile *)0)->vf), "VmaFile.vf too small for a VfsFile");
@@ -552,8 +554,10 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
             for (uint32_t i = 1; i < FILE_READAHEAD_PAGES; i++) {
                 uint64_t a = page + (uint64_t)i * PAGE_SIZE;
                 uint64_t in_a = a - v->start;
+                /* (a page in swap is this process's own, changed copy:
+                   never the file's again) */
                 if (a >= v->end || in_a + PAGE_SIZE > v->file_len ||
-                    (vmm_get_page_flags(proc->pml4, a) & PAGE_PRESENT)) break;
+                    (vmm_get_pte_raw(proc->pml4, a) & (PAGE_PRESENT | PAGE_SWAPPED))) break;
                 void *next = pcache_get(inum, (uint32_t)((v->file_off + in_a) / PAGE_SIZE));
                 if (!next) break;
                 map_cached(proc, v, a, next);
@@ -568,7 +572,7 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
     if (g_ra_buf) {
         while (npages < FILE_READAHEAD_PAGES) {
             uint64_t a = page + (uint64_t)npages * PAGE_SIZE;
-            if (a >= v->end || (vmm_get_page_flags(proc->pml4, a) & PAGE_PRESENT)) break;
+            if (a >= v->end || (vmm_get_pte_raw(proc->pml4, a) & (PAGE_PRESENT | PAGE_SWAPPED))) break;
             npages++;
         }
     }
@@ -632,26 +636,69 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
     return true;
 }
 
+/* A file page, a page in swap, and making room when RAM is out all need
+   the filesystem's mutex (the disk, the block cache) -- and taking it may
+   sleep, the big lock given back meanwhile: another thread may unmap the
+   very VMA. So it is taken first, and everything looked up again after
+   (the loop); held, nothing here sleeps any more. */
+extern KMutex g_fs_mutex;
+
 bool vma_fault_in(Process *proc, uint64_t addr, uint32_t access)
 {
     if (!proc || !proc->pml4) return false;
-    VMA *v = vma_find(proc, addr);
-    if (!v || !(v->flags & VMA_LAZY) || (v->flags & VMA_GUARD)) return false;
-    if ((v->prot & access) != access) return false;   /* PROT_NONE, or no write/exec */
-
     uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
-    /* Present by now: another core's thread of this process faulted on the
-       same page and filled it while this one waited for the kernel lock.
-       The access just runs again (a permission problem faults anew, with
-       the present bit set). */
-    if (vmm_get_page_flags(proc->pml4, page) & PAGE_PRESENT) return true;
+    bool locked = false, ok = false;
+    int why = 0;   /* a failure's reason, for the log: 1 no VMA, 2 not lazy, 3 access, 4 swap in, 5 file, 6 no memory */
+    /* (under memory pressure the pages a reclaim frees can go to another
+       core's allocations first: a few rounds) */
+    for (int tries = 0; tries < 32; tries++) {
+        VMA *v = vma_find(proc, addr);
+        uint64_t raw = vmm_get_pte_raw(proc->pml4, page);
+        bool swapped = pte_swapped(raw);
+        if (!v || (v->flags & VMA_GUARD)) { why = 1; break; }
+        if ((v->prot & access) != access) { why = 3; break; }   /* PROT_NONE, or no write/exec */
 
-    if ((v->flags & VMA_FILE) && v->file) return fault_in_file(proc, v, page);
+        /* Present by now: another core's thread of this process faulted on
+           the same page and filled it while this one waited for the kernel
+           lock -- also in a region that is not demand-paged (brk's heap: a
+           page brought back from swap). The access just runs again (a
+           permission problem faults anew, with the present bit set). */
+        if (raw & PAGE_PRESENT) { ok = true; break; }
+        if (!swapped && !(v->flags & VMA_LAZY)) { why = 2; break; }
 
-    void *frame = zeroed_frame();
-    if (!frame) return false;   /* out of memory: the access faults for real */
-    vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, pte_flags_for(v));
-    return true;
+        bool is_file = !swapped && (v->flags & VMA_FILE) && v->file;
+        if ((swapped || is_file) && !locked && !kmutex_held(&g_fs_mutex)) {
+            kmutex_lock(&g_fs_mutex);
+            locked = true;
+            continue;                          /* everything again */
+        }
+        if (swapped) { ok = swap_in(proc, v, page); why = 4; break; }
+        if (is_file) { ok = fault_in_file(proc, v, page); why = 5; break; }
+
+        void *frame = zeroed_frame();
+        if (!frame) {
+            /* no RAM at all: some goes out to swap (the reclaim thread was
+               too slow), then all of it again */
+            why = 6;
+            if (!swap_enabled()) break;
+            if (!locked && !kmutex_held(&g_fs_mutex)) { kmutex_lock(&g_fs_mutex); locked = true; }
+            if (!swap_reclaim(256)) break;     /* out of memory: the access faults for real */
+            continue;
+        }
+        vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, pte_flags_for(v));
+        ok = true;
+        break;
+    }
+    if (locked) kmutex_unlock(&g_fs_mutex);
+    if (!ok && why >= 4) {   /* the kernel failing the program, not the program's own fault */
+        extern void uint_to_hex(uint64_t val, char *buf);
+        char b[24];
+        serial_write_string(why == 4 ? "VMA: a page could not come back from swap at " :
+                            why == 5 ? "VMA: a file page could not be read at " : "VMA: no memory for a page at ");
+        uint_to_hex(addr, b); serial_write_string(b);
+        serial_write_string("\r\n");
+    }
+    return ok;
 }
 
 /* Ensure a VMA boundary exists exactly at `addr`, splitting whichever VMA

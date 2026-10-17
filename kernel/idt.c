@@ -404,12 +404,25 @@ static void exception_handler_main(InterruptRegisters *regs)
             serial_write_string("CR2: 0x");
             uint_to_hex(cr2, buf);
             serial_write_string(buf);
+            /* what the CPU said (bit 0 present, 1 write, 2 user, 4 fetch)
+               and what the page table holds there */
+            serial_write_string("  error ");
+            uint_to_hex(regs->err_code, buf);
+            serial_write_string(buf);
+            serial_write_string("  entry ");
+            uint_to_hex(vmm_get_pte_raw(vmm_get_current_pml4(), cr2), buf);
+            serial_write_string(buf);
             serial_write_string("\r\n");
 
             serial_write_string("User Stack Dump:\r\n");
-            uint64_t *stack_ptr = (uint64_t *)regs->rsp;
+            /* through the page tables, present pages only: a stack page in
+               swap (or gone) must not fault the kernel in its own report */
+            PageTable *upml4 = vmm_get_current_pml4();
             for (int i = 0; i < 8; i++) {
-                uint64_t val = stack_ptr[i];
+                uint64_t va = regs->rsp + (uint64_t)i * 8;
+                uint64_t pte = (va & 7) || va >= 0x0000800000000000ULL ? 0 : vmm_get_pte(upml4, va);
+                if (!(pte & PAGE_PRESENT) || !(pte & PAGE_USER)) break;
+                uint64_t val = *(uint64_t *)P2V((pte & PAGE_ADDR_MASK) | (va & 0xFFF));
                 serial_write_string("  +");
                 char offset_buf[16];
                 extern void uint_to_str(uint64_t val, char *buf);

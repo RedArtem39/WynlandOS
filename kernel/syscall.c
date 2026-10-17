@@ -8,6 +8,7 @@
 #include <wynland/smp.h>
 #include <wynland/spinlock.h>
 #include <wynland/kmutex.h>
+#include <wynland/swap.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/heap.h>
@@ -612,6 +613,10 @@ static void itimer_get(Process *p, int64_t out[4])
    (PAGE_SHARED_REF: memfd) releases it. */
 static void user_unmap_page(PageTable *pml4, uint64_t va)
 {
+    if (pte_swapped(vmm_get_pte_raw(pml4, va))) {   /* in swap: the slot goes */
+        vmm_unmap_page(pml4, va);
+        return;
+    }
     uint64_t pte = vmm_get_pte(pml4, va);
     if (!pte) return;
     /* only the process's own pages: the kernel has mappings in the user
@@ -655,7 +660,7 @@ static bool range_has_kernel_pages(PageTable *pml4, uint64_t addr, uint64_t end)
 {
     for (uint64_t a = vmm_next_mapped(pml4, addr, end); a < end;
          a = vmm_next_mapped(pml4, a + PAGE_SIZE, end))
-        if (!(vmm_get_pte(pml4, a) & PAGE_USER)) return true;
+        if (!pte_swapped(vmm_get_pte_raw(pml4, a)) && !(vmm_get_pte(pml4, a) & PAGE_USER)) return true;
     return false;
 }
 
@@ -1156,8 +1161,10 @@ static bool proc_info_text(const char *path, PText *t) {
         pt_kv(t, "SwapCached:     ", 0);
         pt_kv(t, "Shmem:          ", 0);
         pt_kv(t, "SReclaimable:   ", 0);
-        pt_kv(t, "SwapTotal:      ", 0);
-        pt_kv(t, "SwapFree:       ", 0);
+        uint64_t st, sf;
+        swap_stats(&st, &sf);
+        pt_kv(t, "SwapTotal:      ", st / 1024);
+        pt_kv(t, "SwapFree:       ", sf / 1024);
         return true;
     }
     if (str_compare(path, "/proc/cpuinfo") == 0) {
@@ -2005,6 +2012,10 @@ static int64_t kobj_writev(VfsFile *f, uint32_t oflags, const UIoVecR *iov, int 
 static bool poke_user_u32(PageTable *pml4, uint64_t va, uint32_t val) {
     if ((va & 3) || !va) return false;
     uint64_t page = va & ~(PAGE_SIZE - 1);
+    if (pte_swapped(vmm_get_pte_raw(pml4, page))) {   /* in swap (the parent's was): back first */
+        for (Process *q = process_list_head(); q; q = q->next)
+            if (q->pml4 == pml4) { vma_fault_in(q, page, VMA_PROT_WRITE); break; }
+    }
     uint64_t flags = vmm_get_page_flags(pml4, page);
     uint64_t phys = vmm_get_phys(pml4, page);
     if (!(flags & PAGE_PRESENT) || !(flags & PAGE_USER) || !phys) return false;
@@ -6162,6 +6173,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 si.uptime = (int64_t)(timer_get_ms() / 1000);
                 si.totalram = pmm_get_total_memory();
                 si.freeram = pmm_get_free_memory();
+                swap_stats(&si.totalswap, &si.freeswap);
                 si.procs = 1;
                 si.mem_unit = 1;
                 memcpy((void *)a1, &si, sizeof(si));

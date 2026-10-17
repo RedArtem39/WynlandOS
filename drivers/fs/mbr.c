@@ -18,6 +18,7 @@ extern void uint_to_hex(uint64_t val, char *buf);
 
 uint32_t g_root_partition_lba = 0;
 uint32_t g_root_partition_sectors = 0;
+static uint32_t g_swap_lba, g_swap_sectors;
 
 void mbr_init(void) {
     g_root_partition_lba = 0;
@@ -59,6 +60,10 @@ void mbr_init(void) {
         serial_write_string("\r\n");
 
         if (type == 0xEF) have_esp = true;
+        if (type == 0x82 && g_swap_sectors == 0) {   /* Linux swap */
+            g_swap_lba = lba;
+            g_swap_sectors = cnt;
+        }
         if (type == 0x83 && g_root_partition_lba == 0) {
             g_root_partition_lba = lba;
             g_root_partition_sectors = cnt;
@@ -78,3 +83,6 @@ uint32_t mbr_root_partition_lba(void) {
 uint32_t mbr_root_partition_sectors(void) {
     return g_root_partition_sectors;
 }
+
+uint32_t mbr_swap_partition_lba(void) { return g_swap_lba; }
+uint32_t mbr_swap_partition_sectors(void) { return g_swap_sectors; }

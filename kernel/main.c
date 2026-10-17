@@ -942,6 +942,8 @@ void kernel_main(BootInfo *boot_info_loader)
     {   /* ext2 writes are write-back: this thread puts them on the disk */
         extern void ext2_flusher_thread(void *arg);
         thread_create(ext2_flusher_thread, NULL);
+        extern void swap_start_daemon(void);
+        swap_start_daemon();            /* pages out to the swap partition when RAM runs low */
     }
     {   /* alarm(), setitimer(): SIGALRM when due */
         extern void itimer_thread(void *arg);

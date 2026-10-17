@@ -152,6 +152,8 @@ OVMF_FW        = tools/ovmf/OVMF.fd
 # refuses the FAT32 volume that mtools still accepts (Phase 20a finding).
 ESP_SIZE_MB    = 64
 TOTAL_IMG_MB   = 2048
+# swap partition (MBR type 0x82) after the root one: kernel/swap.c
+SWAP_SIZE_MB  ?= 512
 ESP_PART_IMG   = $(IMG_DIR)/esp_part.img
 EXT2_PART_IMG  = $(IMG_DIR)/ext2_part.img
 MBR_SECT       = $(BUILD)/mbr.bin
@@ -322,6 +324,11 @@ $(BUILD)/nopietest-static.elf: tests/nopietest.c
 	@echo "  CC(HOST)   $< (static glibc, not PIE)"
 	@gcc -O2 -static -no-pie -o $@ $<
 
+$(BUILD)/swaptest.elf: tests/swaptest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, swap)"
+	@gcc -O2 -o $@ $<
+
 $(BUILD)/sandboxtest.elf: tests/sandboxtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, seccomp/namespaces/chroot)"
@@ -487,7 +494,7 @@ $(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/etc/wynland/jit.allow $(E
 	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 
-$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
+$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/swaptest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 
@@ -510,15 +517,17 @@ $(ESP_PART_IMG): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/resolution.cfg
 	@mcopy -o -i $@ $(KERNEL_ELF) ::/kernel.elf
 	@mcopy -o -i $@ $(BUILD)/resolution.cfg ::/resolution.cfg
 
-# Final assembly: zeroed disk <- MBR sector <- ESP @1MiB <- ext2 root @1MiB+ESP.
-$(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG)
-	@echo "  IMG        Assembling MBR + ESP + ext2 disk image..."
+# Final assembly: zeroed disk <- MBR sector <- ESP @1MiB <- ext2 root @1MiB+ESP,
+# then the swap partition (its contents don't matter: a sparse tail).
+$(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG) make_mbr.py
+	@echo "  IMG        Assembling MBR + ESP + ext2 + swap disk image..."
 	@dd if=/dev/zero of=$@ bs=1M count=$(TOTAL_IMG_MB) status=none
-	@python3 make_mbr.py $(MBR_SECT) $(TOTAL_IMG_MB) $(ESP_SIZE_MB)
+	@truncate -s $$(( $(TOTAL_IMG_MB) + $(SWAP_SIZE_MB) ))M $@
+	@python3 make_mbr.py $(MBR_SECT) $(TOTAL_IMG_MB) $(ESP_SIZE_MB) $(SWAP_SIZE_MB)
 	@dd if=$(MBR_SECT) of=$@ bs=512 count=1 conv=notrunc status=none
 	@dd if=$(ESP_PART_IMG) of=$@ bs=1M seek=1 conv=notrunc status=none
 	@dd if=$(EXT2_PART_IMG) of=$@ bs=1M seek=$$(( 1 + $(ESP_SIZE_MB) )) conv=notrunc status=none
-	@echo "  => wynland.img created ($(TOTAL_IMG_MB) MB, ESP $(ESP_SIZE_MB) MB + ext2 root)"
+	@echo "  => wynland.img created ($(TOTAL_IMG_MB) MB, ESP $(ESP_SIZE_MB) MB + ext2 root, + $(SWAP_SIZE_MB) MB swap)"
 
 # ---------- Run in QEMU ----------
 
