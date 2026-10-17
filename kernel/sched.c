@@ -12,6 +12,7 @@
 #include <wynland/smp.h>
 #include <wynland/spinlock.h>
 #include <wynland/futex.h>
+#include <wynland/waitqueue.h>
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 
@@ -682,15 +683,17 @@ static void sweep_dead(void)
                signal): it never ran its own unlink, so its wait queue
                would keep pointing at the freed Thread */
             if (to_free->wq_head) {
-                /* a futex queue is under the futex lock (a wait queue
-                   under the big lock, held here too) */
+                /* a futex queue is under the futex lock, a wait queue
+                   under the wait queues' (futex -> waitqueue: only here) */
                 uint64_t ff = futex_lock_irqsave();
+                uint64_t wf = waitqueue_lock_irqsave();
                 Thread **pp = to_free->wq_head;
                 while (*pp) {
                     if (*pp == to_free) { *pp = to_free->wq_next; break; }
                     pp = &(*pp)->wq_next;
                 }
                 to_free->wq_head = NULL;
+                waitqueue_unlock_irqrestore(wf);
                 futex_unlock_irqrestore(ff);
             }
 
@@ -995,7 +998,11 @@ static int64_t sched_block_until(void *wq, uint64_t wake_deadline, uint64_t wake
         if (rflags & 0x200) __asm__ volatile("sti");
         return -4; /* -EINTR */
     }
-    sched_lock_for_switch();
+    /* the big lock's deferred interrupt work wakes wait queues: not with
+       the caller's lock held (it may be the wait queues' own) -- left to
+       the lock's next holder or the next tick */
+    if (drop) spin_lock(&g_sched_lock);
+    else sched_lock_for_switch();
     if (t->state == THREAD_STATE_TERMINATED || (intr && signal_waiting(t))) {   /* killed meanwhile (another core) */
         spin_unlock(&g_sched_lock);
         if (drop) spin_unlock(drop);
@@ -1068,6 +1075,11 @@ void sched_sleep_ms(uint64_t ms) {
 
 int64_t sched_block_unlock(void *wq, uint64_t wake_deadline, Spinlock *l) {
     return sched_block_until(wq, wake_deadline, SCHED_NO_DEADLINE, true, l);
+}
+
+int64_t sched_block_unlock_ex(void *wq, uint64_t wake_deadline, uint64_t wake_deadline_ms,
+                              Spinlock *l, bool intr) {
+    return sched_block_until(wq, wake_deadline, wake_deadline_ms, intr, l);
 }
 
 int64_t sched_sleep_ms_intr(uint64_t ms) {

@@ -2,6 +2,7 @@
  * WynlandOS - Physical Memory Manager (PMM) Implementation
  */
 
+#include <wynland/spinlock.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/memlayout.h>
@@ -191,10 +192,14 @@ static uint64_t frame_of(void *addr, void *caller)
    takes hundreds of thousands of them. */
 static uint64_t g_alloc_hint;
 
+/* The bitmap and the refcounts: callers run on several cores, some outside
+   the big kernel lock (kernel/spinlock.h). Never held across anything that
+   could fault or sleep. */
+static Spinlock g_pmm_lock = SPINLOCK_INIT("pmm");
+
 void *pmm_alloc_page(void)
 {
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_pmm_lock);
 
     void *result = NULL;
     uint64_t bitmap_bytes = (total_pages + 7) / 8;
@@ -227,9 +232,7 @@ void *pmm_alloc_page(void)
     }
 
 cleanup:
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
+    spin_unlock_irqrestore(&g_pmm_lock, rflags);
     /*
     if (result) {
         serial_write_string("PMM Alloc: ");
@@ -247,8 +250,7 @@ void *pmm_alloc_contiguous(uint32_t count)
 {
     if (count == 0) return NULL;
 
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_pmm_lock);
 
     void *result = NULL;
     uint32_t run = 0;
@@ -276,16 +278,13 @@ void *pmm_alloc_contiguous(uint32_t count)
     }
 
 cleanup:
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
+    spin_unlock_irqrestore(&g_pmm_lock, rflags);
     return result;
 }
 
 void pmm_free_page(void *addr)
 {
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_pmm_lock);
 
     uint64_t idx = frame_of(addr, __builtin_return_address(0));
     if (idx < total_pages) {
@@ -303,15 +302,12 @@ void pmm_free_page(void *addr)
         }
     }
 
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
+    spin_unlock_irqrestore(&g_pmm_lock, rflags);
 }
 
 void pmm_page_incref(void *addr)
 {
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_pmm_lock);
 
     uint64_t idx = frame_of(addr, __builtin_return_address(0));
     if (idx < total_pages && bitmap_test(idx)) {
@@ -325,9 +321,7 @@ void pmm_page_incref(void *addr)
         }
     }
 
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
+    spin_unlock_irqrestore(&g_pmm_lock, rflags);
 }
 
 uint32_t pmm_page_refcount(void *addr)

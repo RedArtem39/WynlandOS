@@ -9,7 +9,9 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <signal.h>
 #include <spawn.h>
 #include <pwd.h>
@@ -161,6 +163,51 @@ static void *long_sleeper(void *out)
     return NULL;
 }
 
+/* pipes and eventfds outside the big lock: writers on several cores */
+#define PW_THREADS 4
+#define PW_RECORDS 2000
+#define PW_LEN 100
+static int g_pw_fd;
+static void *pipe_writer(void *arg)
+{
+    unsigned char rec[PW_LEN];
+    for (int i = 0; i < PW_RECORDS; i++) {
+        memset(rec, (int)(long)arg, sizeof rec);   /* a record is one byte value throughout */
+        if (write(g_pw_fd, rec, sizeof rec) != (ssize_t)sizeof rec) return (void *)1L;
+    }
+    return NULL;
+}
+static int g_ev_fd;
+static void *ev_adder(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 5000; i++) {
+        uint64_t one = 1;
+        if (write(g_ev_fd, &one, 8) != 8) return (void *)1L;
+    }
+    return NULL;
+}
+static int g_pp_wfd;
+static void *late_closer(void *arg)
+{
+    (void)arg;
+    struct timespec n = { 0, 100000000 };
+    nanosleep(&n, NULL);
+    close(g_pp_wfd);
+    return NULL;
+}
+static int g_pollw_fd;
+static void *poll_feeder(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 2000; i++) {
+        char c = 'x';
+        if (write(g_pollw_fd, &c, 1) != 1) return (void *)1L;
+        if ((i & 7) == 0) sched_yield();
+    }
+    return NULL;
+}
+
 static void *report_tid(void *out)
 {
     *(pid_t *)out = (pid_t)syscall(SYS_gettid);
@@ -272,6 +319,80 @@ int main(int argc, char **argv)
               "clock_gettime into an untouched page");
         if (ro != MAP_FAILED) munmap(ro, 4096);
         if (lazy != MAP_FAILED) munmap(lazy, 4096);
+    }
+    {   /* 4 threads write 100-byte records into one pipe: every record
+           arrives whole (PIPE_BUF), none is lost */
+        int fd[2];
+        int ok = pipe(fd) == 0;
+        pthread_t th[PW_THREADS];
+        g_pw_fd = fd[1];
+        for (long i = 0; ok && i < PW_THREADS; i++) pthread_create(&th[i], NULL, pipe_writer, (void *)(i + 1));
+        long got = 0, torn = 0, per[PW_THREADS + 1] = {0};
+        unsigned char rec[PW_LEN];
+        size_t have = 0;
+        while (ok && got < (long)PW_THREADS * PW_RECORDS) {
+            ssize_t r = read(fd[0], rec + have, sizeof rec - have);
+            if (r <= 0) break;
+            have += (size_t)r;
+            if (have < sizeof rec) continue;
+            have = 0;
+            int v = rec[0];
+            for (int k = 1; k < PW_LEN; k++) if (rec[k] != v) { torn++; break; }
+            if (v >= 1 && v <= PW_THREADS) per[v]++;
+            got++;
+        }
+        long bad = 0;
+        for (int i = 0; ok && i < PW_THREADS; i++) { void *rv; pthread_join(th[i], &rv); if (rv) bad++; }
+        for (int i = 1; i <= PW_THREADS; i++) if (per[i] != PW_RECORDS) bad++;
+        if (ok) { close(fd[0]); close(fd[1]); }
+        fprintf(stderr, "[forktest] pipe: %ld records, %ld torn, %ld bad\n", got, torn, bad);
+        check(ok && got == (long)PW_THREADS * PW_RECORDS && torn == 0 && bad == 0,
+              "pipe: 4 writer threads, every 100-byte record whole");
+    }
+    {   /* eventfd: 4 threads add 5000 each */
+        g_ev_fd = eventfd(0, 0);
+        pthread_t th[4];
+        for (long i = 0; i < 4; i++) pthread_create(&th[i], NULL, ev_adder, NULL);
+        for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
+        uint64_t sum = 0;
+        check(g_ev_fd >= 0 && read(g_ev_fd, &sum, 8) == 8 && sum == 20000, "eventfd: 4 threads, the sum adds up");
+        if (g_ev_fd >= 0) close(g_ev_fd);
+    }
+    {   /* a reader asleep on an empty pipe gets EOF when another thread
+           closes the write end */
+        int fd[2];
+        pthread_t th;
+        int ok = pipe(fd) == 0;
+        g_pp_wfd = fd[1];
+        if (ok) pthread_create(&th, NULL, late_closer, NULL);
+        char c;
+        long t0 = now_ms();
+        ssize_t r = ok ? read(fd[0], &c, 1) : -1;
+        long dt = now_ms() - t0;
+        if (ok) { pthread_join(th, NULL); close(fd[0]); }
+        check(r == 0 && dt < 1500, "pipe: closing the write end wakes a sleeping reader (EOF)");
+    }
+    {   /* poll() on a pipe, fed one byte at a time from another thread:
+           every wake-up arrives (no poll sleeps out its timeout) */
+        int fd[2];
+        pthread_t th;
+        int ok = pipe(fd) == 0;
+        g_pollw_fd = fd[1];
+        if (ok) pthread_create(&th, NULL, poll_feeder, NULL);
+        long got = 0, stalls = 0;
+        while (ok && got < 2000) {
+            struct pollfd pf = { fd[0], POLLIN, 0 };
+            long t0 = now_ms();
+            int n = poll(&pf, 1, 3000);
+            if (now_ms() - t0 > 1000) stalls++;
+            if (n <= 0) break;
+            char buf[64];
+            ssize_t r = read(fd[0], buf, sizeof buf);
+            if (r <= 0) break;
+            got += r;
+        }
+        if (ok) { pthread_join(th, NULL); close(fd[0]); close(fd[1]); }
+        check(got == 2000 && stalls == 0, "poll: a pipe written by another thread, no wake-up lost");
     }
     {   /* the clock: monotonic, finer than a millisecond */
         struct timespec a, b;

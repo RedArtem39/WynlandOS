@@ -29,6 +29,25 @@ int64_t waitqueue_wait(WaitQueue *q, uint64_t deadline);
 /* Same, with the deadline on the 1 kHz timer_get_ms() clock. */
 int64_t waitqueue_wait_ms(WaitQueue *q, uint64_t deadline_ms);
 
+/* Every waitqueue_wake_all() anywhere counts one up. A waiter that reads
+   it before looking at its condition (poll() over many fds) passes it to
+   waitqueue_wait_ms_seq(), which does not sleep if a wake-up came in
+   between -- a waker running outside the big kernel lock is not missed. */
+uint64_t waitqueue_seq(void);
+int64_t waitqueue_wait_ms_seq(WaitQueue *q, uint64_t deadline_ms, uint64_t seq);
+
+/* For a condition under a spinlock of the caller's (a pipe's): called with
+   `held` locked, which is let go once the thread is on `q` (and taken
+   again by nobody: the caller locks anew after). A waker that changes the
+   condition under `held` and then calls waitqueue_wake_all() is never
+   missed. */
+struct Spinlock;
+int64_t waitqueue_wait_locked(WaitQueue *q, uint64_t deadline_ms, struct Spinlock *held);
+
+/* The lists' lock (the reaper unlinks a killed thread under it) */
+uint64_t waitqueue_lock_irqsave(void);
+void waitqueue_unlock_irqrestore(uint64_t flags);
+
 /* Wakes every thread currently parked on `q`. Safe to call from a normal
    thread (producer just wrote/read something) or from interrupt context
    (net_poll() driven off the timer tick, Phase 22d) -- it only flips

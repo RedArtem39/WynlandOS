@@ -231,3 +231,7 @@ int64_t sched_sleep_ms_intr(uint64_t ms);
    sched_sleep_ms_intr(). */
 struct Spinlock;
 int64_t sched_block_unlock(void *wq, uint64_t wake_deadline, struct Spinlock *l);
+/* The same with both deadlines (100 Hz ticks, 1 kHz ms; SCHED_NO_DEADLINE
+   for none), and the signal check only when intr. */
+int64_t sched_block_unlock_ex(void *wq, uint64_t wake_deadline, uint64_t wake_deadline_ms,
+                              struct Spinlock *l, bool intr);

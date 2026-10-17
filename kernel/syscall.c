@@ -6,6 +6,7 @@
 #include <wynland/hda.h>
 #include <wynland/vmm.h>
 #include <wynland/smp.h>
+#include <wynland/spinlock.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
 #include <wynland/heap.h>
@@ -219,11 +220,28 @@ typedef struct {
     bool     is_eventfd;
     bool     ev_semaphore;   /* EFD_SEMAPHORE: read takes 1, not all */
     uint64_t evcount;
+    /* Outside the big kernel lock (read()/write() on a pipe or eventfd, see
+       pipe_fast() below): the buffer, counter and readers/writers are under
+       `lock`; `users` counts the reads and writes in progress, which hold
+       the KPipe (not the fd: it may be closed meanwhile). The last close
+       with users left only marks it `dead`; the last user frees it. */
+    Spinlock lock;
+    uint32_t users;
+    bool     dead;
 } KPipe;
 
 #define EVENTFD_MAX 0xFFFFFFFFFFFFFFFEULL
 
 static KPipe *g_pipes[MAX_PIPES];
+/* g_pipes[] slots, and the users/readers/writers counts of each KPipe
+   (readers/writers also under the KPipe's lock: a reader sleeping for data
+   must see the last writer go). Order: g_pipe_lock -> KPipe.lock. */
+static Spinlock g_pipe_lock = SPINLOCK_INIT("pipes");
+/* A reader of fd tables outside the big lock (pipe_fast()) looks a slot up
+   and takes what it needs under this; whoever empties a slot does so before
+   kfile_close(), which passes through this lock before freeing the wrapper
+   -- a reader that saw the old pointer is done with it by then. */
+static Spinlock g_fdtab_lock = SPINLOCK_INIT("fd tables");
 
 /* Shared-memory segments -- Zerp's pixel transport. Mirrors the KPipe/
    g_pipes[] pattern exactly: a fixed global table, fd sentinel dispatch,
@@ -295,25 +313,40 @@ static uint64_t sleep_eintr(uint64_t rem_uaddr, uint64_t end_ms) {
     return (uint64_t)-4; /* -EINTR */
 }
 
-static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
-    const uint8_t *src = (const uint8_t *)buf;
-    /* POSIX PIPE_BUF atomicity: a write of <= PIPE_BUF_SIZE bytes waits
-       until it fits WHOLE. Writing whatever fits would split fixed-size
-       records (Zerp's 20-byte messages don't divide 4096) and desync
-       every reader that parses them. Larger writes may still be split. */
+extern uint64_t timer_get_ms(void);
+
+/* The pipe's buffer and counter are under pipe->lock; user memory is
+   copied outside it (a copy may fault, and a fault may sleep), through a
+   bounce buffer of one pipe's size. */
+
+/* Write up to PIPE_BUF_SIZE bytes of the user's `ubuf`. POSIX PIPE_BUF
+   atomicity: a write of <= PIPE_BUF_SIZE bytes waits until it fits WHOLE.
+   Writing whatever fits would split fixed-size records (Zerp's 20-byte
+   messages don't divide 4096) and desync every reader that parses them.
+   Larger writes may still be split. Bytes written, -EPIPE (no reader
+   left), -EAGAIN (nonblock, no room), -EFAULT, -EINTR (dying). */
+static int64_t pipe_write(KPipe *pipe, uint64_t ubuf, uint32_t size, bool nonblock) {
+    uint8_t bounce[PIPE_BUF_SIZE];
+    uint32_t len = size > PIPE_BUF_SIZE ? PIPE_BUF_SIZE : size;
+    if (copy_from_user(bounce, (const void *)ubuf, len) != 0) return -14;
     uint32_t need = size <= PIPE_BUF_SIZE ? size : 1;
+    uint64_t f = spin_lock_irqsave(&pipe->lock);
     while (PIPE_BUF_SIZE - pipe->count < need) {
-        if (pipe->is_pipe && pipe->readers == 0) return 0; /* caller: EPIPE */
-        if (sched_dying()) return 0;
-        waitqueue_wait(&pipe->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+        if (pipe->is_pipe && pipe->readers == 0) { spin_unlock_irqrestore(&pipe->lock, f); return -32; }
+        if (nonblock) { spin_unlock_irqrestore(&pipe->lock, f); return -11; }
+        if (sched_dying()) { spin_unlock_irqrestore(&pipe->lock, f); return -4; }
+        waitqueue_wait_locked(&pipe->write_wq, timer_get_ms() + PIPE_WAIT_RETRY_TICKS * 10, &pipe->lock);
+        spin_lock(&pipe->lock);
     }
+    if (pipe->is_pipe && pipe->readers == 0) { spin_unlock_irqrestore(&pipe->lock, f); return -32; }
     uint32_t written = 0;
-    while (written < size && pipe->count < PIPE_BUF_SIZE) {
-        pipe->buffer[pipe->tail] = src[written];
+    while (written < len && pipe->count < PIPE_BUF_SIZE) {
+        pipe->buffer[pipe->tail] = bounce[written];
         pipe->tail = (pipe->tail + 1) % PIPE_BUF_SIZE;
         pipe->count++;
         written++;
     }
+    spin_unlock_irqrestore(&pipe->lock, f);
     if (written > 0) {
         waitqueue_wake_all(&pipe->read_wq);
         waitqueue_wake_all(&g_poll_any_wq);
@@ -321,25 +354,125 @@ static uint32_t pipe_write(KPipe *pipe, const void *buf, uint32_t size) {
     return written;
 }
 
-static uint32_t pipe_read(KPipe *pipe, void *buf, uint32_t size) {
-    uint8_t *dst = (uint8_t *)buf;
+/* Read up to `size` bytes into the user's `ubuf`. Bytes read, 0 at EOF (no
+   writer left), -EAGAIN (nonblock, empty), -EFAULT (what was taken is
+   lost, as on Linux), -EINTR (dying). */
+static int64_t pipe_read(KPipe *pipe, uint64_t ubuf, uint32_t size, bool nonblock) {
+    uint8_t bounce[PIPE_BUF_SIZE];
+    if (size > PIPE_BUF_SIZE) size = PIPE_BUF_SIZE;
+    uint64_t f = spin_lock_irqsave(&pipe->lock);
     while (pipe->count == 0) {
-        if (pipe->is_pipe && pipe->writers == 0) return 0; /* EOF */
-        if (sched_dying()) return 0;
-        waitqueue_wait(&pipe->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
+        if (pipe->is_pipe && pipe->writers == 0) { spin_unlock_irqrestore(&pipe->lock, f); return 0; } /* EOF */
+        if (nonblock) { spin_unlock_irqrestore(&pipe->lock, f); return -11; }
+        if (sched_dying()) { spin_unlock_irqrestore(&pipe->lock, f); return -4; }
+        waitqueue_wait_locked(&pipe->read_wq, timer_get_ms() + PIPE_WAIT_RETRY_TICKS * 10, &pipe->lock);
+        spin_lock(&pipe->lock);
     }
     uint32_t read_bytes = 0;
     while (read_bytes < size && pipe->count > 0) {
-        dst[read_bytes] = pipe->buffer[pipe->head];
+        bounce[read_bytes] = pipe->buffer[pipe->head];
         pipe->head = (pipe->head + 1) % PIPE_BUF_SIZE;
         pipe->count--;
         read_bytes++;
     }
+    spin_unlock_irqrestore(&pipe->lock, f);
     if (read_bytes > 0) {
         waitqueue_wake_all(&pipe->write_wq);
         waitqueue_wake_all(&g_poll_any_wq);
     }
+    if (read_bytes && copy_to_user((void *)ubuf, bounce, read_bytes) != 0) return -14;
     return read_bytes;
+}
+
+/* eventfd: read takes the counter (or 1 of it, EFD_SEMAPHORE), 8 bytes */
+static int64_t eventfd_read(KPipe *kp, uint64_t ubuf, uint64_t len, bool nonblock) {
+    if (len < 8) return -22;                 /* -EINVAL */
+    uint64_t f = spin_lock_irqsave(&kp->lock);
+    while (kp->evcount == 0) {
+        if (nonblock) { spin_unlock_irqrestore(&kp->lock, f); return -11; } /* -EAGAIN */
+        if (sched_dying()) { spin_unlock_irqrestore(&kp->lock, f); return -4; }
+        waitqueue_wait_locked(&kp->read_wq, timer_get_ms() + PIPE_WAIT_RETRY_TICKS * 10, &kp->lock);
+        spin_lock(&kp->lock);
+    }
+    uint64_t v = kp->ev_semaphore ? 1 : kp->evcount;
+    kp->evcount -= v;
+    spin_unlock_irqrestore(&kp->lock, f);
+    waitqueue_wake_all(&kp->write_wq);
+    waitqueue_wake_all(&g_poll_any_wq);
+    if (copy_to_user((void *)ubuf, &v, 8) != 0) return -14;
+    return 8;
+}
+
+/* eventfd: write adds to the counter; blocks only at the very top */
+static int64_t eventfd_write(KPipe *kp, uint64_t ubuf, uint64_t len, bool nonblock) {
+    uint64_t v;
+    if (len < 8) return -22;                 /* -EINVAL */
+    if (copy_from_user(&v, (const void *)ubuf, 8) != 0) return -14;
+    if (v == 0xFFFFFFFFFFFFFFFFULL) return -22;
+    uint64_t f = spin_lock_irqsave(&kp->lock);
+    while (EVENTFD_MAX - kp->evcount < v) {
+        if (nonblock) { spin_unlock_irqrestore(&kp->lock, f); return -11; } /* -EAGAIN */
+        if (sched_dying()) { spin_unlock_irqrestore(&kp->lock, f); return -4; }
+        waitqueue_wait_locked(&kp->write_wq, timer_get_ms() + PIPE_WAIT_RETRY_TICKS * 10, &kp->lock);
+        spin_lock(&kp->lock);
+    }
+    kp->evcount += v;
+    spin_unlock_irqrestore(&kp->lock, f);
+    if (v) {
+        waitqueue_wake_all(&kp->read_wq);
+        waitqueue_wake_all(&g_poll_any_wq);
+    }
+    return 8;
+}
+
+/* One read()/write() on a pipe end or an eventfd, KPipe held (see users) */
+static int64_t kpipe_io(KPipe *kp, uint32_t kind, bool is_write, uint64_t ubuf, uint64_t len, bool nonblock) {
+    if (kp->is_eventfd) {
+        if (kind != 0xFFFFFFFC) return -9;
+        return is_write ? eventfd_write(kp, ubuf, len, nonblock) : eventfd_read(kp, ubuf, len, nonblock);
+    }
+    if (is_write ? kind != 0xFFFFFFFB : kind != 0xFFFFFFFA) return -9;   /* the wrong end: -EBADF */
+    uint32_t n = len > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)len;
+    if (!is_write) return n ? pipe_read(kp, ubuf, n, nonblock) : 0;
+    if (n == 0) return 0;
+    int64_t w = pipe_write(kp, ubuf, n, nonblock);
+    if (w == -32) signal_raise_current(13 /* SIGPIPE */);
+    return w;
+}
+
+/* Done with a KPipe taken by pipe_fast(): the last user of a closed one frees it */
+static void kpipe_put(KPipe *kp) {
+    uint64_t f = spin_lock_irqsave(&g_pipe_lock);
+    bool gone = --kp->users == 0 && kp->dead;
+    spin_unlock_irqrestore(&g_pipe_lock, f);
+    if (gone) kfree(kp);
+}
+
+/* read()/write() on a pipe or an eventfd, outside the big kernel lock
+   (kernel/syscall.c syscall_lock()): the fd is looked up and its KPipe
+   taken under g_fdtab_lock -- nothing else of the fd table is touched.
+   Returns false for any other kind of fd (the caller takes the big lock). */
+static bool pipe_fast(bool is_write, uint64_t fd, uint64_t ubuf, uint64_t len, int64_t *out) {
+    Process *proc = sched_current()->proc;
+    if (!proc || fd >= MAX_OPEN_FILES) return false;
+    uint64_t f = spin_lock_irqsave(&g_fdtab_lock);
+    VfsFile *vf = proc->fd_table[fd];
+    uint32_t kind = vf ? vf->node.first_cluster : 0;
+    if (!vf || (kind != 0xFFFFFFFA && kind != 0xFFFFFFFB && kind != 0xFFFFFFFC) ||
+        vf->current_cluster >= MAX_PIPES) {
+        spin_unlock_irqrestore(&g_fdtab_lock, f);
+        return false;
+    }
+    bool nonblock = (proc->fd_oflags[fd] & LINUX_O_NONBLOCK) != 0;
+    spin_lock(&g_pipe_lock);
+    KPipe *kp = g_pipes[vf->current_cluster];
+    if (kp) kp->users++;
+    spin_unlock(&g_pipe_lock);
+    spin_unlock_irqrestore(&g_fdtab_lock, f);
+    if (!kp) return false;
+    *out = kpipe_io(kp, kind, is_write, ubuf, len, nonblock);
+    kpipe_put(kp);
+    return true;
 }
 
 extern BootInfo *g_boot_info;
@@ -1415,6 +1548,9 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
     uint64_t deadline_ms = (timeout_ms < 0) ? SCHED_NO_DEADLINE : timer_get_ms() + (uint64_t)timeout_ms;
 
     for (;;) {
+        /* read before looking: a wake-up after the look (from a pipe
+           written outside the big lock) keeps the sleep below from starting */
+        uint64_t seq = waitqueue_seq();
         if (fds) {
             for (uint64_t i = 0; i < nfds; i++) fds[i].revents = 0;
         }
@@ -1592,11 +1728,11 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
            sources that don't signal it yet (TCP, PTYs). */
         if (sched_dying() || sleep_interrupted()) return -LNX_EINTR;
         if (single_wq && nfds == 1) {
-            waitqueue_wait_ms(single_wq, sleep_until);
+            waitqueue_wait_ms_seq(single_wq, sleep_until, seq);
         } else {
             uint64_t nap_deadline = now_ms + 50;
             if (sleep_until != SCHED_NO_DEADLINE && nap_deadline > sleep_until) nap_deadline = sleep_until;
-            waitqueue_wait_ms(&g_poll_any_wq, nap_deadline);
+            waitqueue_wait_ms_seq(&g_poll_any_wq, nap_deadline, seq);
         }
     }
 }
@@ -1628,12 +1764,19 @@ void kfile_get(VfsFile *f) {
     else if (IS_DRM_DEV(fc)) drm_client_ref(f->current_cluster);
     else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
              g_pipes[f->current_cluster]) {
+        uint64_t pf = spin_lock_irqsave(&g_pipe_lock);
         KPipe *kp = g_pipes[f->current_cluster];
+        spin_lock(&kp->lock);
         if (fc == 0xFFFFFFFA) kp->readers++; else kp->writers++;
+        spin_unlock(&kp->lock);
+        spin_unlock_irqrestore(&g_pipe_lock, pf);
     }
     else if (fc == 0xFFFFFFFC && f->current_cluster < MAX_PIPES && g_pipes[f->current_cluster] &&
-             g_pipes[f->current_cluster]->is_eventfd)
+             g_pipes[f->current_cluster]->is_eventfd) {
+        uint64_t pf = spin_lock_irqsave(&g_pipe_lock);
         g_pipes[f->current_cluster]->readers++;     /* an eventfd: its fds (see kfile_close()) */
+        spin_unlock_irqrestore(&g_pipe_lock, pf);
+    }
     else if (fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) pty_ref((int)f->current_cluster, fc == PTY_FD_MASTER);
     else if (fc == 0xFFFFFFFD) { /* SHM segment: keep close()'s decrement balanced */
         int seg_idx = (int)f->current_cluster;
@@ -1652,6 +1795,9 @@ VfsFile *kfile_dup(const VfsFile *f) {
 /* Drop one fd's wrapper: the per-type cleanup SYS_close, process teardown
    and discarded SCM_RIGHTS fds all share. Frees f. */
 void kfile_close(VfsFile *f) {
+    /* the slot is empty already: a lock-free reader that saw f is past
+       g_fdtab_lock (and done with f) once this gets it */
+    { uint64_t bf = spin_lock_irqsave(&g_fdtab_lock); spin_unlock_irqrestore(&g_fdtab_lock, bf); }
     uint32_t fc = f->node.first_cluster;
     if (fc == SOCK_FD_TCP) {
         if (f->current_cluster != TCP_FD_NOT_CONNECTED) {
@@ -1692,13 +1838,25 @@ void kfile_close(VfsFile *f) {
     } else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
                g_pipes[f->current_cluster] && g_pipes[f->current_cluster]->is_pipe) {
         uint32_t idx = f->current_cluster;
+        uint64_t pf = spin_lock_irqsave(&g_pipe_lock);
         KPipe *kp = g_pipes[idx];
+        spin_lock(&kp->lock);
         if (fc == 0xFFFFFFFA) { if (kp->readers) kp->readers--; }
         else                  { if (kp->writers) kp->writers--; }
-        kfree(f);
-        if (kp->readers == 0 && kp->writers == 0) {
+        spin_unlock(&kp->lock);
+        bool last = kp->readers == 0 && kp->writers == 0, free_now = false;
+        if (last) {
             g_pipes[idx] = NULL;
+            if (kp->users) kp->dead = true;      /* a read/write in progress frees it */
+            else free_now = true;
+        }
+        spin_unlock_irqrestore(&g_pipe_lock, pf);
+        kfree(f);
+        if (free_now) {
             kfree(kp);
+        } else if (last) {
+            waitqueue_wake_all(&kp->read_wq);    /* (its user holds the KPipe: still there) */
+            waitqueue_wake_all(&kp->write_wq);
         } else {
             /* last writer gone: blocked readers see EOF; last reader gone:
                blocked writers see EPIPE; poll() re-evaluates */
@@ -1717,13 +1875,18 @@ void kfile_close(VfsFile *f) {
            time, and the 256-entry table ran out ("Too many open files in
            system") */
         uint32_t idx = f->current_cluster;
+        uint64_t pf = spin_lock_irqsave(&g_pipe_lock);
         KPipe *kp = g_pipes[idx];
-        kfree(f);
         if (kp->readers) kp->readers--;
+        bool free_now = false;
         if (kp->readers == 0) {
             g_pipes[idx] = NULL;
-            kfree(kp);
+            if (kp->users) kp->dead = true;
+            else free_now = true;
         }
+        spin_unlock_irqrestore(&g_pipe_lock, pf);
+        kfree(f);
+        if (free_now) kfree(kp);
     } else if (fc == 0xFFFFFFFA || fc == 0xFFFFFFFB || fc == 0xFFFFFFFC) {
         /* what is left of the old sentinels: only the wrapper to free */
         kfree(f);
@@ -2127,6 +2290,8 @@ static void lockfree_init(void)
         96,   /* gettimeofday */
         201,  /* time */
         202,  /* futex (its own lock: kernel/futex.c) */
+        0,    /* read, write: on a pipe or an eventfd (pipe_fast()); */
+        1,    /*   anything else takes the big lock there */
         228,  /* clock_gettime */
         229,  /* clock_getres */
         230,  /* clock_nanosleep */
@@ -2224,6 +2389,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                all of them instead of validating only the first path taken.
                Real read(fd, NULL, n>0) is -EFAULT, not the old silent
                "return 0". */
+            {   /* a pipe or an eventfd: outside the big lock */
+                int64_t pr;
+                if (pipe_fast(false, a1, a2, a3, &pr)) return (uint64_t)pr;
+                bkl_lock();
+            }
             if (a3 != 0 && !user_prepare_write(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
             }
@@ -2340,26 +2510,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                        client's pipe each frame) depend on this -- without
                        it one quiet client parked the whole compositor. */
                     KPipe *kp = g_pipes[pipe_idx];
-                    if (kp->is_eventfd) {
-                        /* the counter (or 1 of it, EFD_SEMAPHORE), 8 bytes */
-                        if (a3 < 8) return (uint64_t)-22;                 /* -EINVAL */
-                        while (kp->evcount == 0) {
-                            if (fd_oflags[a1] & LINUX_O_NONBLOCK) return (uint64_t)-11; /* -EAGAIN */
-                            if (sched_dying()) return (uint64_t)-LNX_EINTR;
-                            waitqueue_wait(&kp->read_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
-                        }
-                        uint64_t v = kp->ev_semaphore ? 1 : kp->evcount;
-                        if (copy_to_user((void *)a2, &v, 8) != 0) return (uint64_t)-14;
-                        kp->evcount -= v;
-                        waitqueue_wake_all(&kp->write_wq);
-                        waitqueue_wake_all(&g_poll_any_wq);
-                        return 8;
-                    }
-                    if (kp->count == 0 && kp->is_pipe && kp->writers == 0) return 0; /* EOF */
-                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && kp->count == 0) {
-                        return (uint64_t)-11; /* -EAGAIN */
-                    }
-                    return pipe_read(kp, (void *)a2, (uint32_t)a3);
+                    return (uint64_t)kpipe_io(kp, fd_table[a1]->node.first_cluster, false, a2, a3,
+                                              (fd_oflags[a1] & LINUX_O_NONBLOCK) != 0);
                 }
                 return (uint64_t)-1;
             }
@@ -2394,6 +2546,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             /* Mirrors SYS_read's guard above: every branch below reads at
                most a3 bytes FROM a2 (console/serial, pipe_write/tcp_send/
                udp_socket_sendto/pty_ring_write, vfs_write() fallback). */
+            {   /* a pipe or an eventfd: outside the big lock */
+                int64_t pr;
+                if (pipe_fast(true, a1, a2, a3, &pr)) return (uint64_t)pr;
+                bkl_lock();
+            }
             if (a3 != 0 && !user_check_read(a2, a3)) {
                 return (uint64_t)-14; /* -EFAULT */
             }
@@ -2437,40 +2594,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                        IF=0 (SFMASK) and pipe_write() only sleeps when it
                        can't proceed, which these checks rule out. */
                     KPipe *kp = g_pipes[pipe_idx];
-                    if (kp->is_eventfd) {
-                        /* adds to the counter; blocks only at the very top */
-                        uint64_t v;
-                        if (a3 < 8) return (uint64_t)-22;                 /* -EINVAL */
-                        if (copy_from_user(&v, (const void *)a2, 8) != 0) return (uint64_t)-14;
-                        if (v == 0xFFFFFFFFFFFFFFFFULL) return (uint64_t)-22;
-                        while (EVENTFD_MAX - kp->evcount < v) {
-                            if (fd_oflags[a1] & LINUX_O_NONBLOCK) return (uint64_t)-11; /* -EAGAIN */
-                            if (sched_dying()) return (uint64_t)-LNX_EINTR;
-                            waitqueue_wait(&kp->write_wq, timer_get_ticks() + PIPE_WAIT_RETRY_TICKS);
-                        }
-                        kp->evcount += v;
-                        if (v) {
-                            waitqueue_wake_all(&kp->read_wq);
-                            waitqueue_wake_all(&g_poll_any_wq);
-                        }
-                        return 8;
-                    }
-                    if (a3 == 0) return 0;
-                    if (kp->is_pipe && kp->readers == 0) {
-                        signal_raise_current(13 /* SIGPIPE */);
-                        return (uint64_t)-32; /* -EPIPE */
-                    }
-                    uint32_t len = a3 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)a3;
-                    uint32_t want = len <= PIPE_BUF_SIZE ? len : 1;
-                    if ((fd_oflags[a1] & LINUX_O_NONBLOCK) && PIPE_BUF_SIZE - kp->count < want) {
-                        return (uint64_t)-11; /* -EAGAIN */
-                    }
-                    uint32_t w = pipe_write(kp, (const void *)a2, len);
-                    if (w == 0 && kp->is_pipe && kp->readers == 0) {
-                        signal_raise_current(13 /* SIGPIPE */);
-                        return (uint64_t)-32; /* -EPIPE */
-                    }
-                    return w;
+                    return (uint64_t)kpipe_io(kp, fd_table[a1]->node.first_cluster, true, a2, a3,
+                                              (fd_oflags[a1] & LINUX_O_NONBLOCK) != 0);
                 }
                 return (uint64_t)-1;
             }
@@ -3120,6 +3245,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
                 // Register pipe
                 int p_idx = -1;
+                spin_init(&p->lock, "pipe");
+                uint64_t pf = spin_lock_irqsave(&g_pipe_lock);
                 for (int i = 0; i < MAX_PIPES; i++) {
                     if (g_pipes[i] == NULL) {
                         g_pipes[i] = p;
@@ -3127,6 +3254,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         break;
                     }
                 }
+                spin_unlock_irqrestore(&g_pipe_lock, pf);
                 if (p_idx == -1) {
                     kfree(p);
                     return (uint64_t)-23; /* -ENFILE */
@@ -3265,6 +3393,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 p->evcount = (uint32_t)initval;
 
                 int p_idx = -1;
+                spin_init(&p->lock, "eventfd");
+                uint64_t pf = spin_lock_irqsave(&g_pipe_lock);
                 for (int i = 0; i < MAX_PIPES; i++) {
                     if (g_pipes[i] == NULL) {
                         g_pipes[i] = p;
@@ -3272,6 +3402,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         break;
                     }
                 }
+                spin_unlock_irqrestore(&g_pipe_lock, pf);
                 if (p_idx == -1) {
                     kfree(p);
                     return (uint64_t)-23; /* -ENFILE */
@@ -4377,7 +4508,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 int fm = pty_new_fd(fd_table, fd_flags, fd_oflags, idx, true, 0);
                 if (fm < 0) { pty_ref(idx, true); pty_unref(idx, true); return (uint64_t)(int64_t)fm; }
                 int fs = pty_new_fd(fd_table, fd_flags, fd_oflags, idx, false, 0);
-                if (fs < 0) { kfile_close(fd_table[fm]); fd_table[fm] = NULL; return (uint64_t)(int64_t)fs; }
+                if (fs < 0) { VfsFile *mf = fd_table[fm]; fd_table[fm] = NULL; kfile_close(mf); return (uint64_t)(int64_t)fs; }
                 ptyfd[0] = fm;
                 ptyfd[1] = fs;
                 return 0;
@@ -6757,6 +6888,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 struct epoll_event out[MAX_EPOLL_EVENTS];
                 int64_t got;
                 for (;;) {
+                    uint64_t seq = waitqueue_seq();   /* see do_poll() */
                     got = epoll_collect(inst, fd_table, out, maxevents);
                     if (got > 0 || timeout_ms == 0) break;
                     uint64_t now = timer_get_ms();
@@ -6766,7 +6898,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                        wakes this queue; the nap bounds the rest (TCP, PTYs) */
                     uint64_t nap = now + 50;
                     if (deadline != SCHED_NO_DEADLINE && nap > deadline) nap = deadline;
-                    waitqueue_wait_ms(&g_poll_any_wq, nap);
+                    waitqueue_wait_ms_seq(&g_poll_any_wq, nap, seq);
                 }
                 if (--inst->refs == 0) inst->num_watches = 0;
                 if (me) wait_mask_end(got);

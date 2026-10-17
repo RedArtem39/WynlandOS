@@ -2,6 +2,7 @@
  * WynlandOS - Kernel Heap Allocator Implementation
  */
 
+#include <wynland/spinlock.h>
 #include <wynland/heap.h>
 #include <wynland/pmm.h>
 #include <wynland/vmm.h>
@@ -142,6 +143,12 @@ static const uint16_t g_small_size[] = { 16, 32, 48, 64, 80, 96, 128, 160, 192, 
 static HeapHeader *g_small_free[SMALL_CLASSES];   /* linked through ->next */
 
 static void *kmalloc_general(size_t size);
+static void *kmalloc_general_locked(size_t size);
+
+/* The whole heap -- block list and size-class lists: callers run on
+   several cores, some outside the big kernel lock. Taken with interrupts
+   off; heap_grow() under it takes the pmm's lock (heap -> pmm). */
+static Spinlock g_heap_lock = SPINLOCK_INIT("heap");
 
 static int small_class(size_t size)
 {
@@ -156,11 +163,10 @@ void *kmalloc(size_t size)
     int c = small_class(size);
     if (c < 0) return kmalloc_general(size);
 
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_heap_lock);
     if (!g_small_free[c]) {
         /* a chunk of objects of this class */
-        uint8_t *chunk = (uint8_t *)kmalloc_general(SMALL_CHUNK);
+        uint8_t *chunk = (uint8_t *)kmalloc_general_locked(SMALL_CHUNK);
         if (chunk) {
             size_t stride = sizeof(HeapHeader) + g_small_size[c];
             for (size_t off = 0; off + stride <= SMALL_CHUNK; off += stride) {
@@ -183,18 +189,24 @@ void *kmalloc(size_t size)
         h->magic = HEAP_MAGIC_SMALL;
         result = (void *)((uintptr_t)h + sizeof(HeapHeader));
     }
-    if (rflags & 0x200) __asm__ volatile("sti");
+    spin_unlock_irqrestore(&g_heap_lock, rflags);
     return result;
 }
 
 static void *kmalloc_general(size_t size)
 {
+    if (size == 0) return NULL;
+    uint64_t rflags = spin_lock_irqsave(&g_heap_lock);
+    void *r = kmalloc_general_locked(size);
+    spin_unlock_irqrestore(&g_heap_lock, rflags);
+    return r;
+}
+
+static void *kmalloc_general_locked(size_t size)
+{
     if (size == 0) {
         return NULL;
     }
-
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
 
     void *result = NULL;
     size_t aligned_size = align_up(size);
@@ -256,16 +268,12 @@ static void *kmalloc_general(size_t size)
     result = (void *)((uintptr_t)curr + sizeof(HeapHeader));
 
 cleanup:
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
     return result;
 }
 
 void kfree(void *ptr)
 {
-    uint64_t rflags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags));
+    uint64_t rflags = spin_lock_irqsave(&g_heap_lock);
 
     if (ptr != NULL) {
         HeapHeader *block = (HeapHeader *)((uintptr_t)ptr - sizeof(HeapHeader));
@@ -296,9 +304,7 @@ void kfree(void *ptr)
         }
     }
 
-    if (rflags & 0x200) {
-        __asm__ volatile("sti");
-    }
+    spin_unlock_irqrestore(&g_heap_lock, rflags);
 }
 
 size_t heap_get_used_memory(void)
