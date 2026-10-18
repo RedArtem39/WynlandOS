@@ -18,7 +18,12 @@
  */
 
 extern "C" {
-void zerp_qpa_capture_args(int argc, char **argv);
+/* how many of argv[1..] were Zerp's fd numbers: 3, or 0 (not started by
+   Zerp -- a key binding's `exec`, a shell) */
+int  zerp_qpa_capture_args(int argc, char **argv);
+/* the platform plugin to use: ours with Zerp's fds, else Wayland when a
+   compositor is there (Zerp 2.0's session), else ours */
+const char *zerp_qpa_platform();
 int  zerp_qpa_c2s_fd();
 int  zerp_qpa_s2c_fd();
 int  zerp_qpa_shm_fd();

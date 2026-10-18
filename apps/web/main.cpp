@@ -337,8 +337,8 @@ void WebView::focusOutEvent(QFocusEvent *e) { QQuickPaintedItem::focusOutEvent(e
 
 int main(int argc, char **argv)
 {
-    zerp_qpa_capture_args(argc, argv);
-    qputenv("QT_QPA_PLATFORM", "qwynlandfb");
+    const int zerpArgs = zerp_qpa_capture_args(argc, argv);   // Zerp's fds first, when it started us
+    qputenv("QT_QPA_PLATFORM", zerp_qpa_platform());
     qputenv("QT_QUICK_BACKEND", "software");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     if (!qEnvironmentVariableIsSet("FONTCONFIG_FILE"))
@@ -371,10 +371,10 @@ int main(int argc, char **argv)
     qmlRegisterType<WebView>("Wynland.Web", 1, 0, "WebView");
     QQmlApplicationEngine engine;
     engine.addImportPath(QStringLiteral("/usr/lib/x86_64-linux-gnu/qt6/qml"));
-    // the first tabs: argv[4..], else boot.cfg's "weburls=a b c" (a debugging
+    // the first tabs: the arguments after Zerp's fds, else boot.cfg's "weburls=a b c" (a debugging
     // aid, as for wpetest), else the home page
     QStringList urls;
-    for (int i = 4; i < argc; i++) urls << QString::fromLocal8Bit(argv[i]);
+    for (int i = 1 + zerpArgs; i < argc; i++) urls << QString::fromLocal8Bit(argv[i]);
     if (urls.isEmpty()) {
         QFile cfg(QStringLiteral("/etc/wynland/boot.cfg"));
         if (cfg.open(QIODevice::ReadOnly))

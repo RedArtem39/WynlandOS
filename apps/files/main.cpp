@@ -265,8 +265,8 @@ bool Fs::spawn(const QString &path)
 
 int main(int argc, char **argv)
 {
-    zerp_qpa_capture_args(argc, argv);
-    qputenv("QT_QPA_PLATFORM", "qwynlandfb");
+    const int zerpArgs = zerp_qpa_capture_args(argc, argv);   // Zerp's fds first, when it started us
+    qputenv("QT_QPA_PLATFORM", zerp_qpa_platform());
     qputenv("QT_QUICK_BACKEND", "software");
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     if (!qEnvironmentVariableIsSet("FONTCONFIG_FILE"))
@@ -280,7 +280,7 @@ int main(int argc, char **argv)
     engine.addImportPath(QStringLiteral("/usr/lib/x86_64-linux-gnu/qt6/qml"));
     engine.rootContext()->setContextProperty(QStringLiteral("fs"), &fs);
     engine.rootContext()->setContextProperty(QStringLiteral("startDir"),
-        argc > 4 ? QString::fromLocal8Bit(argv[4]) : fs.home());
+        argc > 1 + zerpArgs ? QString::fromLocal8Bit(argv[1 + zerpArgs]) : fs.home());
     QObject::connect(&engine, &QQmlApplicationEngine::warnings, [](const QList<QQmlError> &ws) {
         for (const QQmlError &w : ws) fprintf(stderr, "[files] %s\n", qPrintable(w.toString()));
     });

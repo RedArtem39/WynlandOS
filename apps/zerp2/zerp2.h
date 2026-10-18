@@ -173,6 +173,10 @@ public:
     // command line, the session's environment
     Q_INVOKABLE bool run(const QString &command);
     Q_INVOKABLE void logout() { QCoreApplication::quit(); }   // the session ends: wynlogin shows the login screen
+    // the session starts again, no password asked (a new screen mode:
+    // resolution(1)); the exit status wynlogin knows (apps/accounts/wynlogin.c)
+    static constexpr int kRestartExit = 3;
+    Q_INVOKABLE void restartSession() { QCoreApplication::exit(kRestartExit); }
     Q_INVOKABLE void focus(QObject *client);
     Q_INVOKABLE void closeFocused();
     Q_INVOKABLE void moveFocusedTo(int workspace);

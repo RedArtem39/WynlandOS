@@ -324,6 +324,51 @@ static QByteArray bootCfg()
     return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
 }
 
+// The screen mode chosen with resolution(1): "mode = WxH" in the user's
+// ~/.config/wynland/display.conf, else the machine's /etc/wynland/
+// display.conf (the login screen: only that one). Empty: the connector's
+// preferred mode (the boot size).
+static QByteArray displayMode(bool greeter)
+{
+    QStringList files;
+    if (!greeter) files << QString::fromLocal8Bit(qgetenv("HOME")) + QStringLiteral("/.config/wynland/display.conf");
+    files << QStringLiteral("/etc/wynland/display.conf");
+    for (const QString &path : files) {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) continue;
+        for (const QByteArray &raw : f.readAll().split('\n')) {
+            const QByteArray line = raw.trimmed();
+            if (!line.startsWith("mode")) continue;
+            const int eq = line.indexOf('=');
+            if (eq < 0) continue;
+            const QByteArray v = line.mid(eq + 1).trimmed();
+            const QList<QByteArray> wh = v.split('x');
+            if (wh.size() == 2 && wh[0].toInt() > 0 && wh[1].toInt() > 0) return v;
+        }
+        return QByteArray();   // the user's file without a mode: the boot size
+    }
+    return QByteArray();
+}
+
+// eglfs's KMS configuration (/usr/share/zerp2/kms.json), with that mode
+// for the one output (Qt names it Virtual1: virtio-gpu's connector), in
+// the session's runtime directory
+static QByteArray kmsConfig(const QByteArray &mode)
+{
+    const QByteArray base = "/usr/share/zerp2/kms.json";
+    if (mode.isEmpty()) return base;
+    QFile in(QString::fromLatin1(base));
+    if (!in.open(QIODevice::ReadOnly)) return base;
+    QByteArray json = in.readAll().trimmed();
+    if (!json.endsWith('}')) return base;
+    json.chop(1);
+    json += ",\n    \"outputs\": [ { \"name\": \"Virtual1\", \"mode\": \"" + mode + "\" } ]\n}\n";
+    const QByteArray path = qgetenv("XDG_RUNTIME_DIR") + "/zerp2-kms.json";
+    QFile out(QString::fromLocal8Bit(path));
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(json) != json.size()) return base;
+    return path;
+}
+
 int main(int argc, char **argv)
 {
     g_kbdFd = inputFd("WYNLAND_KBD_FD", "/dev/input/kbd");
@@ -332,7 +377,6 @@ int main(int argc, char **argv)
             g_miceFd >= 0 ? "ok" : "MISSING");
     qputenv("QT_QPA_PLATFORM", "eglfs");
     qputenv("QT_QPA_EGLFS_INTEGRATION", "eglfs_kms");
-    qputenv("QT_QPA_EGLFS_KMS_CONFIG", "/usr/share/zerp2/kms.json");
     qputenv("QT_QPA_EGLFS_KMS_ATOMIC", "0");
     qputenv("QT_QPA_EGLFS_DISABLE_INPUT", "1");   // no evdev here -- InputPump instead
     qputenv("QT_QPA_EGLFS_HIDECURSOR", "1");      // the GPU cursor plane is the pointer
@@ -364,6 +408,8 @@ int main(int argc, char **argv)
     const int greeterReq = greeterMode ? atoi(argv[2]) : -1;
     const int greeterRep = greeterMode ? atoi(argv[3]) : -1;
     const bool firstBoot = greeterMode && argc >= 5 && !strcmp(argv[4], "--first");
+    const QByteArray mode = displayMode(greeterMode);
+    qputenv("QT_QPA_EGLFS_KMS_CONFIG", kmsConfig(mode));
 
     QGuiApplication app(argc, argv);
     qmlRegisterType<ZSurface>("Zerp", 1, 0, "ZSurface");
@@ -372,6 +418,9 @@ int main(int argc, char **argv)
     qmlRegisterType<ZGlobalShortcutsQuickExtension>("Zerp", 1, 0, "GlobalShortcuts");
     qmlRegisterUncreatableType<ZLayerSurface>("Zerp", 1, 0, "LayerSurface", QStringLiteral("made by the layer shell"));
     const QSize scr = app.primaryScreen() ? app.primaryScreen()->size() : QSize(1920, 1080);
+    fprintf(stderr, "[zerp2] screen %s %dx%d (mode %s)\n",
+            app.primaryScreen() ? qPrintable(app.primaryScreen()->name()) : "?", scr.width(), scr.height(),
+            mode.isEmpty() ? "preferred" : mode.constData());
     ZServer server(uint32_t(scr.width()) * uint32_t(scr.height()) * 4u);
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("zerp"), &server);
@@ -559,5 +608,12 @@ int main(int argc, char **argv)
         else
             QTimer::singleShot(snapAt * 1000, win, snapshot);
     }
-    return app.exec();
+    const int rc = app.exec();
+    fprintf(stderr, "[zerp2] session ends (status %d)\n", rc);
+    // no teardown: QtWaylandCompositor's destructors crashed with clients
+    // still connected (and the status -- a restart asked for -- was lost
+    // to the signal). Nothing is left to save; the kernel gives the
+    // screen back to the console when the DRM fd closes.
+    fflush(nullptr);
+    ::_exit(rc);
 }

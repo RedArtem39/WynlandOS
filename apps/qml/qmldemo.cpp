@@ -22,8 +22,8 @@ Q_IMPORT_PLUGIN(QWynlandFbIntegrationPlugin)
 
 int main(int argc, char **argv)
 {
-    zerp_qpa_capture_args(argc, argv);
-    qputenv("QT_QPA_PLATFORM", "qwynlandfb");
+    const int zerpArgs = zerp_qpa_capture_args(argc, argv);   // Zerp's fds first, when it started us
+    qputenv("QT_QPA_PLATFORM", zerp_qpa_platform());
     qputenv("QT_QUICK_BACKEND", "software");   // no GL in the plugin yet
     qputenv("QT_QUICK_CONTROLS_STYLE", "Basic");
     if (!qEnvironmentVariableIsSet("FONTCONFIG_FILE"))
@@ -33,7 +33,7 @@ int main(int argc, char **argv)
 
     QGuiApplication app(argc, argv);
 
-    const QString file = argc > 4 ? QString::fromLocal8Bit(argv[4])
+    const QString file = argc > 1 + zerpArgs ? QString::fromLocal8Bit(argv[1 + zerpArgs])
                                   : QStringLiteral("/usr/share/zerp/qml/demo.qml");
     QQmlApplicationEngine engine;
     /* Ubuntu's QML module tree. Qt derives it from its install prefix,

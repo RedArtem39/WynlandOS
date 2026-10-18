@@ -391,13 +391,14 @@ private:
 
 int main(int argc, char **argv)
 {
+    // (Zerp's fd numbers first, when Zerp started it)
+    const int zerpArgs = zerp_qpa_capture_args(argc, argv);
     // what to run in it: after -e, or the arguments themselves (no options of ours)
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-e")) { g_cmd = argv + i + 1; break; }
+    for (int i = 1 + zerpArgs; i < argc; i++) {
+        if (!strcmp(argv[i], "-e")) { if (argv[i + 1]) g_cmd = argv + i + 1; break; }
         if (argv[i][0] != '-') { g_cmd = argv + i; break; }
     }
-    zerp_qpa_capture_args(argc, argv);
-    qputenv("QT_QPA_PLATFORM", "qwynlandfb");
+    qputenv("QT_QPA_PLATFORM", zerp_qpa_platform());
     if (!qEnvironmentVariableIsSet("FONTCONFIG_FILE"))
         qputenv("FONTCONFIG_FILE", "/etc/fonts/fonts.conf");
     signal(SIGPIPE, SIG_IGN);

@@ -33,6 +33,7 @@ static const uint8_t cursor_mask[19][18] = {
 static BootInfo *g_boot_info = NULL;
 static int32_t mouse_x = 0;
 static int32_t mouse_y = 0;
+static int32_t bound_w = 1, bound_h = 1;   /* mouse_set_bounds() */
 static uint8_t mouse_buttons = 0;
 static bool mouse_has_wheel = false;   /* IntelliMouse: 4-byte packets */
 static int8_t mouse_wheel = 0;         /* this packet's wheel delta */
@@ -208,6 +209,8 @@ void mouse_init(BootInfo *info)
     g_boot_info = info;
     mouse_x = info->fb_width / 2;
     mouse_y = info->fb_height / 2;
+    bound_w = (int32_t)info->fb_width;
+    bound_h = (int32_t)info->fb_height;
     mouse_buttons = 0;
     cursor_visible = false;
 
@@ -391,9 +394,9 @@ void mouse_handle_interrupt(uint8_t data)
             int32_t new_y = mouse_y - rel_y;
 
             if (new_x < 0) new_x = 0;
-            if (new_x >= (int32_t)g_boot_info->fb_width) new_x = g_boot_info->fb_width - 1;
+            if (new_x >= bound_w) new_x = bound_w - 1;
             if (new_y < 0) new_y = 0;
-            if (new_y >= (int32_t)g_boot_info->fb_height) new_y = g_boot_info->fb_height - 1;
+            if (new_y >= bound_h) new_y = bound_h - 1;
 
             if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons) || mouse_wheel) {
                 mouse_hide();
@@ -421,6 +424,16 @@ void mouse_handle_interrupt(uint8_t data)
             }
             break;
     }
+}
+
+/* (a smaller screen: the pointer comes inside it at its next move) */
+void mouse_set_bounds(uint32_t w, uint32_t h)
+{
+    if (!w || !h) return;
+    bound_w = (int32_t)w;
+    bound_h = (int32_t)h;
+    if (mouse_x >= bound_w) mouse_x = bound_w - 1;
+    if (mouse_y >= bound_h) mouse_y = bound_h - 1;
 }
 
 int32_t mouse_get_x(void)

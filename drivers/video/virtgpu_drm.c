@@ -46,6 +46,7 @@
 #include <wynland/sched.h>
 #include <wynland/process.h>
 #include <wynland/waitqueue.h>
+#include <wynland/mouse.h>
 
 extern void serial_write_string(const char *str);
 extern uint64_t timer_get_ms(void);
@@ -980,9 +981,22 @@ static int64_t ioctl_map_dumb(uint32_t slot, uint64_t argp)
 extern uint32_t comp_get_width(void);
 extern uint32_t comp_get_height(void);
 
-static void kms_mode(struct drm_mode_modeinfo_u *m)
+/* The modes the connector offers: the boot framebuffer's size (preferred:
+   what a compositor takes unless told otherwise), then the usual sizes up
+   to 4K. virtio-gpu scans out a buffer of any size -- QEMU's window
+   follows it -- so each of them works (kms_present() sets the scanout to
+   the framebuffer's size). */
+static const uint16_t kms_sizes[][2] = {
+    { 3840, 2160 }, { 2560, 1600 }, { 2560, 1440 }, { 2560, 1080 }, { 1920, 1200 },
+    { 1920, 1080 }, { 1680, 1050 }, { 1600, 900 },  { 1440, 900 },  { 1366, 768 },
+    { 1280, 1024 }, { 1280, 800 },  { 1280, 720 },  { 1024, 768 },  { 800, 600 },
+};
+
+/* the size scanned out now: the compositor's mode, else the boot one */
+static uint32_t g_scan_w, g_scan_h;
+
+static void kms_mode_wh(struct drm_mode_modeinfo_u *m, uint32_t w, uint32_t h, bool preferred)
 {
-    uint32_t w = comp_get_width(), h = comp_get_height();
     memset(m, 0, sizeof(*m));
     m->hdisplay = (uint16_t)w; m->hsync_start = (uint16_t)(w + 16);
     m->hsync_end = (uint16_t)(w + 32); m->htotal = (uint16_t)(w + 48);
@@ -990,7 +1004,7 @@ static void kms_mode(struct drm_mode_modeinfo_u *m)
     m->vsync_end = (uint16_t)(h + 6); m->vtotal = (uint16_t)(h + 10);
     m->vrefresh = 60;
     m->clock = (uint32_t)((uint64_t)m->htotal * m->vtotal * 60 / 1000);
-    m->type = 0x48; /* DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER */
+    m->type = preferred ? 0x48 : 0x40; /* DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER */
     /* name "WxH" */
     char tmp[12]; int n = 0, k = 0;
     uint32_t v[2] = { w, h };
@@ -1000,6 +1014,19 @@ static void kms_mode(struct drm_mode_modeinfo_u *m)
         while (n && k < 30) m->name[k++] = tmp[--n];
         if (i == 0) m->name[k++] = 'x';
     }
+}
+
+/* mode `i` of the connector's list; false past its end */
+static bool kms_mode_at(uint32_t i, struct drm_mode_modeinfo_u *m)
+{
+    uint32_t bw = comp_get_width(), bh = comp_get_height();
+    if (i == 0) { kms_mode_wh(m, bw, bh, true); return true; }
+    uint32_t n = 1;
+    for (uint32_t k = 0; k < sizeof(kms_sizes) / sizeof(kms_sizes[0]); k++) {
+        if (kms_sizes[k][0] == bw && kms_sizes[k][1] == bh) continue;
+        if (n++ == i) { kms_mode_wh(m, kms_sizes[k][0], kms_sizes[k][1], false); return true; }
+    }
+    return false;
 }
 
 static DrmFb *fb_find(uint32_t id)
@@ -1023,6 +1050,8 @@ static void kms_restore_console(void)
     send_sync(&ss, sizeof(ss), NULL);
     g_scan_fb = 0;
     g_scan_owner = 0;
+    g_scan_w = g_scan_h = 0;
+    mouse_set_bounds(comp_get_width(), comp_get_height());
     extern void virtio_gpu_flush(uint32_t x, uint32_t y, uint32_t w, uint32_t h);
     virtio_gpu_flush(0, 0, comp_get_width(), comp_get_height());
 }
@@ -1078,6 +1107,10 @@ static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t 
         if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) dbg_num("DRM: SET_SCANOUT failed, resp=", ok ? (int64_t)rt : -1);
         if (!ok || rt != VIRTIO_GPU_RESP_OK_NODATA) return false;
         g_scan_fb = fb->id;
+        if (fb->width != g_scan_w || fb->height != g_scan_h) {   /* a mode change */
+            g_scan_w = fb->width; g_scan_h = fb->height;
+            mouse_set_bounds(fb->width, fb->height);
+        }
     }
     VirtioGpuResourceFlush rf;
     memset(&rf, 0, sizeof(rf));
@@ -1108,16 +1141,18 @@ static int64_t ioctl_getconnector(uint64_t argp)
     struct drm_mode_get_connector_u c;
     if (copy_from_user(&c, (void *)argp, sizeof(c))) return -EFAULT;
     if (c.connector_id != KMS_CONNECTOR_ID) return -ENOENT;
-    if (c.count_modes >= 1 && c.modes_ptr) {
-        struct drm_mode_modeinfo_u m;
-        kms_mode(&m);
-        if (copy_to_user((void *)c.modes_ptr, &m, sizeof(m))) return -EFAULT;
+    uint32_t nmodes = 0;
+    struct drm_mode_modeinfo_u m;
+    while (kms_mode_at(nmodes, &m)) {
+        if (nmodes < c.count_modes && c.modes_ptr &&
+            copy_to_user((void *)(c.modes_ptr + (uint64_t)nmodes * sizeof(m)), &m, sizeof(m))) return -EFAULT;
+        nmodes++;
     }
     if (c.count_encoders >= 1 && c.encoders_ptr) {
         uint32_t e = KMS_ENCODER_ID;
         if (copy_to_user((void *)c.encoders_ptr, &e, 4)) return -EFAULT;
     }
-    c.count_modes = 1;
+    c.count_modes = nmodes;
     c.count_props = 0;
     c.count_encoders = 1;
     c.encoder_id = KMS_ENCODER_ID;
@@ -1153,7 +1188,8 @@ static int64_t ioctl_getcrtc(uint64_t argp)
     c.x = c.y = 0;
     c.gamma_size = 0;
     c.mode_valid = 1;
-    kms_mode(&c.mode);
+    if (g_scan_fb && g_scan_w) kms_mode_wh(&c.mode, g_scan_w, g_scan_h, g_scan_w == comp_get_width() && g_scan_h == comp_get_height());
+    else kms_mode_at(0, &c.mode);
     if (copy_to_user((void *)argp, &c, sizeof(c))) return -EFAULT;
     return 0;
 }

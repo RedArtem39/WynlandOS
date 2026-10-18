@@ -170,10 +170,15 @@ static pid_t start_session_bus(const struct passwd *pw, char **env, char *addr, 
     return pid;
 }
 
-static void run_session(const char *user)
+/* Zerp 2.0's exit status asking for the session again (a new screen mode:
+   resolution(1); apps/zerp2/zerp2.h restartSession()) */
+#define SESSION_RESTART 3
+
+/* the user's session until it ends; true: it asked to start again */
+static bool run_session(const char *user)
 {
     struct passwd *pw = getpwnam(user);
-    if (!pw) { logf_("no account %s", user); return; }
+    if (!pw) { logf_("no account %s", user); return false; }
     input_open();
     char **env = make_env(pw);
     static char bus_addr[200];
@@ -188,13 +193,14 @@ static void run_session(const char *user)
     pid_t pid = spawn_as(ZERP2, argv, env, user, pw->pw_uid, pw->pw_gid);
     input_close();
     if (pid < 0 && bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }
-    if (pid < 0) { logf_("could not start the session of %s", user); sleep(2); return; }
+    if (pid < 0) { logf_("could not start the session of %s", user); sleep(2); return false; }
     logf_("session of %s (uid %u): pid %d", user, pw->pw_uid, (int)pid);
     int st;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
     logf_("session of %s ended (%s %d)", user, WIFEXITED(st) ? "exit" : "signal",
           WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
     if (bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }   /* the session's bus goes with it */
+    return WIFEXITED(st) && WEXITSTATUS(st) == SESSION_RESTART;
 }
 
 /* The desktop the account chose on the first boot ("zerp", "caelestia"):
@@ -351,6 +357,8 @@ int main(void)
         } else {
             greet(who, sizeof who);
         }
-        if (who[0]) run_session(who);
+        /* (a restart: the same user, no password -- the session itself,
+           running as them, asked for it) */
+        while (who[0] && run_session(who)) logf_("restarting the session of %s", who);
     }
 }

@@ -7,6 +7,7 @@
 #include <QtCore/QDir>
 #include <QtCore/QJsonArray>
 #include <QtCore/QJsonDocument>
+#include <QtCore/QTimer>
 #include <QtNetwork/QLocalServer>
 #include <QtNetwork/QLocalSocket>
 
@@ -333,6 +334,12 @@ QByteArray HyprIpc::dispatch(const QByteArray &line)
     }
     if (d == "exec") { m_srv->run(QString::fromUtf8(arg)); return "ok"; }
     if (d == "exit") { m_srv->logout(); return "ok"; }
+    // WynlandOS's own: the session again (resolution(1) after a new mode);
+    // a moment later, so the reply gets out first
+    if (d == "restartsession") {
+        QTimer::singleShot(300, m_srv, [srv = m_srv] { srv->restartSession(); });
+        return "ok";
+    }
     // no counterpart in Zerp: special workspaces, floating, pinning, dpms, global shortcuts
     return "ok";
 }

@@ -16,6 +16,9 @@ void mouse_show(void);
 int32_t mouse_get_x(void);
 int32_t mouse_get_y(void);
 uint8_t mouse_get_buttons(void);
+/* The area the pointer moves in: the screen's size now (the boot
+   framebuffer's, or the mode a compositor set: drivers/video/virtgpu_drm.c) */
+void    mouse_set_bounds(uint32_t w, uint32_t h);
 int     mouse_read_queue(uint8_t *buf, int size);
 
 /* Absolute pointer events (SYS_mouse_events): x, y and button mask after

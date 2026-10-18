@@ -146,6 +146,8 @@ g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
 echo "  QT6        built build/zerp2.elf"
 # hyprctl: Hyprland's command line, for Zerp 2.0's Hyprland IPC (apps/zerp2/hypripc.cpp)
 gcc -O2 -Wall -o "$OUT/hyprctl" apps/zerp2/hyprctl.c
+# resolution: the screen mode from the terminal (apps/zerp2/resolution.c)
+gcc -O2 -Wall -o "$OUT/resolution" apps/zerp2/resolution.c
 
 # linux-dmabuf: GPU buffers from Wayland clients (Mesa's EGL, Vulkan WSI).
 # Qt's own client buffer plugin -- Ubuntu does not build it -- from
@@ -205,6 +207,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     echo "F /usr/bin/qmldemo build/qmldemo.elf"
     echo "F /usr/bin/zerp2 build/zerp2.elf"
     echo "F /usr/bin/hyprctl build/hyprctl"
+    echo "F /usr/bin/resolution build/resolution"
     echo "D /usr/share/zerp2"
     echo "D /usr/share/zerp2/qml"
     echo "F /usr/share/zerp2/kms.json apps/zerp2/kms.json"
