@@ -215,6 +215,15 @@ static const struct sh_case CASES[] = {
       "nice -n 5 sh -c 'nice; nice -n 3 nice'", "5\n8\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
+    /* Ubuntu's curl, cmake, pkgconf (the old musl ports had none of the
+       system's terminfo, CA store or modules) */
+    { "/bin/sh", "curl (libcurl): a file:// URL",
+      "echo wyn-curl > c.txt && curl -s file:///tmp/shhome/c.txt", "wyn-curl\n" },
+    { "/bin/sh", "cmake: runs, finds its modules (-P script)",
+      "printf 'include(CMakePrintHelpers)\\nmessage(STATUS \"wyn-cmake\")\\n' > t.cmake && cmake -P t.cmake | grep -o wyn-cmake",
+      "wyn-cmake\n" },
+    { "/bin/sh", "pkg-config: a .pc file",
+      "printf 'Name: wyn\\nDescription: t\\nVersion: 4.2\\n' > wyn.pc && PKG_CONFIG_PATH=. pkg-config --modversion wyn", "4.2\n" },
     { "/bin/sh", "man: groff's pipeline",
       "man -l /usr/share/fish/man/man1/cd.1 2>/dev/null | grep -m1 -o 'change directory'", "change directory\n" },
     { "/usr/bin/fish", "fish: CMD --help (man)",
@@ -346,6 +355,15 @@ static void run_pty(void)
     int comp = pty_read_until(m, buf, sizeof buf, &len, "sha256sum", 10000);
     check(comp, "fish -i: Tab completes a command");
     if (!comp) dump_tail(buf, len);
+
+    /* nano on the PTY (TERM=xterm-256color from terminfo: the old musl
+       build had no terminfo and said "Error opening terminal"), ^X out */
+    write(m, "\x15" "nano /tmp/shhome/nano.txt\r", 27);
+    int nano = pty_read_until(m, buf, sizeof buf, &len, "GNU nano", 15000);
+    check(nano, "nano opens on the PTY (xterm-256color)");
+    if (!nano) dump_tail(buf, len);
+    write(m, "\x18", 1);
+    usleep(1000000);
     write(m, "\x15" "exit\r", 6);   /* ^U: clear the line ("\x15e" would be one hex escape) */
 
     long t1 = now_ms();

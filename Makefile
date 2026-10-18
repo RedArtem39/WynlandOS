@@ -392,7 +392,6 @@ $(BUILD)/renderD128:
 
 # ext2 root partition: built by the host's own mke2fs + debugfs (root-free),
 # populated from the manifest, verified file-by-file afterwards.
-PORT_STAGING = $(wildcard build/ports/curl build/ports/nano build/ports/pkgconf build/ports/cmake build/ports/cert.pem)
 # Qt 6 / Qt Quick (tools/stage_qt6.sh): Ubuntu's prebuilt Qt, QML modules and the
 # qmldemo app. WITH_QT6=0 builds the image without it.
 WITH_QT6 ?= 1
@@ -494,7 +493,7 @@ $(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/etc/wynland/jit.allow $(E
 	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 
-$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(PORT_STAGING) $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/swaptest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
+$(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/swaptest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
 	@e2fsck -f -n $@ > /dev/null 2>&1 && echo "  EXT2       e2fsck: clean" || echo "  EXT2       WARNING: e2fsck reported issues"
 

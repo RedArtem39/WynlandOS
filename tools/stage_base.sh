@@ -33,6 +33,7 @@ PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
  fastfetch libyyjson0
  man-db groff-base libpipeline1 libgdbm6t64 libuchardet0 libseccomp2
  w3m libgc1 libgpm2
+ nano curl libcurl4t64 cmake cmake-data pkgconf pkgconf-bin libpkgconf3
  vulkan-tools
  dbus-daemon dbus-bin dbus-session-bus-common dbus-system-bus-common libexpat1"
 
