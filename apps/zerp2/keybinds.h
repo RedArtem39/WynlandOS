@@ -11,9 +11,11 @@
 // the key still reaches the window; l and e are accepted. Keys are xkb
 // names (T, Return, Page_Down, SUPER_L, F12, ...), any case.
 //
-// The keyboard layouts too, as Hyprland's input options:
+// The keyboard layouts too, as Hyprland's input options -- here or, as
+// keyboard(1) writes them, in ~/.config/wynland/keyboard.conf (else
+// /etc/wynland/keyboard.conf, the login screen's), which wins:
 //
-//     kb_layout  = us,ru                  (the ones zerp_layouts.h has)
+//     kb_layout  = us,ru                  (the ones zerp_layouts.h has; us alone by default)
 //     kb_options = grp:alt_shift_toggle   (or grp:win_space_toggle)
 //
 // Zerp gets PC scancodes (set 1): a key here is code + 128 when it came
@@ -39,27 +41,30 @@ public:
     // run a binding's action; pressed false: its key went up (globals)
     using Run = std::function<void(const Bind &, bool pressed)>;
 
-    void load();                  // the user's file, else the system's
+    void load();                  // the user's file, else the system's; then loadKeyboard()
+    // the layouts alone: keyboard.conf (the user's, else the machine's;
+    // only the machine's for the login screen)
+    void loadKeyboard(bool machineOnly);
     void setRun(Run r) { m_run = std::move(r); }
     // one key event (raw scancode, E0 already folded in); true: swallow it
     bool key(int kid, bool release);
     int count() const { return m_binds.size(); }
     // the modifiers held now (the window's own state is Zerp's business)
     int mods() const { return m_mods; }
-    // kb_layout's layouts (ZERP_LAYOUT_*; us,ru without the line) and
+    // kb_layout's layouts (ZERP_LAYOUT_*; us alone without the line) and
     // how to switch: Alt+Shift (grp:alt_shift_toggle, the default), Super+Space
     enum Toggle { AltShift, SuperSpace };
     const QVector<int> &layouts() const { return m_layouts; }
     Toggle toggle() const { return m_toggle; }
 
 private:
-    bool parseFile(const QString &path);
+    bool parseFile(const QString &path, bool layoutsOnly = false);
     static int keyFromName(const QString &name);
     static int modsFromString(const QString &s);
     static int modOfKey(int kid);
 
     QVector<Bind> m_binds;
-    QVector<int> m_layouts{ 0, 1 };
+    QVector<int> m_layouts{ 0 };
     Toggle m_toggle = AltShift;
     Run m_run;
     int m_mods = 0;

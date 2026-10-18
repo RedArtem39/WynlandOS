@@ -535,8 +535,10 @@ int ZServer::countOn(int w) const
 void ZServer::setLayouts(const QVector<int> &layouts)
 {
     if (layouts.isEmpty() || layouts == m_layouts) return;
+    // the layout on stays on if it is still in the list
+    const int now = layout();
     m_layouts = layouts;
-    m_layoutIdx = 0;
+    m_layoutIdx = qMax(0, int(m_layouts.indexOf(now)));
     applyLayout();
     emit keyboardLayoutChanged();
 }

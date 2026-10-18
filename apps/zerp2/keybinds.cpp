@@ -67,7 +67,7 @@ int KeyBinds::modOfKey(int kid)
     return 0;
 }
 
-bool KeyBinds::parseFile(const QString &path)
+bool KeyBinds::parseFile(const QString &path, bool layoutsOnly)
 {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) return false;
@@ -109,7 +109,7 @@ bool KeyBinds::parseFile(const QString &path)
             else if (rhs.contains(QStringLiteral("grp:alt_shift_toggle"))) m_toggle = AltShift;
             continue;
         }
-        if (!lhs.startsWith(QStringLiteral("bind"))) continue;
+        if (layoutsOnly || !lhs.startsWith(QStringLiteral("bind"))) continue;
         const QString flags = lhs.mid(4);
         const QStringList parts = rhs.split(QChar(','));
         if (parts.size() < 3) {
@@ -130,18 +130,27 @@ bool KeyBinds::parseFile(const QString &path)
         }
         m_binds.append(b);
     }
-    fprintf(stderr, "[zerp2] %d key bindings from %s\n", int(m_binds.size()), qPrintable(path));
+    if (!layoutsOnly) fprintf(stderr, "[zerp2] %d key bindings from %s\n", int(m_binds.size()), qPrintable(path));
     return true;
 }
 
 void KeyBinds::load()
 {
     m_binds.clear();
-    m_layouts = { 0, 1 };
+    for (int &a : m_active) a = -1;   // (indexes into the old list)
+    m_layouts = { 0 };
     m_toggle = AltShift;
     const QString home = qEnvironmentVariable("HOME");
-    if (!home.isEmpty() && parseFile(home + QStringLiteral("/.config/zerp2/keybinds.conf"))) return;
-    parseFile(QStringLiteral("/etc/zerp2/keybinds.conf"));
+    if (home.isEmpty() || !parseFile(home + QStringLiteral("/.config/zerp2/keybinds.conf")))
+        parseFile(QStringLiteral("/etc/zerp2/keybinds.conf"));
+    loadKeyboard(false);
+}
+
+void KeyBinds::loadKeyboard(bool machineOnly)
+{
+    const QString home = qEnvironmentVariable("HOME");
+    if (!machineOnly && !home.isEmpty() && parseFile(home + QStringLiteral("/.config/wynland/keyboard.conf"), true)) return;
+    parseFile(QStringLiteral("/etc/wynland/keyboard.conf"), true);
 }
 
 bool KeyBinds::key(int kid, bool release)

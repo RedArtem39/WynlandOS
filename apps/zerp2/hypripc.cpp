@@ -210,7 +210,9 @@ QByteArray HyprIpc::command(QByteArray cmd, bool json)
         else { bool ok = false; const int i = how.toInt(&ok); if (!ok || i < 0 || i >= n) return "invalid layout"; m_srv->setLayoutIndex(i); }
         return "ok";
     }
-    if (name == "keyword" || name == "reload" || name == "setcursor" ||
+    // the configuration again: key bindings, keyboard layouts (keyboard(1))
+    if (name == "reload") { emit m_srv->reloadRequested(); return "ok"; }
+    if (name == "keyword" || name == "setcursor" ||
         name == "notify" || name == "dismissnotify" || name == "seterror" || name == "eval")
         return "ok";
 

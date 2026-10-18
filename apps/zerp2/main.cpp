@@ -88,14 +88,24 @@ public:
     {
         m_kbd = g_kbdFd;
         // the configured bindings (keybinds.h: Caelestia's, Hyprland style)
-        // and keyboard layouts; the login screen: us,ru on Alt+Shift
+        // and keyboard layouts (again on hyprctl reload: keyboard(1)); the
+        // login screen: the machine's layouts (/etc/wynland/keyboard.conf)
         if (!m_greeter) {
-            m_binds.load();
             m_binds.setRun([this](const KeyBinds::Bind &b, bool pressed) { run(b, pressed); });
+            reload();
+            connect(srv, &ZServer::reloadRequested, this, &InputPump::reload);
+        } else {
+            m_binds.loadKeyboard(true);
             m_srv->setLayouts(m_binds.layouts());
         }
         connect(&m_timer, &QTimer::timeout, this, &InputPump::poll);
         m_timer.start(4);
+    }
+
+    void reload()
+    {
+        m_binds.load();
+        m_srv->setLayouts(m_binds.layouts());
     }
 
 private:

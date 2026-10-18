@@ -216,6 +216,7 @@ signals:
     void focusDirectionRequested(int dx, int dy);
     void showFpsChanged();
     void keyboardLayoutChanged();
+    void reloadRequested();   // hyprctl reload: the key bindings and layouts again
 
 private:
     void applyLayout();
@@ -232,7 +233,7 @@ private:
     ZClientModel m_model;
     ZClient *m_focused = nullptr;
     QTimer m_pump, m_reaper;
-    QVector<int> m_layouts{ 0, 1 };  // ZERP_LAYOUT_US, ZERP_LAYOUT_RU
+    QVector<int> m_layouts{ 0 };     // ZERP_LAYOUT_US alone until configured
     int m_layoutIdx = 0;
     QPointer<QObject> m_compositor;  // QWaylandCompositor (Shell.qml)
 };
