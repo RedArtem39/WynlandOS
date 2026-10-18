@@ -66,6 +66,10 @@ HyprIpc::HyprIpc(ZServer *server, const QString &monitorName, QSize monitorSize,
     connect(m_srv, &ZServer::focusChanged, this, &HyprIpc::scheduleSync);
     connect(m_srv, &ZServer::workspaceChanged, this, &HyprIpc::scheduleSync);
     connect(m_srv, &ZServer::layoutChanged, this, &HyprIpc::scheduleSync);
+    // the keyboard layout switched: Hyprland's event (Caelestia's bar shows it)
+    connect(m_srv, &ZServer::keyboardLayoutChanged, this, [this] {
+        event("activelayout", "at-translated-set-2-keyboard," + m_srv->layoutName().toUtf8());
+    });
     m_seenActive = m_srv->workspace();
     m_seenWs = workspaces();
     fprintf(stderr, "[zerp2] hyprland ipc: %s\n", qPrintable(m_dir));
@@ -196,7 +200,17 @@ QByteArray HyprIpc::command(QByteArray cmd, bool json)
     auto out = [](const QJsonDocument &d) { return d.toJson(QJsonDocument::Compact); };
 
     if (name == "dispatch") return dispatch(args);
-    if (name == "keyword" || name == "reload" || name == "switchxkblayout" || name == "setcursor" ||
+    // switchxkblayout DEVICE next|prev|N (one keyboard here: any device)
+    if (name == "switchxkblayout") {
+        const QList<QByteArray> a = args.split(' ');
+        const QByteArray how = a.size() >= 2 ? a[1] : QByteArray("next");
+        const int n = m_srv->layouts().size();
+        if (how == "next") m_srv->nextLayout();
+        else if (how == "prev") m_srv->setLayoutIndex((m_srv->layoutIndex() + n - 1) % qMax(1, n));
+        else { bool ok = false; const int i = how.toInt(&ok); if (!ok || i < 0 || i >= n) return "invalid layout"; m_srv->setLayoutIndex(i); }
+        return "ok";
+    }
+    if (name == "keyword" || name == "reload" || name == "setcursor" ||
         name == "notify" || name == "dismissnotify" || name == "seterror" || name == "eval")
         return "ok";
 
@@ -238,8 +252,9 @@ QByteArray HyprIpc::command(QByteArray cmd, bool json)
     }
     if (name == "devices") {
         const QJsonObject kb{ { "address", "0x1" }, { "name", "at-translated-set-2-keyboard" }, { "rules", "" },
-                              { "model", "" }, { "layout", "us" }, { "variant", "" }, { "options", "" },
-                              { "active_keymap", "English (US)" }, { "capsLock", false }, { "numLock", false },
+                              { "model", "" }, { "layout", m_srv->layoutList() }, { "variant", "" }, { "options", "" },
+                              { "active_keymap", m_srv->layoutName() }, { "active_layout_index", m_srv->layoutIndex() },
+                              { "capsLock", false }, { "numLock", false },
                               { "main", true } };
         const QJsonObject mouse{ { "address", "0x2" }, { "name", "ps2-mouse" }, { "defaultSpeed", 0.0 } };
         return out(QJsonDocument(QJsonObject{ { "mice", QJsonArray{ mouse } }, { "keyboards", QJsonArray{ kb } },
@@ -252,7 +267,7 @@ QByteArray HyprIpc::command(QByteArray cmd, bool json)
     }
     if (name == "getoption") {
         QJsonObject o{ { "option", QString::fromUtf8(args) }, { "set", false } };
-        if (args == "input:kb_layout") { o["str"] = "us"; o["set"] = true; }
+        if (args == "input:kb_layout") { o["str"] = m_srv->layoutList(); o["set"] = true; }
         else o["int"] = 0;
         return out(QJsonDocument(o));
     }

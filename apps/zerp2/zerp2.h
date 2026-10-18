@@ -27,6 +27,7 @@ class QWaylandXdgToplevel;
 
 extern "C" {
 #include "../../zerp_protocol.h"
+#include "../../zerp_layouts.h"
 }
 
 class ZClient : public QObject
@@ -74,6 +75,8 @@ public:
     // a raw scancode (release bit 7); mods: the modifiers held, for
     // Wayland clients (their xkb state follows them)
     void sendKey(bool e0, uint8_t scancode, Qt::KeyboardModifiers mods = Qt::NoModifier);
+    // the keyboard layout now (ZERP_LAYOUT_*): what its scancodes type
+    void sendLayout(int layout) { send(ZerpMsg{ ZERP_MSG_LAYOUT, uint32_t(layout), 0, 0, 0 }); }
     // drains c2s; returns false once the client is gone
     bool pump(QVector<QString> *spawnRequests);
     bool alive() const;
@@ -156,8 +159,27 @@ class ZServer : public QObject
     Q_PROPERTY(QObject *focusedClient READ focusedClient NOTIFY focusChanged)
     Q_PROPERTY(int workspace READ workspace WRITE setWorkspace NOTIFY workspaceChanged)
     Q_PROPERTY(bool showFps READ showFps WRITE setShowFps NOTIFY showFpsChanged)
+    // the keyboard layout: "EN", "RU" (the bar's indicator)
+    Q_PROPERTY(QString layoutShort READ layoutShort NOTIFY keyboardLayoutChanged)
+    Q_PROPERTY(bool multiLayout READ multiLayout NOTIFY keyboardLayoutChanged)
 public:
     explicit ZServer(uint32_t shmBytes, QObject *parent = nullptr);
+
+    // Keyboard layouts (zerp_layouts.h): the ones to switch between
+    // (kb_layout in keybinds.conf; us,ru by default) and the one on now.
+    // Zerp clients hear it (ZERP_MSG_LAYOUT), Wayland ones get its xkb
+    // keymap from the compositor's seat.
+    void setCompositor(QObject *waylandCompositor) { m_compositor = waylandCompositor; applyLayout(); }
+    void setLayouts(const QVector<int> &layouts);
+    int layout() const { return m_layouts.value(m_layoutIdx, 0); }
+    int layoutIndex() const { return m_layoutIdx; }
+    const QVector<int> &layouts() const { return m_layouts; }
+    QString layoutShort() const;
+    QString layoutName() const;      // "English (US)", as Hyprland's active_keymap
+    QString layoutList() const;      // "us,ru"
+    bool multiLayout() const { return m_layouts.size() > 1; }
+    Q_INVOKABLE void nextLayout() { setLayoutIndex((m_layoutIdx + 1) % qMax(1, int(m_layouts.size()))); }
+    void setLayoutIndex(int i);
 
     QList<QObject *> clients() const;
     QObject *model() { return &m_model; }
@@ -193,8 +215,10 @@ signals:
     void workspaceChanged();
     void focusDirectionRequested(int dx, int dy);
     void showFpsChanged();
+    void keyboardLayoutChanged();
 
 private:
+    void applyLayout();
     void pumpAll();
     void reap();
     void refocus();
@@ -208,6 +232,9 @@ private:
     ZClientModel m_model;
     ZClient *m_focused = nullptr;
     QTimer m_pump, m_reaper;
+    QVector<int> m_layouts{ 0, 1 };  // ZERP_LAYOUT_US, ZERP_LAYOUT_RU
+    int m_layoutIdx = 0;
+    QPointer<QObject> m_compositor;  // QWaylandCompositor (Shell.qml)
 };
 
 // One client's pixels as a QML item; forwards the pointer to the client.

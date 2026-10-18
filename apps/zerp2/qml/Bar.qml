@@ -79,6 +79,25 @@ Item {
                 c.beginPath(); c.arc(9, 13, 1.4, 0, Math.PI * 2); c.fill();
             }
         }
+        // the keyboard layout (Alt+Shift switches it; so does a click)
+        Rectangle {
+            visible: zerp.multiLayout
+            anchors.verticalCenter: parent.verticalCenter
+            height: 22
+            width: kbd.implicitWidth + 14
+            radius: 11
+            color: kbdArea.containsMouse ? "#1b1f27" : "transparent"
+            Behavior on color { ColorAnimation { duration: 150 } }
+            Text {
+                id: kbd
+                anchors.centerIn: parent
+                color: "#d6dbe4"
+                font.pixelSize: 12
+                font.bold: true
+                text: zerp.layoutShort
+            }
+            MouseArea { id: kbdArea; anchors.fill: parent; hoverEnabled: true; onClicked: zerp.nextLayout() }
+        }
         // the user; a click logs out (wynlogin shows the login screen)
         Rectangle {
             anchors.verticalCenter: parent.verticalCenter

@@ -12,6 +12,7 @@
 #include <QtQuick/QSGTexture>
 #include <QtWaylandCompositor/QWaylandClient>
 #include <QtWaylandCompositor/QWaylandCompositor>
+#include <QtWaylandCompositor/QWaylandKeymap>
 #include <QtWaylandCompositor/QWaylandSeat>
 #include <QtWaylandCompositor/QWaylandSurface>
 #include <QtWaylandCompositor/QWaylandXdgSurface>
@@ -426,6 +427,7 @@ int ZServer::spawn(const QString &path)
         delete c;
         return -1;
     }
+    if (layout() != ZERP_LAYOUT_US) c->sendLayout(layout());
     m_clients.append(c);
     m_model.add(c);
     emit clientsChanged();
@@ -528,6 +530,45 @@ int ZServer::countOn(int w) const
     int n = 0;
     for (ZClient *c : m_clients) if (c->workspace() == w) n++;
     return n;
+}
+
+void ZServer::setLayouts(const QVector<int> &layouts)
+{
+    if (layouts.isEmpty() || layouts == m_layouts) return;
+    m_layouts = layouts;
+    m_layoutIdx = 0;
+    applyLayout();
+    emit keyboardLayoutChanged();
+}
+
+void ZServer::setLayoutIndex(int i)
+{
+    if (i < 0 || i >= m_layouts.size() || i == m_layoutIdx) return;
+    m_layoutIdx = i;
+    applyLayout();
+    fprintf(stderr, "[zerp2] keyboard layout %s\n", ZERP_LAYOUT_XKB[layout()]);
+    emit keyboardLayoutChanged();
+}
+
+QString ZServer::layoutShort() const { return QString::fromLatin1(ZERP_LAYOUT_SHORT[layout()]); }
+QString ZServer::layoutName() const { return QString::fromLatin1(ZERP_LAYOUT_NAME[layout()]); }
+
+QString ZServer::layoutList() const
+{
+    QStringList l;
+    for (int x : m_layouts) l << QString::fromLatin1(ZERP_LAYOUT_XKB[x]);
+    return l.join(QChar(','));
+}
+
+// to every client: Zerp ones are told, Wayland ones get the layout's xkb
+// keymap (the seat sends it to each keyboard)
+void ZServer::applyLayout()
+{
+    for (ZClient *c : m_clients)
+        if (!c->wayland()) c->sendLayout(layout());
+    auto *comp = qobject_cast<QWaylandCompositor *>(m_compositor.data());
+    QWaylandSeat *seat = comp ? comp->defaultSeat() : nullptr;
+    if (seat && seat->keymap()) seat->keymap()->setLayout(QString::fromLatin1(ZERP_LAYOUT_XKB[layout()]));
 }
 
 void ZServer::remove(const QVector<ZClient *> &gone, const char *why)

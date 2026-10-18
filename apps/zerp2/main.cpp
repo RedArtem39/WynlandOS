@@ -28,6 +28,7 @@
 #include <QtQuick/QQuickWindow>
 #include <QtGui/QScreen>
 #include <QtQml/qqml.h>
+#include <QtWaylandCompositor/QWaylandCompositor>
 #include <sys/stat.h>
 
 #include "zerp2.h"
@@ -74,16 +75,7 @@ static const int kKeys[59] = {
     Qt::Key_Backslash, Qt::Key_Z, Qt::Key_X, Qt::Key_C, Qt::Key_V, Qt::Key_B, Qt::Key_N, Qt::Key_M,
     Qt::Key_Comma, Qt::Key_Period, Qt::Key_Slash, Qt::Key_Shift, Qt::Key_Asterisk, Qt::Key_Alt,
     Qt::Key_Space, Qt::Key_CapsLock };
-static const char kLower[59] = {
-    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\r',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
-    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ', 0 };
-static const char kUpper[59] = {
-    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\r',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
-    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ', 0 };
+// (their text: the layout's, zerp_layouts.h)
 
 // the demo's "snapat=key+N": run once by the first global shortcut pressed
 static std::function<void()> g_onGlobal;
@@ -95,6 +87,13 @@ public:
     InputPump(QQuickWindow *w, ZServer *srv, bool greeter = false) : m_win(w), m_srv(srv), m_greeter(greeter)
     {
         m_kbd = g_kbdFd;
+        // the configured bindings (keybinds.h: Caelestia's, Hyprland style)
+        // and keyboard layouts; the login screen: us,ru on Alt+Shift
+        if (!m_greeter) {
+            m_binds.load();
+            m_binds.setRun([this](const KeyBinds::Bind &b, bool pressed) { run(b, pressed); });
+            m_srv->setLayouts(m_binds.layouts());
+        }
         connect(&m_timer, &QTimer::timeout, this, &InputPump::poll);
         m_timer.start(4);
     }
@@ -219,6 +218,26 @@ private:
         return false;
     }
 
+    // The keyboard layout's switch. Alt+Shift: on letting go of either,
+    // if nothing else was pressed meanwhile (Super+Shift+Alt+S stays a
+    // shortcut); the keys still reach the window -- they are modifiers.
+    // Super+Space: on the press, Space swallowed (true).
+    bool layoutToggle(bool e0, int code, bool release)
+    {
+        const bool alt = code == 0x38, shift = !e0 && (code == 0x2A || code == 0x36);        if (!m_greeter && m_binds.toggle() == KeyBinds::SuperSpace) {
+            if (!release && !e0 && code == 0x39 && m_super) { m_srv->nextLayout(); return true; }
+            return false;
+        }
+        if (!release) {
+            if ((alt && m_shift) || (shift && (m_alt || m_altR))) m_layoutArmed = true;
+            else if (!alt && !shift) m_layoutArmed = false;
+        } else if (m_layoutArmed && (alt || shift)) {
+            m_layoutArmed = false;
+            m_srv->nextLayout();
+        }
+        return false;
+    }
+
     void key(unsigned char sc)
     {
         if (sc == 0xE0) { m_e0 = true; return; }
@@ -233,15 +252,8 @@ private:
         if (e0 && (code == 0x5B || code == 0x5C)) m_super = !release;
         if (!e0 && (code == 0x2A || code == 0x36)) m_shift = !release;
         const int kid = code + (e0 ? 128 : 0);
-        // the configured bindings (keybinds.h: Caelestia's, Hyprland style)
-        if (!m_greeter) {
-            if (!m_bindsLoaded) {
-                m_bindsLoaded = true;
-                m_binds.load();
-                m_binds.setRun([this](const KeyBinds::Bind &b, bool pressed) { run(b, pressed); });
-            }
-            if (m_binds.key(kid, release)) return;
-        }
+        if (layoutToggle(e0, code, release)) { m_swallow[kid] = true; return; }
+        if (!m_greeter && m_binds.key(kid, release)) return;
         if (release && m_swallow[kid]) { m_swallow[kid] = false; return; }
         if (!m_greeter && !release && (m_alt || m_altR || m_super) && binding(e0, code)) {
             m_swallow[kid] = true;   // its release must not reach the client either
@@ -293,10 +305,7 @@ private:
         if (qk == Qt::Key_CapsLock && !release) m_caps = !m_caps;
 
         if (!e0 && code < 59) {
-            const bool shift = m_mods & Qt::ShiftModifier;
-            char c = shift ? kUpper[code] : kLower[code];
-            if (m_caps && c >= 'a' && c <= 'z') c = char(c - 32);
-            else if (m_caps && c >= 'A' && c <= 'Z') c = char(c + 32);
+            const uint16_t c = zerp_key_char(m_srv->layout(), code, (m_mods & Qt::ShiftModifier) != 0, m_caps);
             if (c && !(m_mods & Qt::ControlModifier)) text = QString(QChar(c));
         }
         QKeyEvent ke(release ? QEvent::KeyRelease : QEvent::KeyPress, qk, m_mods, text);
@@ -309,7 +318,7 @@ private:
     bool m_alt = false, m_altR = false, m_super = false, m_shift = false;
     bool m_swallow[256] = {};
     KeyBinds m_binds;
-    bool m_bindsLoaded = false;
+    bool m_layoutArmed = false;   // Alt+Shift held, nothing else yet
     QTimer m_timer;
     int m_kbd = -1;
     QPointF m_pos;
@@ -444,6 +453,8 @@ int main(int argc, char **argv)
     }
     auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (!win) { fprintf(stderr, "[zerp2] FAIL: root is not a Window\n"); return 1; }
+    // the keyboard layout's keymap for Wayland clients goes through its seat
+    server.setCompositor(win->findChild<QWaylandCompositor *>());
     InputPump pump(win, &server, greeterMode);
     // debugging: boot.cfg "logoutat=N" -- the session logs out after N s
     // (the login screen with an account, for its picture)

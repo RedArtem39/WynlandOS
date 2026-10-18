@@ -1,6 +1,7 @@
 #include "qwynlandfbinput.h"
 #include "qwynlandfbscreen.h"
 #include "../zerp_protocol.h"
+#include "../zerp_layouts.h"
 #include <unistd.h>
 #include <qpa/qwindowsysteminterface.h>
 
@@ -25,22 +26,9 @@ static const int SCANCODE_TO_QTKEY[59] = {
     Qt::Key_Shift, Qt::Key_Asterisk, Qt::Key_Alt, Qt::Key_Space
 };
 
-/* Same table zerp_term.c uses -- gives handleKeyEvent() a real `text`
-   payload for printable keys (QLineEdit etc. need this, not just the
-   Qt::Key code). */
-static const char SCANCODE_TO_ASCII[59] = {
-    0,  27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0,
-    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
-};
-
-static const char SCANCODE_TO_ASCII_SHIFT[59] = {
-    0,  27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0,
-    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' '
-};
+/* The `text` of printable keys (QLineEdit etc. need it, not just the
+   Qt::Key code) comes from the layout Zerp says is on (ZERP_MSG_LAYOUT):
+   zerp_layouts.h. The Qt::Key stays the US one -- shortcuts. */
 
 /* keys past the 59-entry table: F1-F10 (0x3B-0x44), F11/F12, and the
    0xE0-prefixed navigation block */
@@ -96,6 +84,8 @@ void QWynlandFbInputReader::run()
     m_running = true;
     Qt::MouseButtons buttons = Qt::NoButton;
     bool e0 = false;
+    int layout = ZERP_LAYOUT_US;
+    bool caps = false;
 
     while (m_running) {
         ZerpMsg msg;
@@ -160,17 +150,22 @@ void QWynlandFbInputReader::run()
                 m_modifiers.setFlag(Qt::AltModifier, !release);
             }
 
-            char ch = 0;
+            if (!ext && code == 0x3A && !release) caps = !caps;   /* Caps Lock */
+
+            uint16_t ch = 0;
             if (!ext && code < 59 && !(m_modifiers & (Qt::ControlModifier | Qt::AltModifier)))
-                ch = (m_modifiers & Qt::ShiftModifier) ? SCANCODE_TO_ASCII_SHIFT[code] : SCANCODE_TO_ASCII[code];
-            if (ch == '\n') ch = '\r';
-            QString text = (ch != 0) ? QString(QChar((uchar)ch)) : QString();
+                ch = zerp_key_char(layout, code, (m_modifiers & Qt::ShiftModifier) != 0, caps);
+            QString text = (ch != 0) ? QString(QChar(ch)) : QString();
 
             QWindowSystemInterface::handleKeyEvent(
                 nullptr, release ? QEvent::KeyRelease : QEvent::KeyPress,
                 qtKey, m_modifiers, text);
             break;
         }
+
+        case ZERP_MSG_LAYOUT:
+            if (msg.x < ZERP_LAYOUT_COUNT) layout = (int)msg.x;
+            break;
 
         default:
             break;

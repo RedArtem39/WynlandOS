@@ -23,6 +23,7 @@
 #define ZERP_MSG_TILE_RECT   3   /* x,y,w,h = this client's newly (re)assigned screen tile */
 #define ZERP_MSG_INPUT_KEY   4   /* x = scancode, rest unused */
 #define ZERP_MSG_INPUT_MOUSE 5   /* x,y = position within the client's content rect (the TILE_RECT area it renders), clamped into it; w = buttons mask */
+#define ZERP_MSG_LAYOUT      8   /* x = the keyboard layout now (ZERP_LAYOUT_*, zerp_layouts.h): what the scancodes type */
 
 typedef struct {
     uint32_t type;

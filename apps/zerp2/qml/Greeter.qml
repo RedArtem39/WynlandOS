@@ -241,6 +241,17 @@ Window {
         }
     }
 
+    // ---- the keyboard layout (Alt+Shift), bottom right: passwords
+    Text {
+        anchors { right: parent.right; bottom: parent.bottom; margins: 24 }
+        color: "#d6dbe4"
+        opacity: 0.85
+        font.pixelSize: 14
+        font.bold: true
+        text: zerp.layoutShort
+        MouseArea { anchors.fill: parent; anchors.margins: -8; onClicked: zerp.nextLayout() }
+    }
+
     // ---- keys: the first one wakes the screen and is typed in
     Item {
         id: keys

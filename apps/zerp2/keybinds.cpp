@@ -1,5 +1,6 @@
 // WynlandOS - Zerp 2.0's key bindings (see keybinds.h)
 #include "keybinds.h"
+#include "../../zerp_layouts.h"
 
 #include <QtCore/QFile>
 #include <QtCore/QHash>
@@ -88,6 +89,26 @@ bool KeyBinds::parseFile(const QString &path)
         QStringList names = vars.keys();
         std::sort(names.begin(), names.end(), [](const QString &a, const QString &b) { return a.size() > b.size(); });
         for (const QString &v : names) rhs.replace(v, vars.value(v));
+        // the keyboard layouts (also as Hyprland's input:kb_layout)
+        QString opt = lhs;
+        if (opt.startsWith(QStringLiteral("input:"))) opt = opt.mid(6);
+        if (opt == QStringLiteral("kb_layout")) {
+            QVector<int> ls;
+            for (const QString &name : rhs.split(QChar(','), Qt::SkipEmptyParts)) {
+                int found = -1;
+                for (int i = 0; i < ZERP_LAYOUT_COUNT; i++)
+                    if (name.trimmed() == QLatin1String(ZERP_LAYOUT_XKB[i])) found = i;
+                if (found < 0) fprintf(stderr, "[zerp2] %s:%d: no layout \"%s\" (there are us, ru)\n", qPrintable(path), n, qPrintable(name.trimmed()));
+                else if (!ls.contains(found)) ls << found;
+            }
+            if (!ls.isEmpty()) m_layouts = ls;
+            continue;
+        }
+        if (opt == QStringLiteral("kb_options")) {
+            if (rhs.contains(QStringLiteral("grp:win_space_toggle"))) m_toggle = SuperSpace;
+            else if (rhs.contains(QStringLiteral("grp:alt_shift_toggle"))) m_toggle = AltShift;
+            continue;
+        }
         if (!lhs.startsWith(QStringLiteral("bind"))) continue;
         const QString flags = lhs.mid(4);
         const QStringList parts = rhs.split(QChar(','));
@@ -116,6 +137,8 @@ bool KeyBinds::parseFile(const QString &path)
 void KeyBinds::load()
 {
     m_binds.clear();
+    m_layouts = { 0, 1 };
+    m_toggle = AltShift;
     const QString home = qEnvironmentVariable("HOME");
     if (!home.isEmpty() && parseFile(home + QStringLiteral("/.config/zerp2/keybinds.conf"))) return;
     parseFile(QStringLiteral("/etc/zerp2/keybinds.conf"));

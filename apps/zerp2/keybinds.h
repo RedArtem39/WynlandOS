@@ -11,6 +11,11 @@
 // the key still reaches the window; l and e are accepted. Keys are xkb
 // names (T, Return, Page_Down, SUPER_L, F12, ...), any case.
 //
+// The keyboard layouts too, as Hyprland's input options:
+//
+//     kb_layout  = us,ru                  (the ones zerp_layouts.h has)
+//     kb_options = grp:alt_shift_toggle   (or grp:win_space_toggle)
+//
 // Zerp gets PC scancodes (set 1): a key here is code + 128 when it came
 // after an E0 prefix. Feed every scancode to key(); it says whether the
 // window must not see it.
@@ -41,6 +46,11 @@ public:
     int count() const { return m_binds.size(); }
     // the modifiers held now (the window's own state is Zerp's business)
     int mods() const { return m_mods; }
+    // kb_layout's layouts (ZERP_LAYOUT_*; us,ru without the line) and
+    // how to switch: Alt+Shift (grp:alt_shift_toggle, the default), Super+Space
+    enum Toggle { AltShift, SuperSpace };
+    const QVector<int> &layouts() const { return m_layouts; }
+    Toggle toggle() const { return m_toggle; }
 
 private:
     bool parseFile(const QString &path);
@@ -49,6 +59,8 @@ private:
     static int modOfKey(int kid);
 
     QVector<Bind> m_binds;
+    QVector<int> m_layouts{ 0, 1 };
+    Toggle m_toggle = AltShift;
     Run m_run;
     int m_mods = 0;
     bool m_alone[256] = {};       // a modifier pressed with nothing after it (yet)
