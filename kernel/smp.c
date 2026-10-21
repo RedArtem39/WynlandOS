@@ -382,10 +382,69 @@ static void delay_ms(uint32_t ms)
     while (timer_get_ms() - t0 < ms) __builtin_ia32_pause();
 }
 
-/* The APIC timer's rate against the PIT's millisecond clock (the boot
-   core's own timer, one-shot and masked, counting down meanwhile). */
+/* The local APIC's registers mapped (xAPIC) or switched to MSRs (x2APIC,
+   when the firmware turned it on): once, by whichever comes first --
+   lapic_clock_takeover() at boot, or smp_init() */
+static void lapic_map(void)
+{
+    uint64_t apic_base = rdmsr(MSR_APIC_BASE);
+    g_x2apic = (apic_base & (1u << 10)) != 0;
+    if (!g_x2apic && !g_lapic) {
+        uint64_t phys = apic_base & 0xFFFFF000ULL;
+        g_lapic = (volatile uint32_t *)vmm_map_mmio(phys, PAGE_SIZE);
+    }
+}
+
+static void log_num(const char *a, uint64_t v, const char *b);
+static inline void port_out8(uint16_t p, uint8_t v) { __asm__ volatile("outb %0, %1" :: "a"(v), "Nd"(p)); }
+static inline uint8_t port_in8(uint16_t p) { uint8_t v; __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(p)); return v; }
+
+/* No ticking PIT (kernel/clock.c): the boot core's APIC timer every
+   millisecond, on the PIT's own vector -- kernel/irq.c's IRQ0 path keeps
+   the clock as before, and acknowledges it at the APIC (g_clock_lapic). */
+bool g_clock_lapic;
+
+bool lapic_clock_takeover(uint64_t tsc_hz)
+{
+    if (!tsc_hz) return false;
+    lapic_map();
+    lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS);
+    lapic_write(LAPIC_TPR, 0);
+    lapic_write(LAPIC_TIMER_DIV, 0x3);              /* divide by 16 */
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED | VEC_LAPIC_TIMER);
+    lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFFu);
+    uint64_t t0 = __builtin_ia32_rdtsc();
+    while (__builtin_ia32_rdtsc() - t0 < tsc_hz / 100) __builtin_ia32_pause();   /* 10 ms */
+    uint32_t left = lapic_read(LAPIC_TIMER_CUR);
+    lapic_write(LAPIC_TIMER_INIT, 0);
+    g_lapic_per_ms = (0xFFFFFFFFu - left) / 10;
+    if (!g_lapic_per_ms) return false;
+    port_out8(0x21, port_in8(0x21) | 1);             /* the PIC's IRQ0: nothing comes anyway */
+    g_clock_lapic = true;
+    lapic_write(LAPIC_LVT_TIMER, LVT_PERIODIC | 0x20);
+    lapic_write(LAPIC_TIMER_INIT, g_lapic_per_ms);
+    log_num("Clock: the boot core's APIC timer, ", g_lapic_per_ms, " counts/ms\r\n");
+    return true;
+}
+
+/* The APIC timer's rate: known already (it is the clock), else against
+   the TSC's known rate, else against the PIT's millisecond clock (the
+   boot core's own timer, one-shot and masked, counting down meanwhile). */
 static void lapic_calibrate(void)
 {
+    extern uint64_t g_tsc_hz;
+    if (g_clock_lapic) return;
+    if (g_tsc_hz) {
+        lapic_write(LAPIC_TIMER_DIV, 0x3);
+        lapic_write(LAPIC_LVT_TIMER, LVT_MASKED | VEC_LAPIC_TIMER);
+        lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFFu);
+        uint64_t t0 = __builtin_ia32_rdtsc();
+        while (__builtin_ia32_rdtsc() - t0 < g_tsc_hz / 20) __builtin_ia32_pause();   /* 50 ms */
+        uint32_t left = lapic_read(LAPIC_TIMER_CUR);
+        lapic_write(LAPIC_TIMER_INIT, 0);
+        g_lapic_per_ms = (0xFFFFFFFFu - left) / 50;
+        return;
+    }
     lapic_write(LAPIC_TIMER_DIV, 0x3);
     lapic_write(LAPIC_LVT_TIMER, LVT_MASKED | VEC_LAPIC_TIMER);
     uint64_t t0 = timer_get_ms();
@@ -525,12 +584,7 @@ static void log_num(const char *a, uint64_t v, const char *b)
 void smp_init(BootInfo *bi)
 {
     sched_clock_calibrate();      /* the scheduler's clock (kernel/sched.c) */
-    uint64_t apic_base = rdmsr(MSR_APIC_BASE);
-    g_x2apic = (apic_base & (1u << 10)) != 0;
-    if (!g_x2apic) {
-        uint64_t phys = apic_base & 0xFFFFF000ULL;
-        g_lapic = (volatile uint32_t *)vmm_map_mmio(phys, PAGE_SIZE);
-    }
+    lapic_map();
     Cpu *bsp = &g_cpus[0];
     bsp->apic_id = lapic_id();
     bsp->online = true;

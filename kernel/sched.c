@@ -136,6 +136,13 @@ static inline uint64_t rdtsc_now(void)
 void sched_clock_calibrate(void)
 {
     extern uint64_t timer_get_ms(void);
+    extern uint64_t g_tsc_hz;     /* kernel/clock.c: the HPET's or the processor's word */
+    if (g_tsc_hz >= 1000) {
+        g_tsc0 = rdtsc_now();
+        g_ms0 = timer_get_ms();
+        g_tsc_per_ms = g_tsc_hz / 1000;
+        return;
+    }
     uint64_t m0 = timer_get_ms();
     while (timer_get_ms() == m0) __builtin_ia32_pause();
     uint64_t t0 = rdtsc_now(), ms0 = timer_get_ms();

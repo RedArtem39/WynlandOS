@@ -956,6 +956,11 @@ void kernel_main(BootInfo *boot_info_loader)
     {
         if (acpi_init(boot_info->rsdp_addr))
             boot_mark("ACPI (FADT)");
+        /* the clock without the PIT (kernel/clock.c): the TSC's rate (HPET
+           or CPUID), and the APIC timer when the PIT is gated off */
+        extern void clock_init(void);
+        clock_init();
+        boot_mark("clock");
     }
     serial_write_string("\r\nWynlandOS Kernel Starting...\r\n");
 

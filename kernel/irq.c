@@ -357,8 +357,11 @@ void irq_handler(InterruptRegisters *regs)
         bool ten = (timer_ms % TIMER_MS_PER_TICK) == 0;
         if (ten) timer_ticks++;
         tick_account(regs);
-        /* Send End of Interrupt (EOI) to PIC before yielding */
-        outb(PIC1_COMMAND, PIC_EOI);
+        /* End of Interrupt before yielding: to the PIC -- or to the APIC
+           when its timer is the clock (no ticking PIT: kernel/clock.c) */
+        extern bool g_clock_lapic;
+        if (g_clock_lapic) lapic_eoi();
+        else outb(PIC1_COMMAND, PIC_EOI);
 
         int took = bkl_irq_enter();
         if (took < 0) {
