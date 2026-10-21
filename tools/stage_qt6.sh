@@ -107,6 +107,13 @@ g++ $CXXFLAGS -I"$ROOT/usr/include" -o "$OUT/term.elf" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Gui -lQt6Core -lvterm
 echo "  QT6        built build/term.elf"
 
+# wynvt (apps/wynvt): the text console -- libvterm on the framebuffer, no
+# Qt; the kernel console's font without its freestanding types
+sed '/#include <wynland\/types.h>/d' include/wynland/font.h > "$B/font8x16.h"
+rm -f "$OUT/wynvt"; gcc -O2 -Wall -I"$B" -Iapps/accounts -I"$ROOT/usr/include" -o "$OUT/wynvt"     apps/wynvt/wynvt.c apps/accounts/accounts.c -L"$LIB" -Wl,-rpath-link,"$LIB" -lvterm -lcrypt 2>&1 | grep -v "accounts.c\|warn_unused_result\|^ *[0-9]* |\|^ *|" || true
+[ -x "$OUT/wynvt" ] || { echo "  QT6        wynvt did not build"; exit 1; }
+echo "  QT6        built build/wynvt"
+
 # Zerp 2.0 (apps/zerp2): Qt Quick on eglfs/KMS, no QPA plugin of ours
 Z2INC="-I$INC -I$INC/QtGui/$QTVER/QtGui $(for m in QtCore QtGui QtQml QtQuick QtWaylandCompositor QtNetwork; do printf -- '-I%s/%s ' "$INC" "$m"; done)"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_zerp2.cpp" apps/zerp2/zerp2.h
@@ -210,6 +217,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     echo "F /usr/bin/zerp2 build/zerp2.elf"
     echo "F /usr/bin/hyprctl build/hyprctl"
     echo "F /usr/bin/resolution build/resolution"
+    echo "F /usr/sbin/wynvt build/wynvt"
     echo "F /usr/bin/keyboard build/keyboard"
     echo "D /usr/share/zerp2"
     echo "D /usr/share/zerp2/qml"

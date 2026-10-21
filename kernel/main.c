@@ -698,6 +698,10 @@ static void console_print_char_raw(BootInfo *info, char c, uint32_t fg, uint32_t
 /* under the console's lock (cursor, UTF-8 state, the screen) */
 void console_print_char(BootInfo *info, char c, uint32_t fg, uint32_t bg)
 {
+    /* a program holds the framebuffer (wynvt, classic Zerp: fb0_hold() in
+       drivers/fs/ext2.c): the kernel's text -- a crash banner too -- stays
+       on the serial line */
+    if (g_quiet_console) return;
     uint64_t f;
     bool took = console_lock(&f);
     console_print_char_raw(info, c, fg, bg);

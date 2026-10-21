@@ -1786,6 +1786,7 @@ void kfile_get(VfsFile *f) {
         spin_unlock_irqrestore(&g_pipe_lock, pf);
     }
     else if (fc == PTY_FD_MASTER || fc == PTY_FD_SLAVE) pty_ref((int)f->current_cluster, fc == PTY_FD_MASTER);
+    else if (fc == 0xFFFFFFF0) { extern void fb0_hold(int delta); fb0_hold(1); }   /* /dev/fb0 (ext2.c) */
     else if (fc == 0xFFFFFFFD) { /* SHM segment: keep close()'s decrement balanced */
         int seg_idx = (int)f->current_cluster;
         if (seg_idx >= 0 && seg_idx < MAX_SHM_SEGMENTS) g_shm_segments[seg_idx].refcount++;

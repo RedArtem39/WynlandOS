@@ -171,11 +171,14 @@ static int mouse_hide_count = 0;
 
 /* With virtio-gpu up, the pointer lives on the GPU's cursor plane (see
    drivers/video/virtio_gpu.c): the software cursor below would only
-   scribble into the GOP framebuffer, which isn't even being scanned out. */
+   scribble into the GOP framebuffer, which isn't even being scanned out.
+   Nor when a program holds the framebuffer (g_quiet_console: wynvt) --
+   its pixels are its own, the kernel neither draws nor "restores" them. */
 static bool mouse_hw_cursor(void)
 {
     extern bool virtio_gpu_is_active(void);
-    return virtio_gpu_is_active();
+    extern bool g_quiet_console;
+    return virtio_gpu_is_active() || g_quiet_console;
 }
 
 void mouse_hide(void)

@@ -2201,6 +2201,17 @@ bool vfs_display_device_denied(const char *path) {
     return p && p->pid != 0 && !(p->uid == 0 && !p->userns);
 }
 
+/* While a program holds /dev/fb0 (wynvt, classic Zerp) the screen is its:
+   the kernel console stops drawing its own text into the same pixels.
+   Every fd's wrapper counts (open, kfile_get(), vfs_close()). */
+static volatile int g_fb0_holders;
+void fb0_hold(int delta)
+{
+    extern bool g_quiet_console;
+    int n = __atomic_add_fetch(&g_fb0_holders, delta, __ATOMIC_ACQ_REL);
+    g_quiet_console = n > 0;
+}
+
 VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     FS_GUARD();
     if (vfs_display_device_denied(path)) return NULL;
@@ -2208,9 +2219,11 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
        paths), byte-identical behavior to the previous FAT32 driver. */
     if (str_compare(path, "/dev/fb0") == 0) {
         extern BootInfo *g_boot_info;
-        return alloc_device_file("fb0",
-                                 g_boot_info ? (g_boot_info->fb_pitch * g_boot_info->fb_height) : 0,
-                                 false, DEV_FB0, flags);
+        VfsFile *f = alloc_device_file("fb0",
+                                       g_boot_info ? (g_boot_info->fb_pitch * g_boot_info->fb_height) : 0,
+                                       false, DEV_FB0, flags);
+        if (f) fb0_hold(1);
+        return f;
     }
     if (str_compare(path, "/dev/input/mice") == 0) {
         return alloc_device_file("mice", 0, false, DEV_MICE, flags);
@@ -2365,6 +2378,7 @@ void vfs_close(VfsFile *file) {
     }
     if ((file->flags & VFS_F_PINNED) && file->node.first_cluster < 0xFFFFFF00u)
         ext2_unpin_inode(file->node.first_cluster);
+    if (file->node.first_cluster == DEV_FB0) fb0_hold(-1);
     kfree(file);
 }
 

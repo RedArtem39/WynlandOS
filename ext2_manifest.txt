@@ -107,6 +107,7 @@ F  /etc/wynrc/services/swaptest rootfs/etc/wynrc/services/swaptest
 F  /etc/wynrc/services/gltest rootfs/etc/wynrc/services/gltest
 F  /etc/wynrc/services/kmstest rootfs/etc/wynrc/services/kmstest
 F  /etc/wynrc/services/zerp rootfs/etc/wynrc/services/zerp
+F  /etc/wynrc/services/console rootfs/etc/wynrc/services/console
 F  /etc/wynrc/runlevels/boot rootfs/etc/wynrc/runlevels/boot
 F  /etc/wynrc/runlevels/default rootfs/etc/wynrc/runlevels/default
 Fo /kmstest.elf         build/kmstest.elf

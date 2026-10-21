@@ -174,6 +174,20 @@ static pid_t start_session_bus(const struct passwd *pw, char **env, char *addr, 
    resolution(1); apps/zerp2/zerp2.h restartSession()) */
 #define SESSION_RESTART 3
 
+/* What runs now -- the login screen or a session, and the session's bus:
+   stopping wynlogin (rc-service wynlogin stop: SIGTERM) stops them too,
+   or the orphaned display server kept the screen and the keyboard (the
+   text console started next got neither) */
+static volatile pid_t g_display_pid = -1, g_bus_pid = -1;
+
+static void on_term(int sig)
+{
+    (void)sig;
+    if (g_display_pid > 0) kill(g_display_pid, SIGTERM);
+    if (g_bus_pid > 0) kill(g_bus_pid, SIGTERM);
+    _exit(0);
+}
+
 /* the user's session until it ends; true: it asked to start again */
 static bool run_session(const char *user)
 {
@@ -190,16 +204,20 @@ static bool run_session(const char *user)
         env[n + 1] = NULL;
     }
     char *argv[] = { ZERP2, NULL };
+    g_bus_pid = bus;
     pid_t pid = spawn_as(ZERP2, argv, env, user, pw->pw_uid, pw->pw_gid);
+    g_display_pid = pid;
     input_close();
     if (pid < 0 && bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }
     if (pid < 0) { logf_("could not start the session of %s", user); sleep(2); return false; }
     logf_("session of %s (uid %u): pid %d", user, pw->pw_uid, (int)pid);
     int st;
     while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    g_display_pid = -1;
     logf_("session of %s ended (%s %d)", user, WIFEXITED(st) ? "exit" : "signal",
           WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
     if (bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }   /* the session's bus goes with it */
+    g_bus_pid = -1;
     return WIFEXITED(st) && WEXITSTATUS(st) == SESSION_RESTART;
 }
 
@@ -248,6 +266,7 @@ static void greet(char *who, size_t cap)
     input_open();
     char **env = make_env(g ? g : &fake);
     pid_t pid = spawn_as(ZERP2, argv, env, g ? GREETER_USER : NULL, guid, ggid);
+    g_display_pid = pid;
     input_close();
     close(req[1]);
     close(rep[0]);
@@ -300,11 +319,12 @@ static void greet(char *who, size_t cap)
     close(rep[1]);
     /* the greeter fades out and exits by itself; make sure */
     for (int i = 0; i < 50; i++) {
-        if (waitpid(pid, NULL, WNOHANG) == pid) return;
+        if (waitpid(pid, NULL, WNOHANG) == pid) { g_display_pid = -1; return; }
         usleep(100000);
     }
     kill(pid, SIGTERM);
     waitpid(pid, NULL, 0);
+    g_display_pid = -1;
 }
 
 static void autologin_name(char *out, size_t cap)
@@ -345,6 +365,7 @@ static void ensure_machine_id(void)
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, on_term);
     if (geteuid() != 0) { logf_("must run as root"); return 1; }
     ensure_machine_id();
     char auto_user[64];

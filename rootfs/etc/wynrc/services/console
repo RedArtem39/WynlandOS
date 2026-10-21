@@ -1,0 +1,6 @@
+description=the text console (wynvt): login and a shell, no desktop
+type=daemon
+exec=/usr/sbin/wynvt
+provide=display
+when=console=1
+restart=always
