@@ -494,6 +494,16 @@ static void exception_handler_main(InterruptRegisters *regs)
         return;
     }
 
+    /* the boot log says how this boot ended (kernel/bootlog.c): the loader
+       of the next one saves it to the boot stick; and the panic screen is
+       drawn even over a program's framebuffer (wynvt, classic Zerp) */
+    {
+        extern void bootlog_set_state(uint32_t state);
+        extern bool g_quiet_console;
+        bootlog_set_state(1);   /* BOOTLOG_PANIC */
+        g_quiet_console = false;
+    }
+
     /* Write emergency info to serial port COM1 first */
     serial_write_string("\r\n======================================\r\n");
     serial_write_string("!!! KERNEL PANIC: CPU EXCEPTION !!!\r\n");
@@ -642,10 +652,34 @@ static void exception_handler_main(InterruptRegisters *regs)
         print_reg(g_boot_info, "RBP", regs->rbp);
         print_reg(g_boot_info, "RFL", regs->rflags);
         
-        console_print_string(g_boot_info, "\nSystem Halted.", 0x00FFAAAA, bg_color);
+        console_print_string(g_boot_info, "\nRestarting in 10 s: the boot stick gets this log (\\logs).", 0x00FFAAAA, bg_color);
     }
 
-    /* Loop forever and halt */
+    /* A warm reset after a while to read the screen: the CPU only, RAM
+       keeps the boot log for the next boot's loader. The keyboard
+       controller's reset line, then port CF9's soft reset (not 0x06, a
+       full reset that may clear the memory), then a triple fault. */
+    serial_write_string("Restarting (warm) in 10 s: the next boot's loader saves this log.\r\n");
+    __asm__ volatile("cli");
+    {
+        /* 10 s by the TSC clock (kernel/sched.c: it runs with interrupts
+           off); before it is calibrated it stands still -- then a bounded
+           count of port writes (~1 us each on hardware, longer in a VM) */
+        extern uint64_t sched_clock_ns(void);
+        uint64_t t0 = sched_clock_ns();
+        for (uint32_t i = 0; i < 10u * 1000u * 1000u && sched_clock_ns() - t0 < 10000000000ULL; i++)
+            __asm__ volatile("outb %%al, $0x80" :: "a"((uint8_t)0) : "memory");
+    }
+    for (int i = 0; i < 100000; i++) {                   /* the controller's input buffer empty */
+        uint8_t st;
+        __asm__ volatile("inb $0x64, %0" : "=a"(st));
+        if (!(st & 0x02)) break;
+    }
+    __asm__ volatile("outb %%al, $0x64" :: "a"((uint8_t)0xFE));
+    for (uint32_t i = 0; i < 100000u; i++) __asm__ volatile("outb %%al, $0x80" :: "a"((uint8_t)0));
+    __asm__ volatile("outb %%al, %%dx" :: "a"((uint8_t)0x04), "d"((uint16_t)0xCF9));
+    for (uint32_t i = 0; i < 100000u; i++) __asm__ volatile("outb %%al, $0x80" :: "a"((uint8_t)0));
+    __asm__ volatile("lidt %0; int3" :: "m"((uint16_t[3]){0, 0, 0}));
     while (1) {
         __asm__ volatile("cli; hlt");
     }

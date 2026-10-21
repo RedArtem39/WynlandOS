@@ -240,7 +240,9 @@ struct EFI_FILE_PROTOCOL {
     EFI_STATUS  (*Read)(struct EFI_FILE_PROTOCOL *This,
                         UINTN *BufferSize,
                         VOID *Buffer);
-    VOID*       Write;
+    EFI_STATUS  (*Write)(struct EFI_FILE_PROTOCOL *This,
+                         UINTN *BufferSize,
+                         VOID *Buffer);
     VOID*       GetPosition;
     VOID*       SetPosition;
     EFI_STATUS  (*GetInfo)(struct EFI_FILE_PROTOCOL *This,
@@ -248,10 +250,13 @@ struct EFI_FILE_PROTOCOL {
                            UINTN *BufferSize,
                            VOID *Buffer);
     VOID*       SetInfo;
-    VOID*       Flush;
+    EFI_STATUS  (*Flush)(struct EFI_FILE_PROTOCOL *This);
 };
 
 #define EFI_FILE_MODE_READ      0x0000000000000001ULL
+#define EFI_FILE_MODE_WRITE     0x0000000000000002ULL
+#define EFI_FILE_MODE_CREATE    0x8000000000000000ULL
+#define EFI_FILE_DIRECTORY      0x0000000000000010ULL
 #define EFI_FILE_READ_ONLY      0x0000000000000001ULL
 
 /* ============================================================

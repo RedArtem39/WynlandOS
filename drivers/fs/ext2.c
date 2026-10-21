@@ -216,6 +216,7 @@ static uint32_t        g_inode_size = 128;
 #define DEV_URANDOM    0xFFFFFFF8
 #define DEV_ZERO       0xFFFFFFED   /* /dev/zero: reads zeros, writes vanish */
 #define DEV_DSP        0xFFFFFFC0   /* include/wynland/hda.h */
+#define DEV_SYSRQ      0xFFFFFFB1   /* /proc/sysrq-trigger: "c" crashes the kernel on purpose */
 #define DEV_USB0       0xFFFFFFB0   /* USB mass storage (drivers/usb); outside 0xFFFFFFF0+, whose
                                        0xFFFFFFF4.. are sysfs's PCI files */
 
@@ -2195,7 +2196,8 @@ static VfsFile *alloc_device_file(const char *name, uint32_t size,
 bool vfs_display_device_denied(const char *path) {
     FS_GUARD();
     if (str_compare(path, "/dev/input/kbd") != 0 && str_compare(path, "/dev/input/mice") != 0 &&
-        str_compare(path, "/dev/fb0") != 0 && str_compare(path, "/dev/usb0") != 0) return false;
+        str_compare(path, "/dev/fb0") != 0 && str_compare(path, "/dev/usb0") != 0 &&
+        str_compare(path, "/proc/sysrq-trigger") != 0) return false;
     Thread *t = sched_current();
     Process *p = t ? t->proc : NULL;
     return p && p->pid != 0 && !(p->uid == 0 && !p->userns);
@@ -2231,6 +2233,8 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     if (str_compare(path, "/dev/input/kbd") == 0) {
         return alloc_device_file("kbd", 0, false, DEV_KBD, flags);
     }
+    if (str_compare(path, "/proc/sysrq-trigger") == 0)
+        return alloc_device_file("sysrq-trigger", 0, false, DEV_SYSRQ, flags);
     if (str_compare(path, "/dev/usb0") == 0) {
         if (!usb_storage_ready()) return NULL;
         uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
@@ -2552,6 +2556,15 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     }
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_ZERO) return (int)size;
+    /* Linux's crash on request (root's): the panic path -- its screen, the
+       boot log marked, the warm reset -- tried without waiting for a bug */
+    if (file->node.first_cluster == DEV_SYSRQ) {
+        if (size && ((const char *)buf)[0] == 'c') {
+            serial_write_string("sysrq: a kernel crash, as asked\r\n");
+            __asm__ volatile("ud2");
+        }
+        return (int)size;
+    }
     if (file->node.first_cluster == DEV_USB0) {
         uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
         if (file->offset >= bytes) return 0;

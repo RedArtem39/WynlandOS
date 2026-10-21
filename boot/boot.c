@@ -11,6 +11,7 @@
 #include "uefi.h"
 #include "elf.h"
 #include <wynland/boot_info.h>
+#include <wynland/bootlog.h>
 
 /* ============================================================
  * Global State
@@ -128,6 +129,91 @@ static void ReadResolution(UINT32 *want_w, UINT32 *want_h) {
     }
     f->Close(f);
     rootDir->Close(rootDir);
+}
+
+/*
+ * The previous boot's log (include/wynland/bootlog.h): when it ended in a
+ * panic -- or never said it ended -- it goes to \logs on the boot volume,
+ * written by the firmware's file system driver. Then this boot's log is
+ * claimed: the first BOOTLOG_ADDRS range the firmware still has free.
+ * First of all, before anything else allocates.
+ */
+static void PutDec(CHAR16 *out, UINT32 v)
+{
+    CHAR16 tmp[12];
+    int n = 0;
+    do { tmp[n++] = (CHAR16)(L'0' + v % 10); v /= 10; } while (v && n < 11);
+    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+    out[n] = 0;
+}
+
+static void SaveLog(BootLog *l)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *loadedImage;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fileSystem;
+    EFI_FILE_PROTOCOL *root, *dir, *f;
+    EFI_GUID loadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+    EFI_GUID fileSystemGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(gImageHandle, &loadedImageGuid, (VOID**)&loadedImage))) return;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(loadedImage->DeviceHandle, &fileSystemGuid, (VOID**)&fileSystem))) return;
+    if (EFI_IS_ERROR(fileSystem->OpenVolume(fileSystem, &root))) return;
+    if (EFI_IS_ERROR(root->Open(root, &dir, L"\\logs", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+                                EFI_FILE_DIRECTORY))) {
+        root->Close(root);
+        return;
+    }
+    /* \logs\panic-<boot>.log, or unclean-<boot>.log (reset without a word) */
+    CHAR16 name[48];
+    const CHAR16 *kind = l->state == BOOTLOG_PANIC ? L"panic-" : L"unclean-";
+    int n = 0;
+    while (kind[n]) { name[n] = kind[n]; n++; }
+    PutDec(name + n, l->boot_no);
+    while (name[n]) n++;
+    const CHAR16 *ext = L".log";
+    for (int i = 0; ext[i]; i++) name[n++] = ext[i];
+    name[n] = 0;
+    if (!EFI_IS_ERROR(dir->Open(dir, &f, name, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+        /* the ring in order: the oldest byte first */
+        UINT64 size = l->size, head = l->head;
+        UINT64 start = head > size ? head % size : 0, len = head > size ? size : head;
+        UINTN a = (UINTN)(start + len > size ? size - start : len);
+        UINTN b = (UINTN)(len - a);
+        if (a) f->Write(f, &a, l->data + start);
+        if (b) f->Write(f, &b, l->data);
+        f->Flush(f);
+        f->Close(f);
+        Print(L"  saved the last boot's log: \\logs\\");
+        Print(name);
+        Print(L"\r\n");
+    }
+    dir->Close(dir);
+    root->Close(root);
+}
+
+static UINT64 BootLogSetup(void)
+{
+    UINT32 boot_no = 1;
+    for (int i = 0; i < BOOTLOG_NADDRS; i++) {
+        BootLog *l = (BootLog *)(UINTN)BOOTLOG_ADDRS[i];
+        if (!bootlog_valid(l, BOOTLOG_ADDRS[i])) continue;
+        boot_no = l->boot_no + 1;
+        if (l->state != BOOTLOG_CLEAN) SaveLog(l);
+        l->magic = 0;                      /* read: never saved twice */
+    }
+    for (int i = 0; i < BOOTLOG_NADDRS; i++) {
+        EFI_PHYSICAL_ADDRESS a = BOOTLOG_ADDRS[i];
+        if (EFI_IS_ERROR(gBS->AllocatePages(AllocateAddress, EfiReservedMemoryType, BOOTLOG_BYTES / 4096, &a))) continue;
+        BootLog *l = (BootLog *)(UINTN)a;
+        memset(l, 0, sizeof(BootLog));
+        l->magic = BOOTLOG_MAGIC;
+        l->self = a;
+        l->size = BOOTLOG_BYTES - sizeof(BootLog);
+        l->state = BOOTLOG_RUNNING;
+        l->boot_no = boot_no;
+        l->check = bootlog_check(l);
+        return a;
+    }
+    return 0;
 }
 
 static EFI_STATUS InitGraphics(BootInfo *info) {
@@ -706,6 +792,9 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 
     memset(&bootInfo, 0, sizeof(BootInfo));
     bootInfo.mmap_addr = (UINT64)(UINTN)memRegions;
+
+    /* the last boot's log to \logs (when it crashed), this boot's claimed */
+    bootInfo.log_addr = BootLogSetup();
 
     /* [1/4] Initialize graphics */
     Print(L"[1/4] Initializing graphics...\r\n");

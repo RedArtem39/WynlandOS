@@ -563,6 +563,8 @@ static int serial_is_transmit_empty(void)
 
 static void serial_write_char(char c)
 {
+    extern void bootlog_putc(char c);
+    bootlog_putc(c);                 /* the log that outlives a crash (kernel/bootlog.c) */
     while (serial_is_transmit_empty() == 0);
     outb(PORT_COM1, c);
 }
@@ -795,6 +797,8 @@ void console_print_string(BootInfo *info, const char *str, uint32_t fg, uint32_t
 void sys_reboot(void)
 {
     extern bool ext2_flush(void);
+    extern void bootlog_set_state(uint32_t state);
+    bootlog_set_state(2);   /* BOOTLOG_CLEAN: nothing for the loader to save */
     ext2_flush();   /* write-back cache: nothing may be left behind */
     /* ACPI reset register first, then the keyboard-controller pulse. */
     acpi_reset();
@@ -812,6 +816,8 @@ void sys_reboot(void)
 void sys_poweroff(void)
 {
     extern bool ext2_flush(void);
+    extern void bootlog_set_state(uint32_t state);
+    bootlog_set_state(2);   /* BOOTLOG_CLEAN */
     ext2_flush();
     if (acpi_poweroff()) return;
     serial_write_string("ACPI: poweroff via FADT failed, trying fixed ports\r\n");
@@ -898,6 +904,10 @@ void kernel_main(BootInfo *boot_info_loader)
 
     /* ---- Initialize VMM ---- */
     vmm_init(boot_info);
+    {
+        extern void bootlog_init(BootInfo *bi);
+        bootlog_init(boot_info);
+    }
 
     /* ---- Initialize Heap ---- */
     heap_init();

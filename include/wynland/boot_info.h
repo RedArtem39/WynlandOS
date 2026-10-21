@@ -57,6 +57,9 @@ typedef struct PACKED {
 
     /* === Magic === */
     uint64_t    magic;          /* WYNLAND_BOOT_MAGIC - for validation */
+
+    /* === The boot log that outlives a crash (include/wynland/bootlog.h) === */
+    uint64_t    log_addr;       /* physical; 0: none this boot */
 } BootInfo;
 
 #define WYNLAND_BOOT_MAGIC 0x57594E4C414E4400ULL  /* "WYNLAND\0" as uint64 */
