@@ -14,6 +14,9 @@ static inline uint32_t inl(uint16_t port) {
     return val;
 }
 
+/* The standard 256 bytes of configuration space through ports CF8/CFC:
+   every PC has them. (ECAM -- drivers/acpi/acpi.c, MCFG -- is for the
+   extended space past 256, which nothing here reads yet.) */
 uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
     uint32_t address = (uint32_t)((bus << 16) | (slot << 11) |
                                   (func << 8) | (offset & 0xfc) | ((uint32_t)0x80000000));

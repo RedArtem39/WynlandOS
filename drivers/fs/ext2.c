@@ -37,6 +37,8 @@
 #include <wynland/virtgpu_drm.h>
 #include <wynland/vfs.h>
 #include <wynland/ahci.h>
+#include <wynland/nvme.h>
+#include <wynland/usb.h>
 #include <wynland/heap.h>
 #include <wynland/vma.h>
 #include <wynland/types.h>
@@ -214,6 +216,8 @@ static uint32_t        g_inode_size = 128;
 #define DEV_URANDOM    0xFFFFFFF8
 #define DEV_ZERO       0xFFFFFFED   /* /dev/zero: reads zeros, writes vanish */
 #define DEV_DSP        0xFFFFFFC0   /* include/wynland/hda.h */
+#define DEV_USB0       0xFFFFFFB0   /* USB mass storage (drivers/usb); outside 0xFFFFFFF0+, whose
+                                       0xFFFFFFF4.. are sysfs's PCI files */
 
 /* ============================================================
  * Local string helpers (same conventions as every other driver)
@@ -2137,7 +2141,7 @@ bool vfs_init(void) {
     FS_GUARD();
     ahci_init();
 
-    if (sata_port_num == -1) {
+    if (sata_port_num == -1 && !nvme_ok()) {
         serial_write_string("VFS Error: AHCI not initialized, cannot init VFS!\r\n");
         return false;
     }
@@ -2183,13 +2187,15 @@ static VfsFile *alloc_device_file(const char *name, uint32_t size,
 }
 
 /* The display server's devices -- the keyboard, the pointer, the
-   framebuffer: whoever reads them sees every key typed and the screen.
+   framebuffer: whoever reads them sees every key typed and the screen --
+   and the raw USB stick (/dev/usb0: every byte on it, the filesystem's
+   permissions bypassed).
    Root's only (on the host): the login manager and init open them and
    hand the fds to the display server they start. */
 bool vfs_display_device_denied(const char *path) {
     FS_GUARD();
     if (str_compare(path, "/dev/input/kbd") != 0 && str_compare(path, "/dev/input/mice") != 0 &&
-        str_compare(path, "/dev/fb0") != 0) return false;
+        str_compare(path, "/dev/fb0") != 0 && str_compare(path, "/dev/usb0") != 0) return false;
     Thread *t = sched_current();
     Process *p = t ? t->proc : NULL;
     return p && p->pid != 0 && !(p->uid == 0 && !p->userns);
@@ -2211,6 +2217,12 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     }
     if (str_compare(path, "/dev/input/kbd") == 0) {
         return alloc_device_file("kbd", 0, false, DEV_KBD, flags);
+    }
+    if (str_compare(path, "/dev/usb0") == 0) {
+        if (!usb_storage_ready()) return NULL;
+        uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
+        if (bytes > 0xFFFFFFFFULL) bytes = 0xFFFFFFFFULL;
+        return alloc_device_file("usb0", (uint32_t)bytes, false, DEV_USB0, flags);
     }
     /* DRM nodes (drivers/video/virtgpu_drm.c): ioctl/mmap-only devices */
     if (str_compare(path, "/dev/dri/renderD128") == 0) {
@@ -2414,6 +2426,14 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_DSP) return -1;  /* playback only */
     if (file->node.first_cluster == DEV_ZERO) { memset(buf, 0, size); return (int)size; }
+    if (file->node.first_cluster == DEV_USB0) {
+        uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
+        if (file->offset >= bytes) return 0;
+        if (file->offset + size > bytes) size = (uint32_t)(bytes - file->offset);
+        if (usb_storage_read_bytes(file->offset, buf, size) < 0) return -1;
+        file->offset += size;
+        return (int)size;
+    }
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* always EOF */
@@ -2518,6 +2538,14 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     }
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_ZERO) return (int)size;
+    if (file->node.first_cluster == DEV_USB0) {
+        uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
+        if (file->offset >= bytes) return 0;
+        if (file->offset + size > bytes) size = (uint32_t)(bytes - file->offset);
+        if (usb_storage_write_bytes(file->offset, buf, size) < 0) return -1;
+        file->offset += size;
+        return (int)size;
+    }
 
     if (file->node.first_cluster >= 0xFFFFFFF0) {
         if (file->node.first_cluster == DEV_NULL) { /* discard everything */

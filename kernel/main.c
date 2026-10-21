@@ -29,6 +29,7 @@
 #include <wynland/process.h>
 #include <wynland/rtc.h>
 #include <wynland/smp.h>
+#include <wynland/acpi.h>
 
 /* the screen's back-buffer (drivers/video/backbuffer.c) */
 extern void compositor_init(BootInfo *info);
@@ -791,7 +792,9 @@ void sys_reboot(void)
 {
     extern bool ext2_flush(void);
     ext2_flush();   /* write-back cache: nothing may be left behind */
-    /* 1. Pulse CPU reset via keyboard controller (port 0x64) */
+    /* ACPI reset register first, then the keyboard-controller pulse. */
+    acpi_reset();
+    /* Pulse CPU reset via keyboard controller (port 0x64) */
     uint8_t temp = 0x02;
     while (temp & 0x02) {
         temp = inb(0x64);
@@ -806,6 +809,8 @@ void sys_poweroff(void)
 {
     extern bool ext2_flush(void);
     ext2_flush();
+    if (acpi_poweroff()) return;
+    serial_write_string("ACPI: poweroff via FADT failed, trying fixed ports\r\n");
     /* QEMU q35 ACPI shutdown */
     outw(0x604, 0x2000);
     /* QEMU piix4 ACPI shutdown */
@@ -934,6 +939,10 @@ void kernel_main(BootInfo *boot_info_loader)
     /* ---- Initialize Serial Port (COM1) ---- */
     serial_init();
     boot_mark("serial up");
+    {
+        if (acpi_init(boot_info->rsdp_addr))
+            boot_mark("ACPI (FADT)");
+    }
     serial_write_string("\r\nWynlandOS Kernel Starting...\r\n");
 
     /* ---- Initialize Filesystem ---- */
@@ -987,6 +996,11 @@ void kernel_main(BootInfo *boot_info_loader)
         extern void hda_init(void);
         hda_init();
         boot_mark("sound (HDA)");
+    }
+    {
+        extern void usb_init(void);
+        usb_init();
+        boot_mark("USB (xHCI)");
     }
     tcp_init();
     udp_socket_init();

@@ -101,3 +101,9 @@ void ahci_init(void);
 bool ahci_read(uint32_t lba, uint32_t count, void *buf);
 bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf);
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf);
+
+/* Shared disk-wait helpers: drop the big lock while a command is in
+   flight so the rest of the system keeps running. */
+bool disk_wait_begin(void);
+void disk_wait_end(bool dropped);
+void disk_wait_step(void);

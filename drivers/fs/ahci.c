@@ -6,6 +6,8 @@
 #include <wynland/sched.h>
 #include <wynland/sched.h>
 #include <wynland/ahci.h>
+#include <wynland/nvme.h>
+#include <wynland/disklabel.h>
 #include <wynland/pci.h>
 #include <wynland/vmm.h>
 #include <wynland/heap.h>
@@ -21,6 +23,10 @@ int sata_port_num = -1;
 static uint8_t *bounce(void);
 
 void ahci_init(void) {
+    if (nvme_init()) {
+        serial_write_string("AHCI: NVMe boot disk present; SATA path skipped.\r\n");
+        return;
+    }
     (void)bounce();
     serial_write_string("AHCI: Scanning PCI for SATA controller...\r\n");
     PciDevice dev;
@@ -118,6 +124,15 @@ void ahci_init(void) {
     port->cmd |= 0x0001; // ST = 1
     
     serial_write_string("AHCI: Port initialized successfully.\r\n");
+
+    /* only our own disk (disklabel.h): another one -- a real machine's
+       Windows disk -- is never written */
+    uint8_t *lba0 = (uint8_t *)kmalloc(512);
+    if (!lba0 || !ahci_read(0, 1, lba0) || !wyn_disk_is_ours(lba0)) {
+        serial_write_string("AHCI: the SATA disk is not a WynlandOS disk -- left alone.\r\n");
+        sata_port_num = -1;
+    }
+    if (lba0) kfree(lba0);
 }
 
 /* ahci_read - read sectors from SATA disk via AHCI DMA */
@@ -189,7 +204,7 @@ volatile uint64_t g_disk_cyc, g_disk_cmds;
 static uint64_t g_disk_t0;
 
 /* returns whether the big lock was given back (ahci_wait_end() retakes it) */
-static bool ahci_wait_begin(void)
+bool disk_wait_begin(void)
 {
     Thread *t = sched_current();
     g_disk_t0 = __builtin_ia32_rdtsc();
@@ -198,7 +213,7 @@ static bool ahci_wait_begin(void)
     if (t) t->no_preempt++;
     return false;
 }
-static void ahci_wait_end(bool dropped)
+void disk_wait_end(bool dropped)
 {
     Thread *t = sched_current();
     g_disk_cyc += __builtin_ia32_rdtsc() - g_disk_t0;
@@ -207,19 +222,20 @@ static void ahci_wait_end(bool dropped)
     if (dropped) bkl_retake(true);
     else if (t) t->no_preempt--;
 }
-static inline void ahci_wait_step(void)
+void disk_wait_step(void)
 {
     if (g_ahci_irq_ok) __asm__ volatile("sti; pause; cli" ::: "memory");
 }
 
 bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
+    if (nvme_ok()) return nvme_read(lba, count, buf);
     /* Everything uses command slot 0: a second command started while one
        is in flight (a kernel thread preempted mid-command, then a syscall
        reading) corrupted both -- "Task File Error", or a library read
        back damaged. Interrupts stay off for the whole command. */
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-    bool dropped = ahci_wait_begin();
+    bool dropped = disk_wait_begin();
     bool ok = true;
     if (dma_contiguous(buf, count * 512)) {
         ok = ahci_read_hw(lba, count, buf);
@@ -234,7 +250,7 @@ bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
             done += n;
         }
     }
-    ahci_wait_end(dropped);
+    disk_wait_end(dropped);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return ok;
 }
@@ -252,7 +268,7 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
     
     int timeout = 100000000;
     while ((port->ci & (1 << slot)) || (port->tfd & (AHCI_DEV_BUSY | AHCI_DEV_DRQ))) {
-        ahci_wait_step();
+        disk_wait_step();
         if (--timeout == 0) {
             serial_write_string("AHCI Read: Port is busy/hung!\r\n");
             return false;
@@ -303,7 +319,7 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
     
     timeout = 100000000;
     while (1) {
-        ahci_wait_step();
+        disk_wait_step();
         if ((port->ci & (1 << slot)) == 0) {
             break;
         }
@@ -339,9 +355,10 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
 static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf);
 
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
+    if (nvme_ok()) return nvme_write(lba, count, buf);
     uint64_t rflags;   /* see ahci_read(): one command at a time, contiguous DMA */
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
-    bool dropped = ahci_wait_begin();
+    bool dropped = disk_wait_begin();
     bool ok = true;
     if (dma_contiguous(buf, count * 512)) {
         ok = ahci_write_hw(lba, count, buf);
@@ -356,7 +373,7 @@ bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
             done += n;
         }
     }
-    ahci_wait_end(dropped);
+    disk_wait_end(dropped);
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return ok;
 }
@@ -372,7 +389,7 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf) {
     
     int timeout = 100000000;
     while ((port->ci & (1 << slot)) || (port->tfd & (AHCI_DEV_BUSY | AHCI_DEV_DRQ))) {
-        ahci_wait_step();
+        disk_wait_step();
         if (--timeout == 0) {
             serial_write_string("AHCI Write: Port is busy/hung!\r\n");
             return false;
@@ -423,7 +440,7 @@ static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf) {
     
     timeout = 100000000;
     while (1) {
-        ahci_wait_step();
+        disk_wait_step();
         if ((port->ci & (1 << slot)) == 0) {
             break;
         }

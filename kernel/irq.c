@@ -110,6 +110,17 @@ void kbd_raw_queue_push(uint8_t scancode)
     }
 }
 
+/* A USB HID keyboard's scancodes enter the same queues as the PS/2 one. */
+void keyboard_inject_scancode(uint8_t scancode)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    if (!g_kbd_raw_read_ms || timer_ms - g_kbd_raw_read_ms > KBD_OWNER_MS)
+        keyboard_push_scancode(scancode);
+    kbd_raw_queue_push(scancode);
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
 int kbd_raw_read_queue(uint8_t *buf, int size)
 {
     int read_bytes = 0;

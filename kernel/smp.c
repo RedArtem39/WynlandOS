@@ -14,6 +14,7 @@
 #include <wynland/heap.h>
 #include <wynland/pmm.h>
 #include <wynland/boot_info.h>
+#include <wynland/acpi.h>
 
 extern void serial_write_string(const char *str);
 extern void uint_to_str(uint64_t val, char *buf);
@@ -446,47 +447,6 @@ void smp_kick_idle(void)
 
 /* ---- ACPI: which cores exist --------------------------------------------- */
 
-typedef struct PACKED {
-    char     sig[4];
-    uint32_t len;
-    uint8_t  rev, csum;
-    char     oem[6], oem_table[8];
-    uint32_t oem_rev, creator, creator_rev;
-} AcpiHeader;
-
-/* ACPI tables live in firmware memory the direct map may have left out
-   (reserved ranges): map what is read, at P2V() of it. */
-static void acpi_map(uint64_t addr, uint64_t len)
-{
-    PageTable *k = vmm_get_kernel_pml4();
-    for (uint64_t a = addr & ~0xFFFULL; a < addr + len; a += PAGE_SIZE)
-        if (!vmm_get_phys(k, HHDM_BASE + a)) vmm_map_page(k, HHDM_BASE + a, a, PAGE_NX);
-}
-
-static const AcpiHeader *acpi_find(uint64_t rsdp, const char *sig)
-{
-    if (!rsdp) return NULL;
-    acpi_map(rsdp, 36);
-    const uint8_t *r = (const uint8_t *)P2V(rsdp);
-    bool xsdt = r[15] >= 2 && *(const uint64_t *)(r + 24);
-    uint64_t sdt = xsdt ? *(const uint64_t *)(r + 24) : *(const uint32_t *)(r + 16);
-    acpi_map(sdt, sizeof(AcpiHeader));
-    const AcpiHeader *h = (const AcpiHeader *)P2V(sdt);
-    acpi_map(sdt, h->len);
-    uint32_t n = (h->len - sizeof(AcpiHeader)) / (xsdt ? 8 : 4);
-    const uint8_t *ents = (const uint8_t *)h + sizeof(AcpiHeader);
-    for (uint32_t i = 0; i < n; i++) {
-        uint64_t p = xsdt ? *(const uint64_t *)(ents + 8 * i) : *(const uint32_t *)(ents + 4 * i);
-        acpi_map(p, sizeof(AcpiHeader));
-        const AcpiHeader *t = (const AcpiHeader *)P2V(p);
-        if (t->sig[0] == sig[0] && t->sig[1] == sig[1] && t->sig[2] == sig[2] && t->sig[3] == sig[3]) {
-            acpi_map(p, t->len);
-            return t;
-        }
-    }
-    return NULL;
-}
-
 /* ---- starting the other cores --------------------------------------------- */
 
 extern char ap_trampoline_start[], ap_trampoline_end[];
@@ -576,7 +536,7 @@ void smp_init(BootInfo *bi)
     bsp->online = true;
     lapic_setup(true);
 
-    const uint8_t *madt = (const uint8_t *)acpi_find(bi->rsdp_addr, "APIC");
+    const uint8_t *madt = (const uint8_t *)acpi_find_table("APIC");
     if (!madt) {
         serial_write_string("SMP: no ACPI MADT, one core\r\n");
         return;
@@ -612,8 +572,8 @@ void smp_init(BootInfo *bi)
     lapic_calibrate();
     log_num("SMP: APIC timer ", g_lapic_per_ms, " counts/ms\r\n");
 
-    uint32_t len = ((const AcpiHeader *)madt)->len;
-    for (uint32_t off = sizeof(AcpiHeader) + 8; off + 2 <= len; off += madt[off + 1]) {
+    uint32_t len = *(const uint32_t *)(madt + 4);
+    for (uint32_t off = 44; off + 2 <= len; off += madt[off + 1]) {
         if (madt[off + 1] < 2) break;
         uint32_t apic, flags;
         if (madt[off] == 0) {                       /* processor local APIC */

@@ -66,6 +66,11 @@ def main() -> None:
         struct.pack_into("<II", e, 8, lba, count)
         sector[off:off + 16] = e
 
+    # WynlandOS's disk label, in the boot-code area UEFI never runs: the
+    # kernel's disk drivers (include/wynland/disklabel.h) take only a disk
+    # that carries it -- a laptop's Windows disk is left alone
+    sector[0:16] = b"WYNLANDOS-DISK" + bytes(2)
+
     # Partition entries live at 0x1BE; no boot code needed -- this disk
     # boots through the UEFI firmware loading the ESP's BOOTX64.EFI.
     entry(0x1BE, 0xEF, esp_start, esp_count)

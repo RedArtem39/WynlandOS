@@ -426,6 +426,46 @@ void mouse_handle_interrupt(uint8_t data)
     }
 }
 
+/* A USB HID mouse feeds the same state and queues as the PS/2 one. */
+void mouse_inject_usb(int dx, int dy, uint8_t buttons, int wheel)
+{
+    if (!g_boot_info) return;
+
+    uint8_t btns = buttons & 0x07;
+    int8_t  wh = (int8_t)wheel;
+    int32_t new_x = mouse_x + dx;
+    int32_t new_y = mouse_y + dy;
+
+    if (new_x < 0) new_x = 0;
+    if (new_x >= bound_w) new_x = bound_w - 1;
+    if (new_y < 0) new_y = 0;
+    if (new_y >= bound_h) new_y = bound_h - 1;
+
+    if (new_x != mouse_x || new_y != mouse_y || btns != mouse_buttons || wh) {
+        mouse_hide();
+
+        mouse_x = new_x;
+        mouse_y = new_y;
+        mouse_buttons = btns;
+        mouse_wheel = wh;
+        mouse_event_push();
+
+        if (mouse_hw_cursor()) {
+            extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
+            virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
+        }
+
+        mouse_show();
+    }
+
+    /* /dev/input/mice speaks PS/2 packets: bit3 always set, y positive up. */
+    if ((mouse_queue_tail + MOUSE_QUEUE_SIZE - mouse_queue_head - 1) % MOUSE_QUEUE_SIZE >= 3) {
+        mouse_queue_push((uint8_t)(0x08 | btns));
+        mouse_queue_push((uint8_t)dx);
+        mouse_queue_push((uint8_t)(-dy));
+    }
+}
+
 /* (a smaller screen: the pointer comes inside it at its next move) */
 void mouse_set_bounds(uint32_t w, uint32_t h)
 {

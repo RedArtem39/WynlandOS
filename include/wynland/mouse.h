@@ -8,6 +8,9 @@
 
 void mouse_init(BootInfo *info);
 void mouse_handle_interrupt(uint8_t data);
+/* a USB HID mouse: dx/dy positive right/down, buttons bit0 left, bit1
+   right, bit2 middle, wheel positive = up */
+void mouse_inject_usb(int dx, int dy, uint8_t buttons, int wheel);
 
 void mouse_hide(void);
 void mouse_show(void);
