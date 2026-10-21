@@ -215,6 +215,13 @@ static const struct sh_case CASES[] = {
       "nice -n 5 sh -c 'nice; nice -n 3 nice'", "5\n8\n" },
     { "/bin/sh", "timeout (alarm): kills what runs too long",
       "timeout 2 sleep 30; echo $?", "124\n" },
+    { "/bin/sh", "procfs: /proc lists PIDs; /proc/PID/stat and status",
+      "ls /proc | grep -qx $$ && [ \"$(cut -d' ' -f1 /proc/$$/stat)\" = $$ ] && grep -c '^PPid:' /proc/$$/status && tr '\\0' ' ' < /proc/$$/cmdline | cut -c1-7",
+      "1\n/bin/sh\n" },
+    { "/bin/sh", "procfs: ps and pgrep find a process",
+      "sleep 30 & p=$!; pgrep -x sleep | grep -qx $p && ps -o comm= -p $p; kill $p", "sleep\n" },
+    { "/bin/sh", "mkdir and rmdir take \"dir/\" (git clone's .git/hooks/)",
+      "mkdir sl1/ && test -d sl1 && rmdir sl1/ && ! test -e sl1 && echo ok", "ok\n" },
     /* Ubuntu's curl, cmake, pkgconf (the old musl ports had none of the
        system's terminfo, CA store or modules) */
     { "/bin/sh", "curl (libcurl): a file:// URL",

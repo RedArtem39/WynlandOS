@@ -35,6 +35,10 @@ Process *process_create(PageTable *pml4) {
     memset(p, 0, sizeof(Process));
     p->pid = g_next_pid++;
     p->pml4 = pml4;
+    {
+        extern uint64_t timer_get_ms(void);
+        p->start_ms = timer_get_ms();
+    }
     p->thread_count = 0;
     p->main_thread = NULL;
     p->brk_start = HEAP_BASE;

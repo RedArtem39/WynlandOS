@@ -3054,9 +3054,36 @@ static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t
 
 static void fill_stat(VfsStat *out, const char *path, uint32_t inum, const Ext2Inode *ip);
 
+/* /proc/PID and its files (kernel/procfs.c): no inodes -- a directory
+   owned by the process's owner, read-only files of size 0 (as Linux's),
+   exe a symlink. false: not such a path. */
+static bool proc_pid_stat(const char *path, VfsStat *out, bool nofollow) {
+    extern struct Process *procfs_target(const char *path, const char **rest);
+    const char *rest = NULL;
+    Process *p = procfs_target(path, &rest);
+    if (!p || !rest) return false;
+    static const char *const files[] = { "cmdline", "comm", "stat", "statm", "status" };
+    bool dir = !*rest || str_compare(rest, "fd") == 0 || str_compare(rest, "ns") == 0;
+    bool link = str_compare(rest, "exe") == 0;
+    bool file = false;
+    for (uint32_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) if (str_compare(rest, files[i]) == 0) file = true;
+    if (!dir && !link && !file) return false;
+    memset(out, 0, sizeof(*out));
+    str_copy(out->name, *rest ? rest : "proc");
+    out->first_cluster = 0x70000000u + (uint32_t)p->pid;
+    out->is_dir = dir;
+    out->is_link = link && nofollow;
+    out->mode = dir ? 0555 : link ? 0777 : 0444;
+    out->uid = p->uid;
+    out->gid = p->gid;
+    out->nlink = 1;
+    return true;
+}
+
 bool vfs_stat(const char *path, VfsStat *out) {
     FS_GUARD();
     if (!out) return false;
+    if (proc_pid_stat(path, out, false)) return true;
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return false;
@@ -3067,6 +3094,7 @@ bool vfs_stat(const char *path, VfsStat *out) {
 bool vfs_lstat(const char *path, VfsStat *out) {
     FS_GUARD();
     if (!out) return false;
+    if (proc_pid_stat(path, out, true)) return true;
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return false;

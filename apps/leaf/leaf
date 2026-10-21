@@ -35,6 +35,8 @@ import sys
 import tarfile
 import tempfile
 import time
+import http.client
+import urllib.error
 import urllib.request
 
 ROOT = os.environ.get("LEAF_ROOT", "/")
@@ -47,6 +49,11 @@ BASE = os.path.join(LIB, "base")
 ARCH = "amd64"
 KEYRING = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
 # what is not worth the disk: docs, man pages, translations
+# the system's identity: never replaced by a package's (Ubuntu's base-files
+# made it say "ubuntu" -- programs that check the distribution saw that)
+OS_IDENTITY = {"/etc/os-release", "/usr/lib/os-release", "/etc/lsb-release",
+               "/etc/issue", "/etc/issue.net", "/etc/debian_version"}
+
 SKIP_PREFIXES = ("./usr/share/doc/", "./usr/share/man/", "./usr/share/info/",
                  "./usr/share/locale/", "./usr/share/lintian/")
 
@@ -189,7 +196,22 @@ def read_sources():
 
 
 def fetch(url, dest=None, quiet=False):
-    """download url (to dest, or into memory), with a progress line"""
+    """download url (to dest, or into memory), with a progress line -- a
+    stalled or dropped connection (a slow mirror) tried again, three times,
+    from the start, before the error is the user's"""
+    for attempt in range(3):
+        try:
+            return fetch_once(url, dest, quiet)
+        except (TimeoutError, ConnectionError, urllib.error.URLError, http.client.HTTPException) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code < 500:
+                raise                          # 404 and the like: no use asking again
+            if attempt == 2:
+                die(f"{url}: {e}")
+            warn(f"{os.path.basename(url)}: {e} -- again in 5 s")
+            time.sleep(5)
+
+
+def fetch_once(url, dest=None, quiet=False):
     req = urllib.request.Request(url, headers={"User-Agent": "leaf/1 (WynlandOS)"})
     with urllib.request.urlopen(req, timeout=60) as r:
         total = int(r.headers.get("Content-Length") or 0)
@@ -228,43 +250,62 @@ def cmd_update(args):
         warn("gpgv or the Ubuntu keyring is missing: the index is NOT checked")
     for url, suite, comps in read_sources():
         say(f"{url} {suite}")
-        signed = fetch(f"{url}/dists/{suite}/InRelease", quiet=True)
-        if have_gpgv:
-            with tempfile.NamedTemporaryFile(delete=False) as t:
-                t.write(signed)
-            r = subprocess.run(["gpgv", "--keyring", KEYRING, t.name],
-                               capture_output=True, text=True)
-            os.unlink(t.name)
-            if r.returncode != 0:
-                die(f"bad signature on {suite}/InRelease:\n{r.stderr}")
-        text = signed.decode("utf-8", "replace")
-        # the SHA256 list of the files the release describes
-        sums = {}
-        in_sha = False
-        for line in text.splitlines():
-            if line.startswith("SHA256:"):
-                in_sha = True
-                continue
-            if in_sha:
-                if not line.startswith(" "):
-                    in_sha = False
-                    continue
-                h, size, name = line.split()
-                sums[name] = (h, int(size))
-        for comp in comps:
-            rel = f"{comp}/binary-{ARCH}/Packages.xz"
-            if rel not in sums:
-                warn(f"{suite}/{rel}: not in the release")
-                continue
-            data = fetch(f"{url}/dists/{suite}/{rel}")
-            if hashlib.sha256(data).hexdigest() != sums[rel][0]:
-                die(f"{suite}/{rel}: checksum mismatch")
-            packages = lzma.decompress(data)
-            index = parse_packages(packages, url)
-            with open(os.path.join(LISTS, list_name(url, suite, comp) + ".json"), "w") as f:
-                json.dump(index, f, separators=(",", ":"))
-            print(f"   {comp}: {len(index)} packages")
+        # a mirror syncing between the InRelease and the index gives a
+        # checksum mismatch (apt's "Hash Sum mismatch"): all of the suite
+        # again, a few times, before giving up
+        for attempt in range(3):
+            try:
+                update_suite(url, suite, comps, have_gpgv)
+                break
+            except ChecksumMismatch as e:
+                if attempt == 2:
+                    die(str(e))
+                warn(f"{e}: the mirror is syncing? again in 5 s")
+                time.sleep(5)
     say("done")
+
+
+class ChecksumMismatch(Exception):
+    pass
+
+
+def update_suite(url, suite, comps, have_gpgv):
+    signed = fetch(f"{url}/dists/{suite}/InRelease", quiet=True)
+    if have_gpgv:
+        with tempfile.NamedTemporaryFile(delete=False) as t:
+            t.write(signed)
+        r = subprocess.run(["gpgv", "--keyring", KEYRING, t.name],
+                           capture_output=True, text=True)
+        os.unlink(t.name)
+        if r.returncode != 0:
+            die(f"bad signature on {suite}/InRelease:\n{r.stderr}")
+    text = signed.decode("utf-8", "replace")
+    # the SHA256 list of the files the release describes
+    sums = {}
+    in_sha = False
+    for line in text.splitlines():
+        if line.startswith("SHA256:"):
+            in_sha = True
+            continue
+        if in_sha:
+            if not line.startswith(" "):
+                in_sha = False
+                continue
+            h, size, name = line.split()
+            sums[name] = (h, int(size))
+    for comp in comps:
+        rel = f"{comp}/binary-{ARCH}/Packages.xz"
+        if rel not in sums:
+            warn(f"{suite}/{rel}: not in the release")
+            continue
+        data = fetch(f"{url}/dists/{suite}/{rel}")
+        if hashlib.sha256(data).hexdigest() != sums[rel][0]:
+            raise ChecksumMismatch(f"{suite}/{rel}: checksum mismatch")
+        packages = lzma.decompress(data)
+        index = parse_packages(packages, url)
+        with open(os.path.join(LISTS, list_name(url, suite, comp) + ".json"), "w") as f:
+            json.dump(index, f, separators=(",", ":"))
+        print(f"   {comp}: {len(index)} packages")
 
 
 KEEP = ("Package", "Version", "Depends", "Pre-Depends", "Provides", "Filename",
@@ -368,6 +409,7 @@ def resolve(index, state, names, upgrade=False):
     plan = {}
     order = []
     missing = []
+    held = []
 
     def want(name, op=None, ver=None, why=None):
         if dep_met(state, plan, name, op, ver) and not (upgrade and why is None):
@@ -383,6 +425,13 @@ def resolve(index, state, names, upgrade=False):
         n = rec["Package"]
         if n in plan:
             return True
+        # the image's own packages (glibc first of all) are never replaced:
+        # a dependency on another version of one is unmet, not a downgrade
+        # of the system's libc under every program (a stale index once had
+        # libc6-dev want libc6 2.43-2ubuntu2 against the image's ...2.4)
+        if n in state.base and n not in state.db:
+            held.append(f"{n} {state.base[n]}")
+            return False
         plan[n] = rec
         for field in ("Pre-Depends", "Depends"):
             for alts in parse_rel(rec.get(field, "")):
@@ -405,7 +454,11 @@ def resolve(index, state, names, upgrade=False):
         if not want(name):
             die(f"cannot install {name}")
     if missing:
-        die("unmet dependencies:\n  " + "\n  ".join(missing))
+        msg = "unmet dependencies:\n  " + "\n  ".join(missing)
+        if held:
+            msg += ("\nthe system's own packages stay as they are (" + ", ".join(sorted(set(held))) +
+                    "): 'leaf update' may bring versions that fit them")
+        die(msg)
     return [plan[n] for n in order]
 
 
@@ -500,6 +553,8 @@ def install_deb(state, rec, path, conffiles_keep=True):
             dirs.append(abspath)
             continue
         os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if abspath in OS_IDENTITY:
+            continue                       # the system says it is WynlandOS, whatever a package ships
         if abspath in conffiles and conffiles_keep and os.path.exists(dest) and old:
             files.append(abspath)          # the user's config stays; the new one beside it
             dest = dest + ".leaf-new"

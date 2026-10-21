@@ -47,6 +47,17 @@ if host_files:
             n, v = line.split()
             pkgs.setdefault(n, v)
 
+# Ubuntu packages the image stands in for with its own files: base-files
+# is the system's identity (/etc/os-release, /etc/issue, ...) -- WynlandOS's.
+# Installed as a dependency (bash pre-depends on it) it made the system
+# say "ubuntu". Counted as installed, at the host's version (the same
+# release), so no dependency asks for it again.
+OWN = ["base-files"]
+q = subprocess.run(["dpkg-query", "-W", "-f", "${Package} ${Version}\n", *OWN], capture_output=True, text=True)
+for line in q.stdout.splitlines():
+    n, v = line.split()
+    pkgs[n] = v
+
 with open(out_path, "w") as f:
     for n in sorted(pkgs):
         f.write(f"{n} {pkgs[n]}\n")

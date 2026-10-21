@@ -1313,6 +1313,16 @@ static void proc_canonical(char *path) {
 }
 
 static int64_t user_path_at_raw(int dirfd, uint64_t up, char *out);
+
+/* "dir/" names dir: mkdir and rmdir take it so on Linux (git makes
+   .git/hooks/ that way). "/" stays. */
+static void strip_trailing_slashes(char *p)
+{
+    size_t n = 0;
+    while (p[n]) n++;
+    while (n > 1 && p[n - 1] == '/') p[--n] = 0;
+}
+
 static int64_t user_path_at(int dirfd, uint64_t up, char *out) {
     int64_t r = user_path_at_raw(dirfd, up, out);
     if (r == 0) proc_canonical(out);
@@ -1379,7 +1389,8 @@ static int pty_new_fd(VfsFile **fd_table, uint32_t *fd_flags, uint32_t *fd_oflag
 static int64_t open_sandbox_proc(const char *path, int linux_flags, VfsFile **fd_table, uint32_t *fd_flags, uint32_t *fd_oflags) {
     uint64_t gpid = 0;
     int kind = sandbox_proc_file(path, &gpid);
-    if (!kind && sandbox_proc_dir(path)) {
+    bool proc_root = str_compare(path, "/proc") == 0 || str_compare(path, "/proc/") == 0;
+    if (!kind && (proc_root || sandbox_proc_dir(path))) {
         /* /proc/self, /proc/PID (of our pid namespace), their ns/: a
            directory to open files of with openat() (bubblewrap writes its
            child's uid_map this way) */
@@ -1532,14 +1543,31 @@ static uint64_t readlink_fallback(const char *path, uint64_t ubuf, uint64_t bufs
         if (copy_to_user((void *)ubuf, t, len) != 0) return (uint64_t)-14;
         return len;
     }
-    if (str_compare(path, "/proc/self/exe") == 0) {
-        Process *pr = sched_current()->proc;
+    /* /proc/self: the reader's PID (its namespace's) */
+    if (str_compare(path, "/proc/self") == 0) {
+        char t[24];
+        uint_to_str(pid_to_ns(sched_current()->proc->pid, sched_current()->proc), t);
         uint64_t len = 0;
-        while (pr->exe_path[len]) len++;
-        if (!len) return (uint64_t)-2;
+        while (t[len]) len++;
         if (len > bufsiz) len = bufsiz;
-        if (copy_to_user((void *)ubuf, pr->exe_path, len) != 0) return (uint64_t)-14;
+        if (copy_to_user((void *)ubuf, t, len) != 0) return (uint64_t)-14;
         return len;
+    }
+    /* /proc/PID/exe (self too): the image it runs -- another user's
+       process only for root, as on Linux */
+    {
+        const char *rest = NULL;
+        Process *pr = procfs_target(path, &rest);
+        if (pr && rest && str_compare(rest, "exe") == 0) {
+            Process *me = sched_current()->proc;
+            if (pr != me && me->uid != 0 && me->uid != pr->uid) return (uint64_t)-13;   /* -EACCES */
+            uint64_t len = 0;
+            while (pr->exe_path[len]) len++;
+            if (!len) return (uint64_t)-2;
+            if (len > bufsiz) len = bufsiz;
+            if (copy_to_user((void *)ubuf, pr->exe_path, len) != 0) return (uint64_t)-14;
+            return len;
+        }
     }
     char target[MAX_PATH];
     int n = vfs_readlink(path, target, sizeof(target));
@@ -3639,6 +3667,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 char path[MAX_PATH];
                 int64_t pe = user_path_at(num == 263 ? (int)a1 : AT_FDCWD_, up, path);
                 if (pe < 0) return (uint64_t)pe;
+                if (want_dir) strip_trailing_slashes(path);
                 VfsStat ust;
                 if (!vfs_lstat(path, &ust)) return (uint64_t)-2;         /* -ENOENT */
                 if (ust.is_dir && !want_dir) return (uint64_t)-21;      /* -EISDIR */
@@ -3677,6 +3706,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 char path[MAX_PATH];
                 int64_t pe = user_path_at((int)a1, a2, path);
                 if (pe < 0) return (uint64_t)pe;
+                strip_trailing_slashes(path);   /* "dir/": git's mkdir of .git/hooks/ */
                 VfsStat mst;
                 if (vfs_lstat(path, &mst)) return (uint64_t)-17;         /* -EEXIST */
                 if (!vfs_mkdir(path)) return (uint64_t)create_errno(path);
@@ -5587,15 +5617,40 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     uint32_t nl = 0;
                     while (nm[nl]) nl++;
                     bool fds = nl >= 3 && nm[nl - 3] == '/' && nm[nl - 2] == 'f' && nm[nl - 1] == 'd';
+                    /* /proc itself: its files, then the PIDs (kernel/procfs.c);
+                       /proc/PID: the process's files */
+                    static const char *const root_names[] = { "self", "thread-self", "meminfo", "cpuinfo", "stat",
+                                                              "uptime", "loadavg", "mounts", "sys" };
+                    static const uint8_t root_types[] = { 10, 10, 8, 8, 8, 8, 8, 8, 4 };
+                    static const char *const pid_names[] = { "cmdline", "comm", "stat", "statm", "status", "exe", "fd", "ns" };
+                    static const uint8_t pid_types[] = { 8, 8, 8, 8, 8, 10, 4, 4 };
+                    const uint32_t nroot = sizeof(root_names) / sizeof(root_names[0]);
+                    const uint32_t npid = sizeof(pid_names) / sizeof(pid_names[0]);
+                    bool root = str_compare(nm, "/proc") == 0 || str_compare(nm, "/proc/") == 0;
+                    const char *prest = NULL;
+                    bool piddir = !root && !fds && procfs_target(nm, &prest) && prest && !*prest;
                     uint8_t *out = (uint8_t *)a2;
                     uint32_t used = 0;
                     for (;;) {
                         uint32_t idx = pf->offset;
-                        char name[8];
+                        char name[24];
                         uint8_t type = 4;                              /* DT_DIR */
                         if (idx == 0) { name[0] = '.'; name[1] = 0; }
                         else if (idx == 1) { name[0] = '.'; name[1] = '.'; name[2] = 0; }
-                        else if (fds) {
+                        else if (root && idx < 2 + nroot) {
+                            str_copy(name, root_names[idx - 2]);
+                            type = root_types[idx - 2];
+                        } else if (root) {
+                            /* the offset past the names is "the PIDs from here" */
+                            uint64_t pid = procfs_next_pid(idx - (2 + nroot));
+                            if (!pid || pid > 0x7FFFFFF0u) break;
+                            idx = 2 + nroot + (uint32_t)pid;
+                            pf->offset = idx;
+                            uint_to_str(pid, name);
+                        } else if (piddir && idx < 2 + npid) {
+                            str_copy(name, pid_names[idx - 2]);
+                            type = pid_types[idx - 2];
+                        } else if (fds) {
                             int k = (int)idx - 2;
                             while (k < MAX_OPEN_FILES && !fd_table[k]) k++;
                             if (k >= MAX_OPEN_FILES) break;
@@ -5656,30 +5711,32 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                  str_compare(path, "/etc/mtab") == 0;
                 bool is_minfo = str_compare(path, "/proc/self/mountinfo") == 0;
                 const char *sys_text = proc_sys_text(path);
-                if (str_compare(path, "/proc/self/cmdline") == 0) {   /* argv, '\0' after each */
-                    int mi = memfd_new("cmdline");
-                    if (mi < 0) return (uint64_t)-12;
-                    memfd_pwrite(mi, 0, proc->cmdline, proc->cmdline_len);
-                    VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
-                    if (!f) { memfd_unref(mi); return (uint64_t)-12; }
-                    memset(f, 0, sizeof(VfsFile));
-                    str_copy(f->node.name, "cmdline");
-                    f->node.first_cluster = MEMFD_FD;
-                    f->current_cluster = (uint32_t)mi;
-                    fd_table[fd] = f;
-                    fd_flags[fd]  = (linux_flags & 02000000) ? FD_CLOEXEC : 0;
-                    fd_oflags[fd] = LINUX_O_RDONLY;
-                    return (uint64_t)fd;
-                }
-                char comm[24];
-                if (str_compare(path, "/proc/self/comm") == 0) {   /* argv[0]'s last part, 15 chars */
-                    const char *b = proc->cmdline;
-                    for (const char *q = proc->cmdline; *q; q++) if (*q == '/') b = q + 1;
-                    int n = 0;
-                    while (b[n] && n < 15) { comm[n] = b[n]; n++; }
-                    comm[n++] = '\n';
-                    comm[n] = 0;
-                    sys_text = comm;
+                {
+                    /* /proc/PID/{stat,statm,status,comm,cmdline} (kernel/procfs.c):
+                       a snapshot, as a memfd (cmdline: '\0' after each argument) */
+                    const char *leaf = NULL;
+                    Process *tp = procfs_target(path, &leaf);
+                    char *pb;
+                    uint32_t pn = 0;
+                    if (tp && leaf && *leaf && (pb = (char *)kmalloc(8192))) {
+                        bool have = procfs_file(tp, leaf, pb, 8192, &pn);
+                        int mi = have ? memfd_new("proc") : -1;
+                        if (mi >= 0) memfd_pwrite(mi, 0, pb, pn);
+                        kfree(pb);
+                        if (have) {
+                            if (mi < 0) return (uint64_t)-12;
+                            VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+                            if (!f) { memfd_unref(mi); return (uint64_t)-12; }
+                            memset(f, 0, sizeof(VfsFile));
+                            str_copy(f->node.name, leaf);
+                            f->node.first_cluster = MEMFD_FD;
+                            f->current_cluster = (uint32_t)mi;
+                            fd_table[fd] = f;
+                            fd_flags[fd]  = (linux_flags & 02000000) ? FD_CLOEXEC : 0;
+                            fd_oflags[fd] = LINUX_O_RDONLY;
+                            return (uint64_t)fd;
+                        }
+                    }
                 }
                 char *info = NULL;
                 if (!sys_text && ((path[0] == '/' && path[1] == 'p' && path[2] == 'r' && path[3] == 'o' && path[4] == 'c' && path[5] == '/') ||

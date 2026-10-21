@@ -96,6 +96,7 @@ uint64_t vmm_get_pte(PageTable *pml4, uint64_t virt);
 /* The leaf entry as it is, present or not (a page in swap: include/
    wynland/swap.h), 0 when no page table reaches it; its address, or NULL. */
 uint64_t vmm_get_pte_raw(PageTable *pml4, uint64_t virt);
+uint64_t vmm_count_user_pages(PageTable *pml4);   /* present pages below the kernel half (RSS) */
 PageTableEntry *vmm_pte_ptr(PageTable *pml4, uint64_t virt);
 /* Write a leaf entry as given (not present: a swap entry), making the page
    tables above it as needed. */

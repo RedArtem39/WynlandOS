@@ -567,6 +567,32 @@ uint64_t vmm_get_pte_raw(PageTable *pml4, uint64_t virt)
     return pt->entries[PT_INDEX(virt)];
 }
 
+/* the pages present in a process's half of the address space (its RSS,
+   for /proc/PID/stat and statm): a walk of its page tables */
+uint64_t vmm_count_user_pages(PageTable *pml4)
+{
+    uint64_t n = 0;
+    if (!pml4) return 0;
+    for (int i4 = 0; i4 < 256; i4++) {
+        PageTableEntry e4 = pml4->entries[i4];
+        if (!(e4 & PAGE_PRESENT)) continue;
+        PageTable *pdpt = (PageTable *)P2V(e4 & PAGE_ADDR_MASK);
+        for (int i3 = 0; i3 < 512; i3++) {
+            PageTableEntry e3 = pdpt->entries[i3];
+            if (!(e3 & PAGE_PRESENT) || (e3 & PAGE_PS)) continue;
+            PageTable *pd = (PageTable *)P2V(e3 & PAGE_ADDR_MASK);
+            for (int i2 = 0; i2 < 512; i2++) {
+                PageTableEntry e2 = pd->entries[i2];
+                if (!(e2 & PAGE_PRESENT) || (e2 & PAGE_PS)) continue;
+                PageTable *pt = (PageTable *)P2V(e2 & PAGE_ADDR_MASK);
+                for (int i1 = 0; i1 < 512; i1++)
+                    if (pt->entries[i1] & PAGE_PRESENT) n++;
+            }
+        }
+    }
+    return n;
+}
+
 PageTableEntry *vmm_pte_ptr(PageTable *pml4, uint64_t virt)
 {
     PageTableEntry e = pml4->entries[PML4_INDEX(virt)];

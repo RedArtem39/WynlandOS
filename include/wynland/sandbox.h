@@ -96,6 +96,11 @@ bool     sandbox_setgroups_denied(const struct Process *p);
 /* pids/tids as `viewer` sees them (0: not visible to it), and back */
 uint64_t pid_to_ns(uint64_t global, const struct Process *viewer);
 uint64_t pid_from_ns(uint64_t local, const struct Process *viewer);
+
+/* /proc's per-process files (kernel/procfs.c) */
+struct Process *procfs_target(const char *path, const char **rest);   /* /proc/PID|self/...: who, and the rest */
+uint64_t procfs_next_pid(uint64_t from);    /* the reader's next visible PID >= from; 0: none */
+bool procfs_file(struct Process *p, const char *leaf, char *buf, uint32_t cap, uint32_t *len);
 /* a new process or thread id `global` exists in p's pid namespace */
 void     pidns_register(uint64_t global, struct Process *p);
 
