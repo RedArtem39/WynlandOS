@@ -176,6 +176,35 @@ F  /hyprland.wyn        hyprland_stripped.wyn
 F  /lib64/ld-linux-x86-64.so.2      /lib64/ld-linux-x86-64.so.2
 F  /lib64/libc.so.6                 /usr/lib/x86_64-linux-gnu/libc.so.6
 F  /lib64/libm.so.6                 /usr/lib/x86_64-linux-gnu/libm.so.6
+# the rest of glibc (libc6): its compatibility stubs (libdl, libpthread,
+# librt, ...: programs built elsewhere still link them), NSS modules
+# and iconv's gconv modules -- not only what our own programs need
+F /lib64/libBrokenLocale.so.1 /usr/lib/x86_64-linux-gnu/libBrokenLocale.so.1
+F /lib64/libanl.so.1 /usr/lib/x86_64-linux-gnu/libanl.so.1
+F /lib64/libc_malloc_debug.so.0 /usr/lib/x86_64-linux-gnu/libc_malloc_debug.so.0
+F /lib64/libdl.so.2 /usr/lib/x86_64-linux-gnu/libdl.so.2
+F /lib64/libmemusage.so /usr/lib/x86_64-linux-gnu/libmemusage.so
+F /lib64/libnsl.so.1 /usr/lib/x86_64-linux-gnu/libnsl.so.1
+F /lib64/libnss_compat.so.2 /usr/lib/x86_64-linux-gnu/libnss_compat.so.2
+F /lib64/libnss_dns.so.2 /usr/lib/x86_64-linux-gnu/libnss_dns.so.2
+F /lib64/libnss_files.so.2 /usr/lib/x86_64-linux-gnu/libnss_files.so.2
+F /lib64/libnss_hesiod.so.2 /usr/lib/x86_64-linux-gnu/libnss_hesiod.so.2
+F /lib64/libpcprofile.so /usr/lib/x86_64-linux-gnu/libpcprofile.so
+F /lib64/libpthread.so.0 /usr/lib/x86_64-linux-gnu/libpthread.so.0
+F /lib64/librt.so.1 /usr/lib/x86_64-linux-gnu/librt.so.1
+F /lib64/libthread_db.so.1 /usr/lib/x86_64-linux-gnu/libthread_db.so.1
+F /lib64/libutil.so.1 /usr/lib/x86_64-linux-gnu/libutil.so.1
+D /usr/lib/x86_64-linux-gnu/gconv
+F /usr/lib/x86_64-linux-gnu/gconv/ANSI_X3.110.so /usr/lib/x86_64-linux-gnu/gconv/ANSI_X3.110.so
+F /usr/lib/x86_64-linux-gnu/gconv/CP1252.so /usr/lib/x86_64-linux-gnu/gconv/CP1252.so
+F /usr/lib/x86_64-linux-gnu/gconv/ISO8859-1.so /usr/lib/x86_64-linux-gnu/gconv/ISO8859-1.so
+F /usr/lib/x86_64-linux-gnu/gconv/ISO8859-15.so /usr/lib/x86_64-linux-gnu/gconv/ISO8859-15.so
+F /usr/lib/x86_64-linux-gnu/gconv/UNICODE.so /usr/lib/x86_64-linux-gnu/gconv/UNICODE.so
+F /usr/lib/x86_64-linux-gnu/gconv/UTF-16.so /usr/lib/x86_64-linux-gnu/gconv/UTF-16.so
+F /usr/lib/x86_64-linux-gnu/gconv/UTF-32.so /usr/lib/x86_64-linux-gnu/gconv/UTF-32.so
+F /usr/lib/x86_64-linux-gnu/gconv/UTF-7.so /usr/lib/x86_64-linux-gnu/gconv/UTF-7.so
+F /usr/lib/x86_64-linux-gnu/gconv/gconv-modules /usr/lib/x86_64-linux-gnu/gconv/gconv-modules
+F /usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache /usr/lib/x86_64-linux-gnu/gconv/gconv-modules.cache
 F  /lib64/libgcc_s.so.1             /usr/lib/x86_64-linux-gnu/libgcc_s.so.1
 F  /lib64/libstdc++.so.6            /usr/lib/x86_64-linux-gnu/libstdc++.so.6
 F  /lib64/libEGL.so.1               /usr/lib/x86_64-linux-gnu/libEGL.so.1
