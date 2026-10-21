@@ -515,6 +515,7 @@ $(ESP_PART_IMG): $(BOOTLOADER_EFI) $(KERNEL_ELF) $(BUILD)/resolution.cfg
 	@mcopy -o -i $@ $(BOOTLOADER_EFI) ::/EFI/BOOT/BOOTX64.EFI
 	@mcopy -o -i $@ $(KERNEL_ELF) ::/kernel.elf
 	@mcopy -o -i $@ $(BUILD)/resolution.cfg ::/resolution.cfg
+	$(if $(filter 1,$(LIVE)),@echo "WynlandOS live: boot/boot.c reads the system into RAM" | mcopy -o -i $@ - ::/live)
 
 # Final assembly: zeroed disk <- MBR sector <- ESP @1MiB <- ext2 root @1MiB+ESP,
 # then the swap partition (its contents don't matter: a sparse tail).
@@ -527,6 +528,23 @@ $(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG) make_mbr.py
 	@dd if=$(ESP_PART_IMG) of=$@ bs=1M seek=1 conv=notrunc status=none
 	@dd if=$(EXT2_PART_IMG) of=$@ bs=1M seek=$$(( 1 + $(ESP_SIZE_MB) )) conv=notrunc status=none
 	@echo "  => wynland.img created ($(TOTAL_IMG_MB) MB, ESP $(ESP_SIZE_MB) MB + ext2 root, + $(SWAP_SIZE_MB) MB swap)"
+
+# ---------- The live USB stick ----------
+# make live: an image for a USB stick (dd it, or Rufus in DD mode). The
+# loader reads the whole system into RAM (\live on the ESP), so no disk of
+# the machine is touched; no swap partition; the text console (console=1)
+# with the account live / live. Its own copies of the partition images, so
+# the usual image stays as it is.
+LIVE_IMAGE = $(BUILD)/wynland-live.img
+live:
+	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 BOOT_EXTRA='console=1\nlive=1' \
+	    DISK_IMAGE=$(IMG_DIR)/wynland-live.img ESP_PART_IMG=$(IMG_DIR)/esp_live.img \
+	    EXT2_PART_IMG=$(IMG_DIR)/ext2_live.img BOOT_CFG=$(BUILD)/boot-live.cfg \
+	    EXT2_MANIFEST_FULL=$(BUILD)/ext2_manifest_live.txt image
+	@cp $(IMG_DIR)/wynland-live.img $(LIVE_IMAGE)
+	@echo "  => $(LIVE_IMAGE): write it to a USB stick (dd bs=4M, or Rufus in DD mode)"
+
+.PHONY: live
 
 # ---------- Run in QEMU ----------
 

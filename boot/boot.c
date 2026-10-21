@@ -12,6 +12,7 @@
 #include "elf.h"
 #include <wynland/boot_info.h>
 #include <wynland/bootlog.h>
+#include <wynland/disklabel.h>
 
 /* ============================================================
  * Global State
@@ -214,6 +215,95 @@ static UINT64 BootLogSetup(void)
         return a;
     }
     return 0;
+}
+
+/*
+ * The live boot (\live on the boot volume: make live): the system's disk
+ * -- the one labelled WYNLANDOS-DISK (include/wynland/disklabel.h) --
+ * from LBA 0 to the end of its root partition, read into RAM with the
+ * firmware's own driver (a USB stick's too). The kernel then needs no disk
+ * driver of its own to start, and the machine's own disks stay untouched.
+ */
+static int BootFileExists(CHAR16 *name)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *loadedImage;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fileSystem;
+    EFI_FILE_PROTOCOL *root, *f;
+    EFI_GUID loadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+    EFI_GUID fileSystemGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(gImageHandle, &loadedImageGuid, (VOID**)&loadedImage))) return 0;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(loadedImage->DeviceHandle, &fileSystemGuid, (VOID**)&fileSystem))) return 0;
+    if (EFI_IS_ERROR(fileSystem->OpenVolume(fileSystem, &root))) return 0;
+    int found = !EFI_IS_ERROR(root->Open(root, &f, name, EFI_FILE_MODE_READ, 0));
+    if (found) f->Close(f);
+    root->Close(root);
+    return found;
+}
+
+static void LiveLoad(BootInfo *info)
+{
+    if (!BootFileExists(L"\\live")) return;
+    Print(L"[live] looking for the WynlandOS disk...\r\n");
+    EFI_GUID bioGuid = EFI_BLOCK_IO_PROTOCOL_GUID;
+    UINTN n = 0;
+    EFI_HANDLE *hs = NULL;
+    if (EFI_IS_ERROR(gBS->LocateHandleBuffer(2 /* ByProtocol */, &bioGuid, NULL, &n, &hs))) {
+        Print(L"[live] no block devices: booting from the disk instead\r\n");
+        return;
+    }
+    UINT8 *sec = NULL;
+    if (EFI_IS_ERROR(gBS->AllocatePool(EfiLoaderData, 4096, (VOID**)&sec))) return;
+    EFI_BLOCK_IO_PROTOCOL *disk = NULL;
+    for (UINTN i = 0; i < n && !disk; i++) {
+        EFI_BLOCK_IO_PROTOCOL *b;
+        if (EFI_IS_ERROR(gBS->HandleProtocol(hs[i], &bioGuid, (VOID**)&b))) continue;
+        if (!b->Media || !b->Media->MediaPresent || b->Media->LogicalPartition || b->Media->BlockSize != 512) continue;
+        if (EFI_IS_ERROR(b->ReadBlocks(b, b->Media->MediaId, 0, 512, sec))) continue;
+        if (wyn_disk_is_ours(sec)) disk = b;
+    }
+    if (!disk) {
+        Print(L"[live] no disk labelled WYNLANDOS-DISK: booting from the disk instead\r\n");
+        return;
+    }
+    /* the root partition (the second, type 0x83): its end is where to stop */
+    UINT32 start = *(UINT32 *)(sec + 0x1CE + 8), count = *(UINT32 *)(sec + 0x1CE + 12);
+    UINT64 blocks = (UINT64)start + count;
+    if (sec[0x1CE + 4] != 0x83 || !count || blocks > disk->Media->LastBlock + 1) {
+        Print(L"[live] the disk's partition table is not WynlandOS's\r\n");
+        return;
+    }
+    /* in RAMDISK_CHUNK pieces, anywhere: a few GB in one piece is often
+       not there, even with 16 GB of RAM. A table of their addresses. */
+    UINT64 bytes = blocks * 512;
+    const UINT64 per = RAMDISK_CHUNK / 512;        /* blocks a piece */
+    UINT64 nchunks = (blocks + per - 1) / per;
+    UINT64 tpages = (nchunks * 8 + 4095) / 4096;
+    EFI_PHYSICAL_ADDRESS table = 0;
+    if (EFI_IS_ERROR(gBS->AllocatePages(AllocateAnyPages, EfiReservedMemoryType, tpages, &table))) return;
+    UINT64 *chunks = (UINT64 *)(UINTN)table;
+    Print(L"[live] reading the system into memory (");
+    PrintHex(bytes >> 20);
+    Print(L" MB, hex)... ");
+    UINT32 shown = 0;
+    for (UINT64 c = 0; c < nchunks; c++) {
+        UINT64 lba = c * per, nb = blocks - lba < per ? blocks - lba : per;
+        EFI_PHYSICAL_ADDRESS a = 0;
+        int ok = !EFI_IS_ERROR(gBS->AllocatePages(AllocateAnyPages, EfiReservedMemoryType, RAMDISK_CHUNK / 4096, &a));
+        if (ok) ok = !EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, lba, (UINTN)(nb * 512), (VOID *)(UINTN)a));
+        if (!ok) {
+            Print(L"\r\n[live] not enough memory, or a read failed: booting from the disk instead\r\n");
+            if (a) gBS->FreePages(a, RAMDISK_CHUNK / 4096);
+            while (c--) gBS->FreePages(chunks[c], RAMDISK_CHUNK / 4096);
+            gBS->FreePages(table, tpages);
+            return;
+        }
+        chunks[c] = a;
+        UINT32 pct = (UINT32)((c + 1) * 20 / nchunks);
+        while (shown < pct) { shown++; Print(L"#"); }
+    }
+    Print(L" done\r\n");
+    info->ramdisk_addr = table;
+    info->ramdisk_size = bytes;
 }
 
 static EFI_STATUS InitGraphics(BootInfo *info) {
@@ -811,6 +901,9 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         Print(L"ERROR: Failed to load kernel!\r\n");
         while(1);
     }
+
+    /* the live boot: the whole system into RAM (\live on this volume) */
+    LiveLoad(&bootInfo);
 
     /* [3/4] Find ACPI RSDP */
     Print(L"[3/4] Finding ACPI tables...\r\n");

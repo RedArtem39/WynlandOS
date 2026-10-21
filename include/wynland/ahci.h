@@ -4,6 +4,7 @@
 #pragma once
 
 #include <wynland/types.h>
+#include <wynland/boot_info.h>
 
 #define SATA_SIG_ATA    0x00000101  // SATA drive
 #define SATA_SIG_ATAPI  0xEB140101  // SATAPI drive
@@ -98,6 +99,8 @@ typedef struct {
 } __attribute__((packed)) FisRegH2D;
 
 void ahci_init(void);
+void ahci_live_init(BootInfo *bi);   /* after vmm_init(): the live boot's RAM disk */
+bool ahci_live(void);
 bool ahci_read(uint32_t lba, uint32_t count, void *buf);
 bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf);
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf);

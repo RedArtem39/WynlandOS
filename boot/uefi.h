@@ -390,7 +390,11 @@ struct EFI_BOOT_SERVICES {
 
     /* Library Services */
     VOID*   ProtocolsPerHandle;
-    VOID*   LocateHandleBuffer;
+    EFI_STATUS  (*LocateHandleBuffer)(UINTN SearchType,      /* 2: ByProtocol */
+                                      EFI_GUID *Protocol,
+                                      VOID *SearchKey,
+                                      UINTN *NoHandles,
+                                      EFI_HANDLE **Buffer);
     EFI_STATUS  (*LocateProtocol)(EFI_GUID *Protocol,
                                   VOID *Registration,
                                   VOID **Interface);
@@ -436,6 +440,33 @@ struct EFI_SYSTEM_TABLE {
 
 #define EFI_LOADED_IMAGE_PROTOCOL_GUID \
     { 0x5B1B31A1, 0x9562, 0x11d2, { 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B } }
+
+/* EFI_BLOCK_IO_PROTOCOL: a disk (or a partition: LogicalPartition) read by
+   blocks -- the live boot reads the whole system into RAM with it */
+typedef struct {
+    UINT32  MediaId;
+    BOOLEAN RemovableMedia;
+    BOOLEAN MediaPresent;
+    BOOLEAN LogicalPartition;
+    BOOLEAN ReadOnly;
+    BOOLEAN WriteCaching;
+    UINT32  BlockSize;
+    UINT32  IoAlign;
+    UINT64  LastBlock;
+} EFI_BLOCK_IO_MEDIA;
+
+typedef struct EFI_BLOCK_IO_PROTOCOL {
+    UINT64              Revision;
+    EFI_BLOCK_IO_MEDIA *Media;
+    VOID*               Reset;
+    EFI_STATUS  (*ReadBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This, UINT32 MediaId, UINT64 Lba,
+                              UINTN BufferSize, VOID *Buffer);
+    VOID*               WriteBlocks;
+    VOID*               FlushBlocks;
+} EFI_BLOCK_IO_PROTOCOL;
+
+#define EFI_BLOCK_IO_PROTOCOL_GUID \
+    { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 
 #define EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID \
     { 0x0964e5b22, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }

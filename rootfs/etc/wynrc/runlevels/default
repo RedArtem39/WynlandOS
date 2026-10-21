@@ -2,6 +2,7 @@
 # console=1 -- before wynlogin before zerp)
 dbus
 bluez-stub
+liveuser
 console
 wynlogin
 testuser

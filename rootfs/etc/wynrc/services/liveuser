@@ -1,0 +1,4 @@
+description=the live boot's account (live, an administrator; password live)
+type=oneshot
+exec=/usr/lib/wynland/mkliveuser
+when=live=1

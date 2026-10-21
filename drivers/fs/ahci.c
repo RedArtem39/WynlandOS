@@ -22,7 +22,52 @@ int sata_port_num = -1;
 
 static uint8_t *bounce(void);
 
+/* The live boot (boot/boot.c LiveLoad): the loader read our disk, LBA 0 to
+   the end of the root partition, into RAM. Reads and writes are memcpy
+   then; no disk controller is touched at all (a writing goes away with
+   the power: a live system). */
+static const uint64_t *g_ram = NULL;   /* the pieces' physical addresses */
+static uint64_t g_ram_sectors = 0;
+
+static void map_wb(uint64_t phys, uint64_t size)
+{
+    PageTable *k = vmm_get_kernel_pml4();
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE)
+        vmm_map_page(k, HHDM_BASE + phys + off, phys + off, PAGE_WRITE | PAGE_NX);
+}
+
+void ahci_live_init(BootInfo *bi)
+{
+    if (!bi || !bi->ramdisk_addr || bi->ramdisk_size < 512) return;
+    uint64_t n = (bi->ramdisk_size + RAMDISK_CHUNK - 1) / RAMDISK_CHUNK;
+    map_wb(bi->ramdisk_addr, n * 8);
+    const uint64_t *t = (const uint64_t *)P2V(bi->ramdisk_addr);
+    for (uint64_t i = 0; i < n; i++) map_wb(t[i], RAMDISK_CHUNK);
+    g_ram = t;
+    g_ram_sectors = bi->ramdisk_size / 512;
+}
+
+static bool ram_io(uint32_t lba, uint32_t count, uint8_t *buf, bool write)
+{
+    if ((uint64_t)lba + count > g_ram_sectors) return false;
+    uint64_t pos = (uint64_t)lba * 512, left = (uint64_t)count * 512;
+    while (left) {
+        uint64_t off = pos % RAMDISK_CHUNK, n = RAMDISK_CHUNK - off;
+        if (n > left) n = left;
+        uint8_t *mem = (uint8_t *)P2V(g_ram[pos / RAMDISK_CHUNK]) + off;
+        if (write) memcpy(mem, buf, n); else memcpy(buf, mem, n);
+        buf += n; pos += n; left -= n;
+    }
+    return true;
+}
+
+bool ahci_live(void) { return g_ram != NULL; }
+
 void ahci_init(void) {
+    if (g_ram) {
+        serial_write_string("AHCI: live boot -- the system runs from RAM; no disk is touched.\r\n");
+        return;
+    }
     if (nvme_init()) {
         serial_write_string("AHCI: NVMe boot disk present; SATA path skipped.\r\n");
         return;
@@ -228,6 +273,7 @@ void disk_wait_step(void)
 }
 
 bool ahci_read(uint32_t lba, uint32_t count, void *buf) {
+    if (g_ram) return ram_io(lba, count, (uint8_t *)buf, false);
     if (nvme_ok()) return nvme_read(lba, count, buf);
     /* Everything uses command slot 0: a second command started while one
        is in flight (a kernel thread preempted mid-command, then a syscall
@@ -355,6 +401,7 @@ bool ahci_read_hw(uint32_t lba, uint32_t count, void *buf) {
 static bool ahci_write_hw(uint32_t lba, uint32_t count, const void *buf);
 
 bool ahci_write(uint32_t lba, uint32_t count, const void *buf) {
+    if (g_ram) return ram_io(lba, count, (uint8_t *)buf, true);
     if (nvme_ok()) return nvme_write(lba, count, buf);
     uint64_t rflags;   /* see ahci_read(): one command at a time, contiguous DMA */
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");

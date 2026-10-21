@@ -1,0 +1,6 @@
+#!/bin/sh
+# WynlandOS - the live boot's account (make live): "live", an administrator
+# with the password "live". The system runs from RAM: it is made each boot.
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin
+id live >/dev/null 2>&1 && exit 0
+printf 'live\n' | useradd -a -c "Live session" --password-stdin live

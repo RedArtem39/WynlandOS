@@ -216,12 +216,13 @@ L=$REPO/apps/leaf
     echo "F /usr/sbin/wynlogin $OUT/wynlogin"
     echo "D /usr/lib/wynland"
     echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"
+    echo "F /usr/lib/wynland/mkliveuser $REPO/rootfs/usr/lib/wynland/mkliveuser"
     echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
     echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
     echo "D /etc/dbus-1"
     echo "D /etc/dbus-1/system.d"
     echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"
-    for s in wynlogin testuser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    for s in wynlogin testuser liveuser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     echo "F /usr/bin/leaf $L/leaf"

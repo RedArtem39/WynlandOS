@@ -60,6 +60,14 @@ typedef struct PACKED {
 
     /* === The boot log that outlives a crash (include/wynland/bootlog.h) === */
     uint64_t    log_addr;       /* physical; 0: none this boot */
+
+    /* === The live boot: the disk's start, read into RAM by the loader === */
+    uint64_t    ramdisk_addr;   /* physical: a table of the pieces' physical addresses
+                                   (uint64_t, RAMDISK_CHUNK bytes each, in disk order);
+                                   0: no live boot (the disk drivers find the disk) */
+    uint64_t    ramdisk_size;   /* bytes: LBA 0 up to the end of the root partition */
 } BootInfo;
+
+#define RAMDISK_CHUNK (4ULL << 20)
 
 #define WYNLAND_BOOT_MAGIC 0x57594E4C414E4400ULL  /* "WYNLAND\0" as uint64 */

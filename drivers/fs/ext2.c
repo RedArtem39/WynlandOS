@@ -2142,7 +2142,7 @@ bool vfs_init(void) {
     FS_GUARD();
     ahci_init();
 
-    if (sata_port_num == -1 && !nvme_ok()) {
+    if (sata_port_num == -1 && !nvme_ok() && !ahci_live()) {
         serial_write_string("VFS Error: AHCI not initialized, cannot init VFS!\r\n");
         return false;
     }
@@ -2152,7 +2152,7 @@ bool vfs_init(void) {
     mbr_init();
     {
         extern void swap_init(uint32_t lba, uint32_t sectors);
-        if (mbr_swap_partition_sectors()) swap_init(mbr_swap_partition_lba(), mbr_swap_partition_sectors());
+        if (!ahci_live() && mbr_swap_partition_sectors()) swap_init(mbr_swap_partition_lba(), mbr_swap_partition_sectors());
     }
     return ext2_init();
 }

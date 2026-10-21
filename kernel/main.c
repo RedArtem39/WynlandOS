@@ -907,6 +907,8 @@ void kernel_main(BootInfo *boot_info_loader)
     {
         extern void bootlog_init(BootInfo *bi);
         bootlog_init(boot_info);
+        extern void ahci_live_init(BootInfo *bi);
+        ahci_live_init(boot_info);
     }
 
     /* ---- Initialize Heap ---- */
