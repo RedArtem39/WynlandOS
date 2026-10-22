@@ -159,16 +159,19 @@ static void acpi_line(void)
     serial_write_string("\r\n");
 }
 
-/* Firmware tables may sit in reserved ranges the direct map left out. */
-static void acpi_map(uint64_t addr, uint64_t len)
+/* Firmware tables may sit in reserved ranges the direct map left out.
+   false: not a physical address at all (a broken pointer in a table):
+   the caller must not touch it. */
+static bool acpi_map(uint64_t addr, uint64_t len)
 {
-    if (!addr || len > (16u << 20)) return;
+    if (!addr || len > (16u << 20)) return false;
     PageTable *k = vmm_get_kernel_pml4();
     uint64_t end = addr + len;
-    if (end < addr) return;
+    if (end < addr || end > HHDM_SIZE) return false;
     for (uint64_t a = addr & ~0xFFFULL; a < end; a += PAGE_SIZE)
         if (!vmm_get_phys(k, HHDM_BASE + a))
             vmm_map_page(k, HHDM_BASE + a, a, PAGE_NX);
+    return true;
 }
 
 static bool table_sum_ok(const uint8_t *p, uint32_t len)
@@ -225,7 +228,7 @@ static const uint8_t *add_table(const uint8_t *src, uint32_t len)
 static const uint8_t *copy_table(uint64_t phys, uint32_t len)
 {
     if (!phys || len < 36 || len > ACPI_MAX_TABLE) return NULL;
-    acpi_map(phys, len);
+    if (!acpi_map(phys, len)) return NULL;
     return add_table((const uint8_t *)P2V(phys), len);
 }
 
@@ -438,7 +441,7 @@ static volatile uint8_t *ecam_map(uint64_t phys)
 
 static bool acpi_try_root(uint64_t phys, bool xsdt)
 {
-    acpi_map(phys, 36);
+    if (!acpi_map(phys, 36)) return false;
     const uint8_t *h = (const uint8_t *)P2V(phys);
     if (!xsdt) {
         if (!sig_eq((const char *)h, "RSDT")) return false;
@@ -447,7 +450,7 @@ static bool acpi_try_root(uint64_t phys, bool xsdt)
     }
     uint32_t len = rd32(h + 4);
     if (len < 36 || len > (1u << 20)) return false;
-    acpi_map(phys, len);
+    if (!acpi_map(phys, len)) return false;
     h = (const uint8_t *)P2V(phys);
     if (!table_sum_ok(h, len))
         acpi_put("ACPI: root table checksum bad (continuing)\r\n");
@@ -457,8 +460,7 @@ static bool acpi_try_root(uint64_t phys, bool xsdt)
     for (uint32_t i = 0; i < n && g_ntables < ACPI_MAX_TABLES; i++) {
         const uint8_t *e = h + 36 + i * step;
         uint64_t p = xsdt ? rd64(e) : rd32(e);
-        if (!p) continue;
-        acpi_map(p, 36);
+        if (!p || !acpi_map(p, 36)) continue;
         const uint8_t *th = (const uint8_t *)P2V(p);
         uint32_t tl = rd32(th + 4);
         if (tl < 36 || tl > ACPI_MAX_TABLE) continue;
@@ -480,7 +482,10 @@ bool acpi_init(uint64_t rsdp_phys)
         return false;
     }
 
-    acpi_map(rsdp_phys, 36);
+    if (!acpi_map(rsdp_phys, 36)) {
+        acpi_put("ACPI: the RSDP address is not memory\r\n");
+        return false;
+    }
     const uint8_t *r = (const uint8_t *)P2V(rsdp_phys);
     if (!sig_eq((const char *)r, "RSD PTR ")) {
         acpi_put("ACPI: bad RSDP signature\r\n");
@@ -575,25 +580,17 @@ bool acpi_init(uint64_t rsdp_phys)
                         (g_reset_space == 0 || g_reset_space == 1);
     }
 
-    uint64_t dsdt_phys = 0;
-    if (len >= 148) {
-        AcpiReg d;
-        if (parse_gas(f + 140, 12, &d) && d.space == 0) dsdt_phys = d.addr;
-    }
-    if (!dsdt_phys && len >= 44) dsdt_phys = rd32(f + 40);
-
-    if (dsdt_phys) {
-        acpi_map(dsdt_phys, 36);
-        const uint8_t *dh = (const uint8_t *)P2V(dsdt_phys);
-        if (!sig_eq((const char *)dh, "DSDT")) dsdt_phys = 0;
-    }
+    /* X_DSDT (offset 140) is a plain 64-bit address -- not a GAS like
+       the X_ registers after it; DSDT (offset 40) the 32-bit one */
+    uint64_t dsdt_phys = len >= 148 ? rd64(f + 140) : 0;
+    if (dsdt_phys && (!acpi_map(dsdt_phys, 36) ||
+                      !sig_eq((const char *)P2V(dsdt_phys), "DSDT")))
+        dsdt_phys = 0;
     if (!dsdt_phys && len >= 44) {
         dsdt_phys = rd32(f + 40);
-        if (dsdt_phys) {
-            acpi_map(dsdt_phys, 36);
-            const uint8_t *dh = (const uint8_t *)P2V(dsdt_phys);
-            if (!sig_eq((const char *)dh, "DSDT")) dsdt_phys = 0;
-        }
+        if (dsdt_phys && (!acpi_map(dsdt_phys, 36) ||
+                          !sig_eq((const char *)P2V(dsdt_phys), "DSDT")))
+            dsdt_phys = 0;
     }
     if (dsdt_phys) {
         const uint8_t *dh = (const uint8_t *)P2V(dsdt_phys);
