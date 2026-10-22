@@ -243,6 +243,12 @@ def list_name(url, suite, comp):
 
 
 def cmd_update(args):
+    # -eK: the kernel from the developer's machine into a live stick's slot
+    # (rootfs/usr/bin/test-wyn k), for the next boot -- not a package
+    if "-eK" in args:
+        if not shutil.which("test-wyn"):
+            die("-eK: only on a live stick (test-wyn is not here)")
+        os.execvp("test-wyn", ["test-wyn", "k"])
     need_root()
     os.makedirs(LISTS, exist_ok=True)
     have_gpgv = shutil.which("gpgv") and os.path.exists(KEYRING)

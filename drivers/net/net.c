@@ -140,10 +140,47 @@ bool net_past(uint64_t deadline)
     return (int64_t)(net_rdtsc() - deadline) >= 0;
 }
 
+/* The NIC: virtio-net (a VM), else a USB one (a phone's tethering,
+   drivers/usb/usb_net.c) -- which may come and go. */
+static bool g_virtio_nic;
+extern bool usb_net_ready(void);
+extern bool usb_net_send(const void *data, uint32_t len);
+extern int  usb_net_receive(void *buf, uint32_t max);
+extern void usb_net_get_mac(uint8_t *mac);
+
+static bool nic_send(const void *data, uint32_t len)
+{
+    if (g_virtio_nic) return virtio_net_send(data, len);
+    return usb_net_send(data, len);
+}
+
+static int nic_receive(void *buf, uint32_t max)
+{
+    if (g_virtio_nic) return virtio_net_receive(buf, max);
+    return usb_net_receive(buf, max);
+}
+
+/* a NIC is there; a USB one's address becomes ours */
+bool net_nic_present(void)
+{
+    if (g_virtio_nic) return true;
+    if (!usb_net_ready()) return false;
+    usb_net_get_mac(our_mac);
+    return true;
+}
+
+/* the NIC went away: no address, no routes, nothing cached */
+void net_link_down(void)
+{
+    network_up = false;
+    our_ip = our_netmask = our_gateway = our_dns = 0;
+    memset(arp_cache, 0, sizeof(arp_cache));
+}
+
 bool net_init(void)
 {
     net_calibrate_tsc();
-    virtio_net_init();
+    g_virtio_nic = virtio_net_init();
     virtio_net_get_mac(our_mac);
 
     our_ip      = 0;
@@ -189,7 +226,7 @@ void net_poll(void)
        loop and run it again over the same buffer. A second caller skips. */
     if (__sync_lock_test_and_set(&in_poll, 1)) return;
     for (;;) {
-        received = virtio_net_receive(rx_buf, sizeof(rx_buf));
+        received = nic_receive(rx_buf, sizeof(rx_buf));
         if (received <= 0)
             break;
         net_process_packet(rx_buf, (uint32_t)received);
@@ -276,7 +313,7 @@ static void handle_arp(const uint8_t *data, uint32_t len)
         memcpy(arp_reply->target_mac, arp->sender_mac, ETH_ALEN);
         arp_reply->target_ip  = arp->sender_ip;
 
-        virtio_net_send(frame, sizeof(frame));
+        nic_send(frame, sizeof(frame));
 
     } else if (ntohs(arp->opcode) == ARP_OP_REPLY) {
         /* Only replies meant for us, from our own subnet, and new entries
@@ -445,7 +482,7 @@ static void handle_icmp(const uint8_t *data, uint32_t len,
         icmp_r->checksum = 0;
         icmp_r->checksum = htons(ip_checksum(icmp_r, len));
 
-        virtio_net_send(reply_buf, ETH_HLEN + total_ip_len);
+        nic_send(reply_buf, ETH_HLEN + total_ip_len);
 
     } else if (icmp->type == ICMP_TYPE_ECHO_REPLY) {
         ping_reply_received = true;
@@ -512,7 +549,7 @@ static bool net_send_raw_eth(const uint8_t *dst_mac, const uint8_t *src_mac,
     eth->type = htons(type);
     memcpy(tx_buf + ETH_HLEN, payload, payload_len);
 
-    return virtio_net_send(tx_buf, frame_len);
+    return nic_send(tx_buf, frame_len);
 }
 
 /* ============================================================
@@ -817,7 +854,7 @@ bool net_dhcp_request(void)
     dhcp_ack_received   = false;
 
     serial_write_string("[DHCP] Sending DISCOVER\n");
-    virtio_net_send(frame, frame_len);
+    nic_send(frame, frame_len);
 
     /* Poll for DHCPOFFER */
     uint64_t offer_deadline = net_deadline_ms(3000);
@@ -904,7 +941,7 @@ bool net_dhcp_request(void)
     ip->checksum     = htons(ip_checksum(ip, sizeof(Ipv4Header)));
 
     serial_write_string("[DHCP] Sending REQUEST\n");
-    virtio_net_send(frame, frame_len);
+    nic_send(frame, frame_len);
 
     /* Poll for DHCPACK */
     uint64_t ack_deadline = net_deadline_ms(3000);

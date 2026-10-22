@@ -189,6 +189,13 @@ $(BUILD_BOOT)/%.o: $(SRC_BOOT)/%.c
 	@echo "  CC(BOOT)   $<"
 	@$(CC_BOOT) $(CFLAGS_BOOT) -c $< -o $@
 
+# the logo the loader draws (include/wynland/logo_draw.h): its vectors as tables
+$(INC_DIR)/wynland/logo_data.h: assets/logo/wynland-logo.json tools/logo2c.py
+	@echo "  LOGO       $@"
+	@python3 tools/logo2c.py $< $@
+
+$(BUILD_BOOT)/boot.o: $(INC_DIR)/wynland/logo_draw.h $(INC_DIR)/wynland/logo_data.h boot/uefi.h
+
 $(BOOTLOADER_EFI): $(BOOT_OBJ)
 	@echo "  LD(BOOT)   $@"
 	@$(LD_BOOT) $(LDFLAGS_BOOT) -o $@ $^
@@ -487,11 +494,12 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
+	$(if $(filter 1,$(LIVE)),@printf 'F /usr/bin/test-wyn rootfs/usr/bin/test-wyn\nP /usr/bin/test-wyn 0 100755\n' >> $@)
 
 $(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/swaptest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
@@ -532,7 +540,8 @@ $(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG) make_mbr.py
 
 # ---------- The live USB stick ----------
 # make live: an image for a USB stick (dd it, or Rufus in DD mode). The
-# loader reads the whole system into RAM (\live on the ESP), so no disk of
+# loader reads the whole system into RAM (\live on the ESP) -- packed by
+# tools/livepack.c, LZ4: a quarter of it to read off the stick -- so no disk of
 # the machine is touched; no swap partition; the account live / live.
 # The desktop (on a machine without virtio-gpu: simpledrm + llvmpipe), or
 # with LIVE_CONSOLE=1 the text console. Its own copies of the partition
@@ -540,12 +549,26 @@ $(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG) make_mbr.py
 LIVE_IMAGE = $(BUILD)/wynland-live.img
 LIVE_CONSOLE ?= 0
 LIVE_RESOLUTION ?= native
-live:
-	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)live=1' \
+# make devkernel: the current kernel for a live stick's slot, served by
+# tools/devhost.py; on the machine `test-wyn k` (or leaf update -eK) writes
+# it there and the next boot runs it -- no flashing (boot/boot.c SlotKernel)
+devkernel: kernel
+	@mkdir -p $(BUILD)/devhost
+	@python3 tools/kslot.py $(KERNEL_ELF) $(BUILD)/devhost/kernel.elf $(BUILD)/devhost/kernel.hdr
+
+.PHONY: devkernel
+
+$(BUILD)/livepack: tools/livepack.c
+	@mkdir -p $(BUILD)
+	@gcc -O2 -Wall -o $@ $<
+
+live: $(BUILD)/livepack
+	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)$(if $(NETLOG),netlog=$(NETLOG)\n,)$(if $(filter 1,$(LIVE_GPU)),gpu=1\n,)live=1' \
 	    DISK_IMAGE=$(IMG_DIR)/wynland-live.img ESP_PART_IMG=$(IMG_DIR)/esp_live.img \
 	    EXT2_PART_IMG=$(IMG_DIR)/ext2_live.img BOOT_CFG=$(BUILD)/boot-live.cfg \
 	    EXT2_MANIFEST_FULL=$(BUILD)/ext2_manifest_live.txt image
-	@cp $(IMG_DIR)/wynland-live.img $(LIVE_IMAGE)
+	@$(BUILD)/livepack $(IMG_DIR)/wynland-live.img $(IMG_DIR)/wynland-live-packed.img
+	@cp $(IMG_DIR)/wynland-live-packed.img $(LIVE_IMAGE)
 	@echo "  => $(LIVE_IMAGE): write it to a USB stick (dd bs=4M, or Rufus in DD mode)"
 
 .PHONY: live

@@ -1,5 +1,6 @@
 // WynlandOS - reboot, poweroff, halt (one program, by its name): the
-// disks synced, then the kernel's reboot(2). Root's (CAP_SYS_BOOT).
+// disks synced, then the kernel's reboot(2). Root's (CAP_SYS_BOOT), or a
+// person's own account at the machine (kernel/syscall.c, SYS_reboot).
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>

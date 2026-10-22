@@ -28,6 +28,7 @@ typedef struct {
 typedef struct UsbDev {
     bool     used;
     uint8_t  slot, port, speed;
+    uint8_t  max_ep;                         /* the highest endpoint id configured */
     uint8_t  ep0_maxp;
 
     UsbRing  ep0;
@@ -52,6 +53,7 @@ typedef struct UsbDev {
 } UsbDev;
 
 extern UsbDev  g_usb_devs[USB_MAX_DEVS];
+extern Spinlock g_usb_lock;
 extern UsbDev *g_usb_storage;
 extern uint32_t g_usb_max_ports;
 
@@ -88,6 +90,17 @@ bool usb_bulk_xfer(UsbDev *d, uint8_t ep_id, UsbRing *ring, uint64_t phys,
 bool usb_hid_setup(UsbDev *d, uint8_t iface, uint8_t proto, uint8_t ep_addr,
                    uint16_t maxp, uint8_t interval);
 void usb_hid_event(UsbDev *d, uint32_t code, uint32_t resid);
+
+/* ---- usb_net.c ---------------------------------------------------- */
+typedef struct {
+    int      kind;                           /* 1 RNDIS, 2 CDC ECM */
+    uint8_t  comm_iface, data_iface, data_alt, mac_str;
+    uint8_t  in_addr, out_addr;
+    uint16_t in_maxp, out_maxp;
+} UsbNetInfo;
+bool usb_net_setup(UsbDev *d, const UsbNetInfo *ni);
+bool usb_net_event(uint8_t slot, uint8_t ep, uint32_t code, uint32_t resid);
+void usb_net_gone(UsbDev *d);
 
 /* ---- usb_storage.c ------------------------------------------------ */
 bool usb_storage_setup(UsbDev *d, uint8_t ep_in, uint8_t ep_out,

@@ -660,6 +660,12 @@ static void exception_handler_main(InterruptRegisters *regs)
        controller's reset line, then port CF9's soft reset (not 0x06, a
        full reset that may clear the memory), then a triple fault. */
     serial_write_string("Restarting (warm) in 10 s: the next boot's loader saves this log.\r\n");
+    {
+        extern void netlog_panic_flush(void);
+        netlog_panic_flush();                            /* boot.cfg netlog=: the rest of the log */
+        extern void sticklog_panic_flush(void);
+        sticklog_panic_flush();                          /* and onto a live stick */
+    }
     __asm__ volatile("cli");
     {
         /* 10 s by the TSC clock (kernel/sched.c: it runs with interrupts

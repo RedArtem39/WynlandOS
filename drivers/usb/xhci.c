@@ -32,6 +32,7 @@ extern void uint_to_hex(uint64_t v, char *buf);
 #define PORTSC_PED  (1u << 1)
 #define PORTSC_PR   (1u << 4)
 #define PORTSC_PP   (1u << 9)
+#define PORTSC_CSC  (1u << 17)
 #define PORTSC_CHG  0x00FE0000u
 
 UsbDev g_usb_devs[USB_MAX_DEVS];
@@ -51,7 +52,7 @@ static uint8_t  *g_cfg_buf;
 static uint64_t  g_cfg_buf_phys;
 static uint8_t  *g_ctl_buf;
 static uint64_t  g_ctl_buf_phys;
-static Spinlock  g_usb_lock;
+Spinlock         g_usb_lock;
 static bool      g_up;
 static bool      g_usb_ac64 = true;
 
@@ -202,6 +203,8 @@ static void drain_locked(void)
                        (ep == g_bulk_ep_in || ep == g_bulk_ep_out)) {
                 g_bulk_code = code;
                 g_bulk_done = true;
+            } else if (usb_net_event(slot, ep, code, resid)) {
+                /* the network device's */
             } else {
                 for (uint32_t i = 0; i < USB_MAX_DEVS; i++) {
                     UsbDev *d = &g_usb_devs[i];
@@ -225,11 +228,15 @@ void usb_drain(void)
     spin_unlock_irqrestore(&g_usb_lock, fl);
 }
 
+static void port_scan(void);
+
 void usb_poll_thread(void *arg)
 {
     (void)arg;
-    for (;;) {
+    for (uint32_t n = 0;; n++) {
         usb_drain();
+        if (n % 64 == 0) port_scan();           /* ~8 times a second: plugged in, pulled out (a phone
+                                                   switching mode gives up after a second or two) */
         sched_sleep_ms(2);
     }
 }
@@ -278,7 +285,8 @@ static void usb_recover_ep(UsbDev *d, uint8_t ep_id, UsbRing *ring, bool halted)
     usb_cmd_raw((16u << 10) | ep, deq, NULL);
 
     uint16_t addr = (uint16_t)((ep_id >> 1) | ((ep_id & 1u) ? 0x80u : 0u));
-    usb_control(d, 0x02, 1, 0, addr, NULL, 0, false);
+    if (ep_id != 1)                            /* ep0: a STALL is the answer, not a halt */
+        usb_control(d, 0x02, 1, 0, addr, NULL, 0, false);
     usb_log_hex(halted ? "endpoint halted, reset: ep=" : "endpoint timed out, stopped: ep=", ep_id);
 }
 
@@ -312,6 +320,10 @@ bool usb_control(UsbDev *d, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
         usb_drain();
         if (usb_tsc() - start > 10000000000ULL) return false;
         usb_spin();
+    }
+    if (g_ctl_code == 6) {                     /* a STALL halts ep0 too: usable again */
+        usb_recover_ep(d, 1, &d->ep0, true);
+        return false;
     }
     if (g_ctl_code != 1 && g_ctl_code != 13) return false;
     if (len && in) memcpy(buf, g_ctl_buf, len);
@@ -368,8 +380,11 @@ bool usb_configure_ep(UsbDev *d, uint8_t ep_id, uint8_t type, uint16_t maxp,
     icc[1] = 1u | (1u << ep_id);
 
     uint8_t *slot = d->in + g_usb_ctx_stride;
+    /* Context Entries: the highest endpoint so far (a lower one would
+       drop the others) */
+    if (ep_id > d->max_ep) d->max_ep = ep_id;
     *(uint32_t *)(slot + 0) = ((uint32_t)d->speed << 20) |
-                              ((uint32_t)ep_id << 27);
+                              ((uint32_t)d->max_ep << 27);
     *(uint32_t *)(slot + 4) = (uint32_t)d->port << 16;
 
     uint8_t *ep = d->in + (uint32_t)(ep_id + 1) * g_usb_ctx_stride;
@@ -472,6 +487,13 @@ static int reset_port(uint32_t port)
     return (int)((v >> 10) & 0xF);
 }
 
+static UsbDev *dev_on_port(uint32_t port)
+{
+    for (uint32_t i = 0; i < USB_MAX_DEVS; i++)
+        if (g_usb_devs[i].used && g_usb_devs[i].port == port) return &g_usb_devs[i];
+    return NULL;
+}
+
 static UsbDev *dev_alloc(uint8_t slot)
 {
     for (uint32_t i = 0; i < USB_MAX_DEVS; i++) {
@@ -485,20 +507,58 @@ static UsbDev *dev_alloc(uint8_t slot)
     return NULL;
 }
 
+/* the configuration in g_cfg_buf has an interface we drive */
+static bool cfg_known(uint32_t total)
+{
+    for (uint32_t off = 0; off + 9 <= total; ) {
+        uint8_t blen = g_cfg_buf[off];
+        if (blen < 2) break;
+        if (g_cfg_buf[off + 1] == 4) {
+            uint8_t c = g_cfg_buf[off + 5], sc = g_cfg_buf[off + 6], pr = g_cfg_buf[off + 7];
+            if (c == 3 || c == 8 || (c == 0xE0 && sc == 1 && pr == 3) || (c == 2 && (sc == 6 || (sc == 2 && pr == 0xFF))))
+                return true;
+        }
+        off += blen;
+    }
+    return false;
+}
+
+/* a device that failed half way: its slot back to the controller (there
+   are only USB_MAX_SLOTS) */
+static void drop_dev(UsbDev *d)
+{
+    usb_cmd(10, d->slot, 0, NULL);              /* Disable Slot */
+    g_dcbaa[d->slot] = 0;
+    d->used = false;
+}
+
+static bool probe_once(uint32_t port);
+
+/* A device on a port. Address Device may fail the first time (a phone,
+   still settling): its slot dropped, the port reset again, up to 3 tries. */
 static void probe_port(uint32_t port)
 {
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (probe_once(port)) return;
+        usb_delay_ms(150);
+    }
+}
+
+/* false: worth another try */
+static bool probe_once(uint32_t port)
+{
     int speed = reset_port(port);
-    if (!speed) return;
+    if (!speed) return true;
 
     uint32_t slot = 0;
     uint32_t st = usb_cmd(9, 0, 0, &slot);
     if (st != 1 || slot == 0 || slot >= USB_MAX_SLOTS) {
         usb_log_hex("enable slot failed, status=", st);
-        return;
+        return true;
     }
 
     UsbDev *d = dev_alloc((uint8_t)slot);
-    if (!d) return;
+    if (!d) return true;
     d->port = (uint8_t)port;
     d->speed = (uint8_t)speed;
     d->ep0_maxp = (speed == 2) ? 8 : ((speed == 4) ? 512 : 64);
@@ -507,16 +567,16 @@ static void probe_port(uint32_t port)
     d->in  = usb_pages(1, &d->in_phys);
     void *ring = usb_pages(1, &d->ep0.phys);
     if (!d->ctx || !d->in || !ring) {
-        d->used = false;
-        return;
+        drop_dev(d);
+        return true;
     }
     d->ep0.trb = (UsbTrb *)ring;
     usb_ring_init(&d->ep0, d->ep0.phys);
 
     if (!address_device(d)) {
-        usb_log("address device failed");
-        d->used = false;
-        return;
+        usb_log_hex("address device failed, code=", g_cmd_code);
+        drop_dev(d);
+        return false;
     }
 
     /* ep0's packet size was a guess from the speed: a full-speed device
@@ -540,24 +600,31 @@ static void probe_port(uint32_t port)
     }
     if (!usb_get_desc(d, 1, 0, desc, sizeof(desc))) {
         usb_log("device descriptor read failed");
-        d->used = false;
-        return;
+        drop_dev(d);
+        return false;
     }
 
     uint16_t total = 0;
     if (!usb_get_desc(d, 2, 0, g_cfg_buf, 512)) {
         usb_log("configuration descriptor read failed");
-        d->used = false;
-        return;
+        drop_dev(d);
+        return false;
     }
     total = le16(g_cfg_buf + 2);
     if (total < 9 || total > 512) total = 512;
+    /* a device with more configurations (a phone, a modem: one is often
+       vendor-only): the second, when only it has something we drive */
+    if (desc[17] > 1 && !cfg_known(total) && usb_get_desc(d, 2, 1, g_cfg_buf, 512)) {
+        uint16_t t2 = le16(g_cfg_buf + 2);
+        if (t2 >= 9 && t2 <= 512 && cfg_known(t2)) total = t2;
+        else if (usb_get_desc(d, 2, 0, g_cfg_buf, 512)) total = le16(g_cfg_buf + 2) > 512 ? 512 : le16(g_cfg_buf + 2);
+    }
 
     uint8_t cfg_value = g_cfg_buf[5];
     if (!usb_set_config(d, cfg_value)) {
         usb_log("set configuration failed");
-        d->used = false;
-        return;
+        drop_dev(d);
+        return false;
     }
 
     /* One HID interface is driven: a device with several (a gaming mouse
@@ -565,7 +632,9 @@ static void probe_port(uint32_t port)
        else its first -- each endpoint with ITS interface's number and
        protocol (they used to be the last interface's: the mouse's
        endpoint went to the keyboard's interface). */
-    uint8_t iface = 0, cls = 0, proto = 0;
+    uint8_t iface = 0, cls = 0, sub = 0, proto = 0, alt = 0;
+    UsbNetInfo ni;
+    memset(&ni, 0, sizeof ni);
     uint8_t hid_ep = 0, st_in = 0, st_out = 0, hid_iface = 0, hid_proto = 0;
     uint16_t hid_maxp = 0, st_maxp_in = 0, st_maxp_out = 0;
     uint8_t hid_interval = 0;
@@ -578,8 +647,20 @@ static void probe_port(uint32_t port)
 
         if (btype == 4 && blen >= 9) {
             iface = g_cfg_buf[off + 2];
+            alt = g_cfg_buf[off + 3];
             cls = g_cfg_buf[off + 5];
+            sub = g_cfg_buf[off + 6];
             proto = g_cfg_buf[off + 7];
+            /* the network's control interface: RNDIS (Android's tethering
+               is "wireless controller"; Windows-style is CDC, vendor
+               protocol), or CDC ECM */
+            if (!ni.kind && ((cls == 0xE0 && sub == 1 && proto == 3) || (cls == 2 && sub == 2 && proto == 0xFF))) {
+                ni.kind = 1; ni.comm_iface = iface;
+            } else if (!ni.kind && cls == 2 && sub == 6) {
+                ni.kind = 2; ni.comm_iface = iface;
+            }
+        } else if (btype == 0x24 && blen >= 4 && g_cfg_buf[off + 2] == 0x0F) {
+            ni.mac_str = g_cfg_buf[off + 3];      /* CDC Ethernet: iMACAddress */
         } else if (btype == 5 && blen >= 7) {
             uint8_t addr = g_cfg_buf[off + 2];
             uint8_t attr = g_cfg_buf[off + 3] & 0x3;
@@ -596,6 +677,11 @@ static void probe_port(uint32_t port)
                     hid_iface = iface;
                     hid_proto = proto;
                 }
+            } else if (cls == 0x0A && attr == 2 && ni.kind) {
+                ni.data_iface = iface;
+                ni.data_alt = alt;
+                if (addr & 0x80) { ni.in_addr = addr; ni.in_maxp = maxp; }
+                else { ni.out_addr = addr; ni.out_maxp = maxp; }
             } else if (cls == 8 && attr == 2) {
                 if (addr & 0x80) {
                     st_in = addr;
@@ -610,6 +696,11 @@ static void probe_port(uint32_t port)
     }
 
     usb_log_hex("port device, speed=", (uint64_t)speed);
+    if (!hid_ep && !st_in && !ni.in_addr) {
+        usb_log_hex("no HID/storage interface; config bytes=", total);
+        usb_log_hex("  first interface class=", g_cfg_buf[9 + 5]);
+        usb_log_hex("  device class=", desc[4]);
+    }
 
     if (hid_ep && hid_maxp) {
         usb_log_hex("HID interface=", hid_iface);
@@ -621,11 +712,58 @@ static void probe_port(uint32_t port)
             usb_log("HID setup failed");
     }
 
+    if (ni.kind && ni.in_addr && ni.out_addr && ni.in_maxp) {
+        if (!usb_net_setup(d, &ni)) usb_log("network device setup failed");
+    }
+
     if (st_in && st_out && st_maxp_in) {
         if (usb_storage_setup(d, st_in, st_out, st_maxp_in, st_maxp_out))
             usb_log("mass storage ready");
         else
             usb_log("mass storage setup failed");
+    }
+    return true;
+}
+
+/* Hotplug: a port whose connection changed (CSC) gets a device probed on
+   it, or the device that was there let go (Disable Slot). The boot stick
+   in use is never let go: the system may be reading it. */
+static void port_scan(void)
+{
+    for (uint32_t port = 1; port <= g_usb_max_ports && port <= USB_MAX_PORTS; port++) {
+        volatile uint8_t *p = OP + 0x400u + (port - 1u) * 0x10u;
+        uint32_t v = R32(p);
+        if (!(v & PORTSC_CSC)) continue;
+        UsbDev *d = dev_on_port(port);
+        /* what was there is gone -- or was replaced between two looks: a
+           phone switching USB mode (file transfer -> tethering) drops off
+           and comes back as another device within a few ms, and taking
+           it for the old one left it never configured (the phone then
+           falls back to "charging only") */
+        /* still enabled: the device never left (a connect-change with no
+           disconnect, seen on real machines): nothing to do. Disabled:
+           it went away, or went and came back. */
+        if (d && (v & PORTSC_CCS) && (v & PORTSC_PED)) {
+            W32(p, (v & ~(PORTSC_PED | PORTSC_CHG)) | PORTSC_CSC);
+            continue;
+        }
+        W32(p, (v & ~(PORTSC_PED | PORTSC_CHG)) | PORTSC_CSC);
+        if (d && d != g_usb_storage) {
+            usb_log_hex((v & PORTSC_CCS) ? "device replaced, port=" : "device pulled out, port=", port);
+            usb_net_gone(d);
+            usb_cmd(10, d->slot, 0, NULL);      /* Disable Slot */
+            g_dcbaa[d->slot] = 0;
+            d->used = false;
+            d = NULL;
+        }
+        if ((v & PORTSC_CCS) && !d) {
+            usb_log_hex("device plugged in, port=", port);
+            /* USB 2.0 7.1.7.3: 100 ms for the contacts to settle before
+               the reset -- resetting at once failed a phone's addressing */
+            sched_sleep_ms(150);
+            if (!(R32(p) & PORTSC_CCS)) continue;
+            probe_port(port);
+        }
     }
 }
 
@@ -737,6 +875,30 @@ void usb_init(void)
     g_dcbaa = (uint64_t *)dc;
     g_erst_phys = erst_phys;
 
+    /* Scratchpad: pages the controller keeps its own state in, handed over
+       through DCBAA[0]. QEMU asks for none; a real Intel xHCI won't address
+       a device without them. */
+    uint32_t hcs2 = R32(g_mmio + 0x08);
+    uint32_t nsp = (((hcs2 >> 21) & 0x1Fu) << 5) | ((hcs2 >> 27) & 0x1Fu);
+    usb_log_hex("xHCI scratchpad pages=", nsp);
+    if (nsp) {
+        uint64_t arr_phys = 0;
+        uint64_t *arr = usb_pages(1, &arr_phys);
+        if (!arr || nsp > 512) {
+            usb_log("out of memory for the xHCI scratchpad");
+            return;
+        }
+        for (uint32_t i = 0; i < nsp; i++) {
+            uint64_t page = 0;
+            if (!usb_pages(1, &page)) {
+                usb_log("out of memory for the xHCI scratchpad");
+                return;
+            }
+            arr[i] = page;
+        }
+        g_dcbaa[0] = arr_phys;
+    }
+
     /* Event Ring Segment Table: one segment of USB_TRBS TRBs. */
     *(uint64_t *)((uint8_t *)er + 0) = ev_phys;
     *(uint32_t *)((uint8_t *)er + 8) = USB_TRBS;
@@ -787,7 +949,15 @@ void usb_init(void)
         return;
     }
 
-    for (uint32_t port = 1; port <= g_usb_max_ports; port++)
+    /* After the reset every device re-attaches on its own time: USB 2
+       debounces for 100 ms, USB 3 trains its link. QEMU's are there at
+       once; a real machine's are not -- probing right away found none. */
+    usb_delay_ms(300);
+    for (uint32_t port = 1; port <= g_usb_max_ports && port <= USB_MAX_PORTS; port++) {
+        uint32_t v = R32(OP + 0x400u + (port - 1u) * 0x10u);
+        if (v & PORTSC_CCS) usb_log_hex("connected: port=", port);
+    }
+    for (uint32_t port = 1; port <= g_usb_max_ports && port <= USB_MAX_PORTS; port++)
         probe_port(port);
 
     g_up = true;

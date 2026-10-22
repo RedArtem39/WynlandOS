@@ -414,13 +414,21 @@ struct EFI_BOOT_SERVICES {
  * 21. EFI_SYSTEM_TABLE
  * ============================================================ */
 
+/* the keyboard: a key, if one was pressed (EFI_NOT_READY otherwise) */
+typedef struct { UINT16 ScanCode; CHAR16 UnicodeChar; } EFI_INPUT_KEY;
+typedef struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
+    VOID       *Reset;
+    EFI_STATUS (*ReadKeyStroke)(struct EFI_SIMPLE_TEXT_INPUT_PROTOCOL *This, EFI_INPUT_KEY *Key);
+    VOID       *WaitForKey;
+} EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
+
 struct EFI_SYSTEM_TABLE {
     EFI_TABLE_HEADER                Hdr;
     CHAR16                          *FirmwareVendor;
     UINT32                          FirmwareRevision;
     UINT32                          _pad;
     EFI_HANDLE                      ConsoleInHandle;
-    VOID                            *ConIn;
+    EFI_SIMPLE_TEXT_INPUT_PROTOCOL  *ConIn;
     EFI_HANDLE                      ConsoleOutHandle;
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL  *ConOut;
     EFI_HANDLE                      StandardErrorHandle;
@@ -473,8 +481,9 @@ typedef struct EFI_BLOCK_IO_PROTOCOL {
     VOID*               Reset;
     EFI_STATUS  (*ReadBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This, UINT32 MediaId, UINT64 Lba,
                               UINTN BufferSize, VOID *Buffer);
-    VOID*               WriteBlocks;
-    VOID*               FlushBlocks;
+    EFI_STATUS  (*WriteBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This, UINT32 MediaId, UINT64 Lba,
+                               UINTN BufferSize, VOID *Buffer);
+    EFI_STATUS  (*FlushBlocks)(struct EFI_BLOCK_IO_PROTOCOL *This);
 } EFI_BLOCK_IO_PROTOCOL;
 
 #define EFI_BLOCK_IO_PROTOCOL_GUID \

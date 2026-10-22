@@ -40,3 +40,51 @@ void bootlog_set_state(uint32_t state)
 {
     if (g_log) g_log->state = state;
 }
+
+/* the newest `len` bytes of this boot's log, for syslog(2) -- `dmesg` on a
+   machine whose log can't leave it any other way */
+uint32_t bootlog_read(char *dst, uint32_t len)
+{
+    volatile BootLog *l = g_log;
+    if (!l) {
+        uint32_t n = g_early_n < len ? g_early_n : len;
+        for (uint32_t i = 0; i < n; i++) dst[i] = g_early[g_early_n - n + i];
+        return n;
+    }
+    uint64_t head = l->head;
+    uint64_t have = head < l->size ? head : l->size;
+    uint32_t n = have < len ? (uint32_t)have : len;
+    for (uint32_t i = 0; i < n; i++) dst[i] = (char)l->data[(head - n + i) % l->size];
+    return n;
+}
+
+uint32_t bootlog_size(void)
+{
+    return g_log ? g_log->size : (uint32_t)sizeof g_early;
+}
+
+/* bytes ever logged, and the ones from `from` on (as many as the ring
+   still holds) -- for kernel/sticklog.c */
+uint64_t bootlog_head(void)
+{
+    return g_log ? g_log->head : g_early_n;
+}
+
+uint32_t bootlog_copy(uint64_t *from, char *dst, uint32_t len)
+{
+    volatile BootLog *l = g_log;
+    uint64_t head = l ? l->head : g_early_n;
+    uint64_t size = l ? l->size : sizeof g_early;
+    if (head > size && *from < head - size) *from = head - size;   /* overwritten: skipped */
+    uint64_t n = head - *from;
+    if (n > len) n = len;
+    for (uint64_t i = 0; i < n; i++)
+        dst[i] = l ? (char)l->data[(*from + i) % l->size] : g_early[*from + i];
+    *from += n;
+    return (uint32_t)n;
+}
+
+uint32_t bootlog_boot_no(void)
+{
+    return g_log ? g_log->boot_no : 0;
+}

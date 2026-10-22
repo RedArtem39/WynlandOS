@@ -43,6 +43,7 @@
  * cursor plane). Mesa renders with llvmpipe into those buffers (GBM's
  * kms_swrast). Flips complete at a 60 Hz pace.
  */
+#include <wynland/i915.h>
 #include <wynland/types.h>
 #include <wynland/virtio_gpu.h>
 #include <wynland/virtgpu_drm.h>
@@ -1585,6 +1586,7 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp);
 
 int64_t drm_ioctl(uint32_t *slot, uint64_t request, uint64_t argp)
 {
+    if (*slot & I915_CLIENT_BIT) return i915_ioctl(*slot, request, argp);   /* the Intel GPU's render node */
     int64_t r = drm_ioctl_inner(slot, request, argp);
 #if DRM_DEBUG
     uint32_t nr = request & 0xFF;
@@ -1692,6 +1694,7 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp)
 
 int drm_mmap_lookup(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys)
 {
+    if (slot & I915_CLIENT_BIT) return i915_mmap_lookup(slot, offset, len, phys);
     uint32_t handle = (uint32_t)(offset >> 32);
     DrmBo *bo = bo_lookup(slot, handle);
     if (!bo || (offset & 0xFFFFFFFFull) != 0 || len > bo->size) return -EINVAL;
@@ -1740,6 +1743,7 @@ uint32_t drm_open_client(void)
 /* one more fd refers to the client (dup, fork, SCM_RIGHTS) */
 void drm_client_ref(uint32_t slot)
 {
+    if (slot & I915_CLIENT_BIT) { i915_client_ref(slot); return; }
     if (slot == 0 || slot > DRM_MAX_CLIENTS || !g_clients[slot - 1].used) return;
     g_clients[slot - 1].refs++;
 }
@@ -1747,6 +1751,7 @@ void drm_client_ref(uint32_t slot)
 void drm_release(uint32_t slot, uint64_t pid, bool can_sleep)
 {
     (void)pid;
+    if (slot & I915_CLIENT_BIT) { i915_release(slot); return; }
     if (slot == 0 || slot > DRM_MAX_CLIENTS) return;
     DrmClient *c = &g_clients[slot - 1];
     if (!c->used) return;

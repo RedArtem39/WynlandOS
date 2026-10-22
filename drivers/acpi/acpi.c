@@ -17,9 +17,9 @@ extern void serial_write_string(const char *s);
 extern void uint_to_hex(uint64_t v, char *buf);
 extern void uint_to_str(uint64_t v, char *buf);
 
-#define ACPI_MAX_TABLES 24
+#define ACPI_MAX_TABLES 96      /* a laptop has dozens of SSDTs: 24 left no room for the DSDT */
 #define ACPI_MAX_TABLE  (1u << 20)
-#define ACPI_MAX_COPY   (4u << 20)
+#define ACPI_MAX_COPY   (8u << 20)
 #define ACPI_MAX_MCFG   8
 
 typedef struct PACKED {
@@ -599,6 +599,8 @@ bool acpi_init(uint64_t rsdp_phys)
         const uint8_t *dh = (const uint8_t *)P2V(dsdt_phys);
         uint32_t dl = rd32(dh + 4);
         const uint8_t *copy = copy_table(dsdt_phys, dl);
+        if (!copy && dl >= 36 && dl <= ACPI_MAX_TABLE && acpi_map(dsdt_phys, dl))
+            copy = dh;                          /* no room for a copy: read it in place */
         if (copy) {
             g_s5_found = parse_s5(copy, dl);
             acpi_put("ACPI: DSDT ");

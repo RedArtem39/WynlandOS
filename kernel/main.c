@@ -338,11 +338,51 @@ static void boot_mark(const char *what)
    wait on the network (an internet round trip for the geo-IP lookup, a
    few seconds of timeouts with no network at all) and used to hold the
    desktop back until they were done. The zone from the last boot is
-   already in effect (tz_load_cached()). */
+   already in effect (tz_load_cached()). Without a NIC it waits for a
+   USB one, and when that is pulled out, for the next. */
+static void network_lease(bool *tz_done);
+
 static void boot_network(void *arg)
 {
     (void)arg;
-    if (net_dhcp_request()) {
+    extern bool net_nic_present(void);
+    extern void net_link_down(void);
+    bool waiting_said = false, tz_done = false;
+    for (;;) {
+        /* no NIC (yet): a USB one -- a phone's tethering -- may come */
+        if (!net_nic_present()) {
+            if (!waiting_said) boot_mark("no network yet (a USB one may come: a phone's tethering)");
+            waiting_said = true;
+            sched_sleep_ms(500);
+            continue;
+        }
+        if (!net_dhcp_request()) {
+            extern bool usb_net_ready(void);
+            if (!usb_net_ready()) { boot_mark("no network"); return; }
+            sched_sleep_ms(3000);              /* a phone not sharing yet: again */
+            continue;
+        }
+        network_lease(&tz_done);
+        {
+            /* boot.cfg "netlog=IP:PORT": the kernel log to that machine */
+            extern void netlog_start(const char *cfg);
+            char cfg[512] = {0};
+            VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
+            if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
+            netlog_start(cfg);
+        }
+        /* up: a USB NIC may go away (unplugged); then wait for the next */
+        while (net_nic_present()) sched_sleep_ms(500);
+        net_link_down();
+        boot_mark("network down: the USB device is gone");
+        waiting_said = false;
+    }
+}
+
+/* a lease: /etc/resolv.conf, and (once) the time zone */
+static void network_lease(bool *tz_done)
+{
+    {
         /* vfs_create() only makes the directory entry -- call it
            unconditionally and always rewrite: the lease may differ.
            Interrupts off: this thread must not interleave an ext2 update
@@ -364,10 +404,11 @@ static void boot_network(void *arg)
         }
         if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
         boot_mark("network up (DHCP)");
-        tz_auto_detect();
-        boot_mark("timezone detected");
-    } else {
-        boot_mark("no network");
+        if (!*tz_done) {
+            tz_auto_detect();
+            boot_mark("timezone detected");
+            *tz_done = true;
+        }
     }
 }
 
@@ -565,6 +606,8 @@ static void serial_write_char(char c)
 {
     extern void bootlog_putc(char c);
     bootlog_putc(c);                 /* the log that outlives a crash (kernel/bootlog.c) */
+    extern void netlog_putc(char c);
+    netlog_putc(c);                  /* and over the network (kernel/netlog.c) */
     while (serial_is_transmit_empty() == 0);
     outb(PORT_COM1, c);
 }
@@ -1072,6 +1115,16 @@ void kernel_main(BootInfo *boot_info_loader)
     {
         extern Thread *thread_create(void (*entry)(void *), void *arg);
         thread_create(boot_network, NULL);
+        extern void sticklog_start(void);
+        sticklog_start();                    /* the log onto a live stick too (kernel/sticklog.c) */
+        {
+            /* boot.cfg gpu=1: the Intel GPU driver (drivers/gpu/i915.c) */
+            extern void i915_start(const char *cfg);
+            char cfg[512] = {0};
+            VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
+            if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
+            i915_start(cfg);
+        }
     }
 
     /* ---- Draw gradient background ---- */

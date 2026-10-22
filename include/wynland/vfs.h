@@ -41,6 +41,7 @@
 #define DEV_KBD       0xFFFFFFF3
 #define DEV_NULL      0xFFFFFFFE
 #define DEV_URANDOM   0xFFFFFFF8
+#define DEV_HW        0xFFFFFFAF   /* /dev/wynhw: raw PCI, BARs, DMA for user-space drivers (kernel/hwdev.c) */
 
 typedef struct {
     char name[MAX_FILENAME];

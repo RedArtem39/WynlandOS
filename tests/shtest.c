@@ -189,8 +189,10 @@ static const struct sh_case CASES[] = {
     { "/usr/bin/fish", "fish: help opens the local manual in w3m",
       "function w3m; echo $argv; end; help cd | grep '^file:'; command w3m -dump file:///usr/share/doc/fish/cmds/cd.html 2>&1 | grep -m1 -o 'change directory'",
       "file:///usr/share/doc/fish/cmds/cd.html\nchange directory\n" },
-    { "/bin/sh", "reboot: root's only",
-      "/usr/sbin/reboot; echo $?; /usr/sbin/poweroff 2>/dev/null; echo $?",
+    /* a person's own account may (kernel/syscall.c, SYS_reboot): a sandbox
+       -- a user namespace -- never */
+    { "/bin/sh", "reboot: never from a sandbox",
+      "unshare -U /usr/sbin/reboot; echo $?; unshare -U /usr/sbin/poweroff 2>/dev/null; echo $?",
       "reboot: Operation not permitted\n1\n1\n" },
     { "/bin/sh", "clang + make from Ubuntu (leaf): C and C++ build and run",
       "sh /clangtest.sh", "c: argv[0] ./other\nc++: sum 6\nmake: works\n" },

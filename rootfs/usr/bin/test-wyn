@@ -1,0 +1,78 @@
+#!/bin/sh
+# WynlandOS - test-wyn: run a numbered test from the developer's machine.
+#
+#   test-wyn        the list of tests
+#   test-wyn N      test N: its program fetched, run as root, its output
+#                   shown here and sent back (build/netlog/report-*.txt)
+#   test-wyn k      the developer's kernel (make devkernel) into the stick's
+#                   kernel slot: the next boot runs it (also leaf update -eK)
+#
+# The tests are a manifest on the developer's machine (tools/devhost.py
+# serves build/devhost/tests.txt: "N program [arguments]" a line); that
+# machine is the one boot.cfg's netlog= names. Only on a live stick.
+HOST=$(sed -n 's/^netlog=\([0-9.]*\):.*/\1/p' /etc/wynland/boot.cfg 2>/dev/null | head -n 1)
+[ -n "$HOST" ] || HOST=192.168.0.239
+H=http://$HOST:8765
+
+get() { curl -sS --retry 5 --retry-all-errors -o "$2" "$H/$1"; }
+
+if ! get tests.txt /tmp/test-wyn.list; then
+    echo "test-wyn: no answer from $H -- is the network up? (dmesg | grep -i -e network -e dhcp)"
+    exit 1
+fi
+if [ "$1" = k ]; then
+    # a kernel into the stick's slot (partition 4, type 0x7E): the next boot
+    # runs it (boot/boot.c SlotKernel; a key at boot: the stick's own)
+    get kernel.hdr /tmp/kernel.hdr && get kernel.elf /tmp/kernel.elf || { echo "test-wyn: no kernel on $H (make devkernel)"; exit 1; }
+    cat > /tmp/kinstall.sh <<'EOF'
+mbr() { dd if=/dev/usb0 bs=512 count=1 2>/dev/null | od -An -t"$1" -j "$2" -N "$3" | tr -d ' '; }
+T=$(mbr u1 498 1); S=$(mbr u4 502 4); C=$(mbr u4 506 4)
+if [ "$T" != 126 ]; then echo "no kernel slot on this stick (partition 4 type $T): flash a newer image"; exit 1; fi
+B=$(stat -c %s /tmp/kernel.elf)
+if [ $(( (B + 511) / 512 + 1 )) -gt "$C" ]; then echo "the kernel ($B bytes) is bigger than the slot"; exit 1; fi
+dd if=/tmp/kernel.elf of=/dev/usb0 bs=512 seek=$((S + 1)) conv=notrunc 2>/dev/null &&
+dd if=/tmp/kernel.hdr of=/dev/usb0 bs=512 seek="$S" count=1 conv=notrunc 2>/dev/null || { echo "writing the stick failed"; exit 1; }
+A=$(md5sum < /tmp/kernel.elf | cut -d' ' -f1)
+R=$(dd if=/dev/usb0 bs=512 skip=$((S + 1)) count=$(( (B + 511) / 512 )) 2>/dev/null | head -c "$B" | md5sum | cut -d' ' -f1)
+if [ "$A" = "$R" ]; then echo "the kernel is in the slot (LBA $S, $B bytes, read back the same): reboot to run it"
+else echo "READ BACK DIFFERENT: the stick did not take it ($A / $R)"; exit 1; fi
+EOF
+    echo "kernel: $(dd if=/tmp/kernel.hdr bs=1 skip=16 count=64 2>/dev/null | tr -d '\000')"
+    if [ "$(id -u)" = 0 ]; then sh /tmp/kinstall.sh
+    elif [ "$(id -un)" = live ]; then echo live | ary -S sh /tmp/kinstall.sh
+    else ary sh /tmp/kinstall.sh; fi
+    exit $?
+fi
+if [ -z "$1" ]; then
+    echo "tests on $H:"
+    grep -v '^#' /tmp/test-wyn.list
+    exit 0
+fi
+N=$1
+LINE=$(awk -v n="$N" '$1 == n { $1 = ""; sub(/^ +/, ""); print; exit }' /tmp/test-wyn.list)
+if [ -z "$LINE" ]; then
+    echo "test-wyn: no test $N; there are:"
+    grep -v '^#' /tmp/test-wyn.list
+    exit 1
+fi
+set -- $LINE
+P=$1
+shift
+get "$P" "/tmp/$P" && chmod +x "/tmp/$P" || { echo "test-wyn: could not fetch $P"; exit 1; }
+
+OUT=/tmp/test-wyn.$N.out
+echo "== test $N: $P $*" > "$OUT"
+if [ "$(id -u)" = 0 ]; then
+    "/tmp/$P" "$@" >> "$OUT" 2>&1
+elif [ "$(id -un)" = live ]; then
+    echo live | ary -S "/tmp/$P" "$@" >> "$OUT" 2>&1     # the live stick's account
+else
+    ary "/tmp/$P" "$@" >> "$OUT" 2>&1
+fi
+echo "== exit $?" >> "$OUT"
+cat "$OUT"
+if curl -sS --retry 5 --retry-all-errors --data-binary "@$OUT" "$H/report" >/dev/null; then
+    echo "(sent to $HOST)"
+else
+    echo "(could not send it to $HOST: show this screen instead)"
+fi

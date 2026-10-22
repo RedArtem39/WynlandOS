@@ -2235,6 +2235,8 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     }
     if (str_compare(path, "/proc/sysrq-trigger") == 0)
         return alloc_device_file("sysrq-trigger", 0, false, DEV_SYSRQ, flags);
+    if (str_compare(path, "/dev/wynhw") == 0)          /* kernel/hwdev.c: root's, checked on use */
+        return alloc_device_file("wynhw", 0, false, DEV_HW, flags);
     if (str_compare(path, "/dev/usb0") == 0) {
         if (!usb_storage_ready()) return NULL;
         uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
@@ -2244,7 +2246,10 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     /* DRM nodes (drivers/video/virtgpu_drm.c): ioctl/mmap-only devices */
     if (str_compare(path, "/dev/dri/renderD128") == 0) {
         VfsFile *f = alloc_device_file("renderD128", 0, false, DRM_DEV_RENDER, flags);
-        if (f) f->current_cluster = drm_open_client();
+        /* the Intel GPU's when it is up (drivers/gpu/i915_uapi.c), else virtio-gpu's */
+        extern bool i915_ready(void);
+        extern uint32_t i915_open_client(void);
+        if (f) f->current_cluster = i915_ready() ? i915_open_client() : drm_open_client();
         return f;
     }
     if (str_compare(path, "/dev/dri/card0") == 0) {
@@ -2409,7 +2414,15 @@ static uint32_t put_hex(char *o, uint32_t n, uint32_t cap, uint32_t v, int digit
 static uint32_t sysfs_drm_attr(uint32_t kind, char *o, uint32_t cap)
 {
     VgpuPciInfo pi;
-    if (!virtio_gpu_pci_info(&pi)) {
+    extern bool i915_ready(void);
+    extern uint32_t i915_device_id(void), i915_revision(void), i915_subsystem(void);
+    bool intel = i915_ready();
+    if (intel) {                     /* the Intel GPU (drivers/gpu/i915.c): its own PCI identity */
+        memset(&pi, 0, sizeof(pi));
+        pi.vendor = 0x8086; pi.device = (uint16_t)i915_device_id(); pi.revision = (uint8_t)i915_revision();
+        pi.subvendor = (uint16_t)i915_subsystem(); pi.subdevice = (uint16_t)(i915_subsystem() >> 16);
+        pi.slot = 2; pi.class_code = 0x030000;
+    } else if (!virtio_gpu_pci_info(&pi)) {
         memset(&pi, 0, sizeof(pi));
         pi.vendor = 0x1AF4; pi.device = 0x1050; pi.slot = 2;
         pi.subvendor = 0x1AF4; pi.subdevice = 0x1100; pi.class_code = 0x038000;
@@ -2422,7 +2435,7 @@ static uint32_t sysfs_drm_attr(uint32_t kind, char *o, uint32_t cap)
     } else if (kind == 0xFFFFFFEF) { /* revision */
         n = put_str(o, n, cap, "0x"); n = put_hex(o, n, cap, pi.revision, 2, false);
     } else {                         /* uevent of the PCI device */
-        n = put_str(o, n, cap, "DRIVER=virtio-pci\nPCI_CLASS=");
+        n = put_str(o, n, cap, intel ? "DRIVER=i915\nPCI_CLASS=" : "DRIVER=virtio-pci\nPCI_CLASS=");
         n = put_hex(o, n, cap, pi.class_code, 5, true);
         n = put_str(o, n, cap, "\nPCI_ID=");
         n = put_hex(o, n, cap, pi.vendor, 4, true);   n = put_str(o, n, cap, ":");

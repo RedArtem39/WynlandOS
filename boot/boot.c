@@ -13,6 +13,7 @@
 #include <wynland/boot_info.h>
 #include <wynland/bootlog.h>
 #include <wynland/disklabel.h>
+#include <wynland/logo_draw.h>
 
 /* ============================================================
  * Global State
@@ -26,7 +27,26 @@ static EFI_HANDLE         gImageHandle;
  * Helper: Print - output a UCS-2 string via ConOut
  * ============================================================ */
 
+/* while the boot screen (the logo) is up, the text stays off it -- unless
+   something went wrong: an ERROR brings the text back */
+static int g_quiet;
+static int g_fb_ram;          /* a BLT-only GOP: the "framebuffer" is RAM nobody shows */
+
+/* everything printed, also what the boot screen hides: saved to
+   \logs\loader-N.log on a live stick (LiveLoad) */
+static UINT8 g_ldr_log[16384];
+static UINTN g_ldr_len;
+
 static void Print(CHAR16 *str) {
+    for (CHAR16 *c = str; *c && g_ldr_len < sizeof g_ldr_log; c++)
+        if (*c != L'\r') g_ldr_log[g_ldr_len++] = *c < 128 ? (UINT8)*c : '?';
+    CHAR16 *s = str;
+    while (*s == L' ' || *s == L'\r' || *s == L'\n') s++;
+    if (g_quiet && s[0] == L'E' && s[1] == L'R' && s[2] == L'R') {
+        g_quiet = 0;
+        gST->ConOut->ClearScreen(gST->ConOut);
+    }
+    if (g_quiet) return;
     gST->ConOut->OutputString(gST->ConOut, str);
 }
 
@@ -155,6 +175,43 @@ static void PutDec(CHAR16 *out, UINT32 v)
     out[n] = 0;
 }
 
+/* \logs\<kind><no>.log on the boot volume: a, then b */
+static void WriteLogFile(const CHAR16 *kind, UINT32 no, const UINT8 *a, UINTN alen, const UINT8 *b, UINTN blen)
+{
+    EFI_LOADED_IMAGE_PROTOCOL *loadedImage;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fileSystem;
+    EFI_FILE_PROTOCOL *root, *dir, *f;
+    EFI_GUID loadedImageGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+    EFI_GUID fileSystemGuid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(gImageHandle, &loadedImageGuid, (VOID**)&loadedImage))) return;
+    if (EFI_IS_ERROR(gBS->HandleProtocol(loadedImage->DeviceHandle, &fileSystemGuid, (VOID**)&fileSystem))) return;
+    if (EFI_IS_ERROR(fileSystem->OpenVolume(fileSystem, &root))) return;
+    if (EFI_IS_ERROR(root->Open(root, &dir, L"\\logs", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+                                EFI_FILE_DIRECTORY))) {
+        root->Close(root);
+        return;
+    }
+    CHAR16 name[48];
+    int n = 0;
+    while (kind[n]) { name[n] = kind[n]; n++; }
+    PutDec(name + n, no);
+    while (name[n]) n++;
+    const CHAR16 *ext = L".log";
+    for (int i = 0; ext[i]; i++) name[n++] = ext[i];
+    name[n] = 0;
+    if (!EFI_IS_ERROR(dir->Open(dir, &f, name, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0))) {
+        if (alen) f->Write(f, &alen, (VOID *)a);
+        if (blen) f->Write(f, &blen, (VOID *)b);
+        f->Flush(f);
+        f->Close(f);
+        Print(L"  saved a log: \\logs\\");
+        Print(name);
+        Print(L"\r\n");
+    }
+    dir->Close(dir);
+    root->Close(root);
+}
+
 static void SaveLog(BootLog *l)
 {
     EFI_LOADED_IMAGE_PROTOCOL *loadedImage;
@@ -205,6 +262,7 @@ static int BootFileExists(CHAR16 *name);
 /* what BootLogSetup() found, shown by LiveLoad(): setting the screen mode
    in between clears whatever was printed */
 static UINT64 g_log_prev, g_log_now;
+static UINT32 g_boot_no;
 static UINT32 g_log_prev_state;
 
 static UINT64 BootLogSetup(void)
@@ -233,6 +291,7 @@ static UINT64 BootLogSetup(void)
         l->boot_no = boot_no;
         l->check = bootlog_check(l);
         g_log_now = a;
+        g_boot_no = boot_no;
         return a;
     }
     return 0;
@@ -261,7 +320,321 @@ static int BootFileExists(CHAR16 *name)
     return found;
 }
 
+/*
+ * The boot screen: the logo (include/wynland/logo_draw.h) winds in, then
+ * a ring of light runs over it and a thin bar under it fills while the
+ * system is read. Any key -- or anything going wrong -- brings the text
+ * back. Frames are drawn between reads: the reads come in 1 MB pieces.
+ */
+static struct {
+    int      on;
+    UINT64   tsc0, per_ms, last_ms;
+    UINT32  *buf;
+    int      size, x, y, bar_y, bar_h;
+    BootInfo *bi;
+} g_ui;
+
+static UINT64 Rdtsc(void)
+{
+    UINT32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((UINT64)hi << 32) | lo;
+}
+
+static void UiPut(int x, int y, UINT32 rgb)
+{
+    BootInfo *bi = g_ui.bi;
+    if (!bi->fb_format) rgb = (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu) | ((rgb & 0xFFu) << 16);
+    *(volatile UINT32 *)(UINTN)(bi->fb_addr + (UINT64)y * bi->fb_pitch + (UINT64)x * 4) = rgb;
+}
+
+static void UiStart(BootInfo *bi)
+{
+    if (g_fb_ram || bi->fb_bpp != 32 || !bi->fb_addr) return;
+    int size = (int)(bi->fb_height * 3 / 10) & ~1;
+    if (size < 128) size = 128;
+    if (size > LOGO_MAX_SIZE) size = LOGO_MAX_SIZE;
+    if (EFI_IS_ERROR(gBS->AllocatePool(EfiLoaderData, (UINTN)size * size * 4, (VOID **)&g_ui.buf))) return;
+    UINT64 t = Rdtsc();
+    gBS->Stall(20000);
+    g_ui.per_ms = (Rdtsc() - t) / 20;
+    if (!g_ui.per_ms) return;
+    g_ui.bi = bi;
+    g_ui.size = size;
+    g_ui.x = (int)(bi->fb_width - size) / 2;
+    g_ui.y = (int)(bi->fb_height - size) / 2 - (int)bi->fb_height / 24;
+    g_ui.bar_h = size / 100 + 2;
+    g_ui.bar_y = g_ui.y + size + size / 6;
+    for (UINT32 y = 0; y < bi->fb_height; y++)
+        for (UINT32 x = 0; x < bi->fb_width; x++) UiPut((int)x, (int)y, 0);
+    g_ui.tsc0 = Rdtsc();
+    g_ui.last_ms = 0;
+    g_ui.on = 1;
+    g_quiet = 1;
+}
+
+/* back to the text: a key, or an error */
+static void UiOff(void)
+{
+    if (!g_ui.on) return;
+    g_ui.on = 0;
+    g_quiet = 0;
+    gST->ConOut->ClearScreen(gST->ConOut);
+}
+
+/* a frame, if one is due (~30 a second); done/total: the bar */
+static void UiFrame(UINT64 done, UINT64 total, int rest)
+{
+    if (!g_ui.on) return;
+    EFI_INPUT_KEY key;
+    if (!rest && gST->ConIn && !EFI_IS_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &key))) {
+        UiOff();
+        Print(L"[live] reading the system into memory (a key: the text)... ");
+        return;
+    }
+    UINT64 ms = (Rdtsc() - g_ui.tsc0) / g_ui.per_ms;
+    if (!rest && ms - g_ui.last_ms < 33 && g_ui.last_ms) return;
+    g_ui.last_ms = ms ? ms : 1;
+    INT32 glow = 0;
+    if (!rest && ms > LOGO_ASSEMBLE_MS) {
+        glow = (INT32)((ms - LOGO_ASSEMBLE_MS) / 3);
+        if (glow > 256) glow = 256;
+    }
+    logo_draw(g_ui.buf, g_ui.size, rest ? 1u << 30 : (UINT32)ms, glow, (UINT32)(ms - LOGO_ASSEMBLE_MS));
+    for (int y = 0; y < g_ui.size; y++)
+        for (int x = 0; x < g_ui.size; x++) UiPut(g_ui.x + x, g_ui.y + y, g_ui.buf[y * g_ui.size + x]);
+    /* the bar: a dim track, the part done bright; it fades in with the logo */
+    int fill = total ? (int)(done * (UINT64)g_ui.size / total) : 0;
+    UINT32 fade = ms >= LOGO_ASSEMBLE_MS ? 256 : (UINT32)(ms * 256 / LOGO_ASSEMBLE_MS);
+    for (int y = 0; y < g_ui.bar_h; y++)
+        for (int x = 0; x < g_ui.size; x++) {
+            UINT32 r = x < fill ? 0x50 : 0x10, g = x < fill ? 0xB0 : 0x1C, b = x < fill ? 0xFF : 0x3A;
+            UiPut(g_ui.x + x, g_ui.bar_y + y, ((r * fade >> 8) << 16) | ((g * fade >> 8) << 8) | (b * fade >> 8));
+        }
+}
+
+/* an LZ4 block (tools/livepack.c packs them): its size unpacked, or -1 */
+static INT64 Lz4Unpack(const UINT8 *s, UINTN n, UINT8 *d, UINTN cap)
+{
+    const UINT8 *se = s + n;
+    UINT8 *dp = d, *de = d + cap;
+    while (s < se) {
+        UINT8 t = *s++;
+        UINTN l = t >> 4;
+        if (l == 15) {
+            UINT8 b;
+            do { if (s >= se) return -1; b = *s++; l += b; } while (b == 255);
+        }
+        if (l > (UINTN)(se - s) || l > (UINTN)(de - dp)) return -1;
+        memcpy(dp, s, l);
+        dp += l;
+        s += l;
+        if (s >= se) break;                     /* the last literals */
+        if (se - s < 2) return -1;
+        UINTN off = s[0] | (UINTN)s[1] << 8;
+        s += 2;
+        if (!off || off > (UINTN)(dp - d)) return -1;
+        UINTN m = t & 15;
+        if (m == 15) {
+            UINT8 b;
+            do { if (s >= se) return -1; b = *s++; m += b; } while (b == 255);
+        }
+        m += 4;
+        if (m > (UINTN)(de - dp)) return -1;
+        const UINT8 *r = dp - off;
+        while (m--) *dp++ = *r++;               /* may overlap: byte by byte */
+    }
+    return dp - d;
+}
+
+/* The packed live stick (tools/livepack.c): partition 2 holds the system
+   in RAMDISK_CHUNK pieces, LZ4 or all-zero, each unpacked straight into
+   its piece of RAM. Only what is there is read: the minutes a whole raw
+   2 GB took through a firmware's USB driver become seconds. */
+/* a read of the stick; a failed one tried again (a USB stick, a firmware
+   driver may fail one now and then), then reported with its status */
+static int ReadRetry(EFI_BLOCK_IO_PROTOCOL *disk, UINT64 lba, UINTN bytes, VOID *buf)
+{
+    EFI_STATUS st = 0;
+    for (int i = 0; i < 4; i++) {
+        st = disk->ReadBlocks(disk, disk->Media->MediaId, lba, bytes, buf);
+        if (!EFI_IS_ERROR(st)) return 1;
+        gBS->Stall(100000);
+    }
+    UiOff();
+    Print(L"[live] reading the stick failed, 4 times: LBA ");
+    PrintHex(lba);
+    Print(L", bytes ");
+    PrintHex(bytes);
+    Print(L", status ");
+    PrintHex(st);
+    Print(L"\r\n");
+    return 0;
+}
+
+/* the stick is read into these, below 4 GB (LiveLoadInner takes them
+   before the system's 2 GB use the low memory up) */
+static EFI_PHYSICAL_ADDRESS g_low_table, g_low_piece;
+
+/* a piece's sum (tools/livepack.c piece_sum: the same) */
+static UINT32 PieceSum(const UINT8 *p)
+{
+    UINT32 h = 0x811C9DC5u;
+    const UINT64 *w = (const UINT64 *)p;
+    for (UINTN i = 0; i < RAMDISK_CHUNK / 8; i++)
+        h = (h ^ (UINT32)w[i] ^ (UINT32)(w[i] >> 32)) * 16777619u;
+    return h;
+}
+
+static int LivePacked(EFI_BLOCK_IO_PROTOCOL *disk, UINT64 at, UINT64 *chunks, UINT64 nchunks, UINT64 bytes, UINT8 *head)
+{
+    UINT32 tsec = (UINT32)((nchunks * 8 + 511) / 512);
+    EFI_PHYSICAL_ADDRESS tbuf = 0, pbuf = 0;
+    if (*(UINT64 *)(head + 8) != bytes || *(UINT32 *)(head + 20) != RAMDISK_CHUNK) {
+        Print(L"[live] the pack's header does not match\r\n");
+        return 0;
+    }
+    /* what the stick is read into lies below 4 GB: a firmware USB driver
+       that DMAs above it may hand back wrong data without an error */
+    tbuf = g_low_table;
+    pbuf = g_low_piece;
+    if (!tbuf || !pbuf || tsec * 512 > 65536) return 0;
+    UINT32 *sizes = (UINT32 *)(UINTN)tbuf;
+    if (!ReadRetry(disk, at + 1, (UINTN)tsec * 512, sizes)) return 0;
+    UINT64 lba = at + 1 + tsec, packed = 0;
+    for (UINT64 c = 0; c < nchunks; c++) packed += (sizes[2 * c] + 511) / 512 * 512;
+    Print(L"[live] reading the system into memory (");
+    PrintHex(packed >> 20);
+    Print(L" MB packed, ");
+    PrintHex(bytes >> 20);
+    Print(L" MB unpacked, hex)... ");
+    UINT32 shown = 0;
+    UINT64 read = 0;
+    for (UINT64 c = 0; c < nchunks; c++) {
+        UINT8 *dst = (UINT8 *)(UINTN)chunks[c];
+        UINT32 sz = sizes[2 * c], sum = sizes[2 * c + 1], secs = (sz + 511) / 512;
+        if (!sz) {
+            memset(dst, 0, RAMDISK_CHUNK);
+        } else if (sz > RAMDISK_CHUNK) {
+            UiOff();
+            Print(L"[live] the pack's table is damaged at piece ");
+            PrintHex(c);
+            Print(L"\r\n");
+            return 0;
+        } else {
+            UINT8 *src = (UINT8 *)(UINTN)pbuf;
+            /* read, unpacked and summed; a piece that comes out wrong is
+               read again: a laptop's firmware handed back wrong data once
+               in a while, with no error, from a stick that held it right */
+            int good = 0;
+            for (int attempt = 0; attempt < 4 && !good; attempt++) {
+                /* 1 MB at a time: a frame of the boot screen in between */
+                for (UINT32 s = 0; s < secs; ) {
+                    UINT32 n = secs - s < 2048 ? secs - s : 2048;
+                    if (!ReadRetry(disk, lba + s, (UINTN)n * 512, src + (UINTN)s * 512)) {
+                        UiOff();
+                        Print(L"[live] ... at piece ");
+                        PrintHex(c);
+                        Print(L"\r\n");
+                        return 0;
+                    }
+                    s += n;
+                    if (!attempt) read += (UINT64)n * 512;
+                    UiFrame(read, packed, 0);
+                }
+                if (sz == RAMDISK_CHUNK) memcpy(dst, src, RAMDISK_CHUNK);   /* stored as is */
+                int unpacked = sz == RAMDISK_CHUNK || Lz4Unpack(src, sz, dst, RAMDISK_CHUNK) == RAMDISK_CHUNK;
+                good = unpacked && PieceSum(dst) == sum;
+                if (!good) {
+                    Print(L"\r\n[live] piece ");
+                    PrintHex(c);
+                    Print(unpacked ? L" read wrong (its sum), try " : L" read wrong (does not unpack), try ");
+                    PrintHex((UINT64)attempt + 1);
+                    Print(L": LBA ");
+                    PrintHex(lba);
+                    Print(L", sectors ");
+                    PrintHex(secs);
+                    Print(L", buffer at ");
+                    PrintHex((UINT64)(UINTN)src);
+                    Print(L"\r\n");
+                }
+            }
+            if (!good) {
+                UiOff();
+                Print(L"\r\n[live] piece ");
+                PrintHex(c);
+                Print(L" stays wrong after 4 reads\r\n");
+                return 0;
+            }
+        }
+        lba += secs;
+        UINT32 pct = (UINT32)((c + 1) * 20 / nchunks);
+        while (shown < pct) { shown++; Print(L"#"); }
+    }
+    /* the logo at rest, the bar full: what stays up until the kernel draws */
+    UiFrame(packed, packed, 1);
+    return 1;
+}
+
+/* The kernel's log of the last boot from the stick's log area (sector 0:
+   "WYNKLOG1", u64 bytes, u32 boot number; then the text) into
+   \logs\klog-N.log, the area then marked empty. A machine whose screen
+   or network fails still leaves its log here, for any computer to read. */
+static void KlogRescue(EFI_BLOCK_IO_PROTOCOL *disk, UINT32 start, UINT32 count)
+{
+    static UINT8 hdr[512];
+    if (count < 2 || EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start, 512, hdr))) return;
+    for (int i = 0; i < 8; i++) if (hdr[i] != (UINT8)"WYNKLOG1"[i]) return;
+    UINT64 len = *(UINT64 *)(hdr + 8);
+    UINT32 no = *(UINT32 *)(hdr + 16);
+    if (!len || len > (UINT64)(count - 1) * 512) return;
+    UINTN bytes = (UINTN)((len + 511) / 512 * 512);
+    UINT8 *data = NULL;
+    if (EFI_IS_ERROR(gBS->AllocatePool(EfiLoaderData, bytes, (VOID **)&data))) return;
+    if (!EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start + 1, bytes, data)))
+        WriteLogFile(L"klog-", no, data, (UINTN)len, NULL, 0);
+    gBS->FreePool(data);
+    for (int i = 0; i < 512; i++) hdr[i] = 0;
+    if (disk->WriteBlocks) disk->WriteBlocks(disk, disk->Media->MediaId, start, 512, hdr);
+}
+
+static void LiveLoadInner(BootInfo *info);
+
+/* The live boot, and what the loader said on the way kept as
+   \logs\loader-N.log. If the system did not come into memory the kernel
+   would start without it (a blank, garbled screen): the reason stays on
+   the screen until a key instead. */
 static void LiveLoad(BootInfo *info)
+{
+    if (!BootFileExists(L"\\live")) return;
+    LiveLoadInner(info);
+    if (!info->ramdisk_addr) {
+        UiOff();
+        /* what was said behind the boot screen: its last lines, again */
+        {
+            static CHAR16 line[1601];
+            UINTN from = g_ldr_len > 1600 ? g_ldr_len - 1600 : 0, n = 0;
+            for (UINTN i = from; i < g_ldr_len; i++) {
+                line[n++] = g_ldr_log[i];
+                if (g_ldr_log[i] == '\n') { line[n - 1] = L'\r'; line[n++] = L'\n'; }
+                if (n >= 1598) break;
+            }
+            line[n] = 0;
+            gST->ConOut->OutputString(gST->ConOut, line);
+        }
+        Print(L"\r\n[live] THE SYSTEM DID NOT COME INTO MEMORY: the reason is above. Any key to go on.\r\n");
+        WriteLogFile(L"loader-", g_boot_no, g_ldr_log, g_ldr_len, NULL, 0);
+        EFI_INPUT_KEY key;
+        for (int i = 0; i < 6000; i++) {          /* 10 minutes at most */
+            if (gST->ConIn && !EFI_IS_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &key))) break;
+            gBS->Stall(100000);
+        }
+        return;
+    }
+    WriteLogFile(L"loader-", g_boot_no, g_ldr_log, g_ldr_len, NULL, 0);
+}
+
+static void LiveLoadInner(BootInfo *info)
 {
     if (!BootFileExists(L"\\live")) return;
     if (g_log_prev) {
@@ -296,12 +669,36 @@ static void LiveLoad(BootInfo *info)
         Print(L"[live] no disk labelled WYNLANDOS-DISK: booting from the disk instead\r\n");
         return;
     }
-    /* the root partition (the second, type 0x83): its end is where to stop */
+    /* the root partition (the second, type 0x83): its end is where to stop;
+       or (type 0xDA) the pack of it, which says how big the system is */
     UINT32 start = *(UINT32 *)(sec + 0x1CE + 8), count = *(UINT32 *)(sec + 0x1CE + 12);
     UINT64 blocks = (UINT64)start + count;
-    if (sec[0x1CE + 4] != 0x83 || !count || blocks > disk->Media->LastBlock + 1) {
+    int packed = sec[0x1CE + 4] == 0xDA;
+    if ((sec[0x1CE + 4] != 0x83 && !packed) || !count || blocks > disk->Media->LastBlock + 1) {
         Print(L"[live] the disk's partition table is not WynlandOS's\r\n");
         return;
+    }
+    /* partition 3 (type 0x7F, tools/livepack.c): the kernel's own log of
+       the last boot, written there as it ran (kernel/sticklog.c) */
+    if (sec[0x1DE + 4] == 0x7F) KlogRescue(disk, *(UINT32 *)(sec + 0x1DE + 8), *(UINT32 *)(sec + 0x1DE + 12));
+    UINT8 head[512];
+    if (packed) {
+        int ok = !EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start, 512, head));
+        for (int i = 0; ok && i < 8; i++) ok = head[i] == (UINT8)"WYNPACK2"[i];
+        if (!ok) {
+            Print(L"[live] the system's pack is missing or damaged\r\n");
+            return;
+        }
+        blocks = *(UINT64 *)(head + 8) / 512;
+    }
+    if (packed) {
+        g_low_table = g_low_piece = 0xFFFFFFFFull;
+        if (EFI_IS_ERROR(gBS->AllocatePages(AllocateMaxAddress, EfiLoaderData, 16, &g_low_table)) ||
+            EFI_IS_ERROR(gBS->AllocatePages(AllocateMaxAddress, EfiLoaderData, RAMDISK_CHUNK / 4096, &g_low_piece))) {
+            g_low_table = g_low_piece = 0;
+            Print(L"[live] no memory below 4 GB to read the stick into\r\n");
+            return;
+        }
     }
     /* in RAMDISK_CHUNK pieces, anywhere: a few GB in one piece is often
        not there, even with 16 GB of RAM. A table of their addresses. */
@@ -312,15 +709,17 @@ static void LiveLoad(BootInfo *info)
     EFI_PHYSICAL_ADDRESS table = 0;
     if (EFI_IS_ERROR(gBS->AllocatePages(AllocateAnyPages, EfiReservedMemoryType, tpages, &table))) return;
     UINT64 *chunks = (UINT64 *)(UINTN)table;
-    Print(L"[live] reading the system into memory (");
-    PrintHex(bytes >> 20);
-    Print(L" MB, hex)... ");
+    if (!packed) {
+        Print(L"[live] reading the system into memory (");
+        PrintHex(bytes >> 20);
+        Print(L" MB, hex)... ");
+    }
     UINT32 shown = 0;
     for (UINT64 c = 0; c < nchunks; c++) {
         UINT64 lba = c * per, nb = blocks - lba < per ? blocks - lba : per;
         EFI_PHYSICAL_ADDRESS a = 0;
         int ok = !EFI_IS_ERROR(gBS->AllocatePages(AllocateAnyPages, EfiReservedMemoryType, RAMDISK_CHUNK / 4096, &a));
-        if (ok) ok = !EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, lba, (UINTN)(nb * 512), (VOID *)(UINTN)a));
+        if (ok && !packed) ok = !EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, lba, (UINTN)(nb * 512), (VOID *)(UINTN)a));
         if (!ok) {
             Print(L"\r\n[live] not enough memory, or a read failed: booting from the disk instead\r\n");
             if (a) gBS->FreePages(a, RAMDISK_CHUNK / 4096);
@@ -329,8 +728,16 @@ static void LiveLoad(BootInfo *info)
             return;
         }
         chunks[c] = a;
+        if (packed) continue;
         UINT32 pct = (UINT32)((c + 1) * 20 / nchunks);
         while (shown < pct) { shown++; Print(L"#"); }
+    }
+    if (packed) UiStart(info);
+    if (packed && !LivePacked(disk, start, chunks, nchunks, bytes, head)) {
+        Print(L"\r\n[live] reading the system failed\r\n");
+        for (UINT64 c = 0; c < nchunks; c++) gBS->FreePages(chunks[c], RAMDISK_CHUNK / 4096);
+        gBS->FreePages(table, tpages);
+        return;
     }
     Print(L" done\r\n");
     info->ramdisk_addr = table;
@@ -522,6 +929,7 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         for (UINTN k = 0; k < fbPages * 4096; k++) p[k] = 0;
         info->fb_addr = fbAddr;
         info->fb_format = 1; /* BGR, like every virtio-gpu 2D format we use */
+        g_fb_ram = 1;
         Print(L"  GOP is BLT-only: using a RAM framebuffer\r\n");
     }
 
@@ -533,6 +941,73 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
     Print(L"\r\n");
 
     return EFI_SUCCESS;
+}
+
+/* ============================================================
+ * The kernel slot: partition 4 of a live stick (type 0x7E, 16 MB,
+ * tools/livepack.c). Sector 0: "WYNKERN1", u32 bytes, u32 sum (FNV-1a of
+ * them), 64 bytes of text (what it is); then the kernel's ELF. Written
+ * by test-wyn k (rootfs/usr/bin/test-wyn) from the developer's machine
+ * (make devkernel, tools/kslot.py): a new kernel without flashing the
+ * stick again. A key within 2 s boots the stick's own \kernel.elf.
+ * ============================================================ */
+
+static EFI_BLOCK_IO_PROTOCOL *FindOurDisk(UINT8 *sec)
+{
+    EFI_GUID bioGuid = EFI_BLOCK_IO_PROTOCOL_GUID;
+    UINTN n = 0;
+    EFI_HANDLE *hs = NULL;
+    if (EFI_IS_ERROR(gBS->LocateHandleBuffer(2 /* ByProtocol */, &bioGuid, NULL, &n, &hs))) return NULL;
+    for (UINTN i = 0; i < n; i++) {
+        EFI_BLOCK_IO_PROTOCOL *b;
+        if (EFI_IS_ERROR(gBS->HandleProtocol(hs[i], &bioGuid, (VOID**)&b))) continue;
+        if (!b->Media || !b->Media->MediaPresent || b->Media->LogicalPartition || b->Media->BlockSize != 512) continue;
+        if (EFI_IS_ERROR(b->ReadBlocks(b, b->Media->MediaId, 0, 512, sec))) continue;
+        if (wyn_disk_is_ours(sec)) return b;
+    }
+    return NULL;
+}
+
+static UINT8 *SlotKernel(UINTN *size)
+{
+    static UINT8 sec[512], hdr[512];
+    EFI_BLOCK_IO_PROTOCOL *disk = FindOurDisk(sec);
+    if (!disk || sec[0x1EE + 4] != 0x7E) return NULL;
+    UINT32 start = *(UINT32 *)(sec + 0x1EE + 8), count = *(UINT32 *)(sec + 0x1EE + 12);
+    if (count < 2 || EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start, 512, hdr))) return NULL;
+    for (int i = 0; i < 8; i++) if (hdr[i] != (UINT8)"WYNKERN1"[i]) return NULL;
+    UINT32 bytes = *(UINT32 *)(hdr + 8), sum = *(UINT32 *)(hdr + 12);
+    if (!bytes || bytes > (count - 1) * 512u) return NULL;
+    UINTN rounded = (bytes + 511) / 512 * 512;
+    UINT8 *buf = NULL;
+    if (EFI_IS_ERROR(gBS->AllocatePool(EfiLoaderData, rounded, (VOID **)&buf))) return NULL;
+    if (EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start + 1, rounded, buf))) { gBS->FreePool(buf); return NULL; }
+    UINT32 h = 2166136261u;
+    for (UINT32 i = 0; i < bytes; i++) h = (h ^ buf[i]) * 16777619u;
+    if (h != sum) {
+        Print(L"  [kernel] the slot's kernel is damaged (its sum): the stick's own\r\n");
+        gBS->FreePool(buf);
+        return NULL;
+    }
+    CHAR16 what[65];
+    int n = 0;
+    for (; n < 64 && hdr[16 + n] >= 32 && hdr[16 + n] < 127; n++) what[n] = hdr[16 + n];
+    what[n] = 0;
+    Print(L"  [kernel] the slot's kernel: ");
+    Print(what);
+    Print(L"\r\n  [kernel] booting it -- any key within 2 s: the stick's own instead\r\n");
+    EFI_INPUT_KEY key;
+    if (gST->ConIn) while (!EFI_IS_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &key))) ;   /* old keys */
+    for (int i = 0; i < 20; i++) {
+        if (gST->ConIn && !EFI_IS_ERROR(gST->ConIn->ReadKeyStroke(gST->ConIn, &key))) {
+            Print(L"  [kernel] the stick's own kernel\r\n");
+            gBS->FreePool(buf);
+            return NULL;
+        }
+        gBS->Stall(100000);
+    }
+    *size = bytes;
+    return buf;
 }
 
 /* ============================================================
@@ -623,6 +1098,18 @@ static EFI_STATUS LoadKernel(Elf64_Addr *entry_point) {
             kernelFile->Close(kernelFile);
             rootDir->Close(rootDir);
             return status;
+        }
+    }
+
+    /* the kernel in the stick's slot instead (test-wyn k, leaf update -eK),
+       unless a key says the stick's own */
+    {
+        UINTN slotSize = 0;
+        UINT8 *slot = SlotKernel(&slotSize);
+        if (slot) {
+            gBS->FreePool(fileBuffer);
+            fileBuffer = slot;
+            fileSize = slotSize;
         }
     }
 

@@ -2817,24 +2817,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 UIoVecW v = { (uint8_t *)a2, a3 };
                 return (uint64_t)kobj_readv(fd_table[a1], fd_oflags[a1], &v, 1);
             }
-            if (fd_table[a1]->node.first_cluster == 0xFFFFFFF4) { // VENDOR
-                if (fd_table[a1]->offset > 0) return 0;
-                const char *vendor_str = "0x1af4\n";
-                uint32_t len = 7;
-                if (a3 < len) len = a3;
-                for (uint32_t i = 0; i < len; i++) ((char *)a2)[i] = vendor_str[i];
-                fd_table[a1]->offset += len;
-                return len;
-            }
-            if (fd_table[a1]->node.first_cluster == 0xFFFFFFF5) { // DEVICE
-                if (fd_table[a1]->offset > 0) return 0;
-                const char *device_str = "0x1050\n";
-                uint32_t len = 7;
-                if (a3 < len) len = a3;
-                for (uint32_t i = 0; i < len; i++) ((char *)a2)[i] = device_str[i];
-                fd_table[a1]->offset += len;
-                return len;
-            }
+            /* (the DRM device's PCI vendor/device: read by the VFS --
+               drivers/fs/ext2.c sysfs_drm_attr -- virtio-gpu's or the Intel
+               GPU's, whichever is there; they used to be fixed virtio strings
+               here) */
             if (fd_table[a1]->node.first_cluster == 0xFFFFFFFA || fd_table[a1]->node.first_cluster == 0xFFFFFFFC) {
                 uint32_t pipe_idx = fd_table[a1]->current_cluster;
                 if (pipe_idx < MAX_PIPES && g_pipes[pipe_idx] != NULL) {
@@ -3292,6 +3278,29 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                                      PAGE_WRITE | PAGE_USER | cache_flags | PAGE_NX | PAGE_SHARED_MAP);
                     }
 
+                    return virt_addr;
+                }
+
+                /* /dev/wynhw (kernel/hwdev.c): a BAR or a DMA buffer by its
+                   physical address -- root's, outside any sandbox */
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    fd_table[fd]->node.first_cluster == DEV_HW) {
+                    extern int hwdev_mmap_check(uint64_t phys, uint64_t len, uint64_t *cache);
+                    if (!sandbox_capable_host(sched_current()->proc, 17 /* CAP_SYS_RAWIO */)) return (uint64_t)-1;
+                    uint64_t cache = 0;
+                    int r = hwdev_mmap_check(offset, size_aligned, &cache);
+                    if (r) return (uint64_t)(int64_t)r;
+                    uint64_t virt_addr = addr & ~(uint64_t)(PAGE_SIZE - 1);
+                    if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                        virt_addr = mmap_bump(MMAP_SLOT_DMABUF, size_aligned);
+                        if (!virt_addr) return (uint64_t)-12;
+                    }
+                    PageTable *pml4 = vmm_get_current_pml4();
+                    for (uint64_t i = 0; i < pages; i++) {
+                        user_unmap_page(pml4, virt_addr + i * PAGE_SIZE);
+                        vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, offset + i * PAGE_SIZE,
+                                     PAGE_USER | PAGE_WRITE | PAGE_NX | PAGE_SHARED_MAP | cache);
+                    }
                     return virt_addr;
                 }
 
@@ -4986,6 +4995,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint64_t request = a2;
                 void *argp = (void *)a3;
 
+                /* /dev/wynhw: raw PCI for a user-space driver (kernel/hwdev.c) */
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] &&
+                    fd_table[fd]->node.first_cluster == DEV_HW) {
+                    extern int hwdev_ioctl(uint64_t req, void *argp);
+                    if (!sandbox_capable_host(proc, 17 /* CAP_SYS_RAWIO */)) return (uint64_t)-1;
+                    return (uint64_t)(int64_t)hwdev_ioctl(request, argp);
+                }
+
                 /* the network interfaces by name (glibc's if_nametoindex,
                    bubblewrap bringing up a network namespace's loopback): "lo",
                    index 1, up; eth0 when the network is the host's */
@@ -6208,7 +6225,12 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint32_t m2 = (uint32_t)a2;
                 if (m2 != 672274793u && m2 != 85072278u && m2 != 369367448u && m2 != 537993216u)
                     return (uint64_t)-22;
-                if (!sandbox_capable_host(proc, CAP_SYS_BOOT)) return (uint64_t)-1; /* -EPERM */
+                /* Root, or -- as logind/polkit, macOS and Windows allow it --
+                   a person's own account (uid 1000 and up, not nobody) at
+                   this machine: there is no remote login. Never a sandbox
+                   (a user namespace) and never a system service's uid. */
+                bool person = !proc->userns && proc->ruid >= 1000 && proc->ruid != 65534;
+                if (!sandbox_capable_host(proc, CAP_SYS_BOOT) && !person) return (uint64_t)-1; /* -EPERM */
                 switch ((uint32_t)a3) {
                     case 0x01234567u: sys_reboot(); break;                  /* RESTART */
                     case 0x4321FEDCu: case 0xCDEF0123u: sys_poweroff(); break; /* POWER_OFF, HALT */
@@ -6216,6 +6238,22 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     default: return (uint64_t)-22;
                 }
                 return (uint64_t)-5; /* -EIO: still running */
+            }
+
+        case 103: // SYS_syslog(type, buf, len): the boot log (kernel/bootlog.c), read-only
+            {
+                extern uint32_t bootlog_read(char *dst, uint32_t len);
+                extern uint32_t bootlog_size(void);
+                int type = (int)a1;
+                if (type == 10) return bootlog_size();               /* SIZE_BUFFER */
+                if (type == 9) return 0;                              /* SIZE_UNREAD */
+                if (type == 0 || type == 1 || type == 5 || (type >= 6 && type <= 8)) return 0;
+                if (type != 2 && type != 3 && type != 4) return (uint64_t)-22;
+                if ((int64_t)a3 < 0) return (uint64_t)-22;
+                if (!a3) return 0;
+                uint32_t len = a3 > bootlog_size() ? bootlog_size() : (uint32_t)a3;
+                if (!a2 || !user_prepare_write(a2, len)) return (uint64_t)-14;
+                return bootlog_read((char *)a2, len);
             }
 
         case 99: // SYS_sysinfo
