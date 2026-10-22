@@ -499,7 +499,8 @@ $(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(
 
 # ESP partition image: FAT32, firmware-loadable content only.
 # Screen size the bootloader asks the firmware for (boot/boot.c reads
-# \resolution.cfg from the ESP): make RESOLUTION=2560x1440 ...
+# \resolution.cfg from the ESP): make RESOLUTION=2560x1440 ... ("native":
+# the mode the firmware is in -- a laptop panel's own)
 RESOLUTION ?= 1920x1080
 $(BUILD)/resolution.cfg: FORCE
 	@mkdir -p $(BUILD)
@@ -532,12 +533,15 @@ $(DISK_IMAGE): $(ESP_PART_IMG) $(EXT2_PART_IMG) make_mbr.py
 # ---------- The live USB stick ----------
 # make live: an image for a USB stick (dd it, or Rufus in DD mode). The
 # loader reads the whole system into RAM (\live on the ESP), so no disk of
-# the machine is touched; no swap partition; the text console (console=1)
-# with the account live / live. Its own copies of the partition images, so
-# the usual image stays as it is.
+# the machine is touched; no swap partition; the account live / live.
+# The desktop (on a machine without virtio-gpu: simpledrm + llvmpipe), or
+# with LIVE_CONSOLE=1 the text console. Its own copies of the partition
+# images, so the usual image stays as it is.
 LIVE_IMAGE = $(BUILD)/wynland-live.img
+LIVE_CONSOLE ?= 0
+LIVE_RESOLUTION ?= native
 live:
-	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 BOOT_EXTRA='console=1\nlive=1' \
+	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)live=1' \
 	    DISK_IMAGE=$(IMG_DIR)/wynland-live.img ESP_PART_IMG=$(IMG_DIR)/esp_live.img \
 	    EXT2_PART_IMG=$(IMG_DIR)/ext2_live.img BOOT_CFG=$(BUILD)/boot-live.cfg \
 	    EXT2_MANIFEST_FULL=$(BUILD)/ext2_manifest_live.txt image

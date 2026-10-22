@@ -18,7 +18,7 @@ ROOT=$CACHE/root
 OUT=$REPO/build
 MAN=$OUT/base_manifest.txt
 
-PKGS="gnu-coreutils fish fish-common dash grep sed less findutils tar gzip
+PKGS="gnu-coreutils fish fish-common dash grep sed mawk less findutils tar gzip
  xz-utils bzip2 diffutils debianutils ncurses-base ncurses-bin bsdextrautils
  file libmagic1t64 libmagic-mgc procps psmisc util-linux hostname
  python3 python3-minimal python3.14 python3.14-minimal libpython3.14-minimal libpython3.14
@@ -141,6 +141,7 @@ BINS=""
     done
     grep -q '^/usr/bin/sh ' "$links" || echo "S /usr/bin/sh dash"
     grep -q '^/usr/bin/which ' "$links" || echo "S /usr/bin/which which.debianutils"
+    grep -q '^/usr/bin/awk ' "$links" || echo "S /usr/bin/awk mawk"
     # OpenSSL's own directory (Python's ssl looks there): the CA bundle
     echo "D /usr/lib/ssl"
     echo "S /usr/lib/ssl/certs /etc/ssl/certs"

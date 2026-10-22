@@ -332,16 +332,19 @@ static bool aml_int(const uint8_t **pp, const uint8_t *end, uint32_t *out)
     return true;
 }
 
-/* Name (_S5, Package (2) { SLP_TYPa, SLP_TYPb }) in the DSDT. */
+/* Name (_S5, Package (2) { SLP_TYPa, SLP_TYPb }) in the DSDT -- also
+   written Name (\_S5, ...): a root prefix (0x5C) before the name, as real
+   firmware often has it. */
 static bool parse_s5(const uint8_t *dsdt, uint32_t len)
 {
     if (!dsdt || len < 12) return false;
 
-    for (uint32_t i = 0; i + 10 <= len; i++) {
-        if (dsdt[i] != 0x08 || !sig_eq((const char *)(dsdt + i + 1), "_S5_"))
-            continue;
+    for (uint32_t i = 0; i + 11 <= len; i++) {
+        if (dsdt[i] != 0x08) continue;
+        uint32_t at = i + 1 + (dsdt[i + 1] == 0x5C);
+        if (!sig_eq((const char *)(dsdt + at), "_S5_")) continue;
 
-        const uint8_t *pkg = dsdt + i + 5;
+        const uint8_t *pkg = dsdt + at + 4;
         const uint8_t *end = dsdt + len;
         if (*pkg != 0x12) continue;
 
@@ -678,15 +681,28 @@ bool acpi_poweroff(void)
 {
     if (!g_ready || (g_fadt_flags & (1u << 20))) return false;
     if (!acpi_reg_ok(&g_pm1a_reg, g_pm1a_port)) return false;
+    /* Without the firmware's own _S5 numbers, no guessing: on Intel's
+       chipsets 5 is S3 (suspend to RAM), not off -- a laptop "switched
+       off" that way would not come back on (it resumes into nothing) */
+    if (!g_s5_found) {
+        acpi_put("ACPI: no _S5 in the tables -- not powering off\r\n");
+        return false;
+    }
 
     acpi_enable_sci();
 
-    uint32_t a = ((uint32_t)g_slp_typa << 10) | (1u << 13);
-    uint32_t b = ((uint32_t)g_slp_typb << 10) | (1u << 13);
-
-    pm_write(&g_pm1a_reg, g_pm1a_port, a);
+    /* as Linux: the other PM1 control bits (SCI_EN...) kept, the sleep type
+       written first, then with SLP_EN */
+    const uint32_t mask = (7u << 10) | (1u << 13);
+    uint32_t va = pm_read(&g_pm1a_reg, g_pm1a_port) & ~mask;
+    uint32_t vb = acpi_reg_ok(&g_pm1b_reg, g_pm1b_port) ? pm_read(&g_pm1b_reg, g_pm1b_port) & ~mask : 0;
+    va |= (uint32_t)(g_slp_typa & 7) << 10;
+    vb |= (uint32_t)(g_slp_typb & 7) << 10;
+    pm_write(&g_pm1a_reg, g_pm1a_port, va);
+    if (acpi_reg_ok(&g_pm1b_reg, g_pm1b_port)) pm_write(&g_pm1b_reg, g_pm1b_port, vb);
+    pm_write(&g_pm1a_reg, g_pm1a_port, va | (1u << 13));
     if (acpi_reg_ok(&g_pm1b_reg, g_pm1b_port))
-        pm_write(&g_pm1b_reg, g_pm1b_port, b);
+        pm_write(&g_pm1b_reg, g_pm1b_port, vb | (1u << 13));
 
     for (int i = 0; i < 1000; i++) acpi_delay_ms(1);
     return false;                               /* still alive */

@@ -35,6 +35,13 @@
  *
  * Runs in syscall context (interrupts off, under the kernel lock --
  * include/wynland/smp.h): no locking of its own.
+ *
+ * Without virtio-gpu (a real machine: no GPU driver of ours yet) the same
+ * node is a "simpledrm": the screen the firmware set up (GOP) is the one
+ * mode, dumb buffers are plain memory, and a flip copies the buffer onto
+ * the GOP framebuffer, with the pointer drawn over it by the kernel (no
+ * cursor plane). Mesa renders with llvmpipe into those buffers (GBM's
+ * kms_swrast). Flips complete at a 60 Hz pace.
  */
 #include <wynland/types.h>
 #include <wynland/virtio_gpu.h>
@@ -47,6 +54,8 @@
 #include <wynland/process.h>
 #include <wynland/waitqueue.h>
 #include <wynland/mouse.h>
+#include <wynland/spinlock.h>
+#include <wynland/boot_info.h>
 
 extern void serial_write_string(const char *str);
 extern uint64_t timer_get_ms(void);
@@ -263,6 +272,7 @@ typedef struct {
     bool       used;
     uint64_t   user_data;
     VgpuTicket t;        /* the flip's RESOURCE_FLUSH: delivered once done */
+    uint64_t   due_ms;   /* simpledrm: the "vblank" it completes at (0: t) */
 } DrmEvent;
 
 typedef struct {
@@ -492,11 +502,14 @@ static void bo_destroy(DrmBo *bo)
     if (!bo->used || __atomic_test_and_set(&bo->destroying, __ATOMIC_ACQ_REL)) return;
     if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
 
-    VirtioGpuCtxResource cmd;
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
-    cmd.resource_id = bo->res_id;
-    bool unref_ok = send_sync(&cmd, sizeof(cmd), NULL);
+    bool unref_ok = true;               /* simpledrm: no host side (res_id 0) */
+    if (bo->res_id) {
+        VirtioGpuCtxResource cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+        cmd.resource_id = bo->res_id;
+        unref_ok = send_sync(&cmd, sizeof(cmd), NULL);
+    }
 
     /* Only reuse the pages once the host has dropped its reference. Any
        user mapping still left is the caller's bug (Mesa munmaps first);
@@ -516,7 +529,9 @@ static int64_t ioctl_version(uint64_t argp)
     if (copy_from_user(&v, (void *)argp, sizeof(v))) return -EFAULT;
     /* 0.0: Mesa's virgl requires major 0; minor 0 = no sync_file fences. */
     static const char name[] = "virtio_gpu", date[] = "0", desc[] = "WynlandOS virtio-gpu";
-    const char *strs[3] = { name, date, desc };
+    static const char sname[] = "simpledrm", sdesc[] = "WynlandOS: the firmware's framebuffer";
+    const bool simple = !virtio_gpu_is_active();
+    const char *strs[3] = { simple ? sname : name, date, simple ? sdesc : desc };
     uint64_t *lens[3] = { &v.name_len, &v.date_len, &v.desc_len };
     uint64_t ptrs[3] = { v.name, v.date, v.desc };
     for (int i = 0; i < 3; i++) {
@@ -936,6 +951,15 @@ static int64_t ioctl_create_dumb(uint32_t slot, uint64_t argp)
     bo->height = cd.height;
     bo->stride = pitch;
 
+    if (!virtio_gpu_is_active()) {      /* simpledrm: memory alone */
+        bo->res_id = 0;
+        cd.handle = h + 1;
+        cd.pitch = pitch;
+        cd.size = size;
+        if (copy_to_user((void *)argp, &cd, sizeof(cd))) return -EFAULT;
+        return 0;
+    }
+
     VirtioGpuResourceCreate2d cr;
     memset(&cr, 0, sizeof(cr));
     cr.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
@@ -1021,6 +1045,7 @@ static bool kms_mode_at(uint32_t i, struct drm_mode_modeinfo_u *m)
 {
     uint32_t bw = comp_get_width(), bh = comp_get_height();
     if (i == 0) { kms_mode_wh(m, bw, bh, true); return true; }
+    if (!virtio_gpu_is_active()) return false;   /* simpledrm: the firmware's mode only */
     uint32_t n = 1;
     for (uint32_t k = 0; k < sizeof(kms_sizes) / sizeof(kms_sizes[0]); k++) {
         if (kms_sizes[k][0] == bw && kms_sizes[k][1] == bh) continue;
@@ -1036,10 +1061,151 @@ static DrmFb *fb_find(uint32_t id)
     return NULL;
 }
 
+/* ============================================================
+ * simpledrm: the GOP framebuffer as the scanout
+ * ============================================================ */
+
+extern BootInfo *g_boot_info;
+extern void fb0_hold(int delta);
+extern const uint32_t *vgpu_cursor_image(uint32_t *dim, uint32_t *stride);   /* virtio_gpu.c: the arrow, ARGB */
+
+/* What is on the GOP framebuffer: the scanned-out BO (where the pixels
+   under the pointer come back from) and the pointer drawn over it. */
+static Spinlock g_simple_lock = SPINLOCK_INIT("simpledrm");
+static volatile uint32_t g_simple_bo;     /* BO index + 1; 0 = nothing scanned out */
+static uint32_t g_simple_pitch, g_simple_fmt, g_simple_w, g_simple_h;
+static int32_t  g_cur_x, g_cur_y;         /* the pointer as drawn */
+static bool     g_cur_drawn;
+
+static inline uint32_t *gop_row(uint32_t y)
+{
+    return (uint32_t *)((uint8_t *)P2V(g_boot_info->fb_addr) + (uint64_t)y * g_boot_info->fb_pitch);
+}
+
+/* a framebuffer pixel as the GOP stores it (BGRA, i.e. XRGB8888, or RGBA) */
+static inline uint32_t gop_px(uint32_t v, bool swap)
+{
+    return swap ? (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16) : v;
+}
+
+static bool simple_swap(uint32_t fmt)
+{
+    bool fb_rgba = fmt == DRM_FORMAT_XBGR8888 || fmt == DRM_FORMAT_ABGR8888;
+    return fb_rgba != (g_boot_info->fb_format == PIXEL_FORMAT_RGBA);
+}
+
+/* rows [y0, y1), columns [x0, x1) of the scanned-out BO onto the screen;
+   with `cursor`, the pointer blended over them. g_simple_lock held. */
+static void simple_put(int32_t x0, int32_t y0, int32_t x1, int32_t y1, bool cursor)
+{
+    uint32_t sw = g_boot_info->fb_width, sh = g_boot_info->fb_height;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)sw) x1 = (int32_t)sw;
+    if (y1 > (int32_t)sh) y1 = (int32_t)sh;
+    if (!g_simple_bo || x0 >= x1 || y0 >= y1) return;
+    const DrmBo *bo = &g_bos[g_simple_bo - 1];
+    bool swap = simple_swap(g_simple_fmt);
+    uint32_t dim = 0, stride = 0;
+    const uint32_t *cur = cursor ? vgpu_cursor_image(&dim, &stride) : NULL;
+    for (int32_t y = y0; y < y1; y++) {
+        uint32_t *dst = gop_row((uint32_t)y);
+        const uint32_t *src = (y < (int32_t)g_simple_h)
+            ? (const uint32_t *)((const uint8_t *)P2V(bo->phys) + (uint64_t)y * g_simple_pitch) : NULL;
+        for (int32_t x = x0; x < x1; x++) {
+            uint32_t v = (src && x < (int32_t)g_simple_w) ? gop_px(src[x], swap) : 0;
+            int32_t cx = x - g_cur_x, cy = y - g_cur_y;
+            if (cur && cx >= 0 && cy >= 0 && cx < (int32_t)dim && cy < (int32_t)dim) {
+                uint32_t c = cur[cy * stride + cx], a = c >> 24;
+                if (a) {
+                    uint32_t r = 0;
+                    for (int sh8 = 0; sh8 < 24; sh8 += 8) {
+                        uint32_t bc = (v >> sh8) & 0xFF, cc = (c >> sh8) & 0xFF;
+                        r |= ((cc * a + bc * (255 - a)) / 255) << sh8;
+                    }
+                    v = r;
+                }
+            }
+            dst[x] = v;
+        }
+    }
+}
+
+/* the whole frame: rows straight through (write-combined), then the pointer */
+static void simple_present(DrmFb *fb)
+{
+    DrmBo *bo = &g_bos[fb->bo - 1];
+    uint64_t fl = spin_lock_irqsave(&g_simple_lock);
+    bool was = g_simple_bo != 0;
+    g_simple_bo = fb->bo;
+    g_simple_pitch = fb->pitch; g_simple_fmt = fb->format;
+    g_simple_w = fb->width; g_simple_h = fb->height;
+    spin_unlock_irqrestore(&g_simple_lock, fl);
+    if (!was) {
+        fb0_hold(1);   /* the kernel's console and soft pointer keep off the screen */
+        g_cur_x = mouse_get_x(); g_cur_y = mouse_get_y();
+    }
+
+    uint32_t sw = g_boot_info->fb_width, sh = g_boot_info->fb_height;
+    uint32_t w = fb->width < sw ? fb->width : sw, h = fb->height < sh ? fb->height : sh;
+    if (!simple_swap(fb->format)) {
+        for (uint32_t y = 0; y < h; y++)
+            memcpy(gop_row(y), (const uint8_t *)P2V(bo->phys) + (uint64_t)y * fb->pitch, (size_t)w * 4);
+    } else {
+        fl = spin_lock_irqsave(&g_simple_lock);
+        simple_put(0, 0, (int32_t)w, (int32_t)h, false);
+        spin_unlock_irqrestore(&g_simple_lock, fl);
+    }
+    /* the pointer: over the new frame (the copy above may have hit it) */
+    fl = spin_lock_irqsave(&g_simple_lock);
+    uint32_t dim = 0, stride;
+    vgpu_cursor_image(&dim, &stride);
+    simple_put(g_cur_x, g_cur_y, g_cur_x + (int32_t)dim, g_cur_y + (int32_t)dim, true);
+    g_cur_drawn = true;
+    spin_unlock_irqrestore(&g_simple_lock, fl);
+}
+
+/* the mouse IRQ (via virtio_gpu_move_cursor): the pointer to (x, y) --
+   where it was, the frame's own pixels come back */
+void simpledrm_move_cursor(uint32_t x, uint32_t y)
+{
+    if (!g_simple_bo) return;
+    uint64_t fl = spin_lock_irqsave(&g_simple_lock);
+    uint32_t dim = 0, stride;
+    vgpu_cursor_image(&dim, &stride);
+    int32_t ox = g_cur_x, oy = g_cur_y;
+    g_cur_x = (int32_t)x; g_cur_y = (int32_t)y;
+    if (g_cur_drawn) simple_put(ox, oy, ox + (int32_t)dim, oy + (int32_t)dim, true);
+    simple_put(g_cur_x, g_cur_y, g_cur_x + (int32_t)dim, g_cur_y + (int32_t)dim, true);
+    g_cur_drawn = true;
+    spin_unlock_irqrestore(&g_simple_lock, fl);
+}
+
+static void simple_release(void)
+{
+    if (!g_simple_bo) return;
+    uint64_t fl = spin_lock_irqsave(&g_simple_lock);
+    g_simple_bo = 0;
+    g_cur_drawn = false;
+    spin_unlock_irqrestore(&g_simple_lock, fl);
+    /* the console's background, for whatever draws next (the kernel
+       console, the text console) */
+    for (uint32_t y = 0; y < g_boot_info->fb_height; y++)
+        memset(gop_row(y), 0, (size_t)g_boot_info->fb_width * 4);
+    fb0_hold(-1);
+}
+
 /* Put the kernel's own framebuffer (resource 1) back on screen. */
 static void kms_restore_console(void)
 {
     dbg_num("DRM: console restored at ms=", (int64_t)timer_get_ms());
+    if (!virtio_gpu_is_active()) {
+        simple_release();
+        g_scan_fb = 0;
+        g_scan_owner = 0;
+        g_scan_w = g_scan_h = 0;
+        return;
+    }
     VirtioGpuSetScanout ss;
     memset(&ss, 0, sizeof(ss));
     ss.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
@@ -1080,6 +1246,16 @@ static bool send_async(const void *cmd, uint32_t len, VgpuTicket *t)
 static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, VgpuTicket *done)
 {
     DrmBo *bo = &g_bos[fb->bo - 1];
+    if (!virtio_gpu_is_active()) {
+        (void)x; (void)y; (void)w; (void)h;
+        memset(done, 0, sizeof(*done));
+        simple_present(fb);
+        if (g_scan_fb != fb->id) {
+            g_scan_fb = fb->id;
+            g_scan_w = fb->width; g_scan_h = fb->height;
+        }
+        return true;
+    }
     /* Never scan out a frame the GPU is still drawing: wait for the last
        submission that touched this buffer. */
     if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
@@ -1318,6 +1494,13 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
         ev->used = true;
         ev->user_data = p.user_data;
         ev->t = t;
+        /* simpledrm: done at the next 60 Hz "vblank" (a compositor drawing
+           as fast as flips complete would take every core llvmpipe has) */
+        ev->due_ms = 0;
+        if (!virtio_gpu_is_active()) {
+            uint64_t now = timer_get_ms();
+            ev->due_ms = (now / 16 + 1) * 16;   /* > 0 */
+        }
     }
     return 0;
 }
@@ -1326,10 +1509,15 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
  * Events: read() / poll() on the DRM fd
  * ============================================================ */
 
+static bool ev_done(const DrmEvent *e)
+{
+    return e->due_ms ? timer_get_ms() >= e->due_ms : vgpu_done(e->t);
+}
+
 static bool event_ready(DrmClient *c)
 {
     for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++)
-        if (c->events[i].used && vgpu_done(c->events[i].t)) return true;
+        if (c->events[i].used && ev_done(&c->events[i])) return true;
     return false;
 }
 
@@ -1360,7 +1548,7 @@ int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
     uint64_t done = 0;
     for (uint32_t i = 0; i < DRM_MAX_EVENTS && done + sizeof(struct drm_event_vblank_u) <= len; i++) {
         DrmEvent *e = &c->events[i];
-        if (!e->used || !vgpu_done(e->t)) continue;
+        if (!e->used || !ev_done(e)) continue;
         uint64_t ms = timer_get_ms();
         struct drm_event_vblank_u v;
         v.type = 0x02;                 /* DRM_EVENT_FLIP_COMPLETE */
@@ -1385,7 +1573,7 @@ void drm_tick(void)
         DrmClient *c = &g_clients[s];
         if (!c->used) continue;
         for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++) {
-            if (c->events[i].used && vgpu_done(c->events[i].t)) {
+            if (c->events[i].used && ev_done(&c->events[i])) {
                 waitqueue_wake_all(&c->ev_wq);
                 break;
             }
@@ -1458,7 +1646,8 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp)
     case DRM_NR_MODE_CURSOR:    return -EINVAL; /* no properties / KMS cursor yet */
     default: break;
     }
-    if (!virtio_gpu_is_active()) return -ENODEV;
+    /* without virtio-gpu: simpledrm, the GOP framebuffer (above) */
+    if (!virtio_gpu_is_active() && !(g_boot_info && g_boot_info->fb_addr)) return -ENODEV;
 
     /* KMS + dumb buffers + PRIME work on 2D-only hosts too */
     {

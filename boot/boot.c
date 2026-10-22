@@ -120,6 +120,13 @@ static void ReadResolution(UINT32 *want_w, UINT32 *want_h) {
     UINTN n = sizeof(buf) - 1;
     if (!EFI_IS_ERROR(f->Read(f, &n, buf))) {
         buf[n] = 0;
+        /* "native": the mode the firmware is in (a laptop's panel) */
+        if (n >= 6 && buf[0] == 'n' && buf[1] == 'a' && buf[2] == 't') {
+            *want_w = *want_h = 0;
+            f->Close(f);
+            rootDir->Close(rootDir);
+            return;
+        }
         UINT32 w = 0, h = 0, *cur = &w;
         for (UINTN i = 0; i < n; i++) {
             if (buf[i] >= '0' && buf[i] <= '9') *cur = *cur * 10 + (UINT32)(buf[i] - '0');
@@ -163,9 +170,11 @@ static void SaveLog(BootLog *l)
         root->Close(root);
         return;
     }
-    /* \logs\panic-<boot>.log, or unclean-<boot>.log (reset without a word) */
+    /* \logs\panic-<boot>.log, unclean-<boot>.log (reset without a word),
+       or boot-<boot>.log (a live stick keeps every boot's) */
     CHAR16 name[48];
-    const CHAR16 *kind = l->state == BOOTLOG_PANIC ? L"panic-" : L"unclean-";
+    const CHAR16 *kind = l->state == BOOTLOG_PANIC ? L"panic-"
+                       : l->state == BOOTLOG_CLEAN ? L"boot-" : L"unclean-";
     int n = 0;
     while (kind[n]) { name[n] = kind[n]; n++; }
     PutDec(name + n, l->boot_no);
@@ -191,14 +200,25 @@ static void SaveLog(BootLog *l)
     root->Close(root);
 }
 
+static int BootFileExists(CHAR16 *name);
+
+/* what BootLogSetup() found, shown by LiveLoad(): setting the screen mode
+   in between clears whatever was printed */
+static UINT64 g_log_prev, g_log_now;
+static UINT32 g_log_prev_state;
+
 static UINT64 BootLogSetup(void)
 {
     UINT32 boot_no = 1;
+    /* a live stick is for trying a machine out: every boot's log is kept */
+    int keep_all = BootFileExists(L"\\live");
     for (int i = 0; i < BOOTLOG_NADDRS; i++) {
         BootLog *l = (BootLog *)(UINTN)BOOTLOG_ADDRS[i];
         if (!bootlog_valid(l, BOOTLOG_ADDRS[i])) continue;
         boot_no = l->boot_no + 1;
-        if (l->state != BOOTLOG_CLEAN) SaveLog(l);
+        g_log_prev = BOOTLOG_ADDRS[i];
+        g_log_prev_state = l->state;
+        if (l->state != BOOTLOG_CLEAN || keep_all) SaveLog(l);
         l->magic = 0;                      /* read: never saved twice */
     }
     for (int i = 0; i < BOOTLOG_NADDRS; i++) {
@@ -212,6 +232,7 @@ static UINT64 BootLogSetup(void)
         l->state = BOOTLOG_RUNNING;
         l->boot_no = boot_no;
         l->check = bootlog_check(l);
+        g_log_now = a;
         return a;
     }
     return 0;
@@ -243,6 +264,16 @@ static int BootFileExists(CHAR16 *name)
 static void LiveLoad(BootInfo *info)
 {
     if (!BootFileExists(L"\\live")) return;
+    if (g_log_prev) {
+        Print(L"[log] the last boot's log was found at ");
+        PrintHex(g_log_prev);
+        Print(g_log_prev_state == BOOTLOG_PANIC ? L" (a panic)\r\n"
+              : g_log_prev_state == BOOTLOG_CLEAN ? L" (a clean end)\r\n" : L" (it never ended)\r\n");
+    } else {
+        Print(L"[log] no log from the last boot (powered off, or the firmware cleared the RAM)\r\n");
+    }
+    if (g_log_now) { Print(L"[log] this boot's log at "); PrintHex(g_log_now); Print(L"\r\n"); }
+    else Print(L"[log] no room for this boot's log: the firmware has every address\r\n");
     Print(L"[live] looking for the WynlandOS disk...\r\n");
     EFI_GUID bioGuid = EFI_BLOCK_IO_PROTOCOL_GUID;
     UINTN n = 0;
@@ -389,6 +420,42 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
         if ((UINT64)w * h > (UINT64)cfgW * cfgH) { cfgMode = modeNum; cfgW = w; cfgH = h; }
     }
 
+    if (!wantW) {
+        /* native: the screen's own size from its EDID (the first detailed
+           timing is the preferred one) when the GOP offers that mode, else
+           its largest mode -- a laptop's firmware may sit in a small one */
+        UINT32 ew = 0, eh = 0;
+        EFI_GUID edidGuids[2] = { EFI_EDID_ACTIVE_PROTOCOL_GUID, EFI_EDID_DISCOVERED_PROTOCOL_GUID };
+        UINTN nh = 0;
+        EFI_HANDLE *hs = NULL;
+        if (!EFI_IS_ERROR(gBS->LocateHandleBuffer(2 /* ByProtocol */, &gopGuid, NULL, &nh, &hs))) {
+            for (UINTN i = 0; i < nh && !ew; i++) {
+                for (int g = 0; g < 2 && !ew; g++) {
+                    EFI_EDID_PROTOCOL *edid;
+                    if (EFI_IS_ERROR(gBS->HandleProtocol(hs[i], &edidGuids[g], (VOID**)&edid))) continue;
+                    if (!edid->Edid || edid->SizeOfEdid < 128) continue;
+                    const UINT8 *d = edid->Edid + 54;
+                    if (!d[0] && !d[1]) continue;          /* not a timing */
+                    ew = d[2] | ((UINT32)(d[4] & 0xF0) << 4);
+                    eh = d[5] | ((UINT32)(d[7] & 0xF0) << 4);
+                }
+            }
+        }
+        if (ew) {
+            Print(L"  The screen's own size (EDID): ");
+            PrintHex(ew); Print(L" x "); PrintHex(eh); Print(L"\r\n");
+        }
+        for (modeNum = 0; modeNum < gop->Mode->MaxMode; modeNum++) {
+            EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi;
+            UINTN miSize;
+            if (EFI_IS_ERROR(gop->QueryMode(gop, modeNum, &miSize, &mi))) continue;
+            UINT32 w = mi->HorizontalResolution, h = mi->VerticalResolution;
+            if (ew && w == ew && h == eh) { cfgMode = modeNum; cfgW = w; cfgH = h; break; }
+            if (!ew || cfgW != ew) {
+                if ((UINT64)w * h > (UINT64)cfgW * cfgH && w <= 3840 && h <= 2400) { cfgMode = modeNum; cfgW = w; cfgH = h; }
+            }
+        }
+    }
     if (cfgW) {
         bestMode = cfgMode;
         bestWidth = cfgW;

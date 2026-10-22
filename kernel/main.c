@@ -798,17 +798,18 @@ void sys_reboot(void)
 {
     extern bool ext2_flush(void);
     extern void bootlog_set_state(uint32_t state);
-    bootlog_set_state(2);   /* BOOTLOG_CLEAN: nothing for the loader to save */
+    bootlog_set_state(2);   /* BOOTLOG_CLEAN (a live stick's loader keeps it still) */
     ext2_flush();   /* write-back cache: nothing may be left behind */
-    /* ACPI reset register first, then the keyboard-controller pulse. */
-    acpi_reset();
-    /* Pulse CPU reset via keyboard controller (port 0x64) */
-    uint8_t temp = 0x02;
-    while (temp & 0x02) {
-        temp = inb(0x64);
+    /* The keyboard controller's CPU reset first: a warm one, RAM -- and the
+       boot log in it -- survives for the next boot's loader; the ACPI reset
+       register (often CF9's hard reset) only when there is no controller. */
+    if (inb(0x64) != 0xFF) {
+        for (int i = 0; i < 100000 && (inb(0x64) & 0x02); i++) {}
+        outb(0x64, 0xFE);
+        for (volatile int i = 0; i < 10000000; i++) {}
     }
-    outb(0x64, 0xFE);
-    
+    acpi_reset();
+
     /* 2. Fallback: Trigger triple fault by loading an invalid IDT */
     __asm__ volatile("lidt %0; int3" :: "m"((uint16_t[3]){0, 0, 0}));
 }
@@ -820,13 +821,22 @@ void sys_poweroff(void)
     bootlog_set_state(2);   /* BOOTLOG_CLEAN */
     ext2_flush();
     if (acpi_poweroff()) return;
-    serial_write_string("ACPI: poweroff via FADT failed, trying fixed ports\r\n");
-    /* QEMU q35 ACPI shutdown */
-    outw(0x604, 0x2000);
-    /* QEMU piix4 ACPI shutdown */
-    outw(0xB004, 0x2000);
-    /* VirtualBox / older QEMU ACPI shutdown */
-    outw(0x4004, 0x3400);
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (c & (1u << 31)) {
+        /* a virtual machine: its well-known power-off ports. Never on real
+           hardware -- there they are some other device's registers. */
+        serial_write_string("ACPI: poweroff via FADT failed, trying fixed ports\r\n");
+        outw(0x604, 0x2000);    /* QEMU q35 */
+        outw(0xB004, 0x2000);   /* QEMU piix4 */
+        outw(0x4004, 0x3400);   /* VirtualBox / older QEMU */
+    }
+    /* still here: say so on the screen, and stop */
+    extern bool g_quiet_console;
+    g_quiet_console = false;
+    serial_write_string("\r\n\r\n  The system has stopped. It is now safe to turn the computer off\r\n"
+                        "  (hold the power button).\r\n");
+    for (;;) __asm__ volatile("cli; hlt");
 }
 
 extern void thread_enter_user_mode(void (*entry)(void), void *stack); /* gdt_flush.asm */
@@ -1041,15 +1051,22 @@ void kernel_main(BootInfo *boot_info_loader)
         /* facts for userspace (wynrc service conditions): what this boot
            found, next to the user's own choices in boot.cfg */
         extern bool g_virgl;
-        const char *line = g_virgl ? "virgl=1\n" : "virgl=0\n";
-        char cur[16] = {0};
+        extern bool virtio_gpu_is_active(void);
+        /* kms: who scans out -- virtio-gpu with virgl (the GPU), virtio-gpu
+           2D, or the firmware's framebuffer (simpledrm: llvmpipe draws) */
+        const char *line = g_virgl ? "virgl=1\nkms=virgl\n"
+                         : virtio_gpu_is_active() ? "virgl=0\nkms=virtio\n"
+                         : "virgl=0\nkms=simple\n";
+        uint32_t len = 0;
+        while (line[len]) len++;
+        char cur[32] = {0};
         VfsFile *old = vfs_open("/etc/wynland/hw");
-        if (old) { vfs_read(old, cur, 8); vfs_close(old); }
-        if (!str_starts_with(cur, line)) {
+        if (old) { vfs_read(old, cur, sizeof cur - 1); vfs_close(old); }
+        if (!str_starts_with(cur, line) || cur[len]) {
             VfsStat hw_st;
             if (!vfs_stat("/etc/wynland/hw", &hw_st)) vfs_create("/etc/wynland/hw");
             VfsFile *hw = vfs_open_flags("/etc/wynland/hw", VFS_O_WRITE | VFS_O_TRUNC);
-            if (hw) { vfs_write(hw, line, 8); vfs_close(hw); }
+            if (hw) { vfs_write(hw, line, len); vfs_close(hw); }
         }
     }
     {

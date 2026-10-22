@@ -29,6 +29,7 @@
 #include <QtGui/QScreen>
 #include <QtQml/qqml.h>
 #include <QtWaylandCompositor/QWaylandCompositor>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 
 #include "zerp2.h"
@@ -50,6 +51,24 @@
 // login manager, init) opens them and passes the fds in WYNLAND_KBD_FD /
 // WYNLAND_MICE_FD. They stay ours alone: close-on-exec, and the variables
 // do not reach our clients. Run as root, we open them ourselves.
+// No GPU of ours on this machine: the kernel's DRM node is a simpledrm
+// (the firmware's framebuffer; drivers/video/virtgpu_drm.c). Everything
+// renders with llvmpipe then -- we through GBM's kms_swrast, the clients
+// into shared memory (wl_shm): no GPU buffers to pass around.
+static bool noGpu()
+{
+    struct { int major, minor, patch; size_t name_len; char *name; size_t date_len; char *date;
+             size_t desc_len; char *desc; } v = {};
+    char name[32] = {};
+    v.name_len = sizeof name - 1;
+    v.name = name;
+    const int fd = ::open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (fd < 0) return false;
+    const bool ok = ::ioctl(fd, _IOWR('d', 0x00, decltype(v)), &v) == 0;   // DRM_IOCTL_VERSION
+    ::close(fd);
+    return ok && !strcmp(name, "simpledrm");
+}
+
 static int inputFd(const char *var, const char *path)
 {
     int fd = -1;
@@ -405,6 +424,13 @@ int main(int argc, char **argv)
     // eglBindWaylandDisplayWL for the plugin to wait on
     qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "linux-dmabuf-unstable-v1");
     qputenv("QT_WAYLAND_IGNORE_BIND_DISPLAY", "1");
+    const bool software = noGpu();
+    if (software) {
+        fprintf(stderr, "[zerp2] no GPU (simpledrm): llvmpipe for us and the clients\n");
+        qputenv("GBM_ALWAYS_SOFTWARE", "1");
+        qputenv("LIBGL_ALWAYS_SOFTWARE", "1");   // inherited: the clients' EGL draws into wl_shm
+        qunsetenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION");
+    }
     /* scene graph diagnostics on request only (BOOT_EXTRA=qsginfo): every
        Qt client inherits it, and it all lands on the synchronous serial
        console */
@@ -504,6 +530,7 @@ int main(int argc, char **argv)
         // wayland-egl (Mesa's EGL; it speaks linux-dmabuf to us)
         qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "wayland-egl");
         qunsetenv("QT_WAYLAND_IGNORE_BIND_DISPLAY");
+        if (software) qunsetenv("GBM_ALWAYS_SOFTWARE");
         // shells made for Hyprland (Quickshell's) talk to us as to it
         new HyprIpc(&server, outputName, scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with

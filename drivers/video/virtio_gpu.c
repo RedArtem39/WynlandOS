@@ -1434,10 +1434,29 @@ bool virtio_gpu_is_active(void)
     return initialized;
 }
 
+/* The arrow, ARGB (for simpledrm's software pointer: virtgpu_drm.c);
+   `*dim` = the square it covers, `*stride` its rows' length (pixels).
+   Made on first use. */
+const uint32_t *vgpu_cursor_image(uint32_t *dim, uint32_t *stride)
+{
+    static bool made;
+    if (!made) {
+        if (!initialized) cursor_render_shape(cursor_pixels[0], cursor_masks[0]);
+        made = true;
+    }
+    *dim = 24;   /* the shape and its shadow (cursor_render_shape) */
+    *stride = CURSOR_DIM;
+    return cursor_pixels[0];
+}
+
 /* Called from the mouse IRQ on every pointer move. */
 void virtio_gpu_move_cursor(uint32_t x, uint32_t y)
 {
-    if (!initialized) return;
+    if (!initialized) {
+        extern void simpledrm_move_cursor(uint32_t x, uint32_t y);
+        simpledrm_move_cursor(x, y);   /* no virtio-gpu: the GOP framebuffer's pointer */
+        return;
+    }
     uint64_t fl = irq_save();
     cursor_x = x;
     cursor_y = y;

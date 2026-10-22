@@ -560,10 +560,16 @@ static void probe_port(uint32_t port)
         return;
     }
 
+    /* One HID interface is driven: a device with several (a gaming mouse
+       is "mouse + keyboard" in one) gives its mouse, else its keyboard,
+       else its first -- each endpoint with ITS interface's number and
+       protocol (they used to be the last interface's: the mouse's
+       endpoint went to the keyboard's interface). */
     uint8_t iface = 0, cls = 0, proto = 0;
-    uint8_t hid_ep = 0, st_in = 0, st_out = 0;
+    uint8_t hid_ep = 0, st_in = 0, st_out = 0, hid_iface = 0, hid_proto = 0;
     uint16_t hid_maxp = 0, st_maxp_in = 0, st_maxp_out = 0;
     uint8_t hid_interval = 0;
+    int hid_rank = 0;                     /* 3 mouse, 2 keyboard, 1 other HID */
 
     for (uint32_t off = 0; off + 2 <= total; ) {
         uint8_t blen = g_cfg_buf[off];
@@ -581,9 +587,15 @@ static void probe_port(uint32_t port)
             uint8_t interval = g_cfg_buf[off + 6];
 
             if (cls == 3 && attr == 3 && (addr & 0x80)) {
-                hid_ep = addr;
-                hid_maxp = maxp;
-                hid_interval = interval;
+                int rank = proto == 2 ? 3 : proto == 1 ? 2 : 1;
+                if (rank > hid_rank) {
+                    hid_rank = rank;
+                    hid_ep = addr;
+                    hid_maxp = maxp;
+                    hid_interval = interval;
+                    hid_iface = iface;
+                    hid_proto = proto;
+                }
             } else if (cls == 8 && attr == 2) {
                 if (addr & 0x80) {
                     st_in = addr;
@@ -600,8 +612,11 @@ static void probe_port(uint32_t port)
     usb_log_hex("port device, speed=", (uint64_t)speed);
 
     if (hid_ep && hid_maxp) {
-        if (usb_hid_setup(d, iface, proto, hid_ep, hid_maxp, hid_interval))
-            usb_log(proto == 2 ? "HID mouse ready" : "HID keyboard ready");
+        usb_log_hex("HID interface=", hid_iface);
+        usb_log_hex("HID protocol=", hid_proto);
+        usb_log_hex("HID maxp=", hid_maxp);
+        if (usb_hid_setup(d, hid_iface, hid_proto, hid_ep, hid_maxp, hid_interval))
+            usb_log(hid_proto == 2 ? "HID mouse ready" : "HID keyboard ready");
         else
             usb_log("HID setup failed");
     }

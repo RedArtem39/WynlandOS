@@ -115,6 +115,8 @@ static const struct sh_case CASES[] = {
       "mkdir -p q; echo hello > q/h; echo world > q/w; tar czf q.tgz q && rm -r q && tar xzf q.tgz && grep -l o q/* | xargs cat | sed s/o/0/g;"
       " echo abc | xz | xz -d; echo def | gzip | zcat",
       "hell0\nw0rld\nabc\ndef\n" },
+    { "/bin/sh", "awk (fish's completions use it)",
+      "printf 'a 1\\nb 2\\n' | awk '{ s += $2 } END { print NR, s }'", "2 3\n" },
     { "/bin/sh", "sh: pipes, subshells, exit codes, here-docs",
       "x=$(echo a | (read v; echo $v$v)); echo $x; false || echo or; cat <<E\nhere $x\nE\n( exit 3 ); echo $?",
       "aa\nor\nhere aa\n3\n" },

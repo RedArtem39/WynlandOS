@@ -15,11 +15,12 @@
 #include <wynland/types.h>
 
 #define BOOTLOG_MAGIC   0x474F4C544F4F4257ULL     /* "WBOOTLOG" */
-#define BOOTLOG_BYTES   (256u * 1024u)            /* header + ring */
+#define BOOTLOG_BYTES   (2u * 1024u * 1024u)      /* header + ring: a whole boot, up to a desktop */
 
 /* where it may live: the first one free in the firmware's memory map */
-#define BOOTLOG_NADDRS  3
-static const uint64_t BOOTLOG_ADDRS[BOOTLOG_NADDRS] = { 0x0F000000ULL, 0x1F000000ULL, 0x2F000000ULL };
+#define BOOTLOG_NADDRS  6
+static const uint64_t BOOTLOG_ADDRS[BOOTLOG_NADDRS] = {
+    0x0F000000ULL, 0x1F000000ULL, 0x2F000000ULL, 0x3F000000ULL, 0x4F000000ULL, 0x5F000000ULL };
 
 #define BOOTLOG_RUNNING 0     /* still up -- or reset without a word (a hang, a triple fault) */
 #define BOOTLOG_PANIC   1     /* a kernel panic, then a warm reset */
