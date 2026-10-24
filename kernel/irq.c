@@ -104,6 +104,8 @@ static uint32_t kbd_raw_queue_tail = 0;
 void kbd_raw_queue_push(uint8_t scancode)
 {
     uint32_t next = (kbd_raw_queue_head + 1) % KBD_RAW_QUEUE_SIZE;
+    extern void lag_key_in(void);
+    lag_key_in();                                     /* (kernel/lagtrace.c) */
     if (next != kbd_raw_queue_tail) {
         kbd_raw_queue[kbd_raw_queue_head] = scancode;
         kbd_raw_queue_head = next;
@@ -132,6 +134,7 @@ int kbd_raw_read_queue(uint8_t *buf, int size)
         buf[read_bytes++] = kbd_raw_queue[kbd_raw_queue_tail];
         kbd_raw_queue_tail = (kbd_raw_queue_tail + 1) % KBD_RAW_QUEUE_SIZE;
     }
+    if (read_bytes) { extern void lag_key_read(void); lag_key_read(); }
     return read_bytes;
 }
 
@@ -247,6 +250,8 @@ static void timer_device_work(void)
         }
     }
     ps2_drain();
+    extern void serial_drain(void);
+    serial_drain();                  /* the serial port's ring (kernel/main.c) */
     extern void virtio_gpu_tick(void);
     virtio_gpu_tick();
     extern void net_poll(void);
@@ -331,6 +336,7 @@ static void lapic_irq(InterruptRegisters *regs)
 
     /* an AP's 1 kHz tick: preemption */
     tick_account(regs);
+    if (this_cpu()->id == 1) { extern void stall_watch_tick(void); stall_watch_tick(); }
     int took = bkl_irq_enter();
     if (took >= 0) kill_check(regs);
     if (may_preempt(took, regs)) sched_preempt_tick();

@@ -253,31 +253,39 @@ void *pmm_alloc_contiguous(uint32_t count)
     uint64_t rflags = spin_lock_irqsave(&g_pmm_lock);
 
     void *result = NULL;
-    uint32_t run = 0;
-    uint64_t start_idx = 0;
-
-    for (uint64_t idx = 0; idx < total_pages; idx++) {
-        if (!bitmap_test(idx)) {
-            if (run == 0) {
-                start_idx = idx;
-            }
-            run++;
-            if (run == count) {
-                /* Found contiguous range! Mark all as allocated */
-                for (uint64_t j = start_idx; j < start_idx + count; j++) {
-                    bitmap_set(j);
-                    refcount[j] = 1;
+    /* A run of free frames, from where the last one was found (next fit),
+       then from the start; a byte of eight used frames skipped at once.
+       (Bit by bit from frame 0 it took 30+ ms with the lock and
+       interrupts off: the stall watchdog caught it under the GPU's
+       buffer allocations.) */
+    static uint64_t hint;
+    for (int pass = 0; pass < 2 && !result; pass++) {
+        uint64_t from = pass ? 0 : hint, to = pass ? hint + count : total_pages;
+        if (to > total_pages) to = total_pages;
+        uint32_t run = 0;
+        uint64_t start_idx = 0;
+        for (uint64_t idx = from; idx < to; ) {
+            if ((idx & 7) == 0 && idx + 8 <= to && bitmap[idx / 8] == 0xFF) { run = 0; idx += 8; continue; }
+            if (!bitmap_test(idx)) {
+                if (run == 0) start_idx = idx;
+                if (++run == count) {
+                    /* Found contiguous range! Mark all as allocated */
+                    for (uint64_t j = start_idx; j < start_idx + count; j++) {
+                        bitmap_set(j);
+                        refcount[j] = 1;
+                    }
+                    free_pages -= count;
+                    result = (void *)(start_idx * PAGE_SIZE);
+                    hint = start_idx + count;
+                    break;
                 }
-                free_pages -= count;
-                result = (void *)(start_idx * PAGE_SIZE);
-                goto cleanup;
+            } else {
+                run = 0;
             }
-        } else {
-            run = 0;
+            idx++;
         }
     }
 
-cleanup:
     spin_unlock_irqrestore(&g_pmm_lock, rflags);
     return result;
 }

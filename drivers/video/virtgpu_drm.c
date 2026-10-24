@@ -287,6 +287,7 @@ typedef struct {
     VgpuTicket t;        /* the flip's RESOURCE_FLUSH: delivered once done */
     uint64_t   due_ms;   /* simpledrm: the "vblank" it completes at (0: t) */
     uint32_t   hw_surf;  /* the Intel display's flip: done when it shows this (due_ms: the latest) */
+    uint64_t   asked_ms, done_ms;   /* (kernel/lagtrace.c) */
 } DrmEvent;
 
 typedef struct {
@@ -1654,6 +1655,9 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
         if (!ev) return -EBUSY; /* a flip is already pending per Linux rules */
     }
     VgpuTicket t;
+    extern void lag_flip_asked(void), lag_report(void);
+    lag_flip_asked();
+    lag_report();
     if (!kms_present(fb, 0, 0, fb->width, fb->height, &t)) return -ENOMEM;
     g_scan_owner = slot;
     if (ev) {
@@ -1664,6 +1668,8 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
            as fast as flips complete would take every core llvmpipe has) */
         ev->due_ms = 0;
         ev->hw_surf = 0;
+        ev->asked_ms = timer_get_ms();
+        ev->done_ms = 0;
         if (!virtio_gpu_is_active()) {
             uint64_t now = timer_get_ms();
             ev->due_ms = (now / 16 + 1) * 16;   /* > 0 */
@@ -1732,6 +1738,7 @@ int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
         v.crtc_id = KMS_CRTC_ID;
         if (copy_to_user((void *)(ubuf + done), &v, sizeof(v))) return done ? (int64_t)done : -EFAULT;
         done += sizeof(v);
+        if (e->done_ms) { extern void lag_event_read(uint64_t done_ms); lag_event_read(e->done_ms); }
         e->used = false;
     }
     return (int64_t)done;
@@ -1746,6 +1753,17 @@ void drm_tick(void)
         if (!c->used) continue;
         for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++) {
             if (c->events[i].used && ev_done(&c->events[i])) {
+                if (!c->events[i].done_ms) {          /* (kernel/lagtrace.c) */
+                    extern void lag_flip_done(uint64_t asked_ms);
+                    c->events[i].done_ms = timer_get_ms();
+                    lag_flip_done(c->events[i].asked_ms);
+                    /* a poll() over several fds sleeps on the shared queue
+                       (kernel/syscall.c do_poll), not on ours: woken only
+                       by its 50 ms nap, the compositor learned of each
+                       flip ~40 ms late -- and read no keys meanwhile */
+                    extern WaitQueue g_poll_any_wq;
+                    waitqueue_wake_all(&g_poll_any_wq);
+                }
                 waitqueue_wake_all(&c->ev_wq);
                 break;
             }

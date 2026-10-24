@@ -237,6 +237,11 @@ static void exception_handler_main(InterruptRegisters *regs);
 void exception_handler(InterruptRegisters *regs)
 {
     bool took = false;
+    if (regs->int_no == 2) {                          /* NMI: the stall watchdog's (kernel/stallwatch.c) */
+        extern void stall_nmi(InterruptRegisters *r);
+        stall_nmi(regs);
+        return;
+    }
     extern char uaccess_nofault_insn[], uaccess_nofault_fixup[];
     if (regs->int_no == 14 && (regs->cs & 3) != 3 &&
         regs->rip == (uint64_t)(uintptr_t)uaccess_nofault_insn) {
@@ -662,6 +667,8 @@ static void exception_handler_main(InterruptRegisters *regs)
        full reset that may clear the memory), then a triple fault. */
     serial_write_string("Restarting (warm) in 10 s: the next boot's loader saves this log.\r\n");
     {
+        extern void serial_flush_sync(void);
+        serial_flush_sync();                             /* the serial ring's rest */
         extern void netlog_panic_flush(void);
         netlog_panic_flush();                            /* boot.cfg netlog=: the rest of the log */
         extern void sticklog_panic_flush(void);

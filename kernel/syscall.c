@@ -1582,6 +1582,7 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
     /* Deadline and sleeps both on the 1 kHz clock: a timeout expires
        neither early nor up to a 100 Hz tick late. */
     uint64_t deadline_ms = (timeout_ms < 0) ? SCHED_NO_DEADLINE : timer_get_ms() + (uint64_t)timeout_ms;
+    { extern void stall_report(void); stall_report(); }   /* (what the stall watchdog caught: kernel/stallwatch.c) */
 
     for (;;) {
         /* read before looking: a wake-up after the look (from a pipe

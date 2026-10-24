@@ -341,6 +341,14 @@ static uint32_t lapic_id(void)
     return g_x2apic ? v : v >> 24;
 }
 
+static void lapic_send_ipi(uint32_t apic_id, uint32_t icr);
+
+/* an NMI to a core (kernel/stallwatch.c): delivery mode NMI */
+void smp_nmi_cpu(uint32_t cpu)
+{
+    if (cpu < g_cpu_count) lapic_send_ipi(g_cpus[cpu].apic_id, 0x400);
+}
+
 static void lapic_send_ipi(uint32_t apic_id, uint32_t icr)
 {
     uint64_t f = irq_save();

@@ -142,9 +142,14 @@ void rtc_init(void) {
     serial_write_string("\r\n");
 }
 
+uint64_t rtc_get_unix_time_ns(void);
+
+/* Seconds from the same clock as clock_gettime() (the TSC's, below): it
+   came from the 100 Hz tick count, which falls behind when the boot core
+   is held up -- a file just written then looked "from the future" to make
+   (clock skew) */
 uint64_t rtc_get_unix_time(void) {
-    uint64_t elapsed_ticks = timer_get_ticks() - g_boot_tick_baseline;
-    return g_boot_unix_time + elapsed_ticks / 100;
+    return rtc_get_unix_time_ns() / 1000000000ULL;
 }
 
 /* Same clock in milliseconds, from the 1 kHz timer: seconds and the

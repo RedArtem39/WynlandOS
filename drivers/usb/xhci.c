@@ -116,11 +116,34 @@ static void usb_spin(void)
     __asm__ volatile("pause");
 }
 
+/* A wait that lets the rest of the machine run: the big kernel lock let
+   go and the core given up once a millisecond. These waits used to spin
+   with the lock held and interrupts off -- a phone's port reset (20-300
+   ms) or a control transfer stopped the boot core's clock, and with it
+   every key and frame (the stall watchdog caught usb_control). */
+static void usb_relax(uint64_t *last_ns)
+{
+    extern uint64_t sched_clock_ns(void);
+    extern void sched_yield(void);
+    uint64_t now = sched_clock_ns();
+    if (now - *last_ns < 1000000ull) return;
+    *last_ns = now;
+    extern bool bkl_drop(void);
+    extern void bkl_retake(bool had);
+    bool had = bkl_drop();
+    sched_yield();
+    bkl_retake(had);
+}
+
 static void usb_delay_ms(uint32_t ms)
 {
-    uint64_t start = usb_tsc();
+    extern uint64_t sched_clock_ns(void);
+    uint64_t start = usb_tsc(), relaxed = sched_clock_ns();
     uint64_t limit = (uint64_t)ms * 5000000ULL;
-    while (usb_tsc() - start < limit) usb_spin();
+    while (usb_tsc() - start < limit) {
+        usb_spin();
+        if (ms > 1) usb_relax(&relaxed);
+    }
 }
 
 void usb_ring_init(UsbRing *r, uint64_t phys)
@@ -250,12 +273,14 @@ static uint32_t usb_cmd_raw(uint32_t control, uint64_t ptr, uint32_t *out_slot)
     usb_db(0, 0, g_cmd_ring.enq);
     spin_unlock_irqrestore(&g_usb_lock, fl);
 
-    uint64_t start = usb_tsc();
+    extern uint64_t sched_clock_ns(void);
+    uint64_t start = usb_tsc(), relaxed = sched_clock_ns();
     while (!g_cmd_done) {
         usb_drain();
         if (usb_tsc() - start > 10000000000ULL)
             return 0xFFFFFFFFu;
         usb_spin();
+        usb_relax(&relaxed);
     }
     if (out_slot) *out_slot = g_cmd_slot;
     return g_cmd_code;
@@ -315,11 +340,13 @@ bool usb_control(UsbDev *d, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
     usb_db(d->slot, 1, d->ep0.enq);
     spin_unlock_irqrestore(&g_usb_lock, fl);
 
-    uint64_t start = usb_tsc();
+    extern uint64_t sched_clock_ns(void);
+    uint64_t start = usb_tsc(), relaxed = sched_clock_ns();
     while (!g_ctl_done) {
         usb_drain();
         if (usb_tsc() - start > 10000000000ULL) return false;
         usb_spin();
+        usb_relax(&relaxed);
     }
     if (g_ctl_code == 6) {                     /* a STALL halts ep0 too: usable again */
         usb_recover_ep(d, 1, &d->ep0, true);

@@ -607,14 +607,59 @@ static int serial_is_transmit_empty(void)
     return inb(PORT_COM1 + 5) & 0x20;
 }
 
+/* The port itself, asynchronously: 38400 baud is ~260 us a character,
+   and waiting for each one -- interrupts off, a log line ~20 ms -- stopped
+   the boot core so often that keys reached the desktop 150 ms late (the
+   stall watchdog caught serial_write_string). The characters go into a
+   ring; what the UART's FIFO takes (16 at a time, when it is empty) goes
+   at once, the rest from the timer tick (serial_drain). Full: dropped.
+   Synchronous until the timer runs, and for a panic (serial_flush_sync). */
+#define SER_RING 65536
+static char g_ser_ring[SER_RING];
+static volatile uint32_t g_ser_head, g_ser_tail;
+static volatile uint32_t g_ser_draining;
+static bool g_ser_async;
+
+void serial_drain(void)
+{
+    if (__atomic_exchange_n(&g_ser_draining, 1, __ATOMIC_ACQUIRE)) return;   /* (another core is at it) */
+    while (g_ser_tail != g_ser_head && serial_is_transmit_empty()) {
+        for (int k = 0; k < 16 && g_ser_tail != g_ser_head; k++) {
+            outb(PORT_COM1, g_ser_ring[g_ser_tail % SER_RING]);
+            g_ser_tail++;
+        }
+    }
+    __atomic_store_n(&g_ser_draining, 0, __ATOMIC_RELEASE);
+}
+
+/* a panic: all of it out now, waiting as long as it takes */
+void serial_flush_sync(void)
+{
+    while (g_ser_tail != g_ser_head) {
+        while (serial_is_transmit_empty() == 0);
+        outb(PORT_COM1, g_ser_ring[g_ser_tail % SER_RING]);
+        g_ser_tail++;
+    }
+}
+
+void serial_go_async(void) { g_ser_async = true; }
+
 static void serial_write_char(char c)
 {
     extern void bootlog_putc(char c);
     bootlog_putc(c);                 /* the log that outlives a crash (kernel/bootlog.c) */
     extern void netlog_putc(char c);
     netlog_putc(c);                  /* and over the network (kernel/netlog.c) */
-    while (serial_is_transmit_empty() == 0);
-    outb(PORT_COM1, c);
+    if (!g_ser_async) {
+        while (serial_is_transmit_empty() == 0);
+        outb(PORT_COM1, c);
+        return;
+    }
+    uint32_t h = g_ser_head;
+    if (h - g_ser_tail < SER_RING) {
+        g_ser_ring[h % SER_RING] = c;
+        g_ser_head = h + 1;
+    }
 }
 
 /* The serial port and the text console are written by several cores at
@@ -663,6 +708,7 @@ void serial_write_string(const char *str)
         serial_write_char(*str);
         str++;
     }
+    if (g_ser_async) serial_drain();                  /* what the FIFO takes now */
     console_unlock(took, f);
 }
 
@@ -990,6 +1036,7 @@ void kernel_main(BootInfo *boot_info_loader)
     /* ---- Initialize IRQs ---- */
     irq_init();
     boot_mark("interrupts on");
+    serial_go_async();               /* the timer ticks now: it drains the serial ring */
 
     /* ---- Real wall-clock time: read the CMOS RTC now that the PIT (used
        to track elapsed time since this read) is running. Fixes the
