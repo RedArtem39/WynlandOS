@@ -55,7 +55,7 @@
 // (the firmware's framebuffer; drivers/video/virtgpu_drm.c). Everything
 // renders with llvmpipe then -- we through GBM's kms_swrast, the clients
 // into shared memory (wl_shm): no GPU buffers to pass around.
-static bool noGpu()
+static QByteArray drmDriver()
 {
     struct { int major, minor, patch; size_t name_len; char *name; size_t date_len; char *date;
              size_t desc_len; char *desc; } v = {};
@@ -63,10 +63,10 @@ static bool noGpu()
     v.name_len = sizeof name - 1;
     v.name = name;
     const int fd = ::open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
-    if (fd < 0) return false;
+    if (fd < 0) return QByteArray();
     const bool ok = ::ioctl(fd, _IOWR('d', 0x00, decltype(v)), &v) == 0;   // DRM_IOCTL_VERSION
     ::close(fd);
-    return ok && !strcmp(name, "simpledrm");
+    return ok ? QByteArray(name) : QByteArray();
 }
 
 static int inputFd(const char *var, const char *path)
@@ -424,7 +424,17 @@ int main(int argc, char **argv)
     // eglBindWaylandDisplayWL for the plugin to wait on
     qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "linux-dmabuf-unstable-v1");
     qputenv("QT_WAYLAND_IGNORE_BIND_DISPLAY", "1");
-    const bool software = noGpu();
+    const QByteArray driver = drmDriver();
+    const bool software = driver == "simpledrm";
+    // The Intel GPU (drivers/gpu/i915_uapi.c): its depth (HiZ) and colour
+    // compression (CCS) surfaces don't work on our driver yet -- depth
+    // tests fail everywhere (only the clear colour shows) and compressed
+    // draws hang the GPU. Mesa without them, for us and (inherited) the
+    // clients, until the kernel side is right.
+    if (driver == "i915" && !qEnvironmentVariableIsSet("INTEL_DEBUG")) {
+        fprintf(stderr, "[zerp2] Intel GPU: Mesa without HiZ/CCS (INTEL_DEBUG=noccs,nohiz)\n");
+        qputenv("INTEL_DEBUG", "noccs,nohiz");
+    }
     if (software) {
         fprintf(stderr, "[zerp2] no GPU (simpledrm): llvmpipe for us and the clients\n");
         qputenv("GBM_ALWAYS_SOFTWARE", "1");

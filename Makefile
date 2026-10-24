@@ -231,9 +231,23 @@ $(BUILD_DRIVERS)/%.o: $(SRC_DRIVERS)/%.asm
 	@echo "  AS(DRV)    $<"
 	@$(AS) $(ASFLAGS) $< -o $@
 
-$(KERNEL_ELF): $(KERNEL_ALL_OBJ)
-	@echo "  LD(KERN)   $@"
-	@$(LD_KERNEL) $(LDFLAGS_KERNEL) -o $@ $^
+# Three links: the kernel's own symbol table (tools/ksyms.py, for loadable
+# modules: kernel/module.c) is part of it, and lives after what it lists --
+# the third link has a table of the same size as the second's, so nothing
+# moves any more (checked).
+$(KERNEL_ELF): $(KERNEL_ALL_OBJ) tools/ksyms.py
+	@echo "  LD(KERN)   $@ (3 links: the symbol table inside)"
+	@python3 tools/ksyms.py > $(BUILD)/ksyms0.c
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $(BUILD)/ksyms0.c -o $(BUILD)/ksyms0.o
+	@$(LD_KERNEL) $(LDFLAGS_KERNEL) -o $@.1 $(KERNEL_ALL_OBJ) $(BUILD)/ksyms0.o
+	@python3 tools/ksyms.py $@.1 > $(BUILD)/ksyms1.c
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $(BUILD)/ksyms1.c -o $(BUILD)/ksyms1.o
+	@$(LD_KERNEL) $(LDFLAGS_KERNEL) -o $@.2 $(KERNEL_ALL_OBJ) $(BUILD)/ksyms1.o
+	@python3 tools/ksyms.py $@.2 > $(BUILD)/ksyms2.c
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $(BUILD)/ksyms2.c -o $(BUILD)/ksyms2.o
+	@$(LD_KERNEL) $(LDFLAGS_KERNEL) -o $@ $(KERNEL_ALL_OBJ) $(BUILD)/ksyms2.o
+	@python3 tools/ksyms.py --check $@.2 $@
+	@rm -f $@.1 $@.2
 	@echo "  => kernel.elf created"
 
 $(BUILD)/test.bin: test.c
@@ -434,7 +448,7 @@ endif
 WITH_BASE ?= 1
 ifeq ($(WITH_BASE),1)
 BASE_MANIFEST = $(BUILD)/base_manifest.txt
-$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c $(wildcard apps/accounts/* apps/bluez-stub/* rootfs/etc/dbus-1/system.d/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
+$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c apps/modtools/modtools.c $(BUILD)/devhost/hello.ko $(wildcard apps/accounts/* apps/bluez-stub/* rootfs/etc/dbus-1/system.d/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
 	@bash tools/stage_base.sh
 else
 BASE_MANIFEST =
@@ -552,6 +566,19 @@ LIVE_RESOLUTION ?= native
 # make devkernel: the current kernel for a live stick's slot, served by
 # tools/devhost.py; on the machine `test-wyn k` (or leaf update -eK) writes
 # it there and the next boot runs it -- no flashing (boot/boot.c SlotKernel)
+# kernel modules (modules/*.c -> .ko, kernel/module.c loads them): the
+# kernel's flags, one relocatable object each, into build/devhost/ for
+# test-wyn (insmod over the network, no reboot)
+MODULE_SRC = $(wildcard modules/*.c)
+modules: $(patsubst modules/%.c,$(BUILD)/devhost/%.ko,$(MODULE_SRC))
+$(BUILD)/devhost/%.ko: modules/%.c
+	@mkdir -p $(BUILD)/devhost
+	@echo "  CC(MOD)    $<"
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -fno-common -c $< -o $@.o
+	@$(LD_KERNEL) -r -o $@ $@.o
+	@rm -f $@.o
+.PHONY: modules
+
 devkernel: kernel
 	@mkdir -p $(BUILD)/devhost
 	@python3 tools/kslot.py $(KERNEL_ELF) $(BUILD)/devhost/kernel.elf $(BUILD)/devhost/kernel.hdr

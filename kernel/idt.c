@@ -192,10 +192,11 @@ void idt_init(BootInfo *boot_info)
     idt_set_gate(47, (uint64_t)irq15, 0x08, 0x8E);
 
     /* The local APIC's vectors (include/wynland/smp.h) */
-    extern void irqlapic_timer(), irqipi_wake(), irqipi_tlb(), irq_spurious();
+    extern void irqlapic_timer(), irqipi_wake(), irqipi_tlb(), irqgpu(), irq_spurious();
     idt_set_gate(0x40, (uint64_t)irqlapic_timer, 0x08, 0x8E);
     idt_set_gate(0x41, (uint64_t)irqipi_wake,    0x08, 0x8E);
     idt_set_gate(0x42, (uint64_t)irqipi_tlb,     0x08, 0x8E);
+    idt_set_gate(0x50, (uint64_t)irqgpu,         0x08, 0x8E);
     idt_set_gate(0xFF, (uint64_t)irq_spurious,   0x08, 0x8E);
 
     /* Load IDT register */

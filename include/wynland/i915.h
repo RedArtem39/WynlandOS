@@ -40,6 +40,7 @@ typedef struct {
     uint64_t pml4;                                    /* 0: GGTT only */
     bool inval;                                       /* invalidate the TLB before a request (blitter) */
     bool stamp;                                       /* the engine's timestamp before and after */
+    uint32_t swid;                                    /* its software context ID (descriptor bits 47:37) */
 } GpuCtx;
 
 extern Engine i915_rcs, i915_bcs;
@@ -60,6 +61,17 @@ uint32_t i915_ctx_submit(GpuCtx *c, const uint32_t *cmds, uint32_t n);
 bool     i915_wait_seqno(Engine *e, uint32_t seq, uint32_t ms);
 void     i915_engine_reset(Engine *e);
 uint32_t i915_cs_timestamp_hz(void);
+uint32_t i915_rcs_ctx_workarounds(uint32_t *cs);       /* LRIs for a render request: their count (7) */
+void     i915_wr(uint32_t reg, uint32_t v);
+uint32_t i915_ggtt_map(uint64_t phys, uint32_t pages, uint32_t align);   /* align: pages; 0 = none left */
+
+/* the display (i915_display.c): the firmware's lit plane, flipped */
+uint32_t i915_disp_flip(uint64_t phys, uint64_t size, uint32_t w, uint32_t h, uint32_t pitch, uint32_t tiling);
+bool     i915_disp_flip_done(uint32_t ggtt);
+bool     i915_disp_check(uint64_t phys, uint32_t pitch);   /* false: the display failed, copy */
+void     i915_disp_restore(void);
+void     i915_disp_cursor_image(const uint32_t *img, uint32_t dim, uint32_t stride);
+void     i915_disp_cursor_move(int32_t x, int32_t y);
 
 /* the uAPI (i915_uapi.c): DRM render node clients carry this bit */
 #define I915_CLIENT_BIT 0x80000000u
@@ -68,3 +80,10 @@ void     i915_client_ref(uint32_t slot);
 void     i915_release(uint32_t slot);
 int64_t  i915_ioctl(uint32_t slot, uint64_t request, uint64_t argp);
 int      i915_mmap_lookup(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys);
+void     i915_prime_get(uint32_t idx);
+void     i915_prime_put(uint32_t idx);
+int      i915_prime_mmap(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *phys);
+int      i915_bo_info(uint32_t slot, uint32_t handle, uint64_t *phys, uint64_t *size, uint32_t *tiling, uint32_t *ref);
+void     i915_bo_unref(uint32_t ref);
+bool     i915_bo_wait_ref(uint32_t ref, uint32_t ms);       /* its queued GPU work done (false: not in time) */
+int64_t  i915_dumb(uint32_t slot, uint32_t nr, uint64_t argp);

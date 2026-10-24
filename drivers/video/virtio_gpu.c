@@ -1488,7 +1488,15 @@ void virtio_gpu_set_cursor_shape(uint32_t shape)
      nobody calls virtio_gpu_flush() again (an idle window's last frame). */
 void virtio_gpu_tick(void)
 {
-    if (!initialized) return;
+    if (!initialized) {
+        /* no virtio-gpu (real hardware: simpledrm, the Intel display):
+           page-flip events still need their readers woken -- without this a
+           compositor waiting for "flip done" only woke when something else
+           came (a key, a timer): every frame up to a second late */
+        extern void drm_tick(void);
+        drm_tick();
+        return;
+    }
 
     {
         extern uint64_t timer_get_ms(void);

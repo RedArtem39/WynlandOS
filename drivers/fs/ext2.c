@@ -2254,7 +2254,8 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     }
     if (str_compare(path, "/dev/dri/card0") == 0) {
         VfsFile *f = alloc_device_file("card0", 0, false, DRM_DEV_CARD, flags);
-        if (f) f->current_cluster = drm_open_client();
+        extern uint32_t drm_open_card(void);
+        if (f) f->current_cluster = drm_open_card();
         return f;
     }
     if (str_compare(path, "/dev/tty") == 0) {
@@ -2466,7 +2467,11 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
         return (int)size;
     }
 
-    if (file->node.first_cluster >= 0xFFFFFFF0) {
+    /* 0xFFFFFFEF too: the DRM device's PCI revision (below) -- it fell
+       through to the inode reader and read as empty, and libdrm's
+       drmGetDevice2(DRM_DEVICE_GET_PCI_REVISION) -- Mesa's Intel driver
+       asks so -- failed */
+    if (file->node.first_cluster >= 0xFFFFFFEF) {
         if (file->node.first_cluster == DEV_NULL) { /* always EOF */
             return 0;
         }

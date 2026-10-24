@@ -314,6 +314,13 @@ static inline bool may_preempt(int took, InterruptRegisters *regs)
 
 static void lapic_irq(InterruptRegisters *regs)
 {
+    if (regs->int_no == VEC_GPU) {
+        /* the GPU: wakes whoever waits for a request (no big lock needed) */
+        extern void i915_irq(void);
+        i915_irq();
+        lapic_eoi();
+        return;
+    }
     if (regs->int_no == VEC_IPI_TLB) {
         smp_tlb_poll();
         lapic_eoi();

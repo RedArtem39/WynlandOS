@@ -356,6 +356,7 @@ IRQ_STUB 15, 47
 IRQ_STUB lapic_timer, 0x40
 IRQ_STUB ipi_wake,    0x41
 IRQ_STUB ipi_tlb,     0x42
+IRQ_STUB gpu,         0x50   ; the Intel GPU's MSI
 
 ; The APIC's spurious vector: no handler, no EOI.
 global irq_spurious

@@ -4635,6 +4635,21 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return sent;
             }
 
+        /* loadable kernel modules (kernel/module.c): init_module(image,
+           length, name), delete_module(name), and ours, the list (lsmod) */
+        case 175: {
+            extern int64_t sys_init_module(uint64_t img, uint64_t len, uint64_t name);
+            return (uint64_t)sys_init_module(a1, a2, a3);
+        }
+        case 176: {
+            extern int64_t sys_delete_module(uint64_t name);
+            return (uint64_t)sys_delete_module(a1);
+        }
+        case 420: {
+            extern int64_t sys_list_modules(uint64_t buf, uint64_t cap);
+            return (uint64_t)sys_list_modules(a1, a2);
+        }
+
         /* Custom / Extended Syscalls */
 
         case 404: // SYS_kfree: was kfree() of any pointer a program passed in --

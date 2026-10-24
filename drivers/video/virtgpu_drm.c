@@ -69,6 +69,18 @@ extern void *pmm_alloc_contiguous(uint32_t count);
 #define DRM_DEBUG 0
 #endif
 
+/* always on: the Intel GPU's frames, logged once per framebuffer */
+static void ext_say(const char *pre, uint64_t v)
+{
+    extern void uint_to_hex(uint64_t val, char *buf);
+    char b[32];
+    serial_write_string("simpledrm: ");
+    serial_write_string(pre);
+    uint_to_hex(v, b);
+    serial_write_string(b);
+    serial_write_string("\r\n");
+}
+
 static void dbg_num(const char *pre, int64_t v)
 {
 #if DRM_DEBUG
@@ -274,6 +286,7 @@ typedef struct {
     uint64_t   user_data;
     VgpuTicket t;        /* the flip's RESOURCE_FLUSH: delivered once done */
     uint64_t   due_ms;   /* simpledrm: the "vblank" it completes at (0: t) */
+    uint32_t   hw_surf;  /* the Intel display's flip: done when it shows this (due_ms: the latest) */
 } DrmEvent;
 
 typedef struct {
@@ -285,6 +298,8 @@ typedef struct {
     DrmEvent events[DRM_MAX_EVENTS]; /* pending page-flip events, FIFO by seq */
     uint32_t ev_seq;
     WaitQueue ev_wq;    /* read()/poll() sleepers; woken from drm_tick() */
+    uint32_t i915;      /* card0 with the Intel GPU up: its i915 client (objects, rendering);
+                           KMS stays here (drivers/gpu/i915_uapi.c) */
 } DrmClient;
 
 /* A buffer object: one host resource + its guest backing. Shared by every
@@ -317,6 +332,10 @@ typedef struct {
     uint32_t bo;        /* BO index + 1 */
     uint32_t owner;     /* client slot */
     uint32_t width, height, pitch, format;
+    uint64_t ext_phys;  /* an Intel GPU object (bo 0): its memory, */
+    uint32_t ext_ref;   /* its reference (i915_bo_info), */
+    uint64_t ext_size;  /* its size, */
+    uint32_t tiling;    /* and its tiling: 0 linear, 1 X */
 } DrmFb;
 
 typedef struct {
@@ -897,11 +916,13 @@ static int64_t ioctl_prime_fd_to_handle(uint32_t slot, DrmClient *c, uint64_t ar
 
 void drm_prime_get(uint32_t idx)
 {
+    if (idx & I915_CLIENT_BIT) { i915_prime_get(idx); return; }
     if (idx && idx <= DRM_MAX_BOS && g_bos[idx - 1].used) g_bos[idx - 1].refs++;
 }
 
 void drm_prime_put(uint32_t idx)
 {
+    if (idx & I915_CLIENT_BIT) { i915_prime_put(idx); return; }
     if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used) return;
     DrmBo *bo = &g_bos[idx - 1];
     if (bo->refs) bo->refs--;
@@ -910,6 +931,7 @@ void drm_prime_put(uint32_t idx)
 
 int drm_prime_mmap_lookup(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *phys)
 {
+    if (idx & I915_CLIENT_BIT) return i915_prime_mmap(idx, offset, len, phys);
     if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used || g_bos[idx - 1].zombie) return -EINVAL;
     DrmBo *bo = &g_bos[idx - 1];
     /* offset + len could wrap past 2^64 and pass a plain sum check,
@@ -1097,6 +1119,22 @@ static bool simple_swap(uint32_t fmt)
 
 /* rows [y0, y1), columns [x0, x1) of the scanned-out BO onto the screen;
    with `cursor`, the pointer blended over them. g_simple_lock held. */
+static volatile uint64_t g_simple_phys;  /* the frame's memory */
+static volatile bool g_hw_scan;           /* the Intel display shows the frames itself (no copy) */
+static uint32_t g_flip_surf;              /* the last present's display flip (0: copied) */
+static uint32_t g_simple_tiling;          /* 0 linear, 1 X-tiled (512 B x 8 rows, 4 KB tiles) */
+
+/* the frame's pixel row y, from x on (contiguous to the end of the row,
+   or of the 512-byte tile span when X-tiled) */
+static inline const uint32_t *simple_src(uint32_t x, uint32_t y)
+{
+    const uint8_t *base = (const uint8_t *)P2V(g_simple_phys);
+    if (!g_simple_tiling) return (const uint32_t *)(base + (uint64_t)y * g_simple_pitch) + x;
+    uint32_t xb = x * 4;
+    uint64_t off = ((uint64_t)(y / 8) * (g_simple_pitch / 512) + xb / 512) * 4096 + (y % 8) * 512 + xb % 512;
+    return (const uint32_t *)(base + off);
+}
+
 static void simple_put(int32_t x0, int32_t y0, int32_t x1, int32_t y1, bool cursor)
 {
     uint32_t sw = g_boot_info->fb_width, sh = g_boot_info->fb_height;
@@ -1105,16 +1143,14 @@ static void simple_put(int32_t x0, int32_t y0, int32_t x1, int32_t y1, bool curs
     if (x1 > (int32_t)sw) x1 = (int32_t)sw;
     if (y1 > (int32_t)sh) y1 = (int32_t)sh;
     if (!g_simple_bo || x0 >= x1 || y0 >= y1) return;
-    const DrmBo *bo = &g_bos[g_simple_bo - 1];
     bool swap = simple_swap(g_simple_fmt);
     uint32_t dim = 0, stride = 0;
     const uint32_t *cur = cursor ? vgpu_cursor_image(&dim, &stride) : NULL;
     for (int32_t y = y0; y < y1; y++) {
         uint32_t *dst = gop_row((uint32_t)y);
-        const uint32_t *src = (y < (int32_t)g_simple_h)
-            ? (const uint32_t *)((const uint8_t *)P2V(bo->phys) + (uint64_t)y * g_simple_pitch) : NULL;
+        bool row = y < (int32_t)g_simple_h;
         for (int32_t x = x0; x < x1; x++) {
-            uint32_t v = (src && x < (int32_t)g_simple_w) ? gop_px(src[x], swap) : 0;
+            uint32_t v = (row && x < (int32_t)g_simple_w) ? gop_px(*simple_src((uint32_t)x, (uint32_t)y), swap) : 0;
             int32_t cx = x - g_cur_x, cy = y - g_cur_y;
             if (cur && cx >= 0 && cy >= 0 && cx < (int32_t)dim && cy < (int32_t)dim) {
                 uint32_t c = cur[cy * stride + cx], a = c >> 24;
@@ -1135,10 +1171,11 @@ static void simple_put(int32_t x0, int32_t y0, int32_t x1, int32_t y1, bool curs
 /* the whole frame: rows straight through (write-combined), then the pointer */
 static void simple_present(DrmFb *fb)
 {
-    DrmBo *bo = &g_bos[fb->bo - 1];
     uint64_t fl = spin_lock_irqsave(&g_simple_lock);
     bool was = g_simple_bo != 0;
-    g_simple_bo = fb->bo;
+    g_simple_bo = fb->bo ? fb->bo : 0xFFFFFFFFu;    /* (an Intel GPU object: no index of ours) */
+    g_simple_phys = fb->ext_ref ? fb->ext_phys : g_bos[fb->bo - 1].phys;
+    g_simple_tiling = fb->tiling;
     g_simple_pitch = fb->pitch; g_simple_fmt = fb->format;
     g_simple_w = fb->width; g_simple_h = fb->height;
     spin_unlock_irqrestore(&g_simple_lock, fl);
@@ -1149,13 +1186,71 @@ static void simple_present(DrmFb *fb)
 
     uint32_t sw = g_boot_info->fb_width, sh = g_boot_info->fb_height;
     uint32_t w = fb->width < sw ? fb->width : sw, h = fb->height < sh ? fb->height : sh;
+    extern uint64_t sched_clock_ns(void);
+    uint64_t c0 = sched_clock_ns();
+    g_flip_surf = 0;
+    if (fb->ext_ref) {
+        /* the Intel display shows the object itself: no copy (drivers/gpu/i915_display.c);
+           first the GPU done drawing it (submission is asynchronous) */
+        if (!i915_bo_wait_ref(fb->ext_ref, 1000)) ext_say("a frame shown before the GPU was done with it, fb ", fb->id);
+        uint32_t surf = i915_disp_flip(fb->ext_phys, fb->ext_size, fb->width, fb->height, fb->pitch, fb->tiling);
+        static uint32_t hw_flips;
+        if (surf && (++hw_flips == 3 || hw_flips == 10 || hw_flips == 30) && !i915_disp_check(fb->ext_phys, fb->pitch)) {
+            surf = 0;                                 /* (it failed: this frame and the rest copied) */
+            g_hw_scan = false;
+        }
+        if (surf) {
+            g_flip_surf = surf;
+            if (!g_hw_scan) {
+                /* the pointer onto the cursor plane (its display buffer
+                   share and watermarks set up first: i915_display.c) */
+                uint32_t dim = 0, stride = 0;
+                const uint32_t *img = vgpu_cursor_image(&dim, &stride);
+                i915_disp_cursor_image(img, dim, stride);
+                i915_disp_cursor_move(g_cur_x, g_cur_y);
+                g_hw_scan = true;
+                ext_say("frames go to the display without a copy, at GGTT ", surf);
+            }
+            return;
+        }
+        if (g_hw_scan) {                              /* (one that can't: copied, the plane back) */
+            i915_disp_restore();
+            g_hw_scan = false;
+        }
+    }
+    if (fb->ext_ref) {
+        /* the GPU wrote it past the CPU's caches (a scanout buffer is
+           uncached for the GPU): drop any stale lines before reading
+           (clflushopt: unordered, fenced; several times clflush's speed) */
+        uint64_t n = fb->tiling ? (uint64_t)fb->pitch * ((fb->height + 7) & ~7u) : (uint64_t)fb->pitch * fb->height;
+        volatile uint8_t *p = (volatile uint8_t *)P2V(fb->ext_phys);
+        __asm__ volatile("mfence" ::: "memory");
+        for (uint64_t i = 0; i < n; i += 64) __asm__ volatile("clflushopt (%0)" :: "r"(p + i) : "memory");
+        __asm__ volatile("mfence" ::: "memory");     /* (sfence orders no loads: the copy could read stale lines) */
+    }
     if (!simple_swap(fb->format)) {
+        /* linear: whole rows; X-tiled: a 512-byte tile span at a time */
+        uint32_t span = fb->tiling ? 128 : w;
         for (uint32_t y = 0; y < h; y++)
-            memcpy(gop_row(y), (const uint8_t *)P2V(bo->phys) + (uint64_t)y * fb->pitch, (size_t)w * 4);
+            for (uint32_t x = 0; x < w; x += span)
+                memcpy(gop_row(y) + x, simple_src(x, y), (size_t)(w - x < span ? w - x : span) * 4);
     } else {
         fl = spin_lock_irqsave(&g_simple_lock);
         simple_put(0, 0, (int32_t)w, (int32_t)h, false);
         spin_unlock_irqrestore(&g_simple_lock, fl);
+    }
+    if (fb->ext_ref) {
+        static uint64_t n_frames, busy_ns, since;
+        uint64_t c1 = sched_clock_ns();
+        n_frames++;
+        busy_ns += c1 - c0;
+        if (!since) since = c1;
+        if (c1 - since > 5000000000ull) {
+            ext_say("frames in 5 s ", n_frames);
+            ext_say("  copying them, ms ", busy_ns / 1000000);
+            n_frames = busy_ns = 0;
+            since = c1;
+        }
     }
     /* the pointer: over the new frame (the copy above may have hit it) */
     fl = spin_lock_irqsave(&g_simple_lock);
@@ -1171,6 +1266,11 @@ static void simple_present(DrmFb *fb)
 void simpledrm_move_cursor(uint32_t x, uint32_t y)
 {
     if (!g_simple_bo) return;
+    if (g_hw_scan) {
+        g_cur_x = (int32_t)x; g_cur_y = (int32_t)y;
+        i915_disp_cursor_move((int32_t)x, (int32_t)y);
+        return;
+    }
     uint64_t fl = spin_lock_irqsave(&g_simple_lock);
     uint32_t dim = 0, stride;
     vgpu_cursor_image(&dim, &stride);
@@ -1185,6 +1285,10 @@ void simpledrm_move_cursor(uint32_t x, uint32_t y)
 static void simple_release(void)
 {
     if (!g_simple_bo) return;
+    if (g_hw_scan) {                                  /* the firmware's framebuffer on the plane again */
+        i915_disp_restore();
+        g_hw_scan = false;
+    }
     uint64_t fl = spin_lock_irqsave(&g_simple_lock);
     g_simple_bo = 0;
     g_cur_drawn = false;
@@ -1226,9 +1330,13 @@ static void kms_restore_console(void)
 static void fb_remove(DrmFb *fb)
 {
     if (g_scan_fb == fb->id) kms_restore_console();
-    DrmBo *bo = &g_bos[fb->bo - 1];
-    if (bo->refs) bo->refs--;
-    bo_put(bo);
+    if (fb->ext_ref) {
+        i915_bo_unref(fb->ext_ref);
+    } else {
+        DrmBo *bo = &g_bos[fb->bo - 1];
+        if (bo->refs) bo->refs--;
+        bo_put(bo);
+    }
     memset(fb, 0, sizeof(*fb));
 }
 
@@ -1246,7 +1354,6 @@ static bool send_async(const void *cmd, uint32_t len, VgpuTicket *t)
    Returns the RESOURCE_FLUSH ticket: flip completion. */
 static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t h, VgpuTicket *done)
 {
-    DrmBo *bo = &g_bos[fb->bo - 1];
     if (!virtio_gpu_is_active()) {
         (void)x; (void)y; (void)w; (void)h;
         memset(done, 0, sizeof(*done));
@@ -1257,6 +1364,8 @@ static bool kms_present(DrmFb *fb, uint32_t x, uint32_t y, uint32_t w, uint32_t 
         }
         return true;
     }
+    if (fb->ext_ref) return false;                    /* an Intel GPU object: not virtio-gpu's to show */
+    DrmBo *bo = &g_bos[fb->bo - 1];
     /* Never scan out a frame the GPU is still drawing: wait for the last
        submission that touched this buffer. */
     if (bo->has_last) wait_ticket(bo->last, DRM_WAIT_MS);
@@ -1388,14 +1497,62 @@ static int64_t ioctl_setcrtc(uint32_t slot, uint64_t argp)
     return 0;
 }
 
-static int64_t fb_create(uint32_t slot, uint32_t handle, uint32_t w, uint32_t h,
-                         uint32_t pitch, uint32_t format, uint32_t *out_id)
+/* the frame's rows within its object: pitch at least a row, the last row
+   inside; X-tiled ones whole tiles (512-byte rows, 8 rows) -- else the
+   copy to the screen read past the object */
+static bool fb_fits(uint32_t w, uint32_t h, uint32_t pitch, uint32_t tiling, uint64_t size)
 {
+    if (w == 0 || h == 0 || (uint64_t)w * 4 > pitch) return false;
+    if (tiling == 1) return pitch % 512 == 0 && (uint64_t)pitch * ((h + 7) & ~7u) <= size;
+    return (uint64_t)pitch * (h - 1) + (uint64_t)w * 4 <= size;
+}
+
+/* tiling_req: what ADDFB2's modifier says (0 linear, 1 X), -1: none given */
+static int64_t fb_create(uint32_t slot, uint32_t handle, uint32_t w, uint32_t h,
+                         uint32_t pitch, uint32_t format, int tiling_req, uint32_t *out_id)
+{
+    uint32_t partner = (slot && slot <= DRM_MAX_CLIENTS) ? g_clients[slot - 1].i915 : 0;
+    if (partner) {
+        /* the Intel GPU's object (what Mesa rendered into): scanned out
+           from its memory, X tiling undone on the way (simple_present) */
+        if (format != DRM_FORMAT_XRGB8888 && format != DRM_FORMAT_ARGB8888 &&
+            format != DRM_FORMAT_XBGR8888 && format != DRM_FORMAT_ABGR8888) return -EINVAL;
+        uint64_t phys, size;
+        uint32_t tiling, ref;
+        int r = i915_bo_info(partner, handle, &phys, &size, &tiling, &ref);
+        if (r) { ext_say("framebuffer: no such Intel GPU object, handle ", handle); return r; }
+        if (tiling_req >= 0) tiling = (uint32_t)tiling_req;   /* the modifier wins over SET_TILING */
+        if (!fb_fits(w, h, pitch, tiling, size) || tiling > 1) {
+            ext_say("framebuffer refused: tiling ", tiling);
+            ext_say("  pitch ", pitch);
+            ext_say("  size ", size);
+            i915_bo_unref(ref);
+            return -EINVAL;
+        }
+        for (uint32_t i = 0; i < DRM_MAX_FBS; i++) {
+            if (g_fbs[i].used) continue;
+            DrmFb *fb = &g_fbs[i];
+            memset(fb, 0, sizeof(*fb));
+            fb->used = true;
+            fb->id = g_next_fb_id++;
+            fb->owner = slot;
+            fb->width = w; fb->height = h; fb->pitch = pitch; fb->format = format;
+            fb->ext_phys = phys; fb->ext_ref = ref; fb->tiling = tiling; fb->ext_size = size;
+            *out_id = fb->id;
+            ext_say("an Intel GPU framebuffer, w<<16|h ", ((uint64_t)w << 16) | h);
+            ext_say("  pitch ", pitch);
+            ext_say("  tiling ", tiling);
+            ext_say("  format ", format);
+            return 0;
+        }
+        i915_bo_unref(ref);
+        return -ENOSPC;
+    }
     DrmBo *bo = bo_lookup(slot, handle);
     if (!bo) return -ENOENT;
     if (format != DRM_FORMAT_XRGB8888 && format != DRM_FORMAT_ARGB8888 &&
         format != DRM_FORMAT_XBGR8888 && format != DRM_FORMAT_ABGR8888) return -EINVAL;
-    if (w == 0 || h == 0 || (uint64_t)pitch * h > bo->size) return -EINVAL;
+    if (tiling_req > 0 || !fb_fits(w, h, pitch, 0, bo->size)) return -EINVAL;
     for (uint32_t i = 0; i < DRM_MAX_FBS; i++) {
         if (g_fbs[i].used) continue;
         DrmFb *fb = &g_fbs[i];
@@ -1417,7 +1574,7 @@ static int64_t ioctl_addfb(uint32_t slot, uint64_t argp)
     if (copy_from_user(&f, (void *)argp, sizeof(f))) return -EFAULT;
     if (f.bpp != 32) return -EINVAL;
     uint32_t fmt = f.depth == 32 ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888;
-    int64_t r = fb_create(slot, f.handle, f.width, f.height, f.pitch, fmt, &f.fb_id);
+    int64_t r = fb_create(slot, f.handle, f.width, f.height, f.pitch, fmt, -1, &f.fb_id);
     if (r) return r;
     if (copy_to_user((void *)argp, &f, sizeof(f))) return -EFAULT;
     return 0;
@@ -1427,8 +1584,16 @@ static int64_t ioctl_addfb2(uint32_t slot, uint64_t argp)
 {
     struct drm_mode_fb_cmd2_u f;
     if (copy_from_user(&f, (void *)argp, sizeof(f))) return -EFAULT;
-    int64_t r = (f.offsets[0] != 0) ? -EINVAL
-              : fb_create(slot, f.handles[0], f.width, f.height, f.pitches[0], f.pixel_format, &f.fb_id);
+    /* DRM_MODE_FB_MODIFIERS: linear and Intel X tiling are what the copy
+       to the screen undoes (Y, compression: no) */
+    int tiling_req = -1;
+    if ((f.flags & 2) && slot && slot <= DRM_MAX_CLIENTS && g_clients[slot - 1].i915) {   /* (virtio's: as before) */
+        if (f.modifier[0] == 0) tiling_req = 0;
+        else if (f.modifier[0] == 0x0100000000000001ull) tiling_req = 1;   /* I915_FORMAT_MOD_X_TILED */
+        else tiling_req = 99;                         /* refused below */
+    }
+    int64_t r = (f.offsets[0] != 0 || tiling_req == 99) ? -EINVAL
+              : fb_create(slot, f.handles[0], f.width, f.height, f.pitches[0], f.pixel_format, tiling_req, &f.fb_id);
     if (r) {
         /* always logged (a few times): a refused framebuffer is a black
            screen for whoever asked, and the reason is otherwise invisible */
@@ -1498,9 +1663,14 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
         /* simpledrm: done at the next 60 Hz "vblank" (a compositor drawing
            as fast as flips complete would take every core llvmpipe has) */
         ev->due_ms = 0;
+        ev->hw_surf = 0;
         if (!virtio_gpu_is_active()) {
             uint64_t now = timer_get_ms();
             ev->due_ms = (now / 16 + 1) * 16;   /* > 0 */
+            if (g_flip_surf) {                  /* the display's own: its vblank (50 ms at most) */
+                ev->hw_surf = g_flip_surf;
+                ev->due_ms = now + 50;
+            }
         }
     }
     return 0;
@@ -1512,6 +1682,7 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
 
 static bool ev_done(const DrmEvent *e)
 {
+    if (e->hw_surf && i915_disp_flip_done(e->hw_surf)) return true;
     return e->due_ms ? timer_get_ms() >= e->due_ms : vgpu_done(e->t);
 }
 
@@ -1584,9 +1755,44 @@ void drm_tick(void)
 
 static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp);
 
+/* card0 with the Intel GPU up: the screen (KMS, master, auth) is ours,
+   everything else -- objects, dumb buffers, PRIME, rendering -- the
+   partner i915 client's, so Mesa sees "i915" and renders with iris */
+static int64_t card0_i915(uint32_t *slot, uint32_t partner, uint64_t request, uint64_t argp)
+{
+    if (((request >> 8) & 0xFF) != DRM_IOCTL_TYPE) return -ENOTTY;
+    uint32_t nr = request & 0xFF;
+    switch (nr) {
+    case DRM_NR_GET_CAP: {
+        uint64_t cap[2];
+        if (copy_from_user(cap, (void *)argp, sizeof cap)) return -EFAULT;
+        if (cap[0] == 0x1 /* DUMB_BUFFER */ || cap[0] == 0x2 || cap[0] == 0x4 /* DUMB_PREFERRED_DEPTH, _PREFER_SHADOW */ || cap[0] == 0x8 || cap[0] == 0x9 /* CURSOR_W/H */ ||
+            cap[0] == 0x12 /* CRTC_IN_VBLANK_EVENT */ || cap[0] == 0x3 /* VBLANK_HIGH_CRTC */)
+            return ioctl_get_cap(argp);
+        return i915_ioctl(partner, request, argp);
+    }
+    case DRM_NR_MODE_CREATE_DUMB:
+    case DRM_NR_MODE_MAP_DUMB:
+    case DRM_NR_MODE_DESTROY_DUMB:
+        return i915_dumb(partner, nr, argp);
+    case DRM_NR_GET_UNIQUE:
+    case DRM_NR_SET_CLIENT_CAP:
+    case DRM_NR_SET_MASTER:
+    case DRM_NR_DROP_MASTER:
+    case DRM_NR_GET_MAGIC:
+    case DRM_NR_AUTH_MAGIC:
+        return drm_ioctl_inner(slot, request, argp);
+    default:
+        if (nr >= 0xA0 && nr <= 0xBE) return drm_ioctl_inner(slot, request, argp);  /* KMS (0xBF: SYNCOBJ_CREATE) */
+        return i915_ioctl(partner, request, argp);
+    }
+}
+
 int64_t drm_ioctl(uint32_t *slot, uint64_t request, uint64_t argp)
 {
     if (*slot & I915_CLIENT_BIT) return i915_ioctl(*slot, request, argp);   /* the Intel GPU's render node */
+    if (*slot && *slot <= DRM_MAX_CLIENTS && g_clients[*slot - 1].used && g_clients[*slot - 1].i915)
+        return card0_i915(slot, g_clients[*slot - 1].i915, request, argp);
     int64_t r = drm_ioctl_inner(slot, request, argp);
 #if DRM_DEBUG
     uint32_t nr = request & 0xFF;
@@ -1695,6 +1901,8 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp)
 int drm_mmap_lookup(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys)
 {
     if (slot & I915_CLIENT_BIT) return i915_mmap_lookup(slot, offset, len, phys);
+    if (slot && slot <= DRM_MAX_CLIENTS && g_clients[slot - 1].i915)
+        return i915_mmap_lookup(g_clients[slot - 1].i915, offset, len, phys);
     uint32_t handle = (uint32_t)(offset >> 32);
     DrmBo *bo = bo_lookup(slot, handle);
     if (!bo || (offset & 0xFFFFFFFFull) != 0 || len > bo->size) return -EINVAL;
@@ -1726,6 +1934,7 @@ static void client_free(uint32_t slot)
         d.ctx_id = c->ctx_id;
         send_sync(&d, sizeof(d), NULL);
     }
+    if (c->i915) i915_release(c->i915);
     memset(c, 0, sizeof(*c));
 }
 
@@ -1738,6 +1947,17 @@ uint32_t drm_open_client(void)
 {
     uint32_t slot = 0;
     return client_get(&slot) ? slot : 0;
+}
+
+/* card0: with the Intel GPU up, a client with an i915 partner */
+uint32_t drm_open_card(void)
+{
+    uint32_t slot = drm_open_client();
+    if (slot && i915_ready()) {
+        g_clients[slot - 1].i915 = i915_open_client();
+        if (!g_clients[slot - 1].i915) { drm_release(slot, 0, true); return 0; }
+    }
+    return slot;
 }
 
 /* one more fd refers to the client (dup, fork, SCM_RIGHTS) */

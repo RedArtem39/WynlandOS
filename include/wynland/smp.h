@@ -34,6 +34,7 @@
 #define VEC_LAPIC_TIMER  0x40   /* each AP's own 1 kHz clock: preemption */
 #define VEC_IPI_WAKE     0x41   /* "a thread is ready": out of the idle hlt */
 #define VEC_IPI_TLB      0x42   /* page tables changed: flush the TLB */
+#define VEC_GPU          0x50   /* the Intel GPU's MSI (drivers/gpu/i915.c) */
 #define VEC_SPURIOUS     0xFF
 
 struct Thread;

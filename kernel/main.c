@@ -347,7 +347,7 @@ static void boot_network(void *arg)
     (void)arg;
     extern bool net_nic_present(void);
     extern void net_link_down(void);
-    bool waiting_said = false, tz_done = false;
+    bool waiting_said = false, failed_said = false, tz_done = false;
     for (;;) {
         /* no NIC (yet): a USB one -- a phone's tethering -- may come */
         if (!net_nic_present()) {
@@ -358,10 +358,15 @@ static void boot_network(void *arg)
         }
         if (!net_dhcp_request()) {
             extern bool usb_net_ready(void);
-            if (!usb_net_ready()) { boot_mark("no network"); return; }
+            /* the phone went away mid-DHCP (it flips between tethering
+               and charging): wait for it to come back, as at boot -- this
+               used to end the thread, and later tetherings got no DHCP */
+            if (!usb_net_ready() && !failed_said) boot_mark("no network");
+            failed_said = true;
             sched_sleep_ms(3000);              /* a phone not sharing yet: again */
             continue;
         }
+        failed_said = false;
         network_lease(&tz_done);
         {
             /* boot.cfg "netlog=IP:PORT": the kernel log to that machine */

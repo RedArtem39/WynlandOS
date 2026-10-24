@@ -2,7 +2,7 @@
 # WynlandOS - test-wyn: run a numbered test from the developer's machine.
 #
 #   test-wyn        the list of tests
-#   test-wyn N      test N: its program fetched, run as root, its output
+#   test-wyn N [ARGS]  test N (ARGS after the manifest's): its program fetched, run as root, its output
 #                   shown here and sent back (build/netlog/report-*.txt)
 #   test-wyn k      the developer's kernel (make devkernel) into the stick's
 #                   kernel slot: the next boot runs it (also leaf update -eK)
@@ -49,13 +49,15 @@ if [ -z "$1" ]; then
     exit 0
 fi
 N=$1
+shift
+EXTRA="$*"     # test-wyn N more args: after the manifest's own
 LINE=$(awk -v n="$N" '$1 == n { $1 = ""; sub(/^ +/, ""); print; exit }' /tmp/test-wyn.list)
 if [ -z "$LINE" ]; then
     echo "test-wyn: no test $N; there are:"
     grep -v '^#' /tmp/test-wyn.list
     exit 1
 fi
-set -- $LINE
+set -- $LINE $EXTRA
 P=$1
 shift
 get "$P" "/tmp/$P" && chmod +x "/tmp/$P" || { echo "test-wyn: could not fetch $P"; exit 1; }

@@ -113,6 +113,8 @@ gcc -O2 -Wall -o "$OUT/ary" apps/ary/ary.c apps/accounts/accounts.c -lcrypt
 gcc -O2 -Wall -o "$OUT/acct-tools" apps/accounts/tools.c apps/accounts/accounts.c -lcrypt
 # reboot, poweroff, halt (apps/power)
 gcc -O2 -Wall -o "$OUT/power" apps/power/power.c
+# insmod, rmmod, lsmod (apps/modtools): kernel modules (kernel/module.c)
+gcc -O2 -Wall -o "$OUT/modtools" apps/modtools/modtools.c
 gcc -O2 -Wall -o "$OUT/wynlogin" apps/accounts/wynlogin.c apps/accounts/accounts.c -lcrypt
 # bluez-stub: a STAND-IN for BlueZ (no Bluetooth here), apps/bluez-stub
 gcc -O2 -Wall -o "$OUT/bluez-stub" apps/bluez-stub/bluez-stub.c $(pkg-config --cflags --libs dbus-1)
@@ -214,6 +216,10 @@ L=$REPO/apps/leaf
     echo "F /usr/sbin/useradd $OUT/acct-tools"
     echo "F /usr/sbin/userdel $OUT/acct-tools"
     for t in reboot poweroff halt; do echo "F /usr/sbin/$t $OUT/power"; done
+    for t in insmod rmmod lsmod; do echo "F /usr/sbin/$t $OUT/modtools"; done
+    # the example module (modules/hello.c, `make modules`): shtest loads it
+    echo "D /usr/lib/modules"
+    for k in "$OUT"/devhost/*.ko; do [ -f "$k" ] && echo "F /usr/lib/modules/$(basename "$k") $k"; done
     echo "F /usr/sbin/wynlogin $OUT/wynlogin"
     echo "D /usr/lib/wynland"
     echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"

@@ -191,6 +191,13 @@ static const struct sh_case CASES[] = {
       "file:///usr/share/doc/fish/cmds/cd.html\nchange directory\n" },
     /* a person's own account may (kernel/syscall.c, SYS_reboot): a sandbox
        -- a user namespace -- never */
+    /* kernel modules (kernel/module.c): not a user's to load; root's in,
+       listed, out (modules/hello.c, its init and cleanup run) */
+    { "/bin/sh", "kernel modules: insmod, lsmod, rmmod",
+      "insmod /usr/lib/modules/hello.ko 2>&1 | grep -c 'root only';"
+      " echo wyn | ary -S insmod /usr/lib/modules/hello.ko; lsmod | grep -c '^hello ';"
+      " echo wyn | ary -S rmmod hello; lsmod | grep -c '^hello '; true",   /* (grep -c of none: status 1) */
+      "1\ninsmod: hello loaded\n1\n0\n" },
     { "/bin/sh", "reboot: never from a sandbox",
       "unshare -U /usr/sbin/reboot; echo $?; unshare -U /usr/sbin/poweroff 2>/dev/null; echo $?",
       "reboot: Operation not permitted\n1\n1\n" },

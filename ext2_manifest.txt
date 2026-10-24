@@ -262,6 +262,10 @@ D /usr/share/vulkan
 D /usr/share/vulkan/icd.d
 F  /usr/share/vulkan/icd.d/lvp_icd.json /usr/share/vulkan/icd.d/lvp_icd.json
 F  /lib64/libvulkan_lvp.so           /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+# Intel's (anv) on real hardware, through the kernel's i915 interface
+# (drivers/gpu/i915_uapi.c)
+F  /usr/share/vulkan/icd.d/intel_icd.json /usr/share/vulkan/icd.d/intel_icd.json
+F  /lib64/libvulkan_intel.so         /usr/lib/x86_64-linux-gnu/libvulkan_intel.so
 F  /lib64/libdisplay-info.so.3       /usr/lib/x86_64-linux-gnu/libdisplay-info.so.3
 
 # ---- Network configuration; curl, cmake, pkgconf and nano were musl
