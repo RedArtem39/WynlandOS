@@ -99,6 +99,7 @@ typedef struct Thread {
     uint32_t in_syscall;      /* syscall_dispatcher() depth: >0 inside one (its own
                                  nested calls -- clone's fork -- are not filtered again) */
     char     comm[16];        /* prctl(PR_SET_NAME) */
+    uint64_t ready_ns;        /* when it last became READY (kernel/lagtrace.c: ready -> running) */
     uint32_t on_cpu;          /* 1 + the core running it (include/wynland/smp.h), 0: none.
                                  RUNNING alone is not enough: a thread switched
                                  away keeps being "on" its core until the switch

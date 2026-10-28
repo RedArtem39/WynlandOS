@@ -623,7 +623,11 @@ static bool g_ser_async;
 void serial_drain(void)
 {
     if (__atomic_exchange_n(&g_ser_draining, 1, __ATOMIC_ACQUIRE)) return;   /* (another core is at it) */
-    while (g_ser_tail != g_ser_head && serial_is_transmit_empty()) {
+    /* at most 1024 characters a call: an emulated UART is always "empty",
+       and the whole ring at once (each outb a VM exit) held the boot core
+       30+ ms in QEMU -- the timer comes back every millisecond anyway */
+    uint32_t budget = 1024 / 16;
+    while (g_ser_tail != g_ser_head && serial_is_transmit_empty() && budget--) {
         for (int k = 0; k < 16 && g_ser_tail != g_ser_head; k++) {
             outb(PORT_COM1, g_ser_ring[g_ser_tail % SER_RING]);
             g_ser_tail++;
@@ -1211,6 +1215,7 @@ void kernel_main(BootInfo *boot_info_loader)
        something to run) ---- */
     smp_init(boot_info);
     boot_mark("other cores up");
+    { extern void smp_tsc_report(void); smp_tsc_report(); }
 
     /* boot.cfg "dumpevery=N" (debugging): every user thread on the serial
        log every N seconds -- what is a slow or stuck program doing? */

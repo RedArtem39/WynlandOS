@@ -531,9 +531,39 @@ extern Thread *sched_new_ap_idle(void);
 extern void sched_idle_loop_ap(void) __attribute__((noreturn));
 extern void gdt_update_tss_rsp0(uint64_t rsp0);
 
+/* Do the cores' TSCs agree? The scheduler's clock is one rdtsc baseline
+   for all of them (kernel/sched.c); on the laptop a thread's ready ->
+   running time read ~200 ms negative, as if a core were that far behind.
+   Each AP, once online, answers the boot core's pings with its TSC; the
+   round trip's midpoint gives the offset, which the scheduler's clock
+   takes off that core's TSC (g_tsc_off). The TSC itself is left alone:
+   writing TSC_ADJUST (MSR 0x3B) to match the boot core's left the laptop
+   unable to boot. */
+static bool g_tsc_adjust;                             /* CPUID.7.0:EBX[1] */
+static uint64_t g_bsp_tsc_adjust;
+static volatile int64_t g_tsc_adjust_seen[MAX_CPUS];  /* each AP's (logged by the BSP) */
+static volatile int64_t g_tsc_skew[MAX_CPUS];         /* AP's TSC minus the boot core's, cycles */
+static volatile uint32_t g_ts_flag;                   /* 1: the boot core asks; 2: the AP answered */
+static volatile uint64_t g_ts_ap;
+#define TS_ROUNDS 16
+
+static void tsc_adjust_probe(void)
+{
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0));
+    if (a < 7) return;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
+    if (!(b & (1u << 1))) return;
+    g_tsc_adjust = true;
+    g_bsp_tsc_adjust = rdmsr(0x3B);
+}
+
 void ap_main(Cpu *c) __attribute__((noreturn));
 void ap_main(Cpu *c)
 {
+    if (g_tsc_adjust) g_tsc_adjust_seen[c->id] = (int64_t)rdmsr(0x3B);
+    extern bool g_tsc_aux;
+    if (g_tsc_aux) wrmsr(0xC0000103, c->id);          /* TSC_AUX: which core (kernel/sched.c rdtsc_now) */
     smp_set_gs(c);
     __asm__ volatile("mov %0, %%cr0" :: "r"(g_bsp_cr0));
     __asm__ volatile("mov %0, %%cr4" :: "r"(g_bsp_cr4));
@@ -562,6 +592,14 @@ void ap_main(Cpu *c)
 
     lapic_setup(false);
     __atomic_store_n(&c->online, true, __ATOMIC_RELEASE);
+    for (int r = 0; r < TS_ROUNDS; r++) {             /* the boot core's pings (smp_init) */
+        uint64_t t0 = __builtin_ia32_rdtsc();
+        while (__atomic_load_n(&g_ts_flag, __ATOMIC_ACQUIRE) != 1)
+            if (__builtin_ia32_rdtsc() - t0 > 300000000ULL) goto ts_done;   /* ~0.1 s: it gave up */
+        g_ts_ap = __builtin_ia32_rdtsc();
+        __atomic_store_n(&g_ts_flag, 2, __ATOMIC_RELEASE);
+    }
+ts_done:
     sched_idle_loop_ap();
 }
 
@@ -589,8 +627,32 @@ static void log_num(const char *a, uint64_t v, const char *b)
     serial_write_string(b);
 }
 
+/* after the APs are up: what their TSC offsets were (the log) */
+void smp_tsc_report(void)
+{
+    if (!g_tsc_adjust) { serial_write_string("SMP: no TSC_ADJUST\r\n"); return; }
+    extern void uint_to_hex(uint64_t v, char *buf);
+    char b[20];
+    serial_write_string("SMP: TSC_ADJUST boot core ");
+    uint_to_hex(g_bsp_tsc_adjust, b); serial_write_string(b);
+    for (uint32_t i = 1; i < g_cpu_count; i++) {
+        serial_write_string(i == 1 ? ", the others had " : " ");
+        uint_to_hex((uint64_t)g_tsc_adjust_seen[i], b); serial_write_string(b);
+    }
+    extern uint64_t g_tsc_hz;
+    int64_t per_us = (int64_t)(g_tsc_hz / 1000000 ? g_tsc_hz / 1000000 : 1);
+    serial_write_string("\r\nSMP: TSC skew to the boot core (taken off the clock), us:");
+    for (uint32_t i = 1; i < g_cpu_count; i++) {
+        int64_t us = g_tsc_skew[i] / per_us;
+        serial_write_string(us < 0 ? " -" : " +");
+        uint_to_str((uint64_t)(us < 0 ? -us : us), b); serial_write_string(b);
+    }
+    serial_write_string("\r\n");
+}
+
 void smp_init(BootInfo *bi)
 {
+    tsc_adjust_probe();
     sched_clock_calibrate();      /* the scheduler's clock (kernel/sched.c) */
     lapic_map();
     Cpu *bsp = &g_cpus[0];
@@ -668,6 +730,24 @@ void smp_init(BootInfo *bi)
         if (!c->online) {
             log_num("SMP: core with APIC id ", apic, " did not start\r\n");
             continue;
+        }
+        uint64_t best = ~0ULL;
+        for (int r = 0; r < TS_ROUNDS; r++) {         /* ping it (ap_main answers) */
+            __atomic_store_n(&g_ts_flag, 0, __ATOMIC_RELEASE);
+            uint64_t t0 = __builtin_ia32_rdtsc();
+            __atomic_store_n(&g_ts_flag, 1, __ATOMIC_RELEASE);
+            while (__atomic_load_n(&g_ts_flag, __ATOMIC_ACQUIRE) != 2)
+                if (__builtin_ia32_rdtsc() - t0 > 30000000ULL) break;       /* ~10 ms */
+            uint64_t t1 = __builtin_ia32_rdtsc();
+            if (__atomic_load_n(&g_ts_flag, __ATOMIC_ACQUIRE) == 2 && t1 - t0 < best) {
+                best = t1 - t0;
+                g_tsc_skew[n] = (int64_t)(g_ts_ap - (t0 + (t1 - t0) / 2));
+            }
+        }
+        __atomic_store_n(&g_ts_flag, 0, __ATOMIC_RELEASE);
+        if (best != ~0ULL) {
+            extern int64_t g_tsc_off[];
+            __atomic_store_n(&g_tsc_off[n], g_tsc_skew[n], __ATOMIC_RELEASE);
         }
         __atomic_store_n(&g_cpu_count, n + 1, __ATOMIC_RELEASE);
     }

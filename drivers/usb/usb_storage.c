@@ -153,7 +153,9 @@ uint32_t usb_storage_sector_size(void)
 
 static bool storage_lock(uint32_t timeout_ms)
 {
-    uint64_t start = __builtin_ia32_rdtsc();
+    extern void usb_relax(uint64_t *last_ns);
+    extern uint64_t sched_clock_ns(void);
+    uint64_t start = __builtin_ia32_rdtsc(), relaxed = sched_clock_ns();
     uint64_t limit = (uint64_t)timeout_ms * 5000000ULL;
     for (;;) {
         uint64_t fl;
@@ -167,6 +169,7 @@ static bool storage_lock(uint32_t timeout_ms)
         usb_drain();
         if (__builtin_ia32_rdtsc() - start > limit) return false;
         __asm__ volatile("pause");
+        usb_relax(&relaxed);   /* its holder may be giving the big lock away (usb_bulk_xfer) */
     }
 }
 

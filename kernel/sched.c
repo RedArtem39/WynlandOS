@@ -122,11 +122,35 @@ static void reaper_kick(void);
 /* ---- the clock ---- */
 static uint64_t g_tsc0, g_ms0, g_tsc_per_ms;
 
+/* The cores' TSCs need not agree: on the laptop one read ~200 ms behind
+   the boot core, and a deadline set on one core (Qt's 4 ms timers, by
+   CLOCK_MONOTONIC) came ~200 ms late on the other. kernel/smp.c measures
+   each AP's offset as it starts; rdtscp gives the TSC together with the
+   core's number (TSC_AUX, set per core), so the offset taken off is the
+   one of the core the TSC came from, even across a migration. */
+int64_t g_tsc_off[MAX_CPUS];
+bool g_tsc_aux;
+
 static inline uint64_t rdtsc_now(void)
 {
-    uint32_t lo, hi;
+    uint32_t lo, hi, aux;
+    if (g_tsc_aux) {
+        __asm__ volatile("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
+        return (((uint64_t)hi << 32) | lo) - (uint64_t)g_tsc_off[aux & (MAX_CPUS - 1)];
+    }
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+}
+
+static void tsc_aux_setup(void)
+{
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u));
+    if (a < 0x80000001u) return;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001u));
+    if (!(d & (1u << 27))) return;                          /* no rdtscp */
+    __asm__ volatile("wrmsr" :: "c"(0xC0000103u), "a"(0u), "d"(0u));   /* TSC_AUX: the boot core, 0 */
+    g_tsc_aux = true;
 }
 
 /* The TSC's rate against the 1 kHz timer: 50 ms of it, from a tick edge,
@@ -137,6 +161,7 @@ void sched_clock_calibrate(void)
 {
     extern uint64_t timer_get_ms(void);
     extern uint64_t g_tsc_hz;     /* kernel/clock.c: the HPET's or the processor's word */
+    tsc_aux_setup();
     if (g_tsc_hz >= 1000) {
         g_tsc0 = rdtsc_now();
         g_ms0 = timer_get_ms();
@@ -286,11 +311,14 @@ static void place(Thread *t, bool fresh)
     t->vlag = 0;
 }
 
+static inline uint64_t now_ns_for_lag(void) { extern uint64_t sched_clock_ns(void); return sched_clock_ns(); }
+
 /* BLOCKED (or new) -> READY, on the run queue */
 static void make_ready(Thread *t, bool fresh)
 {
     timer_del(t);
     place(t, fresh);
+    t->ready_ns = now_ns_for_lag();
     t->state = THREAD_STATE_READY;
     rq_add(t);
 }
@@ -822,6 +850,11 @@ static bool schedule_locked(bool yielding) {
     // Switch to next_thread
     next_thread->state = THREAD_STATE_RUNNING;
     next_thread->exec_start = now;
+    if (next_thread->ready_ns && next_thread != cpu->idle) {   /* (kernel/lagtrace.c) */
+        extern void lag_ran(Thread *t, uint64_t waited_ns);
+        lag_ran(next_thread, now_ns_for_lag() - next_thread->ready_ns);
+        next_thread->ready_ns = 0;
+    }
     if (next_thread->on_cpu) {
         serial_write_string("SCHED: picked a thread another core runs\r\n");
     }

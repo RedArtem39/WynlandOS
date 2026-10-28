@@ -121,10 +121,12 @@ static void usb_spin(void)
    with the lock held and interrupts off -- a phone's port reset (20-300
    ms) or a control transfer stopped the boot core's clock, and with it
    every key and frame (the stall watchdog caught usb_control). */
-static void usb_relax(uint64_t *last_ns)
+bool g_usb_no_relax;   /* a panic's flush (kernel/sticklog.c): no scheduler */
+void usb_relax(uint64_t *last_ns)
 {
     extern uint64_t sched_clock_ns(void);
     extern void sched_yield(void);
+    if (g_usb_no_relax) return;
     uint64_t now = sched_clock_ns();
     if (now - *last_ns < 1000000ull) return;
     *last_ns = now;
@@ -454,7 +456,11 @@ bool usb_bulk_xfer(UsbDev *d, uint8_t ep_id, UsbRing *ring, uint64_t phys,
     usb_db(d->slot, ep_id, ring->enq);
     spin_unlock_irqrestore(&g_usb_lock, fl);
 
-    uint64_t start = usb_tsc();
+    /* the stick's answer (1-50 ms a write, 100+ while it tidies itself):
+       not with the big lock held -- the stick log writes every second
+       (kernel/sticklog.c), and the whole kernel waited for the stick */
+    extern uint64_t sched_clock_ns(void);
+    uint64_t start = usb_tsc(), relaxed = sched_clock_ns();
     uint64_t limit = (uint64_t)timeout_ms * 5000000ULL;
     while (!g_bulk_done) {
         usb_drain();
@@ -463,6 +469,7 @@ bool usb_bulk_xfer(UsbDev *d, uint8_t ep_id, UsbRing *ring, uint64_t phys,
             return false;
         }
         usb_spin();
+        usb_relax(&relaxed);
     }
     if (g_bulk_code == 1 || g_bulk_code == 13) return true;
     if (g_bulk_code == 6 || g_bulk_code == 4)     /* STALL, transaction error */

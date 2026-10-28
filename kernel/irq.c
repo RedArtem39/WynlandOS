@@ -6,6 +6,7 @@
 #include <wynland/process.h>
 #include <wynland/sched.h>
 #include <wynland/smp.h>
+#include <wynland/waitqueue.h>
 
 
 #define PIC1          0x20
@@ -101,8 +102,10 @@ static uint8_t kbd_raw_queue[KBD_RAW_QUEUE_SIZE];
 static uint32_t kbd_raw_queue_head = 0;
 static uint32_t kbd_raw_queue_tail = 0;
 
+static volatile bool g_kbd_wake;   /* a key came: wake the pollers (timer_device_work) */
 void kbd_raw_queue_push(uint8_t scancode)
 {
+    g_kbd_wake = true;
     uint32_t next = (kbd_raw_queue_head + 1) % KBD_RAW_QUEUE_SIZE;
     extern void lag_key_in(void);
     lag_key_in();                                     /* (kernel/lagtrace.c) */
@@ -250,6 +253,11 @@ static void timer_device_work(void)
         }
     }
     ps2_drain();
+    if (g_kbd_wake) {
+        g_kbd_wake = false;
+        extern WaitQueue g_poll_any_wq;
+        waitqueue_wake_all(&g_poll_any_wq);
+    }
     extern void serial_drain(void);
     serial_drain();                  /* the serial port's ring (kernel/main.c) */
     extern void virtio_gpu_tick(void);

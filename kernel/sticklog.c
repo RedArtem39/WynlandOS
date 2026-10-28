@@ -105,5 +105,7 @@ void sticklog_panic_flush(void)
 {
     extern Spinlock g_usb_lock;
     if (!g_sl_area || spin_held(&g_usb_lock)) return;
+    extern bool g_usb_no_relax;
+    g_usb_no_relax = true;   /* no scheduler now: the USB waits just spin */
     sl_flush();
 }

@@ -237,26 +237,27 @@ static void futex_key(uint64_t uaddr, bool priv, uint64_t *kp, uint64_t *ka) {
    seconds of uptime -- hit live by this phase's own regression test) must
    read as "already expired", not wrap into an astronomical future deadline
    once cast through unsigned math. */
-static bool abs_deadline_from_timespec(uint64_t ts_ptr, bool realtime, uint64_t *out) {
+/* The deadline on the 1 kHz clock (ms). The caller's time came from
+   clock_gettime -- the TSC clock (kernel/sched.c) or the wall clock --
+   so what is left is measured on that same clock; comparing it with the
+   timer's own count put any difference between the two onto every timed
+   wait (Qt's and glibc's condition variables). */
+static bool abs_deadline_from_timespec(uint64_t ts_ptr, bool realtime, uint64_t *out_ms) {
     struct { int64_t sec; int64_t nsec; } ts;
     if (copy_from_user(&ts, (const void *)ts_ptr, sizeof(ts)) != 0) return false;
-
-    const int64_t NS_PER_TICK = 10000000LL; /* 100Hz */
-    uint64_t now_ticks = timer_get_ticks();
+    extern uint64_t sched_clock_ns(void);
+    extern uint64_t rtc_get_unix_time_ns(void);
+    extern uint64_t timer_get_ms(void);
 
     /* normalize to signed ns (tv_nsec is always 0..999999999 by POSIX,
        but don't trust it: fold overflows/underflows defensively) */
     int64_t target_ns = ts.sec * 1000000000LL + ts.nsec;
-    int64_t now_ns;
-    if (realtime) {
-        now_ns = (int64_t)rtc_get_unix_time() * 1000000000LL;
-    } else {
-        now_ns = (int64_t)(now_ticks * (uint64_t)NS_PER_TICK);
-    }
+    int64_t now_ns = realtime ? (int64_t)rtc_get_unix_time_ns() : (int64_t)sched_clock_ns();
+    uint64_t now_ms = timer_get_ms();
 
-    if (target_ns <= now_ns) { *out = now_ticks; return true; } /* already expired */
-    int64_t delta_ns = target_ns - now_ns;
-    *out = now_ticks + (uint64_t)(delta_ns / NS_PER_TICK) + 1;
+    if (target_ns <= now_ns) { *out_ms = now_ms; return true; } /* already expired */
+    uint64_t delta_ns = (uint64_t)(target_ns - now_ns);
+    *out_ms = now_ms + (delta_ns + 999999) / 1000000;
     return true;
 }
 
@@ -296,7 +297,8 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
             if (copy_from_user(&ts, (const void *)timeout_arg, sizeof(ts)) != 0) return -14; /* -EFAULT */
             if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000LL) return -22; /* -EINVAL */
             uint64_t ms = (uint64_t)ts.sec * 1000 + (uint64_t)(ts.nsec + 999999) / 1000000;
-            deadline = timer_get_ticks() + ms / 10 + 1; /* ticks are 10 ms */
+            extern uint64_t timer_get_ms(void);
+            deadline = timer_get_ms() + ms;   /* to the millisecond (it was 10 ms ticks: a 1 ms wait took 10) */
         }
 
         /* The canonical futex contract: verify the caller's expected value
@@ -324,7 +326,7 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
 
         Thread *self = sched_current();
         queue_push(q, self);
-        int64_t r = sched_block_unlock((void *)q, deadline, &g_futex_lock);
+        int64_t r = sched_block_unlock_ex((void *)q, SCHED_NO_DEADLINE, deadline, &g_futex_lock, true);
         /* Resumed: by a WAKE (already unlinked by it) or by the deadline
            pass (still linked, maybe requeued) -- or it never slept (a
            signal). Either way make sure we are off the list. `q` may be

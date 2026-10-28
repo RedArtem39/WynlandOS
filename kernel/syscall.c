@@ -1770,6 +1770,11 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
             uint64_t nap_deadline = now_ms + 50;
             if (sleep_until != SCHED_NO_DEADLINE && nap_deadline > sleep_until) nap_deadline = sleep_until;
             waitqueue_wait_ms_seq(&g_poll_any_wq, nap_deadline, seq);
+            uint64_t woke = timer_get_ms();
+            if (sleep_until != SCHED_NO_DEADLINE && sleep_until == nap_deadline && woke > nap_deadline) {
+                extern void lag_poll_late(uint64_t late_ms);
+                lag_poll_late(woke - nap_deadline);   /* (kernel/lagtrace.c) */
+            }
         }
     }
 }
@@ -6337,6 +6342,13 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         uint64_t rt = rtc_get_unix_time_ms();
                         v = (v > rt) ? mono + (v - rt) : mono;
                         if (v == 0) v = 1;
+                    } else if (abs && v) {
+                        /* CLOCK_MONOTONIC as clock_gettime reads it (the
+                           TSC clock) onto the timer's ms count */
+                        uint64_t mono = timer_get_ms();
+                        uint64_t sc = sched_clock_ns() / 1000000ULL;
+                        v = (v > sc) ? mono + (v - sc) : mono;
+                        if (v == 0) v = 1;
                     }
                     timerfd_settime(ti, v, iv, abs, &ov, &oi);
                 } else {
@@ -7288,6 +7300,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (!user_map_range_ok(a1, len)) return (uint64_t)-22;
                 PageTable *pml4 = vmm_get_current_pml4();
                 uint64_t end = a1 + len;
+                vmm_tlb_batch_begin();   /* other cores running this process: one flush, not one a page */
                 for (uint64_t a = vmm_next_mapped(pml4, a1, end); a < end;
                      a = vmm_next_mapped(pml4, a + PAGE_SIZE, end)) {
                     VMA *v = vma_find(proc, a);
@@ -7295,6 +7308,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (vmm_get_pte(pml4, a) & PAGE_SHARED_MAP) continue;
                     user_unmap_page(pml4, a);
                 }
+                vmm_tlb_batch_end();
                 return 0;
             }
 
@@ -7349,9 +7363,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint64_t req_ms = sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
                 uint64_t now = timer_get_ms();
                 uint64_t end;
-                if (a2 & 1) { /* TIMER_ABSTIME: target on that clock */
-                    uint64_t clock_now = now;
-                    if (clk == 0) clock_now = rtc_get_unix_time_ms();
+                if (a2 & 1) { /* TIMER_ABSTIME: target on that clock -- as clock_gettime reads it */
+                    uint64_t clock_now = clk == 0 ? rtc_get_unix_time_ms() : sched_clock_ns() / 1000000ULL;
                     end = req_ms > clock_now ? now + (req_ms - clock_now) : now;
                 } else {
                     end = now + req_ms;

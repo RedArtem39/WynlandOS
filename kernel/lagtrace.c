@@ -9,6 +9,8 @@
  *   evt   done -> the display server read the flip event
  */
 #include <wynland/types.h>
+#include <wynland/sched.h>
+#include <wynland/process.h>
 
 extern void serial_write_string(const char *s);
 extern void uint_to_str(uint64_t v, char *b);
@@ -17,6 +19,7 @@ extern uint64_t timer_get_ms(void);
 
 typedef struct { uint64_t sum, worst, n; } Step;
 static Step g_key, g_draw, g_flip, g_evt;
+static Step g_run_all, g_run_zerp, g_poll_late;       /* microseconds: ready -> running; poll's late wakes */
 static volatile uint64_t g_key_in;                    /* the oldest key not read yet (0: none) */
 static volatile uint64_t g_read_at;                   /* a key read, no flip since (0: none) */
 static uint64_t g_since;
@@ -38,6 +41,26 @@ void lag_flip_asked(void)
     g_read_at = 0;
 }
 void lag_flip_done(uint64_t asked_ms) { add(&g_flip, timer_ms - asked_ms); }
+
+static bool is_zerp(const Thread *t)
+{
+    const char *p = t->proc ? t->proc->exe_path : "";
+    for (; *p; p++) if (p[0] == 'z' && p[1] == 'e' && p[2] == 'r' && p[3] == 'p') return true;
+    return false;
+}
+/* the scheduler: a thread runs, `waited_ns` after it became ready */
+void lag_ran(Thread *t, uint64_t waited_ns)
+{
+    add(&g_run_all, waited_ns / 1000);
+    if (is_zerp(t)) add(&g_run_zerp, waited_ns / 1000);
+}
+/* do_poll: woke `late_ms` after the deadline it slept for (the display server's) */
+void lag_poll_late(uint64_t late_ms)
+{
+    extern Thread *sched_current(void);
+    Thread *t = sched_current();
+    if (t && is_zerp(t)) add(&g_poll_late, late_ms);
+}
 void lag_event_read(uint64_t done_ms) { add(&g_evt, timer_ms - done_ms); }
 
 static void line(const char *name, const Step *s)
@@ -60,10 +83,13 @@ void lag_report(void)
     stall_report();
     if (timer_ms - g_since < 2000) return;
     g_since = timer_ms;
-    if (!g_key.n) { g_draw.n = g_flip.n = g_evt.n = 0; return; }
+    if (!g_key.n) { Step z = { 0, 0, 0 }; g_draw = g_flip = g_evt = g_run_all = g_run_zerp = g_poll_late = z; return; }
     serial_write_string("LAG (ms):");
     line("key", &g_key); line("draw", &g_draw); line("flip", &g_flip); line("evt", &g_evt);
+    line("poll-late(zerp)", &g_poll_late);
+    serial_write_string("\r\nLAG (us) ready->running:");
+    line("all", &g_run_all); line("zerp", &g_run_zerp);
     serial_write_string("\r\n");
     Step z = { 0, 0, 0 };
-    g_key = g_draw = g_flip = g_evt = z;
+    g_key = g_draw = g_flip = g_evt = g_run_all = g_run_zerp = g_poll_late = z;
 }
