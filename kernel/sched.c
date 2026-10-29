@@ -360,6 +360,29 @@ static Thread *pick_next(Thread *self, Thread *avoid)
     return avoided ? avoid : NULL;
 }
 
+/* A thread killed while it waits leaves its wait queue now, while the
+   queue's owner (a pipe, a timerfd, a socket of the dying process) still
+   exists: left for the reaper, it was unlinked after the process's files
+   had closed and freed the queue -- the reaper walked freed memory (a
+   kernel page fault in reaper_thread). Futex lock, then the wait queues'. */
+void sched_wq_detach(Thread *t)
+{
+    if (!t || !t->wq_head) return;
+    uint64_t ff = futex_lock_irqsave();
+    uint64_t wf = waitqueue_lock_irqsave();
+    Thread **pp = t->wq_head;
+    if (pp) {
+        while (*pp) {
+            if (*pp == t) { *pp = t->wq_next; break; }
+            pp = &(*pp)->wq_next;
+        }
+        t->wq_next = NULL;
+        t->wq_head = NULL;
+    }
+    waitqueue_unlock_irqrestore(wf);
+    futex_unlock_irqrestore(ff);
+}
+
 void sched_terminate(Thread *t)
 {
     if (!t) return;

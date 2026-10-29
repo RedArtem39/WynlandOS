@@ -3139,10 +3139,22 @@ static bool proc_pid_stat(const char *path, VfsStat *out, bool nofollow) {
     return true;
 }
 
+/* /sys/class/backlight/intel_backlight/...: in the image, but only there
+   where the display driver found the panel's PWM */
+static bool backlight_hidden(const char *path) {
+    const char *pre = "/sys/class/backlight/intel_backlight";
+    uint32_t i = 0;
+    while (pre[i] && path[i] == pre[i]) i++;
+    if (pre[i] || (path[i] && path[i] != '/')) return false;
+    extern uint32_t i915_backlight_max(void);
+    return i915_backlight_max() == 0;
+}
+
 bool vfs_stat(const char *path, VfsStat *out) {
     FS_GUARD();
     if (!out) return false;
     if (proc_pid_stat(path, out, false)) return true;
+    if (backlight_hidden(path)) return false;
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return false;
@@ -3154,6 +3166,7 @@ bool vfs_lstat(const char *path, VfsStat *out) {
     FS_GUARD();
     if (!out) return false;
     if (proc_pid_stat(path, out, true)) return true;
+    if (backlight_hidden(path)) return false;
     uint32_t inum;
     Ext2Inode inode;
     if (!ext2_lookup_nofollow(path, &inum, &inode, NULL)) return false;

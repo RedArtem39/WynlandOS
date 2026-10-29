@@ -290,8 +290,8 @@ static bool g_bl_inv;
 static void bl_probe(void)
 {
     if (g_bl != -2) return;
+    if (!i915_ready()) return;          /* not yet: asked again later (stat comes early) */
     g_bl = -1;
-    if (!i915_ready()) return;
     for (int c = 0; c < 2; c++) {
         uint32_t ctl = i915_rd(BLC_CTL(c)), freq = i915_rd(BLC_FREQ(c)), duty = i915_rd(BLC_DUTY(c));
         say("backlight: PWM controller ", (uint64_t)c);

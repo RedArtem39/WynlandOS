@@ -99,8 +99,11 @@ void signal_kill_process(Process *p, int sig) {
     if (it) {
         int guard = 0;
         do {
-            if (it->proc == p && it->state != THREAD_STATE_TERMINATED)
+            if (it->proc == p && it->state != THREAD_STATE_TERMINATED) {
+                extern void sched_wq_detach(Thread *t);
                 sched_terminate(it);
+                if (it != sched_current()) sched_wq_detach(it);   /* (the current one leaves its own way) */
+            }
             it = it->next;
         } while (it != sched_get_thread_list() && ++guard < 4096);
     }

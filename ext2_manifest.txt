@@ -250,6 +250,14 @@ F  /lib64/dri/swrast_dri.so         /usr/lib/x86_64-linux-gnu/dri/swrast_dri.so
 
 # ---- DRM device stubs (kernel recreates them at boot anyway) ----
 F  /dev/dri/card0                   build/card0
+# the panel's backlight, as Linux's sysfs (the kernel answers their reads
+# and writes; it hides them from stat where no backlight PWM is found)
+D  /sys/class
+D  /sys/class/backlight
+D  /sys/class/backlight/intel_backlight
+F  /sys/class/backlight/intel_backlight/brightness        build/sysfile
+F  /sys/class/backlight/intel_backlight/actual_brightness build/sysfile
+F  /sys/class/backlight/intel_backlight/max_brightness    build/sysfile
 F  /dev/dri/renderD128              build/renderD128
 
 # ---- GLVND vendor config ----
@@ -289,6 +297,7 @@ P /tmp 0 41777
 P /dev/shm 0 41777
 P /dev/dri/card0 0 100666
 P /dev/dri/renderD128 0 100666
+P /sys/class/backlight/intel_backlight/brightness 0 100666
 P /var/cache/fontconfig 0 41777
 # device nodes: the devices are the kernel's (found by their numbers);
 # the nodes exist so that they can be bind-mounted (bubblewrap's --dev)
@@ -298,3 +307,4 @@ N /dev/full c 1 7
 N /dev/random c 1 8
 N /dev/urandom c 1 9
 N /dev/tty c 5 0
+N /dev/dsp c 14 3
