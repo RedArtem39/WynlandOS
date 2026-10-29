@@ -365,6 +365,11 @@ $(BUILD)/wpetest.elf: tests/wpetest.c
 	@echo "  CC(HOST)   $< (glibc, WPE WebKit check)"
 	@gcc -O2 -o $@ $<
 
+$(BUILD)/pitest.elf: tests/pitest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, PI mutex check)"
+	@gcc -O2 -pthread -o $@ $<
+
 $(BUILD)/sndtest.elf: tests/sndtest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, sound check)"
@@ -473,6 +478,16 @@ $(CAE_MANIFEST): tools/stage_caelestia.sh $(QS_MANIFEST)
 else
 CAE_MANIFEST =
 endif
+# PipeWire (Ubuntu's: WirePlumber, pipewire-pulse, alsa-lib's OSS plugin
+# over /dev/dsp) and the pwtest check. WITH_PW=0 leaves it out.
+WITH_PW ?= 1
+ifeq ($(WITH_PW),1)
+PW_MANIFEST = $(BUILD)/pw_manifest.txt
+$(PW_MANIFEST): tools/stage_pipewire.sh $(BUILD)/pitest.elf tests/pwtest.sh rootfs/etc/wynrc/services/pwtest rootfs/etc/asound.conf rootfs/usr/lib/wynland/session-audio $(wildcard rootfs/etc/pipewire/*/* rootfs/etc/wireplumber/*/*) $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST)
+	@bash tools/stage_pipewire.sh
+else
+PW_MANIFEST =
+endif
 # Boot choices, read by the kernel from /etc/wynland/boot.cfg:
 #   ZERP=2      desktop: Zerp 2.0 (Qt Quick on the GPU; needs virgl) or 1 (classic)
 #   AUTOTEST=1  run the test programs at boot (gltest, forktest, kmstest)
@@ -508,9 +523,9 @@ $(BOOT_CFG): FORCE
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 	$(if $(filter 1,$(LIVE)),@printf 'F /usr/bin/test-wyn rootfs/usr/bin/test-wyn\nP /usr/bin/test-wyn 0 100755\n' >> $@)

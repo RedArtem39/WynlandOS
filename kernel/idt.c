@@ -242,9 +242,9 @@ void exception_handler(InterruptRegisters *regs)
         stall_nmi(regs);
         return;
     }
-    extern char uaccess_nofault_insn[], uaccess_nofault_fixup[];
+    extern char uaccess_nofault_insn[], uaccess_nofault_fixup[], uaccess_cmpxchg_insn[];
     if (regs->int_no == 14 && (regs->cs & 3) != 3 &&
-        regs->rip == (uint64_t)(uintptr_t)uaccess_nofault_insn) {
+        (regs->rip == (uint64_t)(uintptr_t)uaccess_nofault_insn || regs->rip == (uint64_t)(uintptr_t)uaccess_cmpxchg_insn)) {
         regs->rip = (uint64_t)(uintptr_t)uaccess_nofault_fixup;   /* no resolving at all */
         return;
     }
@@ -269,9 +269,9 @@ void exception_handler(InterruptRegisters *regs)
    sends it to the fixup instead of crashing the kernel */
 static bool uaccess_fault_fixup(InterruptRegisters *regs)
 {
-    extern char uaccess_copy_insn[], uaccess_fixup[];
+    extern char uaccess_copy_insn[], uaccess_fixup[], uaccess_touch_insn[];
     if (regs->int_no != 14 || (regs->cs & 3) == 3) return false;
-    if (regs->rip != (uint64_t)(uintptr_t)uaccess_copy_insn) return false;
+    if (regs->rip != (uint64_t)(uintptr_t)uaccess_copy_insn && regs->rip != (uint64_t)(uintptr_t)uaccess_touch_insn) return false;
     regs->rip = (uint64_t)(uintptr_t)uaccess_fixup;
     return true;
 }

@@ -12,8 +12,8 @@
 void    hda_init(void);
 bool    hda_present(void);
 void    hda_tick(void);                       /* timer IRQ, every 10 ms */
-int64_t hda_dsp_write(const void *buf, uint32_t len);
-int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp);
+int64_t hda_dsp_write(const void *buf, uint32_t len, const uint32_t *fmt);   /* fmt: the open file's format (hda.c) */
+int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp, uint32_t *fmt);
 void    hda_dsp_open(void);
 
 #endif

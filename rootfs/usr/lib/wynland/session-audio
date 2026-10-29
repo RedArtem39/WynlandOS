@@ -1,0 +1,22 @@
+#!/bin/sh
+# WynlandOS - the session's sound, started by wynlogin with the session
+# (as the user, with its XDG_RUNTIME_DIR and session bus): PipeWire, its
+# session manager WirePlumber, and pipewire-pulse (the PulseAudio server
+# for programs that speak PulseAudio). Ends with the session: a SIGTERM
+# stops the three of them.
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/sbin
+[ -n "$XDG_RUNTIME_DIR" ] || export XDG_RUNTIME_DIR=/tmp/runtime-$(id -u)
+mkdir -p "$XDG_RUNTIME_DIR"
+LOG=$XDG_RUNTIME_DIR/audio.log   # (each its own: audio-pipewire.log, -wireplumber, -pulse)
+pipewire >"${LOG%.log}-pipewire.log" 2>&1 &
+PW=$!
+# its socket first: the others connect to it
+i=0
+while [ ! -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+wireplumber >"${LOG%.log}-wireplumber.log" 2>&1 &
+WP=$!
+pipewire-pulse >"${LOG%.log}-pulse.log" 2>&1 &
+PP=$!
+trap 'kill $PP $WP $PW 2>/dev/null; exit 0' TERM INT
+wait $PW
+echo "pipewire exited: $?" >>"${LOG%.log}-pipewire.log"

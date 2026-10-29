@@ -217,6 +217,8 @@ static uint32_t        g_inode_size = 128;
 #define DEV_ZERO       0xFFFFFFED   /* /dev/zero: reads zeros, writes vanish */
 #define DEV_DSP        0xFFFFFFC0   /* include/wynland/hda.h */
 #define DEV_SYSRQ      0xFFFFFFB1   /* /proc/sysrq-trigger: "c" crashes the kernel on purpose */
+#define DEV_BACKLIGHT  0xFFFFFFB2   /* /sys/class/backlight/intel_backlight/(actual_)brightness */
+#define DEV_BL_MAX     0xFFFFFFB3   /* .../max_brightness */
 #define DEV_USB0       0xFFFFFFB0   /* USB mass storage (drivers/usb); outside 0xFFFFFFF0+, whose
                                        0xFFFFFFF4.. are sysfs's PCI files */
 
@@ -2272,6 +2274,18 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         return alloc_device_file("null", 0, false, DEV_NULL, flags);
     }
 
+    /* the panel's backlight (drivers/gpu/i915_display.c), as Linux's sysfs
+       shows it: brightness (read, write a number), actual_brightness,
+       max_brightness. Not there without one. */
+    if (str_compare(path, "/sys/class/backlight/intel_backlight/brightness") == 0 ||
+        str_compare(path, "/sys/class/backlight/intel_backlight/actual_brightness") == 0 ||
+        str_compare(path, "/sys/class/backlight/intel_backlight/max_brightness") == 0) {
+        extern uint32_t i915_backlight_max(void);
+        if (!i915_backlight_max()) return NULL;
+        bool mx = path[37] == 'm';     /* ".../intel_backlight/" is 37 characters */
+        return alloc_device_file(mx ? "max_brightness" : "brightness", 0, false, mx ? DEV_BL_MAX : DEV_BACKLIGHT, flags);
+    }
+
     /* /dev/dsp: the HD Audio output (drivers/sound/hda.c), OSS style */
     if (str_compare(path, "/dev/dsp") == 0) {
         extern bool hda_present(void);
@@ -2457,6 +2471,20 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_DSP) return -1;  /* playback only */
+    if (file->node.first_cluster == DEV_BACKLIGHT || file->node.first_cluster == DEV_BL_MAX) {
+        extern uint32_t i915_backlight_max(void), i915_backlight_get(void);
+        uint32_t v = file->node.first_cluster == DEV_BL_MAX ? i915_backlight_max() : i915_backlight_get();
+        char t[16]; int n = 0, k = 0; char d[12];
+        do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (k) t[n++] = d[--k];
+        t[n++] = '\n';
+        if (file->offset >= (uint32_t)n) return 0;
+        uint32_t c = (uint32_t)n - file->offset;
+        if (c > size) c = size;
+        memcpy(buf, t + file->offset, c);
+        file->offset += c;
+        return (int)c;
+    }
     if (file->node.first_cluster == DEV_ZERO) { memset(buf, 0, size); return (int)size; }
     if (file->node.first_cluster == DEV_USB0) {
         uint64_t bytes = usb_storage_sectors() * usb_storage_sector_size();
@@ -2568,12 +2596,25 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
 int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (file->node.first_cluster == DEV_DSP) {
-        extern int64_t hda_dsp_write(const void *buf, uint32_t len);
-        int64_t r = hda_dsp_write(buf, size);
+        extern int64_t hda_dsp_write(const void *buf, uint32_t len, const uint32_t *fmt);
+        int64_t r = hda_dsp_write(buf, size, &file->current_cluster);   /* (its format: hda.c) */
         return r < 0 ? -1 : (int)r;
     }
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_ZERO) return (int)size;
+    if (file->node.first_cluster == DEV_BACKLIGHT) {      /* a number: the new level */
+        extern void i915_backlight_set(uint32_t v);
+        uint32_t v = 0; bool any = false;
+        for (uint32_t i = 0; i < size; i++) {
+            char ch = ((const char *)buf)[i];
+            if (ch < '0' || ch > '9') { if (any) break; continue; }
+            v = v * 10 + (uint32_t)(ch - '0'); any = true;
+        }
+        if (!any) return -1;
+        i915_backlight_set(v);
+        return (int)size;
+    }
+    if (file->node.first_cluster == DEV_BL_MAX) return -1;
     /* Linux's crash on request (root's): the panic path -- its screen, the
        boot log marked, the warm reset -- tried without waiting for a bug */
     if (file->node.first_cluster == DEV_SYSRQ) {

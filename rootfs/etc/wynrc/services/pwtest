@@ -1,0 +1,9 @@
+description=PipeWire check (WirePlumber, pipewire-pulse, the HDA sink)
+type=oneshot
+exec=/bin/sh /usr/lib/wynland/pwtest
+when=autotest=1|pw
+# after the checks that play through /dev/dsp themselves (osssink): two
+# writers at once would interleave on the card
+after=display testuser sndtest gsttest wpetest
+user=tester
+need=testuser

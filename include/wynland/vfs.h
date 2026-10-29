@@ -25,6 +25,7 @@
    stays readable and writable through its fds, as on Linux */
 #define VFS_F_PINNED  0x80000000u
 #define VFS_F_ROMNT   0x40000000u  /* opened on a read-only mount: no changes through it */
+#define VFS_F_NBFLIGHT 0x20000000u /* an SCM_RIGHTS copy whose sender had O_NONBLOCK (cleared once installed) */
 
 /* Seek whence */
 #define VFS_SEEK_SET  0

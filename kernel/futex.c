@@ -31,6 +31,7 @@
 #include <wynland/smp.h>
 
 extern void serial_write_string(const char *str);
+extern uint64_t timer_get_ms(void);
 
 #define FUTEX_OP_MASK        (128u | 256u) /* PRIVATE_FLAG | CLOCK_REALTIME */
 #define FUTEX_WAIT           0u
@@ -40,6 +41,13 @@ extern void serial_write_string(const char *str);
 #define FUTEX_WAKE_OP        5u
 #define FUTEX_WAIT_BITSET    9u
 #define FUTEX_WAKE_BITSET   10u
+#define FUTEX_LOCK_PI        6u
+#define FUTEX_UNLOCK_PI      7u
+#define FUTEX_TRYLOCK_PI     8u
+#define FUTEX_LOCK_PI2      13u
+#define FUTEX_WAITERS     0x80000000u
+#define FUTEX_OWNER_DIED  0x40000000u
+#define FUTEX_TID_MASK    0x3fffffffu
 
 /* One queue per (address space, futex word) that has waiters, made on the
    first wait and freed when it empties, in a hash table. There used to be
@@ -274,6 +282,118 @@ static bool wake_signal_pending(void) {
     return false;
 }
 
+/* ---- priority-inheriting mutexes (FUTEX_LOCK_PI and co.) ----------------
+   The word holds its owner's thread id (as the owner sees it), FUTEX_WAITERS
+   while someone waits in the kernel. Locking an unowned word takes it;
+   unlocking hands it straight to the first waiter (its id written, it wakes
+   as the owner), as Linux does. No priority is actually lent: nothing here
+   schedules by real-time priority. glibc tries FUTEX_UNLOCK_PI once to see
+   whether the kernel has these at all -- ENOSYS made every
+   PTHREAD_PRIO_INHERIT mutex fail with ENOTSUP (PipeWire's loops). */
+extern int uaccess_cmpxchg32_nofault(uint32_t *uaddr, uint32_t old, uint32_t nw, uint32_t *cur);
+extern int uaccess_touch_write32(uint32_t *uaddr);
+extern uint64_t pid_to_ns(uint64_t g, const Process *viewer);
+
+static uint32_t user_tid(Thread *t) { return (uint32_t)pid_to_ns(t->id, t->proc) & FUTEX_TID_MASK; }
+
+/* the word compare-exchanged, g_futex_lock held. 1: done; 0: it was not
+   `old` (*cur: what it was; the lock still held); -1: it faulted -- the
+   lock went, the page was made writable, start over; -EFAULT: bad address */
+static int cas_locked(uint64_t uaddr, uint32_t old, uint32_t nw, uint32_t *cur, uint64_t fl) {
+    if (uaccess_cmpxchg32_nofault((uint32_t *)uaddr, old, nw, cur) != 0) {
+        spin_unlock_irqrestore(&g_futex_lock, fl);
+        return uaccess_touch_write32((uint32_t *)uaddr) != 0 ? -14 : -1;
+    }
+    return *cur == old ? 1 : 0;
+}
+
+static int64_t pi_lock(uint64_t uaddr, uint64_t key, uint64_t kaddr, uint32_t op, bool realtime, uint64_t timeout_arg) {
+    Thread *self = sched_current();
+    uint32_t me = user_tid(self);
+    uint64_t deadline = SCHED_NO_DEADLINE;
+    if (op != FUTEX_TRYLOCK_PI && timeout_arg && !abs_deadline_from_timespec(timeout_arg, realtime, &deadline)) return -14;
+    for (;;) {
+        uint32_t v, cur;
+        uint64_t fl;
+        if (lock_and_read(uaddr, &v, &fl) != 0) return -14;
+        if ((v & FUTEX_TID_MASK) == 0) {               /* unowned: ours */
+            FutexQueue *q = queue_lookup(key, kaddr, false);
+            if (q) queue_prune(q);
+            uint32_t nw = me | (v & FUTEX_OWNER_DIED) | (q && q->head ? FUTEX_WAITERS : 0);
+            int r = cas_locked(uaddr, v, nw, &cur, fl);
+            if (r == -14) return -14;
+            if (r < 0) continue;
+            if (q) queue_release_if_empty(q);
+            spin_unlock_irqrestore(&g_futex_lock, fl);
+            if (r == 0) continue;                        /* it changed meanwhile */
+            return 0;
+        }
+        if ((v & FUTEX_TID_MASK) == me) { spin_unlock_irqrestore(&g_futex_lock, fl); return -35; } /* -EDEADLK */
+        if (op == FUTEX_TRYLOCK_PI) { spin_unlock_irqrestore(&g_futex_lock, fl); return -11; }     /* -EAGAIN */
+        if (!(v & FUTEX_WAITERS)) {                      /* the owner's unlock comes to us */
+            int r = cas_locked(uaddr, v, v | FUTEX_WAITERS, &cur, fl);
+            if (r == -14) return -14;
+            if (r < 0) continue;
+            if (r == 0) { spin_unlock_irqrestore(&g_futex_lock, fl); continue; }
+        }
+        FutexQueue *q = queue_lookup(key, kaddr, true);
+        if (!q) { spin_unlock_irqrestore(&g_futex_lock, fl); return -12; }
+        queue_push(q, self);
+        /* not interrupted by a signal: Linux restarts LOCK_PI after the
+           handler, so the caller never sees one -- here the handler runs
+           once the lock is ours (a killed process still gets out: -EINTR) */
+        /* (woken every 2 s to say what it waits for: a lost handoff shows) */
+        uint64_t now = timer_get_ms(), nap = now + 2000 < deadline ? now + 2000 : deadline;
+        int64_t r = sched_block_unlock_ex((void *)q, SCHED_NO_DEADLINE, nap, &g_futex_lock, false);
+        spin_lock(&g_futex_lock);
+        futex_unlink_self(self);
+        uint32_t w = 0;
+        bool ours = word_nofault(uaddr, &w) == 0 && (w & FUTEX_TID_MASK) == me;
+        spin_unlock_irqrestore(&g_futex_lock, fl);
+        /* the word decides, not how the sleep ended: an unlock may hand it
+           over just as the timeout fires -- returning ETIMEDOUT then would
+           leave it owned by a thread that thinks it failed, forever */
+        if (ours) return 0;
+        if (r == -110 && timer_get_ms() >= deadline) return -110;   /* -ETIMEDOUT */
+        if (sched_dying() || r == -4) return -4;
+        if (r == -110) {
+            extern void uint_to_hex(uint64_t val, char *buf);
+            char a[24], b[24], c[24];
+            uint_to_hex(me, a); uint_to_hex(w, b); uint_to_hex(uaddr, c);
+            serial_write_string("[futex] PI lock waits 2 s: tid "); serial_write_string(a);
+            serial_write_string(" word "); serial_write_string(b);
+            serial_write_string(" at "); serial_write_string(c); serial_write_string("\r\n");
+        }
+    }
+}
+
+static int64_t pi_unlock(uint64_t uaddr, uint64_t key, uint64_t kaddr) {
+    uint32_t me = user_tid(sched_current());
+    for (;;) {
+        uint32_t v, cur;
+        uint64_t fl;
+        if (lock_and_read(uaddr, &v, &fl) != 0) return -14;
+        if ((v & FUTEX_TID_MASK) != me) { spin_unlock_irqrestore(&g_futex_lock, fl); return -1; } /* -EPERM */
+        FutexQueue *q = queue_lookup(key, kaddr, false);
+        if (q) queue_prune(q);
+        Thread *t = q ? q->head : NULL;
+        uint32_t nw = t ? user_tid(t) | (t->wq_next ? FUTEX_WAITERS : 0) : 0;
+        int r = cas_locked(uaddr, v, nw, &cur, fl);
+        if (r == -14) return -14;
+        if (r < 0) continue;
+        if (r == 0) { spin_unlock_irqrestore(&g_futex_lock, fl); continue; }
+        if (t) {                                         /* the next owner wakes */
+            q->head = t->wq_next;
+            t->wq_next = NULL;
+            t->wq_head = NULL;
+            sched_unblock(t, 0);
+        }
+        if (q) queue_release_if_empty(q);
+        spin_unlock_irqrestore(&g_futex_lock, fl);
+        return 0;
+    }
+}
+
 int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
                       uint64_t timeout_arg, uint64_t uaddr2, uint32_t val3) {
     uint32_t op = op_raw & ~FUTEX_OP_MASK;
@@ -485,10 +605,17 @@ int64_t futex_syscall(uint64_t uaddr, uint32_t op_raw, uint32_t val,
         return (int64_t)(woken + moved);
     }
 
+    case FUTEX_LOCK_PI:
+    case FUTEX_LOCK_PI2:
+    case FUTEX_TRYLOCK_PI:
+        return pi_lock(uaddr, key, kaddr, op, op == FUTEX_LOCK_PI || realtime, timeout_arg);
+    case FUTEX_UNLOCK_PI:
+        return pi_unlock(uaddr, key, kaddr);
+
     default:
-        /* LOCK_PI/WAKE_OP/etc: nothing uses them yet; fail loudly rather
-           than pretend success (that pretense was bug #1 in this file's
-           history). */
+        /* the requeue-PI ops and the like: nothing here uses them yet; fail
+           loudly rather than pretend success (that pretense was bug #1 in
+           this file's history) */
         return -38; /* -ENOSYS */
     }
 }

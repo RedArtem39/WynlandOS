@@ -89,6 +89,11 @@ static uint32_t g_pending;                   /* queued ahead of the hardware: PC
 static bool     g_idle = true;               /* nothing queued: the next write starts fresh */
 static uint32_t g_rate = 48000, g_channels = 2;
 static bool     g_running;
+/* what the writer gave and what of it the card has played (bytes, since
+   the last SNDCTL_DSP_RESET): GETOPTR's position. Silence ahead of the
+   data and after an underrun is not counted -- only the writer's bytes. */
+static uint64_t g_written, g_consumed, g_optr_blocks;
+static uint32_t g_frag_bytes = 4096, g_frags = 16; /* SNDCTL_DSP_SETFRAGMENT: the writer's buffer */
 
 static inline uint8_t  r8 (uint32_t o) { return *(volatile uint8_t  *)(g_mmio + o); }
 static inline uint16_t r16(uint32_t o) { return *(volatile uint16_t *)(g_mmio + o); }
@@ -444,6 +449,9 @@ static void account(void)
         } else {
             g_pending -= played;
         }
+        /* the writer's bytes still queued are at most what is pending
+           (the lead's silence plays first): the rest was played */
+        if (g_written - g_consumed > g_pending) g_consumed = g_written - g_pending;
     }
 }
 
@@ -461,9 +469,21 @@ void hda_dsp_open(void)
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
-int64_t hda_dsp_write(const void *buf, uint32_t len)
+/* The format belongs to the open file (*fmt: rate | channels << 20; 0 for
+   the default 48 kHz stereo), and the card takes it when that file plays.
+   It used to be the card's at once: PipeWire's ALSA plugin opens /dev/dsp
+   again to probe what it takes (1..6 channels, rates) while its stream
+   plays -- each probe switched the playing stream, left mono, and the
+   card ran it at half the pace. */
+static void reconfigure(uint32_t rate, uint32_t ch);
+static uint32_t fmt_rate(const uint32_t *fmt) { return (fmt && *fmt) ? (*fmt & 0xFFFFF) : 48000; }
+static uint32_t fmt_ch(const uint32_t *fmt) { return (fmt && *fmt) ? (*fmt >> 20) : 2; }
+static void fmt_set(uint32_t *fmt, uint32_t rate, uint32_t ch) { if (fmt) *fmt = rate | (ch << 20); }
+
+int64_t hda_dsp_write(const void *buf, uint32_t len, const uint32_t *fmt)
 {
     if (!g_ok) return -5;   /* -EIO */
+    reconfigure(fmt_rate(fmt), fmt_ch(fmt));
     const uint8_t *src = (const uint8_t *)buf;
     uint32_t done = 0;
     uint64_t deadline = timer_get_ms() + 2000;
@@ -492,6 +512,7 @@ int64_t hda_dsp_write(const void *buf, uint32_t len)
             return done ? (int64_t)done : -14;              /* -EFAULT */
         g_wpos = (g_wpos + n) % RING_BYTES;
         g_pending += n;
+        g_written += n;
         done += n;
         deadline = timer_get_ms() + 2000;
     }
@@ -514,6 +535,9 @@ int64_t hda_dsp_write(const void *buf, uint32_t len)
 #define SNDCTL_DSP_NONBLOCK    0x0000500E
 #define SNDCTL_DSP_GETCAPS     0x8004500F
 #define SNDCTL_DSP_GETODELAY   0x80045017
+#define SNDCTL_DSP_GETTRIGGER  0x80045010
+#define SNDCTL_DSP_SETTRIGGER  0x40045010
+#define SNDCTL_DSP_GETOPTR     0x800C5012
 #define AFMT_S16_LE            0x00000010
 #define DSP_CAP_REALTIME       0x00000200
 #define DSP_CAP_TRIGGER        0x00001000
@@ -539,7 +563,7 @@ static void reconfigure(uint32_t rate, uint32_t ch)
     stream_start();
 }
 
-int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp)
+int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp, uint32_t *fmt)
 {
     if (!g_ok) return -5;
     int v = 0;
@@ -547,6 +571,7 @@ int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp)
     case SNDCTL_DSP_RESET:
         stream_stop();
         stream_start();
+        g_written = g_consumed = g_optr_blocks = 0;
         return 0;
     case SNDCTL_DSP_SYNC: {
         uint64_t deadline = timer_get_ms() + 2000;
@@ -562,16 +587,16 @@ int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp)
         return 0;
     case SNDCTL_DSP_SPEED:
         if (get_int(argp, &v)) return -14;
-        reconfigure(v < 46000 ? 44100 : 48000, g_channels);   /* the two the codec takes here */
-        return put_int(argp, (int)g_rate);
+        fmt_set(fmt, v < 46000 ? 44100 : 48000, fmt_ch(fmt));   /* the two the codec takes here */
+        return put_int(argp, (int)fmt_rate(fmt));
     case SNDCTL_DSP_STEREO:
         if (get_int(argp, &v)) return -14;
-        reconfigure(g_rate, v ? 2 : 1);
-        return put_int(argp, g_channels == 2);
+        fmt_set(fmt, fmt_rate(fmt), v ? 2 : 1);
+        return put_int(argp, fmt_ch(fmt) == 2);
     case SNDCTL_DSP_CHANNELS:
         if (get_int(argp, &v)) return -14;
-        reconfigure(g_rate, v <= 1 ? 1 : 2);
-        return put_int(argp, (int)g_channels);
+        fmt_set(fmt, fmt_rate(fmt), v <= 1 ? 1 : 2);
+        return put_int(argp, (int)fmt_ch(fmt));
     case SNDCTL_DSP_SETFMT:
         if (get_int(argp, &v)) return -14;
         return put_int(argp, AFMT_S16_LE);                   /* the only one */
@@ -581,8 +606,31 @@ int64_t hda_dsp_ioctl(uint64_t request, uint64_t argp)
         return put_int(argp, DSP_CAP_REALTIME | DSP_CAP_TRIGGER);
     case SNDCTL_DSP_GETBLKSIZE:
         return put_int(argp, 4096);
-    case SNDCTL_DSP_SETFRAGMENT:
-        return 0;                                            /* fixed 4 KB fragments */
+    case SNDCTL_DSP_SETFRAGMENT: {
+        /* 0xMMMMSSSS: 2^S-byte fragments, M of them. Writes are queued as
+           before; this sizes the buffer GETOPTR's position wraps in. */
+        if (get_int(argp, &v)) return -14;
+        uint32_t sh = (uint32_t)v & 0xFFFF, n = (uint32_t)v >> 16;
+        if (sh >= 4 && sh <= 20 && n >= 2 && n < 0x7FFF) { g_frag_bytes = 1u << sh; g_frags = n; }
+        return 0;
+    }
+    case SNDCTL_DSP_SETTRIGGER:                              /* output runs whenever there is data */
+        return 0;
+    case SNDCTL_DSP_GETTRIGGER:
+        return put_int(argp, 0x2);                           /* PCM_ENABLE_OUTPUT */
+    case SNDCTL_DSP_GETOPTR: {
+        /* {bytes played, fragments since the last call, position in the
+           writer's buffer}: ALSA's OSS plugin moves its hardware pointer
+           by this. Unanswered (ENOTTY), it stayed at 0 -- the buffer
+           filled once and PipeWire's sink never played on. */
+        account();
+        uint64_t blocks = g_consumed / g_frag_bytes;
+        int info[3] = { (int)(uint32_t)g_consumed, (int)(blocks - g_optr_blocks),
+                        (int)(g_consumed % ((uint64_t)g_frag_bytes * g_frags)) };
+        g_optr_blocks = blocks;
+        if (!argp || copy_to_user((void *)argp, info, sizeof(info)) != 0) return -14;
+        return 0;
+    }
     case SNDCTL_DSP_GETODELAY:
         account();
         return put_int(argp, (int)g_pending);

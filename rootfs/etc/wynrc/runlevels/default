@@ -12,6 +12,7 @@ forktest
 sndtest
 jittest
 gsttest
+pwtest
 kmstest
 wpetest
 shtest

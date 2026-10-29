@@ -272,3 +272,56 @@ void i915_disp_cursor_move(int32_t x, int32_t y)
     i915_wr(CUR_POS(p), pos);
     i915_wr(CUR_BASE(p), g_cursor.ggtt);              /* (the write that arms the update) */
 }
+
+/* ---- the panel's backlight ------------------------------------------------
+   The south display engine's PWM (Linux's cnp_setup_backlight, Cannon Point
+   and later): per controller CTL (bit 31 enabled, 29 inverted), FREQ (the
+   period: the maximum) and DUTY (the level). The firmware leaves the eDP
+   panel's controller on; that one is used. None on: no backlight here (a
+   panel may take its level over the eDP AUX channel instead). Exposed as
+   /sys/class/backlight/intel_backlight (drivers/fs/ext2.c). */
+#define BLC_CTL(c)   (0xC8250 + (c) * 0x100)
+#define BLC_FREQ(c)  (0xC8254 + (c) * 0x100)
+#define BLC_DUTY(c)  (0xC8258 + (c) * 0x100)
+static int g_bl = -2;                                 /* -2: not looked yet; -1: none */
+static uint32_t g_bl_max;
+static bool g_bl_inv;
+
+static void bl_probe(void)
+{
+    if (g_bl != -2) return;
+    g_bl = -1;
+    if (!i915_ready()) return;
+    for (int c = 0; c < 2; c++) {
+        uint32_t ctl = i915_rd(BLC_CTL(c)), freq = i915_rd(BLC_FREQ(c)), duty = i915_rd(BLC_DUTY(c));
+        say("backlight: PWM controller ", (uint64_t)c);
+        say("  CTL ", ctl); say("  FREQ ", freq); say("  DUTY ", duty);
+        if ((ctl & (1u << 31)) && freq) {
+            g_bl = c; g_bl_max = freq; g_bl_inv = (ctl & (1u << 29)) != 0;
+            return;
+        }
+    }
+    say("backlight: no PWM controller on (the panel's level may go over eDP AUX): none here ", 0);
+}
+
+uint32_t i915_backlight_max(void) { bl_probe(); return g_bl >= 0 ? g_bl_max : 0; }
+
+uint32_t i915_backlight_get(void)
+{
+    bl_probe();
+    if (g_bl < 0) return 0;
+    uint32_t d = i915_rd(BLC_DUTY(g_bl));
+    if (d > g_bl_max) d = g_bl_max;
+    return g_bl_inv ? g_bl_max - d : d;
+}
+
+/* never fully off: a black panel is no way to set it back */
+void i915_backlight_set(uint32_t v)
+{
+    bl_probe();
+    if (g_bl < 0) return;
+    uint32_t lo = g_bl_max / 100 ? g_bl_max / 100 : 1;
+    if (v < lo) v = lo;
+    if (v > g_bl_max) v = g_bl_max;
+    i915_wr(BLC_DUTY(g_bl), g_bl_inv ? g_bl_max - v : v);
+}

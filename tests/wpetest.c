@@ -49,6 +49,9 @@ static void shot_js(const char *name, const char *url, const char *settle_ms, co
         "WYNLAND_ALLOW_JIT=1",                 /* JavaScriptCore's JIT */
         "WEBKIT_SKIA_ENABLE_CPU_RENDERING=1",  /* first light: no GPU in the web process */
         "GST_DEBUG=1",
+        /* no session sound server here (PipeWire runs with a session): the
+           PulseAudio sink would only fail and retry -- straight to osssink */
+        "GST_PLUGIN_FEATURE_RANK=pulsesink:NONE",
         NULL
     };
     pid_t pid;

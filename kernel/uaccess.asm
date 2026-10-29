@@ -47,3 +47,28 @@ uaccess_nofault_insn:
 uaccess_nofault_fixup:
     mov rax, -14
     ret
+
+; int uaccess_cmpxchg32_nofault(uint32_t *uaddr, uint32_t old, uint32_t new, uint32_t *cur)
+;   the user word compare-exchanged (locked); *cur gets what it held. 0, or
+;   -EFAULT for any fault (as uaccess_read32_nofault: for a PI futex word,
+;   kernel/futex.c, under its spinlock)
+global uaccess_cmpxchg32_nofault
+global uaccess_cmpxchg_insn
+uaccess_cmpxchg32_nofault:
+    mov eax, esi
+uaccess_cmpxchg_insn:
+    lock cmpxchg [rdi], edx
+    mov [rcx], eax
+    xor eax, eax
+    ret
+
+; int uaccess_touch_write32(uint32_t *uaddr)
+;   the user word made writable, its value unchanged (a locked OR with 0):
+;   a lazy or copy-on-write page is resolved as for a copy. 0, or -EFAULT.
+global uaccess_touch_write32
+global uaccess_touch_insn
+uaccess_touch_write32:
+uaccess_touch_insn:
+    lock or dword [rdi], 0
+    xor eax, eax
+    ret

@@ -1076,6 +1076,27 @@ static bool epoll_file_ready(VfsFile *f, VfsFile **fd_table) {
     return inst && epoll_collect(inst, fd_table, NULL, 0) > 0;
 }
 
+/* the earliest expiry (ms) of a timerfd an epoll set watches, nested sets
+   too; 0: none. Nothing wakes a waiter when a timerfd expires, so the
+   wait must not sleep past it: epoll_wait used to nap its 50 ms instead --
+   PipeWire's data loop, on a ~21 ms timer, played its sound 3-4x slow. */
+extern uint32_t timerfd_poll(int idx, WaitQueue **wq, uint64_t *wake_ms);
+static uint64_t epoll_next_timer(EpollInstance *inst, VfsFile **fd_table, int depth) {
+    uint64_t best = 0;
+    if (depth >= 5) return 0;
+    for (int i = 0; i < inst->num_watches; i++) {
+        if (!inst->watches[i].armed) continue;
+        int t = inst->watches[i].target_fd;
+        if (t < 0 || t >= MAX_OPEN_FILES || !fd_table[t]) continue;
+        VfsFile *f = fd_table[t];
+        uint64_t w = 0;
+        if (f->node.first_cluster == TIMERFD_FD) { WaitQueue *wq; timerfd_poll((int)f->current_cluster, &wq, &w); }
+        else if (f->node.first_cluster == EPOLL_FD) { EpollInstance *in = epoll_of(f); if (in) w = epoll_next_timer(in, fd_table, depth + 1); }
+        if (w && (!best || w < best)) best = w;
+    }
+    return best;
+}
+
 extern uint64_t timer_get_ms(void);
 
 /* Poll `nfds` KERNEL-owned wl_pollfd entries for readiness, genuinely
@@ -1349,9 +1370,28 @@ static void strip_trailing_slashes(char *p)
     while (n > 1 && p[n - 1] == '/') p[--n] = 0;
 }
 
+/* /proc/PID/root (and below it): the process's root directory -- here
+   always "/", there are no chroots. PipeWire looks for /proc/PID/root/
+   .flatpak-info to tell sandboxed clients apart; without the directory it
+   took every client for a Flatpak and waited for portal permissions that
+   never came. */
+static void proc_root_path(char *path) {
+    const char *leaf = NULL;
+    if (!procfs_target(path, &leaf) || !leaf) return;
+    if (!(leaf[0] == 'r' && leaf[1] == 'o' && leaf[2] == 'o' && leaf[3] == 't' && (leaf[4] == 0 || leaf[4] == '/'))) return;
+    char t[MAX_PATH];
+    const char *q = leaf + 4;
+    int k = 0;
+    t[k++] = '/';
+    while (*q == '/') q++;
+    while (*q && k < MAX_PATH - 1) t[k++] = *q++;
+    t[k] = 0;
+    str_copy(path, t);
+}
+
 static int64_t user_path_at(int dirfd, uint64_t up, char *out) {
     int64_t r = user_path_at_raw(dirfd, up, out);
-    if (r == 0) proc_canonical(out);
+    if (r == 0) { proc_canonical(out); proc_root_path(out); }
     return r;
 }
 
@@ -1770,6 +1810,10 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                    for it directly: the g_poll_any_wq nap below */
                 if (epoll_file_ready(file, fd_table)) {
                     if (fds && (fds[i].events & 0x0001)) { fds[i].revents |= 0x0001; ready++; }
+                } else {
+                    EpollInstance *in = epoll_of(file);
+                    uint64_t w = in ? epoll_next_timer(in, fd_table, 0) : 0;
+                    if (w && (timer_wake_ms == 0 || w < timer_wake_ms)) timer_wake_ms = w;
                 }
             }
             else {
@@ -1875,7 +1919,35 @@ VfsFile *kfile_dup(const VfsFile *f) {
 
 /* Drop one fd's wrapper: the per-type cleanup SYS_close, process teardown
    and discarded SCM_RIGHTS fds all share. Frees f. */
+/* flock(): advisory whole-file locks as Linux's -- shared or exclusive,
+   held by the open file, dropped with it. Every flock used to succeed:
+   two PipeWire daemons both "held" pipewire-0.lock. ext2 files only. */
+#define MAX_FLOCKS 256
+static struct { uint32_t ino; VfsFile *owner; bool ex; } g_flocks[MAX_FLOCKS];
+static Spinlock g_flock_lock = SPINLOCK_INIT("flock");
+static void flock_drop(VfsFile *f) {
+    uint64_t fl = spin_lock_irqsave(&g_flock_lock);
+    for (int i = 0; i < MAX_FLOCKS; i++) if (g_flocks[i].owner == f) g_flocks[i].owner = NULL;
+    spin_unlock_irqrestore(&g_flock_lock, fl);
+}
+static int flock_try(uint32_t ino, VfsFile *f, bool ex) {
+    uint64_t fl = spin_lock_irqsave(&g_flock_lock);
+    int mine = -1, freei = -1;
+    for (int i = 0; i < MAX_FLOCKS; i++) {
+        if (!g_flocks[i].owner) { if (freei < 0) freei = i; continue; }
+        if (g_flocks[i].ino != ino) continue;
+        if (g_flocks[i].owner == f) { mine = i; continue; }
+        if (ex || g_flocks[i].ex) { spin_unlock_irqrestore(&g_flock_lock, fl); return -11; }
+    }
+    if (mine < 0) mine = freei;
+    if (mine < 0) { spin_unlock_irqrestore(&g_flock_lock, fl); return -37; }   /* -ENOLCK */
+    g_flocks[mine].ino = ino; g_flocks[mine].owner = f; g_flocks[mine].ex = ex;
+    spin_unlock_irqrestore(&g_flock_lock, fl);
+    return 0;
+}
+
 void kfile_close(VfsFile *f) {
+    flock_drop(f);
     /* the slot is empty already: a lock-free reader that saw f is past
        g_fdtab_lock (and done with f) once this gets it */
     { uint64_t bf = spin_lock_irqsave(&g_fdtab_lock); spin_unlock_irqrestore(&g_fdtab_lock, bf); }
@@ -1916,6 +1988,7 @@ void kfile_close(VfsFile *f) {
     } else if (fc == DRM_PRIME_FD) {
         drm_prime_put(f->current_cluster); /* never sleeps: BO freed later */
         kfree(f);
+
     } else if (fc == DRM_SYNC_FD) {
         extern void i915_syncfile_put(uint32_t i);
         i915_syncfile_put(f->current_cluster);
@@ -2369,6 +2442,14 @@ static int64_t usock_sendmsg(int idx, uint32_t oflags, uint64_t umh, int flags) 
                     if (nfds >= USOCK_MAX_MSG_FDS) err = -22;           /* EINVAL (SCM_MAX_FD) */
                     else if (pfd < 0 || pfd >= MAX_OPEN_FILES || !proc->fd_table[pfd]) err = -9; /* EBADF */
                     else if (!(copy = kfile_dup(proc->fd_table[pfd]))) err = -12; /* ENOMEM */
+                    /* O_NONBLOCK belongs to the open file and travels with it
+                       (Linux): here it lives in the fd slot, so it rides along
+                       on the copy. Lost, PipeWire's client read its
+                       non-blocking eventfd "to clear it" and slept forever. */
+                    if (copy) {
+                        copy->flags &= ~VFS_F_NBFLIGHT;
+                        if (proc->fd_oflags[pfd] & LINUX_O_NONBLOCK) copy->flags |= VFS_F_NBFLIGHT;
+                    }
                     if (err) {
                         for (uint32_t j = 0; j < nfds; j++) kfile_close(fds[j]);
                         return err;
@@ -2429,7 +2510,8 @@ static int64_t usock_recvmsg(int idx, uint32_t oflags, uint64_t umh, int flags) 
         if (nfd < 0) { kfile_close(fds[i]); mflags |= UMSG_CTRUNC; continue; }
         proc->fd_table[nfd] = fds[i];
         proc->fd_flags[nfd]  = ((uint32_t)flags & UMSG_CMSG_CLOEXEC) ? FD_CLOEXEC : 0;
-        proc->fd_oflags[nfd] = LINUX_O_RDWR;
+        proc->fd_oflags[nfd] = LINUX_O_RDWR | ((fds[i]->flags & VFS_F_NBFLIGHT) ? LINUX_O_NONBLOCK : 0);
+        fds[i]->flags &= ~VFS_F_NBFLIGHT;
         newfds[ninst++] = nfd;
     }
     uint64_t ctl_used = 0;
@@ -5119,7 +5201,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* /dev/dsp: OSS ioctls to the HD Audio driver */
                 if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
                     fd_table[fd]->node.first_cluster == DEV_DSP) {
-                    return (uint64_t)hda_dsp_ioctl(request, a3);
+                    return (uint64_t)hda_dsp_ioctl(request, a3, &fd_table[fd]->current_cluster);
                 }
 
                 {
@@ -7283,8 +7365,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (sched_dying() || sleep_interrupted()) { got = -LNX_EINTR; break; }
                     /* every pipe/socket/timerfd change and every epoll_ctl
                        wakes this queue; the nap bounds the rest (TCP, PTYs) */
-                    uint64_t nap = now + 50;
+                    uint64_t nap = now + 50, tw = epoll_next_timer(inst, fd_table, 0);
                     if (deadline != SCHED_NO_DEADLINE && nap > deadline) nap = deadline;
+                    if (tw && tw < nap) nap = tw;               /* a watched timerfd's expiry */
                     waitqueue_wait_ms_seq(&g_poll_any_wq, nap, seq);
                 }
                 if (--inst->refs == 0) inst->num_watches = 0;
@@ -7750,9 +7833,22 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return syscall_dispatcher(257, a1, a2, how.flags, how.mode, 0, regs);
             }
 
-        case 73: // SYS_flock: one machine, and fish's history lock is all that asks
-            if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
-            return 0;
+        case 73: // SYS_flock(fd, LOCK_SH 1 | LOCK_EX 2 | LOCK_NB 4 | LOCK_UN 8)
+            {
+                if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
+                VfsFile *f = fd_table[a1];
+                uint32_t ino = f->node.first_cluster;
+                if (ino >= 0xFFFFFF00u) return 0;              /* not a file on disk */
+                if (a2 & 8) { flock_drop(f); return 0; }
+                if (!(a2 & 3)) return (uint64_t)-22;
+                for (;;) {
+                    int r = flock_try(ino, f, (a2 & 2) != 0);
+                    if (r != -11) return (uint64_t)(int64_t)r;
+                    if (a2 & 4) return (uint64_t)-11;           /* -EWOULDBLOCK */
+                    if (sleep_interrupted()) return (uint64_t)-4;
+                    sched_sleep_ms(10);
+                }
+            }
 
         case 98: // SYS_getrusage(who, struct rusage *): the CPU time we count
             {

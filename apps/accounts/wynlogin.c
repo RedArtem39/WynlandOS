@@ -41,6 +41,7 @@
 #define ZERP2 "/usr/bin/zerp2"
 #define GREETER_USER "greeter"
 #define DBUS_DAEMON "/usr/bin/dbus-daemon"
+#define SESSION_AUDIO "/usr/lib/wynland/session-audio"   /* PipeWire, WirePlumber, pipewire-pulse */
 
 extern char **environ;
 
@@ -178,14 +179,27 @@ static pid_t start_session_bus(const struct passwd *pw, char **env, char *addr, 
    stopping wynlogin (rc-service wynlogin stop: SIGTERM) stops them too,
    or the orphaned display server kept the screen and the keyboard (the
    text console started next got neither) */
-static volatile pid_t g_display_pid = -1, g_bus_pid = -1;
+static volatile pid_t g_display_pid = -1, g_bus_pid = -1, g_audio_pid = -1;
 
 static void on_term(int sig)
 {
     (void)sig;
     if (g_display_pid > 0) kill(g_display_pid, SIGTERM);
+    if (g_audio_pid > 0) kill(g_audio_pid, SIGTERM);
     if (g_bus_pid > 0) kill(g_bus_pid, SIGTERM);
     _exit(0);
+}
+
+/* The session's sound (PipeWire and its company: session-audio), on the
+   session's bus, as the user; -1: not installed */
+static pid_t start_session_audio(const struct passwd *pw, char **env)
+{
+    if (access(SESSION_AUDIO, X_OK) != 0) return -1;
+    /* a script: the kernel's spawn reads no "#!" line (execve does) */
+    char *argv[] = { "/bin/sh", SESSION_AUDIO, NULL };
+    pid_t pid = spawn_as("/bin/sh", argv, env, pw->pw_name, pw->pw_uid, pw->pw_gid);
+    if (pid < 0) logf_("could not start the session's sound");
+    return pid;
 }
 
 /* the user's session until it ends; true: it asked to start again */
@@ -205,9 +219,12 @@ static bool run_session(const char *user)
     }
     char *argv[] = { ZERP2, NULL };
     g_bus_pid = bus;
+    pid_t audio = start_session_audio(pw, env);
+    g_audio_pid = audio;
     pid_t pid = spawn_as(ZERP2, argv, env, user, pw->pw_uid, pw->pw_gid);
     g_display_pid = pid;
     input_close();
+    if (pid < 0 && audio > 0) { kill(audio, SIGTERM); waitpid(audio, NULL, 0); }
     if (pid < 0 && bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }
     if (pid < 0) { logf_("could not start the session of %s", user); sleep(2); return false; }
     logf_("session of %s (uid %u): pid %d", user, pw->pw_uid, (int)pid);
@@ -216,6 +233,8 @@ static bool run_session(const char *user)
     g_display_pid = -1;
     logf_("session of %s ended (%s %d)", user, WIFEXITED(st) ? "exit" : "signal",
           WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st));
+    if (audio > 0) { kill(audio, SIGTERM); waitpid(audio, NULL, 0); }   /* and its sound */
+    g_audio_pid = -1;
     if (bus > 0) { kill(bus, SIGTERM); waitpid(bus, NULL, 0); }   /* the session's bus goes with it */
     g_bus_pid = -1;
     return WIFEXITED(st) && WEXITSTATUS(st) == SESSION_RESTART;
