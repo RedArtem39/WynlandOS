@@ -194,6 +194,13 @@ static void handle_close(Client *c, uint32_t h)
 
 /* ---- clients ------------------------------------------------------------ */
 
+/* a context's hardware contexts back (no request of it queued) */
+static void ctx_hw_free(Ctx *x)
+{
+    for (uint32_t k = 0; k < 8; k++)
+        if (x->hw_made[k]) { i915_ctx_destroy(&x->hw[k]); x->hw_made[k] = false; }
+}
+
 static bool vm_new(Client *c, uint32_t *id)
 {
     for (uint32_t i = 0; i < MAX_VMS; i++) {
@@ -238,8 +245,7 @@ void i915_client_ref(uint32_t slot)
     if (c) c->refs++;
 }
 
-/* the last fd: its objects closed. (Its VMs' page tables and contexts are
-   not given back yet: a few pages a client.) */
+/* the last fd: its objects, contexts and VMs given back */
 void i915_release(uint32_t slot)
 {
     Client *c = client(slot);
@@ -254,6 +260,9 @@ void i915_release(uint32_t slot)
 static void client_free(Client *c)
 {
     for (uint32_t h = 1; h <= MAX_HANDLES; h++) handle_close(c, h);
+    for (uint32_t i = 0; i < MAX_CTXS; i++) ctx_hw_free(&c->ctxs[i]);
+    for (uint32_t i = 0; i < MAX_VMS; i++)
+        if (c->vms[i].used) { i915_vm_destroy(&c->vms[i].vm); c->vms[i].used = false; }
     kfree(c);
 }
 
@@ -414,7 +423,8 @@ static int64_t ctx_setparam(Client *c, Ctx *x, uint64_t param, uint32_t size, ui
     case 0x9:                                         /* VM */
         if (value == 0 || value > MAX_VMS || !c->vms[value - 1].used) return -ENOENT;
         x->vm = (uint32_t)value;
-        memset(x->hw_made, 0, sizeof x->hw_made);   /* (hardware contexts hold their VM: new ones) */
+        if (c->busy) client_idle(c);
+        ctx_hw_free(x);                               /* (hardware contexts hold their VM: new ones) */
         return 0;
     case 0xa: {                                       /* ENGINES: { u64 extensions; {u16 class, u16 instance}[] } */
         if (size < 8) { x->nengines = 0; return 0; }
@@ -427,7 +437,8 @@ static int64_t ctx_setparam(Client *c, Ctx *x, uint64_t param, uint32_t size, ui
             x->engine_class[k] = ci[0];
         }
         x->nengines = n;
-        memset(x->hw_made, 0, sizeof x->hw_made);   /* (slots of the old map) */
+        if (c->busy) client_idle(c);
+        ctx_hw_free(x);                               /* (slots of the old map) */
         return 0;
     }
     case 0x4: case 0x5: case 0x6: case 0x8: case 0xb: case 0xc: case 0xe:
@@ -490,6 +501,13 @@ static int64_t ctx_param(Client *c, uint64_t argp, bool set)
 static void sync_signal(Client *c, uint32_t h, uint64_t point);
 static bool sync_done(Client *c, uint32_t h, uint64_t point, bool *bad);
 static void client_free(Client *c);
+static volatile uint32_t g_sf_live;                   /* sync files open (kernel/syscall.c's fds) */
+static uint32_t sf_new(uint64_t n0, uint64_t n1);
+static bool sf_nums(uint32_t i, uint64_t n[2]);
+extern int      drm_install_sync_fd(uint32_t idx, bool cloexec);
+extern uint32_t drm_sync_fd_idx(int fd);
+void i915_syncfile_put(uint32_t i);
+extern WaitQueue g_poll_any_wq;
 
 /* A queue per engine. execbuffer checks a request, maps its objects and
    queues it, and returns: Mesa builds the next frame while the GPU draws
@@ -550,6 +568,13 @@ static bool bo_wait(const Bo *bo, uint64_t ms)
         waitqueue_wait_ms_seq(&g_q[e].done_wq, timer_get_ms() + 5, seq);
     }
     return true;
+}
+
+/* for the display: is the GPU done with it (no waiting) */
+bool i915_bo_idle_ref(uint32_t ref)
+{
+    if (!ref || ref > MAX_BOS || !g_bos[ref - 1].used) return true;
+    return bo_idle(&g_bos[ref - 1]);
 }
 
 /* for the display (drivers/video/virtgpu_drm.c): a frame drawn before it is shown */
@@ -685,6 +710,7 @@ static void eng_thread(void *arg)
         if (!--c->busy && c->dying) client_free(c);   /* its last fd went while this ran */
         g_eng_at[me] = "after a request";
         waitqueue_wake_all(&q->done_wq);
+        if (g_sf_live) waitqueue_wake_all(&g_poll_any_wq);   /* sync files polled with other fds */
     }
 }
 
@@ -884,6 +910,15 @@ static int64_t execbuffer(Client *c, uint64_t argp)
     }
     r->n = n;
     if ((err = eb_fences(c, r, eb.flags, eb.cliprects_ptr, eb.num_cliprects))) goto fail;
+    if (eb.flags & (1u << 16)) {                      /* FENCE_IN: a sync file, fd in rsvd2's low half */
+        uint64_t in[2];
+        if (!sf_nums(drm_sync_fd_idx((int)(int32_t)(uint32_t)eb.rsvd2), in)) EB_FAIL(-EINVAL);
+        /* this engine's own part is ahead in its queue already; the
+           other's (rare: a copy before a draw) waited for here */
+        extern void sched_sleep_ms(uint64_t ms);
+        uint32_t oc = cls ^ 1;
+        for (int k = 0; k < 3000 && g_q[oc].done < in[oc]; k++) sched_sleep_ms(1);
+    }
 #undef EB_FAIL
 
     /* queued: its objects marked busy until it is done */
@@ -896,12 +931,27 @@ static int64_t execbuffer(Client *c, uint64_t argp)
         if (c->sync[i].fnum == ~0ull) { c->sync[i].fcls = cls; c->sync[i].fnum = r->num; }
         if (c->sync[i].pnum == ~0ull) { c->sync[i].pcls = cls; c->sync[i].pnum = r->num; }
     }
+    if (eb.flags & (1u << 17)) {                      /* FENCE_OUT: a sync file for it, fd in rsvd2's high half */
+        uint32_t sf = sf_new(cls ? 0 : r->num, cls ? r->num : 0);
+        int fd = sf ? drm_install_sync_fd(sf, true) : -ENOMEM;
+        if (fd < 0) { if (sf) i915_syncfile_put(sf); err = fd; goto fail_queued; }
+        uint32_t hi = (uint32_t)fd;
+        if (copy_to_user((void *)(argp + 60), &hi, 4)) { err = -EFAULT; goto fail_queued; }
+    }
     c->busy++;
     if (q->tail) q->tail->next = r; else q->head = r;
     q->tail = r;
     if (!q->thread) say("execbuffer: no thread for the engine (i915_uapi_start not run): queued only, class ", cls);
     waitqueue_wake_all(&q->wq);
     return 0;
+
+fail_queued:
+    /* (its number taken: the request still runs, without its sync file) */
+    c->busy++;
+    if (q->tail) q->tail->next = r; else q->head = r;
+    q->tail = r;
+    waitqueue_wake_all(&q->wq);
+    return err;
 
 fail:
     req_free(r);
@@ -1048,6 +1098,41 @@ static int64_t syncobj(Client *c, uint32_t nr, uint64_t argp)
         }
         return 0;
     }
+    case 0xC1: {                                      /* HANDLE_TO_FD { handle, flags, fd, pad, point } */
+        struct { uint32_t handle, flags; int32_t fd; uint32_t pad; uint64_t point; } a;
+        if (copy_from_user(&a, (void *)argp, 16)) return -EFAULT;
+        if (!(a.flags & 1)) { say("SYNCOBJ_HANDLE_TO_FD: only as a sync file (no shared syncobj fds), flags ", a.flags); return -EINVAL; }
+        if (!a.handle || a.handle > MAX_SYNCOBJ || !c->sync[a.handle - 1].used) return -ENOENT;
+        __typeof__(c->sync[0]) *s = &c->sync[a.handle - 1];
+        uint64_t n[2] = { 0, 0 };
+        if (!s->signaled && s->fnum && s->fnum != ~0ull) n[s->fcls & 1] = s->fnum;
+        else if (!s->signaled && !s->fnum && s->pnum && s->pnum != ~0ull) n[s->pcls & 1] = s->pnum;
+        else if (!s->signaled && !s->pnum) return -EINVAL;   /* no fence at all (as Linux) */
+        uint32_t sf = sf_new(n[0], n[1]);
+        if (!sf) return -ENOMEM;
+        int fd = drm_install_sync_fd(sf, true)   /* (always close-on-exec, as Linux) */;
+        if (fd < 0) { i915_syncfile_put(sf); return fd; }
+        a.fd = fd;
+        return copy_to_user((void *)argp, &a, 16) ? -EFAULT : 0;
+    }
+    case 0xC2: {                                      /* FD_TO_HANDLE { handle, flags, fd, pad }: IMPORT_SYNC_FILE into handle */
+        struct { uint32_t handle, flags; int32_t fd; uint32_t pad; } a;
+        if (copy_from_user(&a, (void *)argp, 16)) return -EFAULT;
+        if (!(a.flags & 1)) { say("SYNCOBJ_FD_TO_HANDLE: only a sync file into a syncobj, flags ", a.flags); return -EINVAL; }
+        if (!a.handle || a.handle > MAX_SYNCOBJ || !c->sync[a.handle - 1].used) return -ENOENT;
+        uint64_t n[2];
+        if (!sf_nums(drm_sync_fd_idx(a.fd), n)) return -EINVAL;
+        /* one fence a syncobj here: the copy engine's part (rare) waited for */
+        extern void sched_sleep_ms(uint64_t ms);
+        if (n[0] > g_q[0].done && n[1] > g_q[1].done)
+            for (int k = 0; k < 3000 && g_q[1].done < n[1]; k++) sched_sleep_ms(1);
+        __typeof__(c->sync[0]) *s = &c->sync[a.handle - 1];
+        s->fnum = 0;
+        s->signaled = true;
+        for (uint32_t e = 0; e < 2; e++)
+            if (n[e] > g_q[e].done) { s->signaled = false; s->fcls = e; s->fnum = n[e]; }
+        return 0;
+    }
     case 0xCC: {                                      /* TRANSFER { src, dst, src_point, dst_point, flags, pad } */
         struct { uint32_t src, dst; uint64_t src_point, dst_point; uint32_t flags, pad; } t;
         if (copy_from_user(&t, (void *)argp, sizeof t)) return -EFAULT;
@@ -1061,6 +1146,113 @@ static int64_t syncobj(Client *c, uint32_t nr, uint64_t argp)
     default:
         say("SYNCOBJ ioctl not done: nr ", nr);
         return -EINVAL;
+    }
+}
+
+/* ---- sync files: a fence as an fd ----------------------------------------
+   What Mesa's native fence fds are (EGL_ANDROID_native_fence_sync, Vulkan's
+   sync fds) -- how Chromium's GPU process hands a frame's fence to the
+   browser. A fence here is a place in each engine's queue (0: none); done
+   when both engines got that far. poll() says when; SYNC_IOC_MERGE and
+   SYNC_IOC_FILE_INFO as Linux's sync_file. */
+
+#define MAX_SYNCFILES 256
+static struct { uint32_t refs; uint64_t num[2]; } g_sf[MAX_SYNCFILES];
+
+static uint32_t sf_new(uint64_t n0, uint64_t n1)
+{
+    uint64_t fl = spin_lock_irqsave(&g_lock);
+    for (uint32_t i = 0; i < MAX_SYNCFILES; i++) {
+        if (g_sf[i].refs) continue;
+        g_sf[i].refs = 1;
+        g_sf[i].num[0] = n0;
+        g_sf[i].num[1] = n1;
+        g_sf_live++;
+        spin_unlock_irqrestore(&g_lock, fl);
+        return i + 1;
+    }
+    spin_unlock_irqrestore(&g_lock, fl);
+    say("no room for another sync file: ", MAX_SYNCFILES);
+    return 0;
+}
+
+static bool sf_nums(uint32_t i, uint64_t n[2])
+{
+    if (!i || i > MAX_SYNCFILES || !g_sf[i - 1].refs) return false;
+    n[0] = g_sf[i - 1].num[0];
+    n[1] = g_sf[i - 1].num[1];
+    return true;
+}
+
+void i915_syncfile_get(uint32_t i)
+{
+    uint64_t fl = spin_lock_irqsave(&g_lock);
+    if (i && i <= MAX_SYNCFILES && g_sf[i - 1].refs) g_sf[i - 1].refs++;
+    spin_unlock_irqrestore(&g_lock, fl);
+}
+
+void i915_syncfile_put(uint32_t i)
+{
+    uint64_t fl = spin_lock_irqsave(&g_lock);
+    if (i && i <= MAX_SYNCFILES && g_sf[i - 1].refs && !--g_sf[i - 1].refs) g_sf_live--;
+    spin_unlock_irqrestore(&g_lock, fl);
+}
+
+/* poll(): signaled? If not, the queue whose end wakes it */
+bool i915_syncfile_ready(uint32_t i, WaitQueue **wq)
+{
+    uint64_t n[2];
+    if (!sf_nums(i, n)) return true;
+    if (g_q[0].done < n[0]) { *wq = &g_q[0].done_wq; return false; }
+    if (g_q[1].done < n[1]) { *wq = &g_q[1].done_wq; return false; }
+    return true;
+}
+
+int64_t i915_syncfile_ioctl(uint32_t i, uint64_t request, uint64_t argp)
+{
+    uint64_t n[2];
+    if (!sf_nums(i, n)) return -EINVAL;
+    bool done = g_q[0].done >= n[0] && g_q[1].done >= n[1];
+    switch ((uint32_t)request) {
+    case 0xC0303E03: {                                /* SYNC_IOC_MERGE { name[32], fd2, fence, flags, pad } */
+        struct { char name[32]; int32_t fd2, fence; uint32_t flags, pad; } m;
+        if (copy_from_user(&m, (void *)argp, sizeof m)) return -EFAULT;
+        uint64_t o[2];
+        if (!sf_nums(drm_sync_fd_idx(m.fd2), o)) return -EINVAL;
+        uint32_t sf = sf_new(n[0] > o[0] ? n[0] : o[0], n[1] > o[1] ? n[1] : o[1]);
+        if (!sf) return -ENOMEM;
+        int fd = drm_install_sync_fd(sf, true);
+        if (fd < 0) { i915_syncfile_put(sf); return fd; }
+        m.fence = fd;
+        return copy_to_user((void *)argp, &m, sizeof m) ? -EFAULT : 0;
+    }
+    case 0xC0383E04: {                                /* SYNC_IOC_FILE_INFO { name[32], status, flags, num_fences, pad, sync_fence_info } */
+        struct { char name[32]; int32_t status; uint32_t flags, num_fences, pad; uint64_t info; } f;
+        if (copy_from_user(&f, (void *)argp, sizeof f)) return -EFAULT;
+        uint32_t count = (n[0] ? 1 : 0) + (n[1] ? 1 : 0);
+        if (!count) count = 1;                        /* (a signaled stub) */
+        memset(f.name, 0, sizeof f.name);
+        memcpy(f.name, "i915", 5);
+        f.status = done ? 1 : 0;
+        if (f.num_fences && f.info) {
+            struct { char obj[32], drv[32]; int32_t status; uint32_t flags; uint64_t ts; } e;
+            uint32_t k = 0;
+            for (uint32_t q = 0; q < 2 && k < f.num_fences && k < count; q++) {
+                if (!n[q] && !(q == 0 && !n[1])) continue;   /* (none: one signaled entry) */
+                memset(&e, 0, sizeof e);
+                memcpy(e.obj, q ? "bcs" : "rcs", 4);
+                memcpy(e.drv, "i915", 5);
+                e.status = g_q[q].done >= n[q] ? 1 : 0;
+                if (copy_to_user((void *)(f.info + (uint64_t)k * sizeof e), &e, sizeof e)) return -EFAULT;
+                k++;
+            }
+        }
+        f.num_fences = count;
+        return copy_to_user((void *)argp, &f, sizeof f) ? -EFAULT : 0;
+    }
+    default:
+        say("sync file ioctl not known: ", request);
+        return -25;                                   /* -ENOTTY */
     }
 }
 
@@ -1226,7 +1418,7 @@ int64_t i915_ioctl(uint32_t slot, uint64_t request, uint64_t argp)
         handle_close(c, a[0]);
         return 0;
     }
-    case 0xBF: case 0xC0: case 0xC3: case 0xC4: case 0xC5:
+    case 0xBF: case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC4: case 0xC5:
     case 0xCA: case 0xCB: case 0xCC: case 0xCD:
         return syncobj(c, nr, argp);
     default: break;
@@ -1333,7 +1525,8 @@ int64_t i915_ioctl(uint32_t slot, uint64_t request, uint64_t argp)
         if (copy_from_user(a, (void *)argp, 8)) return -EFAULT;
         if (!a[0] || a[0] >= MAX_CTXS || !c->ctxs[a[0]].used) return -ENOENT;
         client_idle(c);                               /* (queued requests use it) */
-        c->ctxs[a[0]].used = false;                   /* (its hardware contexts' pages kept for now) */
+        ctx_hw_free(&c->ctxs[a[0]]);
+        c->ctxs[a[0]].used = false;
         return 0;
     }
     case 0x34: return ctx_param(c, argp, false);      /* CONTEXT_GETPARAM */
@@ -1347,7 +1540,19 @@ int64_t i915_ioctl(uint32_t slot, uint64_t request, uint64_t argp)
         a[3] = id;
         return copy_to_user((void *)argp, a, 16) ? -EFAULT : 0;
     }
-    case 0x3b: return 0;                              /* VM_DESTROY (kept until the client goes) */
+    case 0x3b: {                                      /* VM_DESTROY { extensions, flags, vm_id } (as VM_CREATE's) */
+        uint32_t a[4];
+        if (copy_from_user(a, (void *)argp, 16)) return -EFAULT;
+        uint32_t id = a[3];
+        if (!id || id > MAX_VMS || !c->vms[id - 1].used) return -ENOENT;
+        for (uint32_t i = 0; i < MAX_CTXS; i++)
+            if (c->ctxs[i].used && c->ctxs[i].vm == id) return 0;   /* a context still on it: kept until the client goes */
+        client_idle(c);
+        for (uint32_t h = 0; h < MAX_HANDLES; h++) if (c->map_vm[h] == id) c->map_vm[h] = 0;
+        i915_vm_destroy(&c->vms[id - 1].vm);
+        c->vms[id - 1].used = false;
+        return 0;
+    }
     case 0x29: return execbuffer(c, argp);            /* GEM_EXECBUFFER2(_WR) */
     default:
         say("i915 ioctl not known: DRM_COMMAND_BASE + ", nr - 0x40);

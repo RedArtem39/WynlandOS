@@ -57,6 +57,8 @@ bool     i915_vm_create(GpuVm *vm);
 bool     i915_vm_map(GpuVm *vm, uint64_t va, uint64_t phys, uint32_t pages, uint32_t pat);
 void     i915_vm_unmap(GpuVm *vm, uint64_t va, uint32_t pages);
 bool     i915_ctx_create(GpuCtx *c, Engine *e, uint64_t pml4);
+void     i915_ctx_destroy(GpuCtx *c);                  /* its pages back once the engine is off it */
+void     i915_vm_destroy(GpuVm *vm);                   /* its page tables back (no context on it) */
 uint32_t i915_ctx_submit(GpuCtx *c, const uint32_t *cmds, uint32_t n);
 bool     i915_wait_seqno(Engine *e, uint32_t seq, uint32_t ms);
 void     i915_engine_reset(Engine *e);
@@ -86,4 +88,5 @@ int      i915_prime_mmap(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *
 int      i915_bo_info(uint32_t slot, uint32_t handle, uint64_t *phys, uint64_t *size, uint32_t *tiling, uint32_t *ref);
 void     i915_bo_unref(uint32_t ref);
 bool     i915_bo_wait_ref(uint32_t ref, uint32_t ms);       /* its queued GPU work done (false: not in time) */
+bool     i915_bo_idle_ref(uint32_t ref);                    /* the same, without waiting */
 int64_t  i915_dumb(uint32_t slot, uint32_t nr, uint64_t argp);

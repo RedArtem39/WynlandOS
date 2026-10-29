@@ -118,6 +118,41 @@ static void fw_put(void)
 /* ---- memory: contiguous pages, and their place in the GGTT ------------ */
 
 
+/* GGTT places given back (gpu_mem_free): taken again first fit, before
+   the bump pointer moves on -- every program's contexts, rings and page
+   table roots come and go with it. (The display's 256 KB-aligned places,
+   i915_ggtt_map, stay bump-allocated: a few per screen.) */
+#define GTT_HOLES 256
+static struct { uint64_t e, n; } g_gtt_holes[GTT_HOLES];
+static uint32_t g_gtt_nholes;
+
+/* an entry index for `pages`, or ~0; with g_lock */
+static uint64_t ggtt_take(uint32_t pages)
+{
+    for (uint32_t i = 0; i < g_gtt_nholes; i++) {
+        if (g_gtt_holes[i].n < pages) continue;
+        uint64_t e = g_gtt_holes[i].e;
+        g_gtt_holes[i].e += pages;
+        g_gtt_holes[i].n -= pages;
+        if (!g_gtt_holes[i].n) g_gtt_holes[i] = g_gtt_holes[--g_gtt_nholes];
+        return e;
+    }
+    if (g_gtt_next + pages > g_gtt_entries) return ~0ull;
+    uint64_t e = g_gtt_next;
+    g_gtt_next += pages;
+    return e;
+}
+
+/* with g_lock: next to a hole, it grows; else a new one (none left: lost) */
+static void ggtt_give(uint64_t e, uint64_t n)
+{
+    for (uint32_t i = 0; i < g_gtt_nholes; i++) {
+        if (g_gtt_holes[i].e + g_gtt_holes[i].n == e) { g_gtt_holes[i].n += n; return; }
+        if (e + n == g_gtt_holes[i].e) { g_gtt_holes[i].e = e; g_gtt_holes[i].n += n; return; }
+    }
+    if (g_gtt_nholes < GTT_HOLES) { g_gtt_holes[g_gtt_nholes].e = e; g_gtt_holes[g_gtt_nholes].n = n; g_gtt_nholes++; }
+}
+
 static bool gpu_mem(GpuMem *m, uint32_t pages)
 {
     void *p = pmm_alloc_contiguous(pages);
@@ -127,20 +162,35 @@ static bool gpu_mem(GpuMem *m, uint32_t pages)
     m->pages = pages;
     memset((void *)m->v, 0, (size_t)pages * 4096);
     uint64_t fl = spin_lock_irqsave(&g_lock);
-    if (g_gtt_next + pages > g_gtt_entries) {
-        spin_unlock_irqrestore(&g_lock, fl);
+    uint64_t e = ggtt_take(pages);
+    spin_unlock_irqrestore(&g_lock, fl);
+    if (e == ~0ull) {
+        for (uint32_t k = 0; k < pages; k++) pmm_free_page((void *)(uintptr_t)(m->phys + (uint64_t)k * 4096));
+        m->pages = 0;
         say("out of GGTT, entries: ", g_gtt_entries);
         return false;
     }
-    uint64_t e = g_gtt_next;
-    g_gtt_next += pages;
-    spin_unlock_irqrestore(&g_lock, fl);
     for (uint32_t k = 0; k < pages; k++) g_gtt[e + k] = (m->phys + (uint64_t)k * 4096) | 1;
     (void)g_gtt[e + pages - 1];
     wr(0x101008, 1);                                  /* GFX_FLSH_CNTL_GEN6: the GGTT's TLB */
     (void)rd(0x101008);
     m->ggtt = (uint32_t)(e * 4096);
     return true;
+}
+
+/* its pages and its GGTT place back (nothing on the GPU uses it any more) */
+static void gpu_mem_free(GpuMem *m)
+{
+    if (!m->pages) return;
+    uint64_t e = m->ggtt / 4096;
+    for (uint32_t k = 0; k < m->pages; k++) g_gtt[e + k] = 0;
+    (void)g_gtt[e + m->pages - 1];
+    wr(0x101008, 1);                                  /* GFX_FLSH_CNTL_GEN6: the GGTT's TLB */
+    uint64_t fl = spin_lock_irqsave(&g_lock);
+    ggtt_give(e, m->pages);
+    spin_unlock_irqrestore(&g_lock, fl);
+    for (uint32_t k = 0; k < m->pages; k++) pmm_free_page((void *)(uintptr_t)(m->phys + (uint64_t)k * 4096));
+    memset(m, 0, sizeof *m);
 }
 
 /* pages already allocated (an object's) at a GGTT place aligned to
@@ -215,11 +265,63 @@ static bool ctx_create(GpuCtx *c, Engine *e, uint64_t pml4)
     return true;
 }
 
+/* A context given up (i915_ctx_destroy) that the engine ran last: it may
+   still be the engine's current one, and the engine saves a context's
+   state into its image when the next one comes in -- freed before, that
+   write lands in someone else's memory. So it waits here: the next
+   request of another context switches it out ("switched"), and the one
+   after (the engine's requests are waited for one by one, kernel/
+   i915_uapi.c) frees it. */
+#define CTX_GRAVES 64
+static struct { Engine *e; GpuMem img, ring; bool switched; } g_graves[CTX_GRAVES];
+
+void i915_ctx_destroy(GpuCtx *c)
+{
+    if (!c->e) return;
+    if (!c->ran) { gpu_mem_free(&c->img); gpu_mem_free(&c->ring); memset(c, 0, sizeof *c); return; }
+    uint64_t fl = spin_lock_irqsave(&g_lock);
+    for (uint32_t i = 0; i < CTX_GRAVES; i++) {
+        if (g_graves[i].e) continue;
+        g_graves[i].e = c->e;
+        g_graves[i].img = c->img;
+        g_graves[i].ring = c->ring;
+        g_graves[i].switched = false;
+        spin_unlock_irqrestore(&g_lock, fl);
+        memset(c, 0, sizeof *c);
+        return;
+    }
+    spin_unlock_irqrestore(&g_lock, fl);
+    say("no room for a context to free: its pages kept, engine ", c->e->base);
+    memset(c, 0, sizeof *c);
+}
+
+/* before `c` goes on its engine: the given-up contexts that are surely off it now */
+static void graves_visit(GpuCtx *c)
+{
+    GpuMem free_img[CTX_GRAVES], free_ring[CTX_GRAVES];
+    uint32_t n = 0;
+    uint64_t fl = spin_lock_irqsave(&g_lock);
+    for (uint32_t i = 0; i < CTX_GRAVES; i++) {
+        if (g_graves[i].e != c->e) continue;
+        if (g_graves[i].switched) {
+            free_img[n] = g_graves[i].img;
+            free_ring[n] = g_graves[i].ring;
+            n++;
+            g_graves[i].e = NULL;
+        } else if (g_graves[i].img.phys != c->img.phys) {
+            g_graves[i].switched = true;              /* this request switches it out */
+        }
+    }
+    spin_unlock_irqrestore(&g_lock, fl);
+    for (uint32_t i = 0; i < n; i++) { gpu_mem_free(&free_img[i]); gpu_mem_free(&free_ring[i]); }
+}
+
 /* commands into the ring, then the request's seqno stored into the
    engine's status page; submitted. The seqno back (0: failed). */
 static uint32_t ctx_submit(GpuCtx *c, const uint32_t *cmds, uint32_t n)
 {
     Engine *e = c->e;
+    graves_visit(c);
     volatile uint32_t *ring = c->ring.v;
     uint32_t need = (n + 30) * 4;
     if (c->tail + need > 4096) {                      /* not at the end: from the start (waited for before) */
@@ -331,6 +433,27 @@ static bool wait_seqno(Engine *e, uint32_t seq, uint32_t ms)
 static bool vm_create(GpuVm *vm)
 {
     return gpu_mem(&vm->pml4, 1);
+}
+
+/* the page tables below `t`, `depth` levels of them (the pages they map
+   are objects', freed with those) */
+static void vm_free_tables(volatile uint64_t *t, int depth)
+{
+    for (uint32_t i = 0; i < 512; i++) {
+        if (!(t[i] & 1)) continue;
+        uint64_t p = t[i] & 0x7FFFFFF000ull;
+        if (depth > 1) vm_free_tables((volatile uint64_t *)P2V(p), depth - 1);
+        pmm_free_page((void *)(uintptr_t)p);
+        t[i] = 0;
+    }
+}
+
+/* an address space no context uses any more: its tables back */
+void i915_vm_destroy(GpuVm *vm)
+{
+    if (!vm->pml4.pages) return;
+    vm_free_tables((volatile uint64_t *)vm->pml4.v, 3);
+    gpu_mem_free(&vm->pml4);
 }
 
 /* the table one level down at `t[i]`: made when missing */

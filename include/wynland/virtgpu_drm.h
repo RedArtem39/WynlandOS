@@ -14,6 +14,9 @@
 #define IS_DRM_DEV(fc) ((fc) == DRM_DEV_CARD || (fc) == DRM_DEV_RENDER)
 /* A dma-buf (PRIME) fd: current_cluster = buffer object index + 1. */
 #define DRM_PRIME_FD   0xFFFFFFD2
+/* A sync_file (a GPU fence as an fd): current_cluster = the Intel GPU
+   driver's sync file index (drivers/gpu/i915_uapi.c). */
+#define DRM_SYNC_FD    0xFFFFFFD3
 
 /* ioctl on a DRM fd. `slot` is the VfsFile's current_cluster (0 = not yet
    bound to a DRM client; the call binds it). Returns 0 or -errno. */

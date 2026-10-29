@@ -1123,6 +1123,18 @@ static bool simple_swap(uint32_t fmt)
 static volatile uint64_t g_simple_phys;  /* the frame's memory */
 static volatile bool g_hw_scan;           /* the Intel display shows the frames itself (no copy) */
 static uint32_t g_flip_surf;              /* the last present's display flip (0: copied) */
+/* A frame the GPU is still drawing: the page flip does not wait for it
+   (the compositor's thread stood in the ioctl while the engine's queue,
+   shared by every program, got to its batch). drm_tick puts it on the
+   display once the GPU is done; its event waits for that. As Linux's
+   atomic commit waits for a frame's fences in a worker. */
+#define SURF_PENDING 1u                   /* an event's hw_surf until its frame is flipped */
+static struct {
+    bool on;
+    uint32_t ref, w, h, pitch, tiling;
+    uint64_t phys, size, since;
+} g_pend;
+static void pend_resolve(uint32_t surf);   /* (below: the events waiting for it) */
 static uint32_t g_simple_tiling;          /* 0 linear, 1 X-tiled (512 B x 8 rows, 4 KB tiles) */
 
 /* the frame's pixel row y, from x on (contiguous to the end of the row,
@@ -1192,9 +1204,25 @@ static void simple_present(DrmFb *fb)
     g_flip_surf = 0;
     if (fb->ext_ref) {
         /* the Intel display shows the object itself: no copy (drivers/gpu/i915_display.c);
-           first the GPU done drawing it (submission is asynchronous) */
+           first the GPU done drawing it (submission is asynchronous) --
+           still drawing: flipped later by drm_tick, no waiting here */
+        if (g_hw_scan && !i915_bo_idle_ref(fb->ext_ref)) {
+            uint64_t pf = spin_lock_irqsave(&g_simple_lock);
+            g_pend.on = true;
+            g_pend.ref = fb->ext_ref; g_pend.phys = fb->ext_phys; g_pend.size = fb->ext_size;
+            g_pend.w = fb->width; g_pend.h = fb->height; g_pend.pitch = fb->pitch; g_pend.tiling = fb->tiling;
+            g_pend.since = timer_get_ms();
+            spin_unlock_irqrestore(&g_simple_lock, pf);
+            g_flip_surf = SURF_PENDING;
+            return;
+        }
         if (!i915_bo_wait_ref(fb->ext_ref, 1000)) ext_say("a frame shown before the GPU was done with it, fb ", fb->id);
+        uint64_t pf = spin_lock_irqsave(&g_simple_lock);
+        bool was_pending = g_pend.on;
+        g_pend.on = false;                            /* (an older one waiting: this newer one instead) */
         uint32_t surf = i915_disp_flip(fb->ext_phys, fb->ext_size, fb->width, fb->height, fb->pitch, fb->tiling);
+        spin_unlock_irqrestore(&g_simple_lock, pf);
+        if (was_pending) pend_resolve(surf);          /* (its event: done with this one) */
         static uint32_t hw_flips;
         if (surf && (++hw_flips == 3 || hw_flips == 10 || hw_flips == 30) && !i915_disp_check(fb->ext_phys, fb->pitch)) {
             surf = 0;                                 /* (it failed: this frame and the rest copied) */
@@ -1285,6 +1313,7 @@ void simpledrm_move_cursor(uint32_t x, uint32_t y)
 
 static void simple_release(void)
 {
+    if (g_pend.on) { g_pend.on = false; pend_resolve(0); }
     if (!g_simple_bo) return;
     if (g_hw_scan) {                                  /* the firmware's framebuffer on the plane again */
         i915_disp_restore();
@@ -1332,6 +1361,11 @@ static void fb_remove(DrmFb *fb)
 {
     if (g_scan_fb == fb->id) kms_restore_console();
     if (fb->ext_ref) {
+        uint64_t pf = spin_lock_irqsave(&g_simple_lock);
+        bool dropped = g_pend.on && g_pend.ref == fb->ext_ref;
+        if (dropped) g_pend.on = false;               /* (its pages go) */
+        spin_unlock_irqrestore(&g_simple_lock, pf);
+        if (dropped) pend_resolve(0);
         i915_bo_unref(fb->ext_ref);
     } else {
         DrmBo *bo = &g_bos[fb->bo - 1];
@@ -1675,7 +1709,7 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
             ev->due_ms = (now / 16 + 1) * 16;   /* > 0 */
             if (g_flip_surf) {                  /* the display's own: its vblank (50 ms at most) */
                 ev->hw_surf = g_flip_surf;
-                ev->due_ms = now + 50;
+                ev->due_ms = now + (g_flip_surf == SURF_PENDING ? 1100 : 50);   /* (waiting for the GPU: drm_tick) */
             }
         }
     }
@@ -1688,6 +1722,9 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
 
 static bool ev_done(const DrmEvent *e)
 {
+    /* not on the display yet -- unless nothing waits any more (resolved
+       before this event was armed: done) */
+    if (e->hw_surf == SURF_PENDING) return !g_pend.on || timer_get_ms() >= e->due_ms;
     if (e->hw_surf && i915_disp_flip_done(e->hw_surf)) return true;
     return e->due_ms ? timer_get_ms() >= e->due_ms : vgpu_done(e->t);
 }
@@ -1744,10 +1781,38 @@ int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
     return (int64_t)done;
 }
 
+/* the events of a frame that waited for the GPU: now its flip's (0: it
+   was not shown -- done at once) */
+static void pend_resolve(uint32_t surf)
+{
+    uint64_t now = timer_get_ms();
+    for (uint32_t s = 0; s < DRM_MAX_CLIENTS; s++)
+        for (uint32_t i = 0; i < DRM_MAX_EVENTS; i++) {
+            DrmEvent *e = &g_clients[s].events[i];
+            if (!g_clients[s].used || !e->used || e->hw_surf != SURF_PENDING) continue;
+            e->hw_surf = surf;
+            e->due_ms = surf ? now + 50 : now;
+        }
+}
+
 /* Timer hook (IRQ context, no sleeping): wake event readers whose flip
    finished. */
 void drm_tick(void)
 {
+    /* a frame the GPU has finished meanwhile: onto the display now */
+    if (g_pend.on) {
+        uint64_t now = timer_get_ms();
+        uint32_t surf = 0;
+        bool flipped = false;
+        uint64_t pf = spin_lock_irqsave(&g_simple_lock);
+        if (g_pend.on && (i915_bo_idle_ref(g_pend.ref) || now - g_pend.since > 1000)) {
+            g_pend.on = false;
+            surf = i915_disp_flip(g_pend.phys, g_pend.size, g_pend.w, g_pend.h, g_pend.pitch, g_pend.tiling);
+            flipped = true;
+        }
+        spin_unlock_irqrestore(&g_simple_lock, pf);
+        if (flipped) pend_resolve(surf);
+    }
     for (uint32_t s = 0; s < DRM_MAX_CLIENTS; s++) {
         DrmClient *c = &g_clients[s];
         if (!c->used) continue;

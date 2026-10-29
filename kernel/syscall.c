@@ -748,6 +748,32 @@ int drm_install_prime_fd(uint32_t idx, uint64_t size, bool cloexec)
     return fd;
 }
 
+/* sync_file fds (a GPU fence): drivers/gpu/i915_uapi.c's sync files */
+int drm_install_sync_fd(uint32_t idx, bool cloexec)
+{
+    Process *p = sched_current()->proc;
+    int fd = get_free_fd(p->fd_table);
+    if (fd < 0) return -24; /* -EMFILE */
+    VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+    if (!f) return -12;
+    memset(f, 0, sizeof(VfsFile));
+    str_copy(f->node.name, "sync_file");
+    f->node.first_cluster = DRM_SYNC_FD;
+    f->current_cluster = idx;
+    p->fd_table[fd] = f;
+    p->fd_flags[fd] = cloexec ? 1 : 0;
+    p->fd_oflags[fd] = LINUX_O_RDWR;
+    return fd;
+}
+
+uint32_t drm_sync_fd_idx(int fd)
+{
+    Process *p = sched_current()->proc;
+    if (fd < 0 || fd >= MAX_OPEN_FILES || !p->fd_table[fd]) return 0;
+    if (p->fd_table[fd]->node.first_cluster != DRM_SYNC_FD) return 0;
+    return p->fd_table[fd]->current_cluster;
+}
+
 uint32_t drm_prime_fd_bo(int fd)
 {
     Process *p = sched_current()->proc;
@@ -1606,6 +1632,17 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
             }
             VfsFile *file = fd_table[fd];
 
+            if (file->node.first_cluster == DRM_SYNC_FD) {
+                /* a GPU fence: readable once signaled */
+                extern bool i915_syncfile_ready(uint32_t i, WaitQueue **wq);
+                WaitQueue *wq = NULL;
+                if (i915_syncfile_ready(file->current_cluster, &wq)) {
+                    if (fds && (fds[i].events & 0x0001)) { fds[i].revents |= 0x0001; ready++; }
+                } else {
+                    single_wq = wq;
+                }
+                continue;
+            }
             if (IS_DRM_DEV(file->node.first_cluster)) {
                 /* readable = a page-flip event is waiting */
                 if (drm_poll_ready(file->current_cluster)) {
@@ -1803,6 +1840,7 @@ void kfile_get(VfsFile *f) {
         if (!ext2_pin_inode(fc)) f->flags &= ~VFS_F_PINNED;
     }
     else if (fc == DRM_PRIME_FD) drm_prime_get(f->current_cluster);
+    else if (fc == DRM_SYNC_FD) { extern void i915_syncfile_get(uint32_t i); i915_syncfile_get(f->current_cluster); }
     else if (IS_DRM_DEV(fc)) drm_client_ref(f->current_cluster);
     else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
              g_pipes[f->current_cluster]) {
@@ -1877,6 +1915,10 @@ void kfile_close(VfsFile *f) {
         kfree(f);
     } else if (fc == DRM_PRIME_FD) {
         drm_prime_put(f->current_cluster); /* never sleeps: BO freed later */
+        kfree(f);
+    } else if (fc == DRM_SYNC_FD) {
+        extern void i915_syncfile_put(uint32_t i);
+        i915_syncfile_put(f->current_cluster);
         kfree(f);
     } else if ((fc == 0xFFFFFFFA || fc == 0xFFFFFFFB) && f->current_cluster < MAX_PIPES &&
                g_pipes[f->current_cluster] && g_pipes[f->current_cluster]->is_pipe) {
@@ -5068,6 +5110,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
                     IS_DRM_DEV(fd_table[fd]->node.first_cluster)) {
                     return (uint64_t)drm_ioctl(&fd_table[fd]->current_cluster, request, a3);
+                }
+                if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    fd_table[fd]->node.first_cluster == DRM_SYNC_FD) {
+                    extern int64_t i915_syncfile_ioctl(uint32_t i, uint64_t request, uint64_t argp);
+                    return (uint64_t)i915_syncfile_ioctl(fd_table[fd]->current_cluster, request, a3);
                 }
                 /* /dev/dsp: OSS ioctls to the HD Audio driver */
                 if (fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
