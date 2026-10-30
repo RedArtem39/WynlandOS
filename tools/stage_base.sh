@@ -111,6 +111,7 @@ gcc -O2 -fPIE -pie -o "$OUT/python3.14" tools/python_launcher.c     "$ROOT/usr/l
 # manager -- yescrypt passwords through libcrypt, as Ubuntu
 gcc -O2 -Wall -o "$OUT/ary" apps/ary/ary.c apps/accounts/accounts.c -lcrypt
 gcc -O2 -Wall -o "$OUT/acct-tools" apps/accounts/tools.c apps/accounts/accounts.c -lcrypt
+gcc -O2 -Wall -o "$OUT/chkpwd" apps/accounts/chkpwd.c apps/accounts/accounts.c -lcrypt
 # reboot, poweroff, halt (apps/power)
 gcc -O2 -Wall -o "$OUT/power" apps/power/power.c
 # insmod, rmmod, lsmod (apps/modtools): kernel modules (kernel/module.c)
@@ -226,6 +227,9 @@ L=$REPO/apps/leaf
     echo "F /usr/lib/wynland/mkliveuser $REPO/rootfs/usr/lib/wynland/mkliveuser"
     echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
     echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
+    # lock screens check the user's own password with it (unix_chkpwd)
+    echo "F /usr/lib/wynland/chkpwd $OUT/chkpwd"
+    echo "P /usr/lib/wynland/chkpwd 0 104755"
     echo "D /etc/dbus-1"
     echo "D /etc/dbus-1/system.d"
     echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"

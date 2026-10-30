@@ -367,6 +367,29 @@ static QByteArray bootCfg()
     return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
 }
 
+// The login screen's skin (what SDDM's themes are): "theme = NAME" in
+// /etc/wynland/login.conf (boot.cfg "logintheme=NAME" over it, for tests)
+// -> /usr/share/wynlogin/themes/NAME/Greeter.qml, a Window given the same
+// `greeter` object, wallpaperUrl and outputName as ours. "", no theme or
+// "default": the built-in one.
+static QString loginTheme()
+{
+    QByteArray name;
+    QFile f(QStringLiteral("/etc/wynland/login.conf"));
+    if (f.open(QIODevice::ReadOnly))
+        for (const QByteArray &raw : f.readAll().split('\n')) {
+            const QByteArray line = raw.trimmed();
+            const int eq = line.indexOf('=');
+            if (eq > 0 && line.left(eq).trimmed() == "theme") name = line.mid(eq + 1).trimmed();
+        }
+    for (const QByteArray &raw : bootCfg().split('\n'))
+        if (raw.trimmed().startsWith("logintheme=")) name = raw.trimmed().mid(11);
+    if (name.isEmpty() || name == "default" || name.contains('/') || name.startsWith('.')) return QString();
+    const QString path = QStringLiteral("/usr/share/wynlogin/themes/") + QString::fromUtf8(name) + QStringLiteral("/Greeter.qml");
+    if (!QFile::exists(path)) { fprintf(stderr, "[zerp2] no login theme %s\n", name.constData()); return QString(); }
+    return path;
+}
+
 // The screen mode chosen with resolution(1): "mode = WxH" in the user's
 // ~/.config/wynland/display.conf, else the machine's /etc/wynland/
 // display.conf (the login screen: only that one). Empty: the connector's
@@ -497,12 +520,23 @@ int main(int argc, char **argv)
     const QString outputName = app.primaryScreen() ? app.primaryScreen()->name() : QStringLiteral("Virtual-1");
     engine.rootContext()->setContextProperty(QStringLiteral("outputName"), outputName);
     const QString qml = greeterMode ? QStringLiteral("Greeter.qml") : QStringLiteral("Shell.qml");
-    engine.load(QUrl::fromLocalFile(QStringLiteral("/usr/share/zerp2/qml/") + qml));
+    // the login screen's skin, if one is chosen (not on the first boot: making
+    // the first account is ours); one that does not load: ours instead
+    const QString theme = greeterMode && !firstBoot ? loginTheme() : QString();
+    if (!theme.isEmpty()) {
+        engine.load(QUrl::fromLocalFile(theme));
+        if (engine.rootObjects().isEmpty() || !qobject_cast<QQuickWindow *>(engine.rootObjects().first())) {
+            fprintf(stderr, "[zerp2] login theme %s did not load: the built-in one\n", qPrintable(theme));
+            engine.clearComponentCache();
+        } else fprintf(stderr, "[zerp2] login theme %s\n", qPrintable(theme));
+    }
+    if (engine.rootObjects().isEmpty() || !qobject_cast<QQuickWindow *>(engine.rootObjects().last()))
+        engine.load(QUrl::fromLocalFile(QStringLiteral("/usr/share/zerp2/qml/") + qml));
     if (engine.rootObjects().isEmpty()) {
         fprintf(stderr, "[zerp2] FAIL: %s did not load\n", qPrintable(qml));
         return 1;
     }
-    auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
+    auto *win = qobject_cast<QQuickWindow *>(engine.rootObjects().last());   // (after a theme that failed: ours)
     if (!win) { fprintf(stderr, "[zerp2] FAIL: root is not a Window\n"); return 1; }
     // the keyboard layout's keymap for Wayland clients goes through its seat
     server.setCompositor(win->findChild<QWaylandCompositor *>());

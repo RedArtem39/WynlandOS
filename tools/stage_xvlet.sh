@@ -20,5 +20,13 @@ mkdir -p "$REPO/build"
     echo "D /usr/share/xvlet"
     (cd "$SRC" && find . -path ./.git -prune -o -type d -print | sed 's|^\./||' | grep -v '^\.$' | sort) | while read -r d; do echo "D /usr/share/xvlet/$d"; done
     (cd "$SRC" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||' | sort) | while read -r f; do echo "F /usr/share/xvlet/$f $SRC/$f"; done
+    # its skin for wynlogin (the login screen), where wynlogin looks for
+    # skins: "theme = xvlet" in /etc/wynland/login.conf picks it
+    if [ -f "$SRC/wynlogin/Greeter.qml" ]; then
+        echo "D /usr/share/wynlogin"
+        echo "D /usr/share/wynlogin/themes"
+        echo "D /usr/share/wynlogin/themes/xvlet"
+        echo "F /usr/share/wynlogin/themes/xvlet/Greeter.qml $SRC/wynlogin/Greeter.qml"
+    fi
 } > "$MAN"
 echo "  XVLET      $(grep -c '^F' "$MAN") files from $SRC ($(cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || echo 'no commit'))"
