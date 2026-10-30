@@ -539,11 +539,20 @@ $(BOOT_CFG): FORCE
 	@printf 'zerp=$(ZERP)\nautotest=$(AUTOTEST)\n%s%s\n' "$(if $(filter 1,$(SNAPSHOT)),snapshot=1\n,)" "$(BOOT_EXTRA)" | sed 's/\\n/\n/g' > $@.tmp
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
+# Your own wallpapers: pictures put in rootfs/usr/share/wynland/wallpapers
+# that ext2_manifest.txt does not list (local, not in the repository).
+# When there are any, the image has only them, the first is the default.
+MY_WALLS := $(shell for f in rootfs/usr/share/wynland/wallpapers/*.png rootfs/usr/share/wynland/wallpapers/*.jpg rootfs/usr/share/wynland/wallpapers/*.webp; do [ -f "$$f" ] && ! grep -q " $$f$$" ext2_manifest.txt && echo "$$f"; done)
+
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
+	@# your own wallpapers (MY_WALLS): in, and then the only ones -- the
+	@# stock photos, the generated spiral and xvlet's generated ones out
+	@$(foreach f,$(MY_WALLS),echo "F /usr/share/wynland/wallpapers/$(notdir $(f)) $(f)" >> $@;)
+	$(if $(MY_WALLS),@grep -vE '^F +/usr/share/wynland/wallpapers/(peaks|fuji|summit|spiral)\.png |^F +/usr/share/wynland/wallpapers/CREDITS |^[FD] +/usr/share/xvlet/assets/walls' $@ > $@.w && mv $@.w $@)
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 	$(if $(filter 1,$(LIVE)),@printf 'F /usr/bin/test-wyn rootfs/usr/bin/test-wyn\nP /usr/bin/test-wyn 0 100755\n' >> $@)
 
@@ -741,7 +750,7 @@ check-tools:
 # Default wallpaper (/wall.png): one of the photos in
 # rootfs/usr/share/wynland/wallpapers (WALLPAPER=fuji, summit, ...); the
 # generated logo one (spiral) is installed beside them
-WALLPAPER ?= peaks
+WALLPAPER ?= $(if $(MY_WALLS),$(basename $(notdir $(firstword $(filter %.png,$(MY_WALLS))))),peaks)
 $(BUILD)/wall.png: rootfs/usr/share/wynland/wallpapers/$(WALLPAPER).png
 	@mkdir -p $(BUILD)
 	@cp $< $@
