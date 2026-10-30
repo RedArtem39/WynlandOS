@@ -2768,6 +2768,10 @@ void process_teardown(Process *proc) {
         kfile_close(f);
     }
 
+    /* the address space goes under the big lock: /proc/PID's readers
+       (kernel/procfs.c) look at it under it */
+    bool had_bkl = g_bkl_owner == (int32_t)this_cpu()->id;
+    if (!had_bkl) bkl_lock();
     vma_free_list(proc);
 
     /* Real address-space teardown: walks the actual page tables (never a
@@ -2781,6 +2785,7 @@ void process_teardown(Process *proc) {
         vmm_destroy_process_pml4(proc->pml4);
         proc->pml4 = NULL;
     }
+    if (!had_bkl) bkl_drop();
 }
 
 bool g_syscall_trace = false;
@@ -2918,6 +2923,72 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     Process *p = sched_current()->proc;   /* after execve: the new image's */
     if (p) { p->st_syscalls++; p->st_sys_tsc += __builtin_ia32_rdtsc() - t0; }
     return r;
+}
+
+/* select()/pselect6(): fd_sets turned into a poll. Its own function (not
+   inlined): its arrays stay out of syscall_dispatch's frame, which every
+   system call pays for. */
+static __attribute__((noinline)) uint64_t do_select(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                                                    uint64_t a5, SyscallRegs *regs, VfsFile **fd_table)
+{
+    /* fd_sets turned into a poll: fish asks "is more input
+       there?" this way after an ESC */
+    int nfds = (int)a1;
+    if (nfds < 0) return (uint64_t)-22;
+    if (nfds > MAX_OPEN_FILES) nfds = MAX_OPEN_FILES;   /* higher fds cannot be open */
+    uint64_t uset[3] = { a2, a3, a4 };
+    uint8_t kset[3][MAX_OPEN_FILES / 8];
+    uint32_t nbytes = (uint32_t)(nfds + 7) / 8;
+    memset(kset, 0, sizeof(kset));
+    for (int k = 0; k < 3; k++)
+        if (uset[k] && nbytes && copy_from_user(kset[k], (const void *)uset[k], nbytes) != 0) return (uint64_t)-14;
+    /* (on the heap: MAX_OPEN_FILES of them is 8 KB -- and in
+       syscall_dispatch's frame it was paid on every system call) */
+    struct wl_pollfd *kfds = (struct wl_pollfd *)kmalloc(sizeof(struct wl_pollfd) * MAX_OPEN_FILES);
+    if (!kfds) return (uint64_t)-12;   /* -ENOMEM */
+    int n = 0;
+    for (int fd = 0; fd < nfds; fd++) {
+        short ev = 0;
+        if (kset[0][fd / 8] & (1 << (fd % 8))) ev |= 0x0001;   /* POLLIN */
+        if (kset[1][fd / 8] & (1 << (fd % 8))) ev |= 0x0004;   /* POLLOUT */
+        if (kset[2][fd / 8] & (1 << (fd % 8))) ev |= 0x0002;   /* POLLPRI */
+        if (!ev) continue;
+        if (!fd_table[fd]) { kfree(kfds); return (uint64_t)-9; }                 /* -EBADF */
+        kfds[n].fd = fd; kfds[n].events = ev; kfds[n].revents = 0;
+        n++;
+    }
+    int64_t timeout_ms = -1;
+    if (a5) {
+        int64_t tv[2];
+        if (copy_from_user(tv, (const void *)a5, sizeof(tv)) != 0) { kfree(kfds); return (uint64_t)-14; }
+        if (tv[0] < 0 || tv[1] < 0) { kfree(kfds); return (uint64_t)-22; }
+        timeout_ms = num == 23 ? tv[0] * 1000 + (tv[1] + 999) / 1000
+                               : tv[0] * 1000 + (tv[1] + 999999) / 1000000;
+    }
+    int64_t me = 0;
+    if (num == 270 && regs->r9) {
+        struct { uint64_t ss, len; } sm;
+        if (copy_from_user(&sm, (const void *)regs->r9, sizeof(sm)) != 0) { kfree(kfds); return (uint64_t)-14; }
+        if (sm.ss) {
+            me = wait_mask_begin(sm.ss, sm.len);
+            if (me < 0) { kfree(kfds); return (uint64_t)me; }
+        }
+    }
+    int ready = do_poll(fd_table, kfds, (uint64_t)n, timeout_ms);
+    if (me) wait_mask_end(ready);
+    if (ready < 0) { kfree(kfds); return (uint64_t)(int64_t)ready; }
+    memset(kset, 0, sizeof(kset));
+    int bits = 0;
+    for (int i = 0; i < n; i++) {
+        int fd = kfds[i].fd;
+        short rv = kfds[i].revents;
+        if ((kfds[i].events & 0x0001) && (rv & (0x0001 | 0x0010 | 0x0008))) { kset[0][fd / 8] |= (uint8_t)(1 << (fd % 8)); bits++; }
+        if ((kfds[i].events & 0x0004) && (rv & (0x0004 | 0x0008))) { kset[1][fd / 8] |= (uint8_t)(1 << (fd % 8)); bits++; }
+        if ((kfds[i].events & 0x0002) && (rv & 0x0002)) { kset[2][fd / 8] |= (uint8_t)(1 << (fd % 8)); bits++; }
+    }
+    for (int k = 0; k < 3; k++)
+        if (uset[k] && nbytes && copy_to_user((void *)uset[k], kset[k], nbytes) != 0) { kfree(kfds); return (uint64_t)-14; }
+    { kfree(kfds); return (uint64_t)bits; }
 }
 
 static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, SyscallRegs *regs) {
@@ -5914,6 +5985,10 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     bool root = str_compare(nm, "/proc") == 0 || str_compare(nm, "/proc/") == 0;
                     const char *prest = NULL;
                     bool piddir = !root && !fds && procfs_target(nm, &prest) && prest && !*prest;
+                    /* .../fd: that process's table (self: ours) */
+                    VfsFile **ft = fd_table;
+                    bool break_fds = false;   /* (an exited one: none) */
+                    if (fds) { Process *fp = procfs_target(nm, NULL); if (fp && !fp->exited) ft = fp->fd_table; else if (fp) break_fds = true; }
                     uint8_t *out = (uint8_t *)a2;
                     uint32_t used = 0;
                     for (;;) {
@@ -5937,7 +6012,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                             type = pid_types[idx - 2];
                         } else if (fds) {
                             int k = (int)idx - 2;
-                            while (k < MAX_OPEN_FILES && !fd_table[k]) k++;
+                            while (k < MAX_OPEN_FILES && (break_fds || !ft[k])) k++;
                             if (k >= MAX_OPEN_FILES) break;
                             pf->offset = (uint32_t)(k + 2);
                             idx = pf->offset;
@@ -6762,63 +6837,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
         case 23:  // SYS_select(nfds, readfds, writefds, exceptfds, struct timeval *)
         case 270: // SYS_pselect6(nfds, readfds, writefds, exceptfds, struct timespec *, {sigset *, size} *)
-            {
-                /* fd_sets turned into a poll: fish asks "is more input
-                   there?" this way after an ESC */
-                int nfds = (int)a1;
-                if (nfds < 0) return (uint64_t)-22;
-                if (nfds > MAX_OPEN_FILES) nfds = MAX_OPEN_FILES;   /* higher fds cannot be open */
-                uint64_t uset[3] = { a2, a3, a4 };
-                uint8_t kset[3][MAX_OPEN_FILES / 8];
-                uint32_t nbytes = (uint32_t)(nfds + 7) / 8;
-                memset(kset, 0, sizeof(kset));
-                for (int k = 0; k < 3; k++)
-                    if (uset[k] && nbytes && copy_from_user(kset[k], (const void *)uset[k], nbytes) != 0) return (uint64_t)-14;
-                struct wl_pollfd kfds[MAX_OPEN_FILES];
-                int n = 0;
-                for (int fd = 0; fd < nfds; fd++) {
-                    short ev = 0;
-                    if (kset[0][fd / 8] & (1 << (fd % 8))) ev |= 0x0001;   /* POLLIN */
-                    if (kset[1][fd / 8] & (1 << (fd % 8))) ev |= 0x0004;   /* POLLOUT */
-                    if (kset[2][fd / 8] & (1 << (fd % 8))) ev |= 0x0002;   /* POLLPRI */
-                    if (!ev) continue;
-                    if (!fd_table[fd]) return (uint64_t)-9;                 /* -EBADF */
-                    kfds[n].fd = fd; kfds[n].events = ev; kfds[n].revents = 0;
-                    n++;
-                }
-                int64_t timeout_ms = -1;
-                if (a5) {
-                    int64_t tv[2];
-                    if (copy_from_user(tv, (const void *)a5, sizeof(tv)) != 0) return (uint64_t)-14;
-                    if (tv[0] < 0 || tv[1] < 0) return (uint64_t)-22;
-                    timeout_ms = num == 23 ? tv[0] * 1000 + (tv[1] + 999) / 1000
-                                           : tv[0] * 1000 + (tv[1] + 999999) / 1000000;
-                }
-                int64_t me = 0;
-                if (num == 270 && regs->r9) {
-                    struct { uint64_t ss, len; } sm;
-                    if (copy_from_user(&sm, (const void *)regs->r9, sizeof(sm)) != 0) return (uint64_t)-14;
-                    if (sm.ss) {
-                        me = wait_mask_begin(sm.ss, sm.len);
-                        if (me < 0) return (uint64_t)me;
-                    }
-                }
-                int ready = do_poll(fd_table, kfds, (uint64_t)n, timeout_ms);
-                if (me) wait_mask_end(ready);
-                if (ready < 0) return (uint64_t)(int64_t)ready;
-                memset(kset, 0, sizeof(kset));
-                int bits = 0;
-                for (int i = 0; i < n; i++) {
-                    int fd = kfds[i].fd;
-                    short rv = kfds[i].revents;
-                    if ((kfds[i].events & 0x0001) && (rv & (0x0001 | 0x0010 | 0x0008))) { kset[0][fd / 8] |= (uint8_t)(1 << (fd % 8)); bits++; }
-                    if ((kfds[i].events & 0x0004) && (rv & (0x0004 | 0x0008))) { kset[1][fd / 8] |= (uint8_t)(1 << (fd % 8)); bits++; }
-                    if ((kfds[i].events & 0x0002) && (rv & 0x0002)) { kset[2][fd / 8] |= (uint8_t)(1 << (fd % 8)); bits++; }
-                }
-                for (int k = 0; k < 3; k++)
-                    if (uset[k] && nbytes && copy_to_user((void *)uset[k], kset[k], nbytes) != 0) return (uint64_t)-14;
-                return (uint64_t)bits;
-            }
+            return do_select(num, a1, a2, a3, a4, a5, regs, fd_table);
         case 41: // SYS_socket
             {
                 int domain = (int)a1;

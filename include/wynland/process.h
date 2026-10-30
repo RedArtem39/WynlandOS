@@ -17,7 +17,9 @@
 #include <wynland/vfs.h>
 #include <wynland/vma.h>
 
-#define MAX_OPEN_FILES 128
+/* Linux's default soft limit: a desktop shell (Wayland, dmabufs, threads'
+   eventfds) with Qt Multimedia (sound streams, their memfds) passes 128 */
+#define MAX_OPEN_FILES 1024
 #define FD_CLOEXEC 1
 
 /* Phase 2 (sec hardening): private per-process heap slot. PML4 index 176

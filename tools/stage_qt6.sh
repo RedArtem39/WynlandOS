@@ -47,6 +47,11 @@ PKGS="$PKGS qt6-wayland-dev libqt6waylandcompositor6 libqt6waylandcompositorxdgs
  libwayland-server0 libwayland-client0 libwayland-cursor0 libwayland-egl1 libxkbcommon0
  qt6-wayland-private-dev"
 
+# Qt Multimedia: sound and video for QML (SoundEffect, MediaPlayer) -- the
+# shells' sounds; FFmpeg decodes (its libraries come with GStreamer's
+# stack), PipeWire plays
+PKGS="$PKGS libqt6multimedia6 qml6-module-qtmultimedia"
+
 # 1. fetch + unpack (cached; only packages not downloaded yet are fetched)
 mkdir -p "$CACHE/debs" "$ROOT"
 NEW=0
@@ -184,6 +189,8 @@ echo "  QT6        built build/libqt-wayland-compositor-linux-dmabuf-unstable-v1
 
 # 3. manifest: QML modules + ldd closure of the app and every QML plugin
 WLPLUG="wayland-shell-integration wayland-decoration-client wayland-graphics-integration-client wayland-graphics-integration-server"
+# (and Qt Multimedia's backend, the same way: a plugin directory, all of it)
+WLPLUG="$WLPLUG multimedia"
 QMLSRC=$LIB/qt6/qml
 QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
 {

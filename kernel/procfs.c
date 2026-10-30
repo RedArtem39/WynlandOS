@@ -15,6 +15,7 @@
 #include <wynland/sandbox.h>
 #include <wynland/vmm.h>
 #include <wynland/vma.h>
+#include <wynland/smp.h>
 #include <wynland/types.h>
 
 extern uint64_t timer_get_ms(void);
@@ -130,8 +131,18 @@ bool procfs_file(Process *p, const char *leaf, char *buf, uint32_t cap, uint32_t
     comm_of(p, comm);
     uint64_t pid = pid_to_ns(p->pid, me);
     uint64_t ppid = pid_to_ns(p->ppid, me), pgrp = pid_to_ns(p->pgid, me), sid = pid_to_ns(p->sid, me);
-    uint64_t rss = p->exited ? 0 : vmm_count_user_pages(p->pml4);
-    uint64_t vsz = p->exited ? 0 : vsize_of(p);
+    /* the memory (its page tables, its VMAs) only for the files showing
+       it -- cmdline and comm are read by the dozen (ps, pgrep, a shell's
+       loop over /proc/[0-9]*); another process's address space is read
+       under the big lock, which its teardown takes to free it */
+    bool mem = same(leaf, "stat") || same(leaf, "statm") || same(leaf, "status");
+    uint64_t rss = 0, vsz = 0;
+    if (mem) {
+        bool had = g_bkl_owner == (int32_t)this_cpu()->id;
+        if (!had) bkl_lock();
+        if (!p->exited && p->pml4) { rss = vmm_count_user_pages(p->pml4); vsz = vsize_of(p); }
+        if (!had) bkl_drop();
+    }
     int nice = 0;   /* (per thread here; main_thread may be gone already) */
 
     if (same(leaf, "cmdline")) {
