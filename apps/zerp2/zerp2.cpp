@@ -1,7 +1,10 @@
 // WynlandOS - Zerp 2.0 client hosting, see zerp2.h.
 #include "zerp2.h"
 
+#include <QtCore/QDir>
+#include <QtCore/QFile>
 #include <QtCore/QFileInfo>
+#include <QtCore/QSaveFile>
 #include <QtCore/QDateTime>
 #include <QtGui/QImage>
 #include <QtGui/QKeyEvent>
@@ -775,4 +778,27 @@ void ZSurface::wheelEvent(QWheelEvent *e)
     mask |= uint32_t(uint8_t(int8_t(qBound(-127, steps, 127)))) << 8;
     m_client->sendMouse(x, y, mask, false);
     e->accept();
+}
+
+// "~/" is the user's home
+static QString homed(const QString &p)
+{
+    return p.startsWith(QLatin1String("~/")) ? qEnvironmentVariable("HOME") + p.mid(1) : p;
+}
+
+QString ZServer::readFile(const QString &path) const
+{
+    QFile f(homed(path));
+    if (!f.open(QIODevice::ReadOnly)) return QString();
+    return QString::fromUtf8(f.readAll());
+}
+
+bool ZServer::writeFile(const QString &path, const QString &text) const
+{
+    const QString p = homed(path);
+    QDir().mkpath(QFileInfo(p).absolutePath());
+    QSaveFile f(p);
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    f.write(text.toUtf8());
+    return f.commit();
 }

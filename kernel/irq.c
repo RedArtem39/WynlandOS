@@ -300,6 +300,12 @@ static void kill_check(InterruptRegisters *regs)
 static void tick_account(InterruptRegisters *regs)
 {
     Thread *at = sched_current();
+    /* the core's own: idle (its idle thread in hlt), in user code, in the
+       kernel -- top, the shell's gauges, /proc/stat */
+    Cpu *cpu = this_cpu();
+    if (!at || at == cpu->idle) cpu->ticks_idle++;
+    else if ((regs->cs & 3) == 3) cpu->ticks_user++;
+    else cpu->ticks_sys++;
     if (at && at->proc && at->proc->pid != 0) {
         /* atomic: threads of one process tick on several cores at once */
         if ((regs->cs & 3) == 3) __atomic_add_fetch(&at->proc->st_user_ticks, 1, __ATOMIC_RELAXED);

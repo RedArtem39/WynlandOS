@@ -44,6 +44,13 @@ typedef struct UsbDev {
     uint8_t  hid_prev[8];
     uint8_t  hid_buttons;
     bool     hid_started;
+    /* a mouse in report protocol: where its report descriptor puts the
+       fields (bit offsets after the report ID; size 0: absent) */
+    bool     hid_parsed;
+    uint8_t  hid_rid;                        /* its report ID, 0: none */
+    uint16_t hid_bo, hid_bn;                 /* buttons: first bit, how many */
+    uint16_t hid_xo, hid_yo, hid_wo;         /* X, Y, the wheel */
+    uint8_t  hid_xs, hid_ys, hid_ws;
 
     /* Mass storage (BOT) */
     bool     storage;

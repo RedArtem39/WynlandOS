@@ -148,6 +148,7 @@ private:
     {
         const QPointF p(e.x, e.y);
         HyprIpc::setCursor(QPoint(e.x, e.y));
+        m_srv->setCursor(QPoint(e.x, e.y));
         Qt::MouseButtons now;
         if (e.buttons & 1) now |= Qt::LeftButton;
         if (e.buttons & 2) now |= Qt::RightButton;
@@ -190,6 +191,10 @@ private:
         if (d == QLatin1String("killactive")) { m_srv->closeFocused(); return; }
         if (d == QLatin1String("fullscreen")) { m_srv->toggleFullscreen(); return; }
         if (d == QLatin1String("exit")) { QCoreApplication::quit(); return; }
+        if (d == QLatin1String("togglecanvas")) { m_srv->toggleCanvas(); return; }
+        if (d == QLatin1String("canvaszoom")) { m_srv->canvasZoom(a.trimmed()); return; }
+        if (d == QLatin1String("canvas")) { m_srv->canvasAction(a.trimmed()); return; }
+        if (d == QLatin1String("cyclewindows")) { m_srv->cycleWindows(a.trimmed().startsWith('p') ? -1 : 1); return; }
         if (d == QLatin1String("movefocus")) {
             const QString w = a.trimmed().toLower();
             if (w.startsWith('l')) m_srv->focusDirection(-1, 0);
@@ -276,7 +281,7 @@ private:
         m_e0 = false;
 
         // modifier tracking for the bindings
-        if (!e0 && code == 0x38) m_alt = !release;
+        if (!e0 && code == 0x38) { m_alt = !release; if (release) m_srv->altReleased(); }
         if (e0 && code == 0x38) m_altR = !release;
         if (e0 && (code == 0x5B || code == 0x5C)) m_super = !release;
         if (!e0 && (code == 0x2A || code == 0x36)) m_shift = !release;
@@ -545,11 +550,26 @@ int main(int argc, char **argv)
         new HyprIpc(&server, outputName, scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
         // the desktop the account chose on its first boot (wynlogin saved
-        // it): Caelestia takes the edges, our bar and dock step aside
-        // (Shell.qml: externalShell) -- and come back if it dies
+        // it; boot.cfg "desktop=NAME" overrides it, for screenshots): a
+        // Quickshell shell (xvlet, Caelestia) takes the edges, our bar and
+        // dock step aside (Shell.qml: externalShell) -- and come back if it dies
+        QByteArray desktop;
         {
             QFile df(qEnvironmentVariable("HOME") + QStringLiteral("/.config/wynland/desktop"));
-            if (df.open(QIODevice::ReadOnly) && df.readAll().trimmed() == "caelestia" &&
+            if (df.open(QIODevice::ReadOnly)) desktop = df.readAll().trimmed();
+            const QByteArray bc = bootCfg();
+            const int d = bc.indexOf("desktop=");
+            if (d >= 0 && (d == 0 || bc[d - 1] == '\n')) desktop = bc.mid(d + 8).split('\n').first().trimmed();
+        }
+        if (desktop == "xvlet" && QFile::exists(QStringLiteral("/usr/bin/quickshell")) &&
+            QFile::exists(QStringLiteral("/usr/share/xvlet/shell.qml"))) {
+            QTimer::singleShot(1000, &server, [&server] {
+                server.run(QStringLiteral("mkdir -p \"$HOME/.cache\"; QT_QUICK_BACKEND=opengl "
+                                          "exec quickshell -p /usr/share/xvlet > \"$HOME/.cache/xvlet.log\" 2>&1"));
+            });
+        }
+        {
+            if (desktop == "caelestia" &&
                 QFile::exists(QStringLiteral("/usr/bin/quickshell"))) {
                 QTimer::singleShot(1000, &server, [&server] {
                     // (its state directory: the launcher's app database is
@@ -637,12 +657,20 @@ int main(int argc, char **argv)
         // "snapat=key+N": N seconds after the first global shortcut
         int snapAt = 60;
         bool afterKey = false;
+        QList<int> series;   // "snapat=40,70,100": several, /tmp/zerp2-snap-N.png (no serial copy)
         const QByteArray cfg = bootCfg();
         const int at = cfg.indexOf("snapat=");
         if (at >= 0) {
             QByteArray v = cfg.mid(at + 7).split('\n').first().trimmed();
             if (v.startsWith("key+")) { afterKey = true; v = v.mid(4); }
+            if (!afterKey && v.contains(',')) for (const QByteArray &s : v.split(',')) series.append(qMax(5, s.trimmed().toInt()));
             snapAt = afterKey ? qMax(1, v.toInt()) : qMax(5, v.toInt());
+        }
+        for (int k = 0; k < series.size(); k++) {
+            QTimer::singleShot(series[k] * 1000, win, [win, k] {
+                const QString f = QStringLiteral("/tmp/zerp2-snap-%1.png").arg(k + 1);
+                if (win->grabWindow().save(f, "PNG")) { ::sync(); fprintf(stderr, "[zerp2] snapshot saved: %s\n", qPrintable(f)); }
+            });
         }
         auto snapshot = [win, greeterMode, firstBoot] {
             ::syscall(1000);   /* WynlandOS: every process's time and threads, on the log */
@@ -663,7 +691,7 @@ int main(int argc, char **argv)
         };
         if (afterKey)
             g_onGlobal = [win, snapAt, snapshot] { QTimer::singleShot(snapAt * 1000, win, snapshot); };
-        else
+        else if (series.isEmpty())
             QTimer::singleShot(snapAt * 1000, win, snapshot);
     }
     const int rc = app.exec();

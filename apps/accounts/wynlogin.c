@@ -245,7 +245,7 @@ static bool run_session(const char *user)
    the session starts; changing it later is editing it) */
 static void save_desktop(const char *user, const char *desktop)
 {
-    if (strcmp(desktop, "zerp") && strcmp(desktop, "caelestia")) return;
+    if (strcmp(desktop, "zerp") && strcmp(desktop, "caelestia") && strcmp(desktop, "xvlet")) return;
     struct passwd *pw = getpwnam(user);
     if (!pw || !pw->pw_dir) return;
     char path[512];

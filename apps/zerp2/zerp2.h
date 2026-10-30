@@ -159,6 +159,8 @@ class ZServer : public QObject
     Q_PROPERTY(QObject *focusedClient READ focusedClient NOTIFY focusChanged)
     Q_PROPERTY(int workspace READ workspace WRITE setWorkspace NOTIFY workspaceChanged)
     Q_PROPERTY(bool showFps READ showFps WRITE setShowFps NOTIFY showFpsChanged)
+    // where the pointer is (the canvas pans when it is pushed at an edge)
+    Q_PROPERTY(QPoint cursor READ cursor NOTIFY cursorChanged)
     // the keyboard layout: "EN", "RU" (the bar's indicator)
     Q_PROPERTY(QString layoutShort READ layoutShort NOTIFY keyboardLayoutChanged)
     Q_PROPERTY(bool multiLayout READ multiLayout NOTIFY keyboardLayoutChanged)
@@ -204,6 +206,21 @@ public:
     Q_INVOKABLE void moveFocusedTo(int workspace);
     Q_INVOKABLE void toggleFullscreen();
     Q_INVOKABLE void focusDirection(int dx, int dy);   // QML layout picks; see Shell.qml
+    // the infinite canvas (Shell.qml keeps it, per workspace): on or off,
+    // and its zoom -- "+", "-", "fit"
+    Q_INVOKABLE void toggleCanvas() { emit canvasToggleRequested(); }
+    Q_INVOKABLE void canvasZoom(const QString &how) { emit canvasZoomRequested(how); }
+    // the rest of the canvas's actions ("fit", "center", "home", "mark set 2"...)
+    Q_INVOKABLE void canvasAction(const QString &what) { emit canvasActionRequested(what); }
+    // Alt-Tab: the next (+1) or previous (-1) window by recent use; the
+    // choice holds while Alt does
+    Q_INVOKABLE void cycleWindows(int dir) { emit cycleRequested(dir); }
+    void altReleased() { emit altUp(); }
+    QPoint cursor() const { return m_cursor; }
+    void setCursor(const QPoint &p) { if (p != m_cursor) { m_cursor = p; emit cursorChanged(); } }
+    // a small file of the session's own (the canvas kept between sessions)
+    Q_INVOKABLE QString readFile(const QString &path) const;
+    Q_INVOKABLE bool writeFile(const QString &path, const QString &text) const;
     Q_INVOKABLE int countOn(int workspace) const;
     bool showFps() const { return m_showFps; }
     void setShowFps(bool s) { if (s != m_showFps) { m_showFps = s; emit showFpsChanged(); } }
@@ -214,6 +231,12 @@ signals:
     void focusChanged();
     void workspaceChanged();
     void focusDirectionRequested(int dx, int dy);
+    void canvasToggleRequested();
+    void canvasZoomRequested(const QString &how);
+    void canvasActionRequested(const QString &what);
+    void cycleRequested(int dir);
+    void altUp();
+    void cursorChanged();
     void showFpsChanged();
     void keyboardLayoutChanged();
     void reloadRequested();   // hyprctl reload: the key bindings and layouts again
@@ -229,6 +252,7 @@ private:
     int m_nextId = 1;
     int m_workspace = 1;
     bool m_showFps = false;
+    QPoint m_cursor;
     QVector<ZClient *> m_clients;
     ZClientModel m_model;
     ZClient *m_focused = nullptr;

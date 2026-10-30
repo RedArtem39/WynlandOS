@@ -4,6 +4,8 @@
  *   ary CMD [ARGS...]   run one command as root
  *   ary su              a root shell ($SHELL, else fish)
  *   ary -S ...          the password from stdin, not the terminal
+ *   ary --check         is the password on stdin the caller's own? exit 0
+ *                       or 1, nothing more (a shell's lock screen, any account)
  *
  * Administrators -- the members of the "wheel" group -- become root with
  * their OWN password, as on Ubuntu or macOS; root itself has none (its
@@ -64,6 +66,20 @@ int main(int argc, char **argv)
     if (geteuid() != 0) {
         fprintf(stderr, "ary: not installed setuid root\n");
         return 1;
+    }
+    if (!strcmp(argv[i], "--check")) {
+        /* the caller's own password, for any account: read /etc/shadow
+           (root's, this is why it is here), answer, become nobody else */
+        struct passwd *pw = getpwuid(getuid());
+        if (!pw) return 1;
+        char user[64], pwd[256];
+        snprintf(user, sizeof user, "%s", pw->pw_name);
+        g_stdin = 1;
+        ask("", pwd, sizeof pwd);
+        bool ok = acct_check_password(user, pwd);
+        explicit_bzero(pwd, sizeof pwd);
+        if (!ok) sleep(1);                 /* (guessing at speed: not here) */
+        return ok ? 0 : 1;
     }
     uid_t real = getuid();
     if (real != 0) {

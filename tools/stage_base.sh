@@ -229,7 +229,7 @@ L=$REPO/apps/leaf
     echo "D /etc/dbus-1"
     echo "D /etc/dbus-1/system.d"
     echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"
-    for s in wynlogin testuser liveuser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     echo "F /usr/bin/leaf $L/leaf"

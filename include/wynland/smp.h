@@ -55,6 +55,8 @@ typedef struct Cpu {
     volatile uint32_t tlb_flush; /* set by tlb_shootdown(), cleared once flushed */
     volatile bool online;
     bool prof_exc;               /* the big lock held for an exception from user code (its profile) */
+    /* where its 1 kHz ticks went (kernel/irq.c tick_account; /proc/stat) */
+    volatile uint64_t ticks_user, ticks_sys, ticks_idle;
 } Cpu;
 
 extern Cpu g_cpus[MAX_CPUS];

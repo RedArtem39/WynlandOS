@@ -322,6 +322,7 @@ bool usb_control(UsbDev *d, uint8_t rt, uint8_t req, uint16_t val, uint16_t idx,
 {
     if (len > 512) len = 512;
     if (len && !in) memcpy(g_ctl_buf, buf, len);
+    if (len && in) memset(g_ctl_buf, 0, len);   /* a short answer: the rest reads as zero */
 
     uint64_t fl = spin_lock_irqsave(&g_usb_lock);
     g_ctl_slot = d->slot;

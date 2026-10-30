@@ -13,21 +13,36 @@ Item {
     property real wsOffset: 0
     property int borderWidth: 2
     property int cornerRadius: 12
+    // on the infinite canvas: target is in the plane's coordinates, drawn
+    // through the camera -- moved by pan, scaled by zoom (the client keeps
+    // its own size); animate off while the camera or the window is dragged
+    property point pan: Qt.point(0, 0)
+    property real zoom: 1
+    property bool animate: true
+    // held by the hand on the canvas: a little bigger about its middle
+    property real lift: 1
+    Behavior on lift { NumberAnimation { duration: 360; easing.type: Easing.OutBack; easing.overshoot: 2.2 } }
+    property real lean: 0               // degrees: it leans with its speed when thrown or held
 
     readonly property bool active: client && client.focused
     readonly property color edgeLeft: active ? "#6fb3ff" : "#22262e"
     readonly property color edgeRight: active ? "#3d7eff" : "#22262e"
 
-    x: target.x + wsOffset
-    y: target.y
+    x: (target.x - pan.x) * zoom + wsOffset
+    y: (target.y - pan.y) * zoom
     width: target.width
     height: target.height
+    transform: [
+        Scale { origin.x: tile.width / 2; origin.y: tile.height / 2; xScale: tile.lift; yScale: tile.lift },
+        Rotation { origin.x: tile.width / 2; origin.y: tile.height / 2; angle: tile.lean },
+        Scale { xScale: tile.zoom; yScale: tile.zoom }
+    ]
     visible: target.width > 0 && Math.abs(wsOffset) < 4000
 
-    Behavior on x { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
-    Behavior on y { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
-    Behavior on width { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
-    Behavior on height { NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+    Behavior on x { enabled: tile.animate; NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+    Behavior on y { enabled: tile.animate; NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+    Behavior on width { enabled: tile.animate; NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
+    Behavior on height { enabled: tile.animate; NumberAnimation { duration: 260; easing.type: Easing.OutCubic } }
 
     // open: pop in
     scale: 0.95

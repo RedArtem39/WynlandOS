@@ -1,0 +1,4 @@
+description=the xvlet demo boot's account (live, as the live stick's): screenshots of the shell in QEMU
+type=oneshot
+exec=/usr/lib/wynland/mkliveuser
+when=xvdemo=1

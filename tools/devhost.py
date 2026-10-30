@@ -24,13 +24,24 @@ NEW_BOOT_AFTER = 20.0          # seconds of silence: the next datagram starts a 
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
-    """GET: the files; POST /report: a program's output, kept in build/netlog"""
+    """GET: the files; POST /report: a program's output, POST /snap: a picture -- kept in build/netlog"""
     logs = ''
 
     def do_POST(self) -> None:
         n = int(self.headers.get('Content-Length') or 0)
         body = self.rfile.read(n) if n else b''
-        name = os.path.join(self.logs, time.strftime('report-%Y%m%d-%H%M%S.txt'))
+        if self.path.startswith('/snap'):
+            # a picture of the screen (Zerp's snapshot, curl'd from a QEMU
+            # boot): kept as it is, not printed
+            name = os.path.join(self.logs, time.strftime('snap-%Y%m%d-%H%M%S') + '-%03d.png' % (int(time.time() * 1000) % 1000))
+            with open(name, 'wb') as f:
+                f.write(body)
+            print(f'\n== a picture from {self.client_address[0]}: {name} ({len(body)} bytes)', flush=True)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'ok\n')
+            return
+        name = os.path.join(self.logs, time.strftime('report-%Y%m%d-%H%M%S') + '-%03d.txt' % (int(time.time() * 1000) % 1000))
         with open(name, 'wb') as f:
             f.write(body)
         print(f'\n== a report from {self.client_address[0]}: {name}\n' + body.decode('utf-8', 'replace'), flush=True)

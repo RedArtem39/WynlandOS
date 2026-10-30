@@ -344,6 +344,10 @@ QByteArray HyprIpc::dispatch(const QByteArray &line)
         return "ok";
     }
     if (d == "fullscreen") { m_srv->toggleFullscreen(); return "ok"; }
+    if (d == "togglecanvas") { m_srv->toggleCanvas(); return "ok"; }
+    if (d == "canvaszoom") { m_srv->canvasZoom(QString::fromUtf8(arg).trimmed()); return "ok"; }
+    if (d == "canvas") { m_srv->canvasAction(QString::fromUtf8(arg).trimmed()); return "ok"; }
+    if (d == "cyclewindows") { m_srv->cycleWindows(arg.trimmed().startsWith('p') ? -1 : 1); return "ok"; }
     if (d == "movefocus") {
         const char dir = arg.isEmpty() ? 'r' : arg[0];
         m_srv->focusDirection(dir == 'l' ? -1 : dir == 'r' ? 1 : 0, dir == 'u' ? -1 : dir == 'd' ? 1 : 0);

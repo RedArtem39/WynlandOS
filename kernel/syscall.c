@@ -1259,10 +1259,16 @@ static bool proc_info_text(const char *path, PText *t) {
         return true;
     }
     if (str_compare(path, "/proc/stat") == 0) {
-        /* user nice system idle ...: all of it as idle, which nobody measures */
-        pt_s(t, "cpu  0 0 0 "); pt_u(t, cs * g_cpu_count); pt_s(t, " 0 0 0 0 0 0\n");
+        /* user nice system idle ...: each core's ticks (kernel/irq.c
+           tick_account, 1 kHz) in USER_HZ (100), and their sum */
+        uint64_t su = 0, ss = 0, si = 0;
         for (uint32_t cpu = 0; cpu < g_cpu_count; cpu++) {
-            pt_s(t, "cpu"); pt_u(t, cpu); pt_s(t, " 0 0 0 "); pt_u(t, cs); pt_s(t, " 0 0 0 0 0 0\n");
+            su += g_cpus[cpu].ticks_user; ss += g_cpus[cpu].ticks_sys; si += g_cpus[cpu].ticks_idle;
+        }
+        pt_s(t, "cpu  "); pt_u(t, su / 10); pt_s(t, " 0 "); pt_u(t, ss / 10); pt_s(t, " "); pt_u(t, si / 10); pt_s(t, " 0 0 0 0 0 0\n");
+        for (uint32_t cpu = 0; cpu < g_cpu_count; cpu++) {
+            pt_s(t, "cpu"); pt_u(t, cpu); pt_s(t, " "); pt_u(t, g_cpus[cpu].ticks_user / 10); pt_s(t, " 0 ");
+            pt_u(t, g_cpus[cpu].ticks_sys / 10); pt_s(t, " "); pt_u(t, g_cpus[cpu].ticks_idle / 10); pt_s(t, " 0 0 0 0 0 0\n");
         }
         pt_s(t, "intr 0\nctxt 0\nbtime "); pt_u(t, rtc_get_unix_time() - ms / 1000);
         pt_s(t, "\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n");
@@ -1946,8 +1952,112 @@ static int flock_try(uint32_t ino, VfsFile *f, bool ex) {
     return 0;
 }
 
+/* fcntl's record locks, as Linux's: byte ranges, read (shared) or write
+   (exclusive), held by a process (F_SETLK, released by any close of the
+   file by that process) or by the open file (F_OFD_SETLK). F_GETLK says
+   which lock would conflict. They used to be stubs -- every F_SETLK won,
+   F_GETLK always "unlocked": Quickshell, which tells a live instance by
+   its instance.lock, found none, and `quickshell ipc` reached nothing.
+   A lock whose process has exited is no longer held. ext2 files only. */
+#define MAX_PLOCKS 256
+#define PL_EOF ((int64_t)0x7FFFFFFFFFFFFFFFLL)
+typedef struct { bool used; uint32_t ino; int64_t s, e; int16_t type; uint64_t pid; VfsFile *ofd; } PLock;
+static PLock g_plocks[MAX_PLOCKS];
+static Spinlock g_plock_lock = SPINLOCK_INIT("plock");
+struct k_flock { int16_t l_type, l_whence; int32_t pad; int64_t l_start, l_len; int32_t l_pid, pad2; };
+
+static bool plock_alive(const PLock *l) {
+    if (l->ofd) return true;
+    Process *p = process_find_by_pid(l->pid);
+    return p && !p->exited;
+}
+static bool plock_mine(const PLock *l, uint64_t pid, VfsFile *ofd) { return ofd ? l->ofd == ofd : (!l->ofd && l->pid == pid); }
+/* the owner's locks over [s, e) go (split where they stick out) */
+static void plock_clear(uint32_t ino, int64_t s, int64_t e, uint64_t pid, VfsFile *ofd) {
+    for (int i = 0; i < MAX_PLOCKS; i++) {
+        PLock *l = &g_plocks[i];
+        if (!l->used || l->ino != ino || !plock_mine(l, pid, ofd) || l->e <= s || l->s >= e) continue;
+        if (l->s < s && l->e > e) {                    /* it covers the range: two pieces */
+            for (int j = 0; j < MAX_PLOCKS; j++) if (!g_plocks[j].used) { g_plocks[j] = *l; g_plocks[j].s = e; break; }
+            l->e = s;
+        } else if (l->s < s) l->e = s;
+        else if (l->e > e) l->s = e;
+        else l->used = false;
+    }
+}
+static PLock *plock_conflict(uint32_t ino, int64_t s, int64_t e, int16_t type, uint64_t pid, VfsFile *ofd) {
+    for (int i = 0; i < MAX_PLOCKS; i++) {
+        PLock *l = &g_plocks[i];
+        if (!l->used || l->ino != ino || plock_mine(l, pid, ofd) || l->e <= s || l->s >= e) continue;
+        if (!plock_alive(l)) { l->used = false; continue; }
+        if (type == 1 /* F_WRLCK */ || l->type == 1) return l;
+    }
+    return NULL;
+}
+static void plock_drop_file(VfsFile *f) {
+    uint64_t fl = spin_lock_irqsave(&g_plock_lock);
+    Thread *t = sched_current();
+    uint64_t pid = t && t->proc ? t->proc->pid : 0;
+    uint32_t ino = f->node.first_cluster;
+    for (int i = 0; i < MAX_PLOCKS; i++) {
+        PLock *l = &g_plocks[i];
+        if (l->used && (l->ofd == f || (!l->ofd && l->ino == ino && l->pid == pid))) l->used = false;
+    }
+    spin_unlock_irqrestore(&g_plock_lock, fl);
+}
+/* F_GETLK / F_SETLK / F_SETLKW and their OFD forms: 0 or -errno */
+static int64_t plock_fcntl(VfsFile *f, int cmd, uint64_t arg) {
+    struct k_flock fk;
+    if (!arg || copy_from_user(&fk, (const void *)arg, sizeof fk) != 0) return -14;
+    uint32_t ino = f->node.first_cluster;
+    if (ino >= 0xFFFFFF00u) {                          /* not a file on disk: nothing conflicts */
+        if (cmd == 5 || cmd == 36) { fk.l_type = 2; if (copy_to_user((void *)arg, &fk, sizeof fk) != 0) return -14; }
+        return 0;
+    }
+    if (fk.l_type < 0 || fk.l_type > 2) return -22;
+    int64_t base = fk.l_whence == 0 ? 0 : fk.l_whence == 1 ? (int64_t)f->offset : fk.l_whence == 2 ? (int64_t)f->node.size : -1;
+    if (base < 0) return -22;
+    int64_t s = base + fk.l_start, e = fk.l_len == 0 ? PL_EOF : s + fk.l_len;
+    if (fk.l_len < 0) { e = s; s += fk.l_len; }
+    if (s < 0) return -22;
+    const bool ofd = cmd >= 36;
+    Thread *t = sched_current();
+    const uint64_t pid = t && t->proc ? t->proc->pid : 0;
+    VfsFile *owner = ofd ? f : NULL;
+    for (;;) {
+        uint64_t fl = spin_lock_irqsave(&g_plock_lock);
+        PLock *c = fk.l_type == 2 ? NULL : plock_conflict(ino, s, e, fk.l_type, pid, owner);
+        if (cmd == 5 || cmd == 36) {                   /* F_GETLK: the one in the way, or F_UNLCK */
+            if (c) {
+                fk.l_type = c->type; fk.l_whence = 0; fk.l_start = c->s;
+                fk.l_len = c->e == PL_EOF ? 0 : c->e - c->s;
+                fk.l_pid = c->ofd ? -1 : (int32_t)pid_to_ns(c->pid, t->proc);
+            } else fk.l_type = 2;
+            spin_unlock_irqrestore(&g_plock_lock, fl);
+            return copy_to_user((void *)arg, &fk, sizeof fk) != 0 ? -14 : 0;
+        }
+        if (!c) {
+            plock_clear(ino, s, e, pid, owner);
+            int64_t r = 0;
+            if (fk.l_type != 2) {
+                int i = 0;
+                while (i < MAX_PLOCKS && g_plocks[i].used) i++;
+                if (i == MAX_PLOCKS) r = -37;          /* -ENOLCK */
+                else g_plocks[i] = (PLock){ true, ino, s, e, fk.l_type, pid, owner };
+            }
+            spin_unlock_irqrestore(&g_plock_lock, fl);
+            return r;
+        }
+        spin_unlock_irqrestore(&g_plock_lock, fl);
+        if (cmd == 6 || cmd == 37) return -11;         /* F_SETLK: -EAGAIN */
+        if (sleep_interrupted()) return -4;            /* F_SETLKW: wait, a signal ends it */
+        sched_sleep_ms(10);
+    }
+}
+
 void kfile_close(VfsFile *f) {
     flock_drop(f);
+    plock_drop_file(f);
     /* the slot is empty already: a lock-free reader that saw f is past
        g_fdtab_lock (and done with f) once this gets it */
     { uint64_t bf = spin_lock_irqsave(&g_fdtab_lock); spin_unlock_irqrestore(&g_fdtab_lock, bf); }
@@ -5186,6 +5296,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (on) fd_oflags[fd] |= LINUX_O_NONBLOCK; else fd_oflags[fd] &= ~LINUX_O_NONBLOCK;
                     return 0;
                 }
+                /* FIONREAD on a pipe: what is waiting in it (QProcess reads
+                   that much; without it, a byte per wakeup -- and loses the rest) */
+                if (request == 0x541B && fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    (fd_table[fd]->node.first_cluster == 0xFFFFFFFA || fd_table[fd]->node.first_cluster == 0xFFFFFFFB) &&
+                    fd_table[fd]->current_cluster < MAX_PIPES && g_pipes[fd_table[fd]->current_cluster]) {
+                    KPipe *p = g_pipes[fd_table[fd]->current_cluster];
+                    int n = p->is_eventfd ? 8 : (int)p->count;
+                    return copy_to_user(argp, &n, 4) ? (uint64_t)-14 : 0;
+                }
                 /* DRM render/card node: straight to the virtio-gpu DRM layer
                    (hot path -- EXECBUFFER per draw batch -- so before the
                    per-call serial log below). */
@@ -5432,16 +5551,15 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                         return (uint64_t)-24; /* -EMFILE */
                     }
                     case 5:   /* F_GETLK */
+                    case 6:   /* F_SETLK */
+                    case 7:   /* F_SETLKW */
                     case 36:  /* F_OFD_GETLK */
-                        /* Locks are not tracked (every F_SETLK succeeds), so
-                           no lock can conflict: say F_UNLCK. Returning 0 with
-                           the struct untouched told SQLite that another
-                           process held its WAL lock -- it then retried with
-                           sleeps for about a minute (WebKit's localStorage,
-                           YouTube's load). */
-                        if (!a3 || !user_prepare_write(a3, 2)) return (uint64_t)-14;   /* -EFAULT */
-                        *(int16_t *)(uintptr_t)a3 = 2;                             /* l_type = F_UNLCK */
-                        return 0;
+                    case 37:  /* F_OFD_SETLK */
+                    case 38:  /* F_OFD_SETLKW */
+                        /* record locks (plock_fcntl); stdin/out/err as
+                           not-yet-materialized: nothing to lock */
+                        if (fd >= MAX_OPEN_FILES || !fd_table[fd]) return (uint64_t)-9;
+                        return (uint64_t)plock_fcntl(fd_table[fd], cmd, a3);
                     default:
                         return 0; /* Stub: unknown fcntl commands (F_SETLK & co.) succeed silently */
                 }

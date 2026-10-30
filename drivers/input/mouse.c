@@ -452,6 +452,7 @@ void mouse_inject_usb(int dx, int dy, uint8_t buttons, int wheel)
         mouse_buttons = btns;
         mouse_wheel = wh;
         mouse_event_push();
+        mouse_wheel = 0;   /* one report's turn: the next move is not a scroll */
 
         if (mouse_hw_cursor()) {
             extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);

@@ -2,6 +2,6 @@ description=the login screen and the user's session (Zerp 2.0)
 type=daemon
 exec=/usr/sbin/wynlogin
 provide=display
-after=liveuser
+after=liveuser xvdemouser
 when=zerp=2 kms=virgl|simple autotest=0
 restart=always

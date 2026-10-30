@@ -3,6 +3,7 @@
 dbus
 bluez-stub
 liveuser
+xvdemouser
 console
 wynlogin
 testuser
