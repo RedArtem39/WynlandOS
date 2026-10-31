@@ -79,9 +79,7 @@ static void tlb_remote(PageTable *pml4, uint64_t virt)
     uint64_t i4 = PML4_INDEX(virt);
     bool shared = pml4 == g_kernel_pml4 ||
                   (g_kernel_pml4 && pml4->entries[i4] == g_kernel_pml4->entries[i4]);
-    /* (a batch belongs to the big lock's holder: a fault resolved
-       outside it -- kernel/idt.c -- flushes at once, never into it) */
-    if (!g_tlb_batch || g_bkl_owner != (int32_t)this_cpu()->id) {
+    if (!g_tlb_batch) {
         tlb_shootdown(shared ? NULL : pml4);
         return;
     }
