@@ -2784,11 +2784,10 @@ bool vfs_may_access(const char *path, uint32_t want) {
     Ext2Inode inode;
     if (!ext2_lookup_path(path, &inum, &inode)) return true;
     uint32_t have = vfs_perm_for(inode.i_uid, inode.i_gid, inode.i_mode);
-    if ((have & want) == want) return true;
-    serial_write_string("perm: denied ");
-    serial_write_string(path);
-    serial_write_string("\r\n");
-    return false;
+    /* (no word on the log: an answer, not an event -- access(W_OK) asked
+       thousands of times by a program polling its files filled the serial
+       log, under the big lock) */
+    return (have & want) == want;
 }
 
 /* chown: root may give a file to anyone; its owner may only move it to

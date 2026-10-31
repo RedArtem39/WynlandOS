@@ -109,12 +109,18 @@ Item {
         Behavior on blur { NumberAnimation { duration: 300 } }
     }
 
-    // ---- the border: a conic gradient turning around the focused window
+    // ---- the border: a conic gradient that turns once round the window
+    // when it gets the focus, then rests (turning for ever, as Hyprland's
+    // borderangle loop, redrew the whole screen every frame -- every one a
+    // GPU submission under the kernel's big lock here)
     property real spin: 0
-    NumberAnimation on spin {
-        from: 0; to: 360; duration: 7000; loops: Animation.Infinite
-        running: tile.fx && tile.active && !tile.flat && tile.visible
+    NumberAnimation {
+        id: spinOnce
+        target: tile; property: "spin"
+        from: 0; to: 360; duration: 1400
+        easing.type: Easing.BezierSpline; easing.bezierCurve: tile.curve
     }
+    onActiveChanged: if (active && fx && !flat) spinOnce.restart()
     Shape {
         anchors.fill: parent
         visible: !tile.flat
