@@ -66,6 +66,9 @@ HyprIpc::HyprIpc(ZServer *server, const QString &monitorName, QSize monitorSize,
     connect(m_srv, &ZServer::focusChanged, this, &HyprIpc::scheduleSync);
     connect(m_srv, &ZServer::workspaceChanged, this, &HyprIpc::scheduleSync);
     connect(m_srv, &ZServer::layoutChanged, this, &HyprIpc::scheduleSync);
+    // what the compositor has to say for the shell to show (Shell.qml)
+    connect(m_srv, &ZServer::ipcEventRequested, this,
+            [this](const QString &n, const QString &d) { event(n.toUtf8(), d.toUtf8()); });
     // the keyboard layout switched: Hyprland's event (Caelestia's bar shows it)
     connect(m_srv, &ZServer::keyboardLayoutChanged, this, [this] {
         event("activelayout", "at-translated-set-2-keyboard," + m_srv->layoutName().toUtf8());

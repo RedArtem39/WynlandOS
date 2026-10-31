@@ -44,6 +44,8 @@ class ZClient : public QObject
     Q_PROPERTY(bool fullscreen READ fullscreen WRITE setFullscreen NOTIFY fullscreenChanged)
     /* the client draws with alpha (ZERP_MSG_ALPHA): blended, glass behind */
     Q_PROPERTY(bool alpha READ alpha NOTIFY alphaChanged)
+    /* gone, but still drawn a moment (its last frame) while it closes */
+    Q_PROPERTY(bool closing READ closing NOTIFY closingChanged)
 public:
     ZClient(int id, const QString &path, QObject *parent);
     ZClient(int id, QObject *xdgSurface, QObject *parent);   // a Wayland toplevel
@@ -59,6 +61,8 @@ public:
     void setFocused(bool f);
     bool fullscreen() const { return m_fullscreen; }
     bool alpha() const { return m_alpha; }
+    bool closing() const { return m_closing; }
+    void setClosing() { if (!m_closing) { m_closing = true; emit closingChanged(); } }
     void setFullscreen(bool f);
     bool wayland() const { return m_wayland; }
     QObject *shellSurface() const { return m_xdg; }
@@ -97,6 +101,7 @@ signals:
     void focusedChanged();
     void fullscreenChanged();
     void alphaChanged();
+    void closingChanged();
     void damaged();
     void fullscreenRequested(ZClient *self, bool on);   // a Wayland client asked
 
@@ -107,7 +112,7 @@ private:
     int m_id;
     QString m_path, m_title, m_appId;
     int m_workspace = 1;
-    bool m_focused = false, m_fullscreen = false, m_alpha = false;
+    bool m_focused = false, m_fullscreen = false, m_alpha = false, m_closing = false;
     int m_c2s = -1, m_s2c = -1;
     long m_pid = -1;
     uint32_t *m_shm = nullptr;
@@ -216,6 +221,10 @@ public:
     // choice holds while Alt does
     Q_INVOKABLE void cycleWindows(int dir) { emit cycleRequested(dir); }
     void altReleased() { emit altUp(); }
+    // an event for the shell on Hyprland's event socket ("name>>data"):
+    // what Zerp would have shown itself (the canvas on, the zoom) is the
+    // shell's to show
+    Q_INVOKABLE void ipcEvent(const QString &name, const QString &data) { emit ipcEventRequested(name, data); }
     QPoint cursor() const { return m_cursor; }
     void setCursor(const QPoint &p) { if (p != m_cursor) { m_cursor = p; emit cursorChanged(); } }
     // a small file of the session's own (the canvas kept between sessions)
@@ -240,6 +249,7 @@ signals:
     void showFpsChanged();
     void keyboardLayoutChanged();
     void reloadRequested();   // hyprctl reload: the key bindings and layouts again
+    void ipcEventRequested(const QString &name, const QString &data);
 
 private:
     void applyLayout();

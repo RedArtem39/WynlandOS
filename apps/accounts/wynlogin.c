@@ -240,12 +240,12 @@ static bool run_session(const char *user)
     return WIFEXITED(st) && WEXITSTATUS(st) == SESSION_RESTART;
 }
 
-/* The desktop the account chose on the first boot ("zerp", "caelestia"):
+/* The shell the account chose on the first boot ("xvlet", "caelestia"):
    ~/.config/wynland/desktop, the user's own file (Zerp 2.0 reads it when
    the session starts; changing it later is editing it) */
 static void save_desktop(const char *user, const char *desktop)
 {
-    if (strcmp(desktop, "zerp") && strcmp(desktop, "caelestia") && strcmp(desktop, "xvlet")) return;
+    if (strcmp(desktop, "caelestia") && strcmp(desktop, "xvlet")) return;
     struct passwd *pw = getpwnam(user);
     if (!pw || !pw->pw_dir) return;
     char path[512];

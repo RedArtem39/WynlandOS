@@ -28,7 +28,7 @@ public:
     bool caelestia() const;
 
     Q_INVOKABLE void login(const QString &user, const QString &password);
-    // desktop: "zerp" (Zerp's own bar and dock) or "caelestia"
+    // desktop: the shell, "xvlet" or "caelestia"
     Q_INVOKABLE void createAccount(const QString &user, const QString &fullName, const QString &password,
                                    const QString &desktop = QString());
     Q_INVOKABLE void quit();          // after the fade-out: wynlogin takes over

@@ -519,6 +519,10 @@ int main(int argc, char **argv)
     ZServer server(uint32_t(scr.width()) * uint32_t(scr.height()) * 4u);
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("zerp"), &server);
+    // the windows' effects (shadows, real rounded corners, the moving
+    // border): on a GPU; drawn by the CPU (simpledrm + llvmpipe) they would
+    // cost every frame, so there only the motion stays
+    engine.rootContext()->setContextProperty(QStringLiteral("gpuEffects"), !software);
     engine.addImportPath(QStringLiteral("/usr/lib/x86_64-linux-gnu/qt6/qml"));
     QObject::connect(&engine, &QQmlApplicationEngine::warnings, [](const QList<QQmlError> &ws) {
         for (const QQmlError &w : ws) fprintf(stderr, "[zerp2] %s\n", qPrintable(w.toString()));
@@ -595,10 +599,12 @@ int main(int argc, char **argv)
         // shells made for Hyprland (Quickshell's) talk to us as to it
         new HyprIpc(&server, outputName, scr, &app);
         server.spawn(QStringLiteral("/usr/bin/term"));   // a terminal to start with
-        // the desktop the account chose on its first boot (wynlogin saved
-        // it; boot.cfg "desktop=NAME" overrides it, for screenshots): a
-        // Quickshell shell (xvlet, Caelestia) takes the edges, our bar and
-        // dock step aside (Shell.qml: externalShell) -- and come back if it dies
+        // The shell: Zerp is the compositor, the bar, the dock and the rest
+        // are a shell's (Quickshell: xvlet by default, Caelestia when the
+        // account chose it on its first boot -- ~/.config/wynland/desktop;
+        // boot.cfg "desktop=NAME" over it, for screenshots). Started always,
+        // and again when it dies (five times, two seconds apart; a clean
+        // exit -- quit -- ends it).
         QByteArray desktop;
         {
             QFile df(qEnvironmentVariable("HOME") + QStringLiteral("/.config/wynland/desktop"));
@@ -607,23 +613,26 @@ int main(int argc, char **argv)
             const int d = bc.indexOf("desktop=");
             if (d >= 0 && (d == 0 || bc[d - 1] == '\n')) desktop = bc.mid(d + 8).split('\n').first().trimmed();
         }
-        if (desktop == "xvlet" && QFile::exists(QStringLiteral("/usr/bin/quickshell")) &&
-            QFile::exists(QStringLiteral("/usr/share/xvlet/shell.qml"))) {
-            QTimer::singleShot(1000, &server, [&server] {
-                server.run(QStringLiteral("mkdir -p \"$HOME/.cache\"; QT_QUICK_BACKEND=opengl "
-                                          "exec quickshell -p /usr/share/xvlet > \"$HOME/.cache/xvlet.log\" 2>&1"));
-            });
+        const bool haveQs = QFile::exists(QStringLiteral("/usr/bin/quickshell"));
+        const bool haveXvlet = QFile::exists(QStringLiteral("/usr/share/xvlet/shell.qml"));
+        QString shellCmd, shellLog;
+        if (haveQs && (desktop == "caelestia" || !haveXvlet)) {
+            // (its state directory: the launcher's app database is there --
+            // Caelestia's CLI makes it, not in the image)
+            shellCmd = QStringLiteral("quickshell -c caelestia");
+            shellLog = QStringLiteral("$HOME/.cache/caelestia.log");
+        } else if (haveQs) {
+            shellCmd = QStringLiteral("quickshell -p /usr/share/xvlet");
+            shellLog = QStringLiteral("$HOME/.cache/xvlet.log");
         }
-        {
-            if (desktop == "caelestia" &&
-                QFile::exists(QStringLiteral("/usr/bin/quickshell"))) {
-                QTimer::singleShot(1000, &server, [&server] {
-                    // (its state directory: the launcher's app database is
-                    // there -- Caelestia's CLI makes it, not in the image)
-                    server.run(QStringLiteral("mkdir -p \"$HOME/.cache\" \"$HOME/.local/state/caelestia\"; QT_QUICK_BACKEND=opengl "
-                                              "exec quickshell -c caelestia > \"$HOME/.cache/caelestia.log\" 2>&1"));
-                });
-            }
+        if (!shellCmd.isEmpty()) {
+            const QString cmd = QStringLiteral(
+                "mkdir -p \"$HOME/.cache\" \"$HOME/.local/state/caelestia\"; : > \"%2\"; n=0; while [ $n -lt 5 ]; do "
+                "QT_QUICK_BACKEND=opengl %1 >> \"%2\" 2>&1 && break; n=$((n + 1)); "
+                "echo \"[zerp2] the shell ended -- again ($n)\" >> \"%2\"; sleep 2; done").arg(shellCmd, shellLog);
+            QTimer::singleShot(1000, &server, [&server, cmd] { server.run(cmd); });
+        } else {
+            fprintf(stderr, "[zerp2] no shell (quickshell is not installed): windows only\n");
         }
         // debugging: boot.cfg "wlrun=CMD[;CMD...]" -- programs started a few
         // seconds in (Wayland clients, for the picture and the tests)

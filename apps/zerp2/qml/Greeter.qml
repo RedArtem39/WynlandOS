@@ -36,7 +36,7 @@ Window {
 
     property bool active: greeter.firstBoot          // the panel is up
     // first boot: the desktop the new account starts with
-    property string desktop: "zerp"
+    property string desktop: "xvlet"
     property bool failed: false
     property string status: greeter.firstBoot ? "new system" : "locked"
 
@@ -212,17 +212,17 @@ Window {
                 }
             }
 
-            // first boot: which desktop -- Zerp's own bar and dock, or the
-            // Caelestia shell (Quickshell) when it is installed
+            // first boot: which shell -- xvlet (ours), or Caelestia when it
+            // is installed
             Row {
                 visible: greeter.firstBoot && greeter.caelestia
                 anchors.horizontalCenter: parent.horizontalCenter
                 spacing: root.s(10)
                 Pill {
-                    icon: "desktop"; label: "Zerp"
-                    fg: root.desktop === "zerp" ? root.accent : root.subtext
-                    border.width: root.desktop === "zerp" ? 1 : 0; border.color: root.accent
-                    onClicked: root.desktop = "zerp"
+                    icon: "desktop"; label: "xvlet"
+                    fg: root.desktop === "xvlet" ? root.accent : root.subtext
+                    border.width: root.desktop === "xvlet" ? 1 : 0; border.color: root.accent
+                    onClicked: root.desktop = "xvlet"
                 }
                 Pill {
                     icon: "desktop"; label: "Caelestia"

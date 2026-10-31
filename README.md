@@ -23,9 +23,12 @@ real laptop (an Intel Tiger Lake machine) from a USB stick.
 ## What it does today
 
 **Desktop — Zerp 2.0.** Our Wayland compositor, written in Qt Quick and drawn
-on the GPU: virtio-gpu + virgl in QEMU, the Intel GPU on the laptop. Tiling,
-or an infinite canvas per workspace (Alt+G): windows dragged with Alt and
-thrown on springs, the view panned and zoomed, Alt-Tab with live previews.
+on the GPU: virtio-gpu + virgl in QEMU, the Intel GPU on the laptop. Like
+Hyprland it draws only windows — panels, launchers and notices are the
+shell's: tiling, or an infinite canvas per workspace (Alt+G) with windows
+dragged with Alt and thrown on springs, the view panned and zoomed; windows
+that pop in and out on Hyprland's curve, real rounded corners, shadows and
+a turning gradient border on the focused one.
 xdg-shell, layer-shell, linux-dmabuf and global shortcuts; X11 programs
 through Xwayland (`xrun xterm`). It answers Hyprland's IPC, so shells made
 for Hyprland run on it.

@@ -2,6 +2,8 @@
 #include "zerp2.h"
 
 #include <QtCore/QDir>
+#include <QtCore/QPointer>
+#include <QtCore/QTimer>
 #include <QtCore/QFile>
 #include <QtCore/QFileInfo>
 #include <QtCore/QSaveFile>
@@ -582,10 +584,17 @@ void ZServer::remove(const QVector<ZClient *> &gone, const char *why)
     if (gone.isEmpty()) return;
     for (ZClient *c : gone) {
         fprintf(stderr, "[zerp2] client %d %s\n", c->id(), why);
-        m_clients.removeOne(c);
-        m_model.remove(c);
+        m_clients.removeOne(c);           // out of the layout now
         if (c == m_focused) m_focused = nullptr;
-        c->deleteLater();
+        // still drawn while it closes (Tile.qml: its last frame shrinks
+        // and fades), then out of the model too
+        c->setClosing();
+        QPointer<ZClient> keep(c);
+        QTimer::singleShot(320, this, [this, keep] {
+            if (!keep) return;
+            m_model.remove(keep);
+            keep->deleteLater();
+        });
     }
     emit clientsChanged();
     if (!m_focused) refocus();

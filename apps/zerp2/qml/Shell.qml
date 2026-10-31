@@ -22,24 +22,18 @@ Window {
     readonly property int gapIn: 10
     readonly property int border: 2
     readonly property int radius: 12
-    readonly property int barHeight: 34
-    readonly property int dockReserve: 84
 
-    // a desktop shell of its own (Caelestia, any layer-shell panel with an
-    // exclusive zone): it has the edges, our bar and dock step aside
+    // Zerp draws no panels of its own: the shell's (layer surfaces) keep
+    // their strips (exclusive zones), the windows tile in what is left
     readonly property var reserved: layerShell.reserved
-    readonly property bool externalShell: reserved.top > 0 || reserved.bottom > 0 || reserved.left > 0 || reserved.right > 0
 
     // usable area for tiles
-    readonly property rect area: externalShell
-        ? Qt.rect(reserved.left + gapOut, reserved.top + gapOut,
-                  width - reserved.left - reserved.right - 2 * gapOut,
-                  height - reserved.top - reserved.bottom - 2 * gapOut)
-        : Qt.rect(gapOut, barHeight + gapOut, width - 2 * gapOut, height - barHeight - dockReserve - 2 * gapOut)
+    readonly property rect area: Qt.rect(reserved.left + gapOut, reserved.top + gapOut,
+                                         width - reserved.left - reserved.right - 2 * gapOut,
+                                         height - reserved.top - reserved.bottom - 2 * gapOut)
     onAreaChanged: relayout()
 
-    // a full-screen window in front: the bar and the dock step aside (they
-    // sit above the windows and covered its top -- a browser's toolbar)
+    // a full-screen window in front: the shell's panels step aside
     readonly property bool fullscreenOn: {
         const f = zerp.focusedClient
         return !!f && f.fullscreen && f.workspace === zerp.workspace
@@ -293,8 +287,7 @@ Window {
             }
         }
         canvasOn = on;
-        canvasNote.show(on[ws] ? "Бесконечный холст" : "Тайлинг",
-                        on[ws] ? "Alt+G — обратно · колёсико и перетаскивание · Ctrl+колёсико — масштаб · Alt+мышь — окна" : "Alt+G — холст");
+        zerp.ipcEvent("canvas", on[ws] ? "1" : "0");
         relayout();
     }
     // zoom about a point of the screen (the pointer, or the view's middle)
@@ -303,7 +296,7 @@ Window {
         var z = Math.max(.15, Math.min(2.5, camZ * f));
         var px = camX + sx / camZ, py = camY + sy / camZ;
         camX = px - sx / z; camY = py - sy / z; camZ = z;
-        canvasNote.show(Math.round(z * 100) + "%", "");
+        zerp.ipcEvent("canvaszoom", String(Math.round(z * 100)));
     }
     // the camera to a place, gliding
     function lookAt(x, y, z) {
@@ -328,7 +321,7 @@ Window {
         if (!n) { lookAt(0, 0, 1); return; }
         var z = Math.max(.15, Math.min(1, area.width / (x1 - x0 + 80), area.height / (y1 - y0 + 80)));
         lookAt((x0 + x1) / 2 - (area.x + area.width / 2) / z, (y0 + y1) / 2 - (area.y + area.height / 2) / z, z);
-        canvasNote.show(Math.round(z * 100) + "%", "все окна");
+        zerp.ipcEvent("canvaszoom", Math.round(z * 100) + ",all");
     }
     // a focused window out of view: the camera brings it in
     function reveal(c) {
@@ -394,23 +387,25 @@ Window {
             // the origin, and back
             if (homeBack) { lookAt(homeBack.x, homeBack.y, homeBack.z); homeBack = null; }
             else { homeBack = { x: camX, y: camY, z: camZ }; lookAt(0, 0, 1); }
-            canvasNote.show(homeBack ? "Начало холста" : "Обратно", "Alt+A");
+            zerp.ipcEvent("canvashome", homeBack ? "home" : "back");
         } else if (w[0] === "mark" && w.length === 3) {
             var key = zerp.workspace + ":" + w[2], m = Object.assign({}, marks);
-            if (w[1] === "set") { m[key] = { x: camX, y: camY, z: camZ }; marks = m; saveLater.restart(); canvasNote.show("Место " + w[2] + " запомнено", "Ctrl+Alt+" + w[2] + " — сюда"); }
-            else if (m[key]) { lookAt(m[key].x, m[key].y, m[key].z); canvasNote.show("Место " + w[2], ""); }
-            else canvasNote.show("Место " + w[2] + " пусто", "Ctrl+Alt+Shift+" + w[2] + " — запомнить");
+            if (w[1] === "set") { m[key] = { x: camX, y: camY, z: camZ }; marks = m; saveLater.restart(); zerp.ipcEvent("canvasmark", "set," + w[2]); }
+            else if (m[key]) { lookAt(m[key].x, m[key].y, m[key].z); zerp.ipcEvent("canvasmark", "go," + w[2]); }
+            else zerp.ipcEvent("canvasmark", "empty," + w[2]);
         }
     }
 
-    // ---- Alt-Tab: the windows by recent use; Alt held keeps the choice open
+    // ---- Alt-Tab: the windows by recent use, each Tab focusing the next at
+    // once (no window of Zerp's: a shell may draw a switcher from the IPC);
+    // the order holds while Alt does
     property var mru: []                 // client ids, the latest first
     property var switchList: []
     property int switchSel: -1
     readonly property bool switching: switchSel >= 0
     function noteFocus() {
         var f = zerp.focusedClient;
-        if (!f) return;
+        if (!f || switching) return;
         var l = mru.filter(function (id) { return id !== f.id; });
         l.unshift(f.id); mru = l;
     }
@@ -426,14 +421,16 @@ Window {
             switchList = l;
             switchSel = dir > 0 ? 1 : l.length - 1;
         } else switchSel = (switchSel + dir + switchList.length) % switchList.length;
-    }
-    function commitSwitch() {
-        if (!switching) return;
         var c = switchList[switchSel];
-        switchSel = -1;
         if (!c) return;
         if (c.workspace !== zerp.workspace) zerp.workspace = c.workspace;
         zerp.focus(c);
+        if (isCanvas(c.workspace) && !c.fullscreen) reveal(c);
+    }
+    function commitSwitch() {
+        if (!switching) return;
+        switchSel = -1;
+        noteFocus();
     }
 
     // ---- momentum: a flick of the empty space keeps the camera going
@@ -738,76 +735,6 @@ Window {
         onWheel: w => { if (w.modifiers & Qt.ControlModifier) shell.canvasWheel(w); else w.accepted = false; }
     }
 
-    // ---- Alt-Tab's row: the windows by recent use, the chosen one lit
-    Rectangle {
-        z: 130
-        visible: shell.switching
-        anchors.centerIn: parent
-        width: Math.min(shell.width - 80, switchRow.implicitWidth + 32); height: switchRow.implicitHeight + 32
-        radius: 28
-        color: "#ee111318"
-        Row {
-            id: switchRow
-            anchors.centerIn: parent
-            spacing: 10
-            Repeater {
-                model: shell.switching ? shell.switchList : []
-                Rectangle {
-                    id: card
-                    required property var modelData
-                    required property int index
-                    readonly property bool on: index === shell.switchSel
-                    // the window's own picture, live (its tile, wherever it is)
-                    readonly property Item src: shell.tileOf(modelData)
-                    width: 260; height: 196
-                    radius: on ? 30 : 22
-                    color: on ? "#2b4a8a" : "#1d2129"
-                    scale: on ? 1.05 : 1
-                    Behavior on scale { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
-                    Behavior on radius { NumberAnimation { duration: 300; easing.type: Easing.OutBack } }
-                    Rectangle {
-                        x: 12; y: 12; width: 236; height: 140; radius: 14
-                        color: "#10131a"; clip: true
-                        ShaderEffectSource {
-                            readonly property real k: card.src ? Math.min(236 / Math.max(1, card.src.width), 140 / Math.max(1, card.src.height)) : 1
-                            anchors.centerIn: parent
-                            width: card.src ? card.src.width * k : 0; height: card.src ? card.src.height * k : 0
-                            sourceItem: card.src && card.src.visible ? card.src : null
-                            live: true; hideSource: false
-                        }
-                        Text { anchors.centerIn: parent; visible: !card.src || !card.src.visible; text: "стол " + card.modelData.workspace; color: "#6f7889"; font.pixelSize: 13 }
-                    }
-                    Text { x: 14; y: 158; width: 232; text: (modelData.appId || "?").split(".").pop() + (modelData.title ? " — " + modelData.title : ""); color: on ? "#ffffff" : "#eef2f8"; font.pixelSize: 13; font.bold: true; elide: Text.ElideRight }
-                    Text { x: 14; y: 176; text: "стол " + modelData.workspace + (shell.isCanvas(modelData.workspace) ? " · холст" : ""); color: on ? "#dbe6ff" : "#6f7889"; font.pixelSize: 11; font.bold: true }
-                }
-            }
-        }
-    }
-
-    // what changed: the mode, the zoom -- a pill low in the middle, a moment
-    Rectangle {
-        id: canvasNote
-        z: 120
-        anchors.horizontalCenter: parent.horizontalCenter
-        y: parent.height * .8
-        width: noteCol.implicitWidth + 44; height: noteCol.implicitHeight + 24
-        radius: height / 2
-        color: "#e6111318"
-        opacity: 0
-        visible: opacity > 0
-        Behavior on opacity { NumberAnimation { duration: 220 } }
-        function show(t, sub) { noteT.text = t; noteS.text = sub; opacity = 1; noteHide.restart(); }
-        Timer { id: noteHide; interval: 1600; onTriggered: canvasNote.opacity = 0 }
-        Column {
-            id: noteCol
-            anchors.centerIn: parent
-            spacing: 2
-            Text { id: noteT; anchors.horizontalCenter: parent.horizontalCenter; color: "#eef2f8"; font.pixelSize: 17; font.bold: true }
-            Text { id: noteS; anchors.horizontalCenter: parent.horizontalCenter; color: "#9aa3b2"; font.pixelSize: 12; visible: text !== "" }
-        }
-    }
-
-    // FPS meter (mod+P)
     property int fps: 0
     property int frames: 0
     onFrameSwapped: frames++
@@ -924,20 +851,5 @@ Window {
         }
     }
 
-    Bar {
-        anchors { left: parent.left; right: parent.right; top: parent.top }
-        height: shell.barHeight
-        fps: zerp.showFps ? shell.fps : -1
-        visible: !shell.fullscreenOn && !shell.externalShell
-        z: 40
-    }
-
-    Dock {
-        anchors { horizontalCenter: parent.horizontalCenter; bottom: parent.bottom; bottomMargin: 10 }
-        screenW: shell.width
-        screenH: shell.height
-        visible: !shell.fullscreenOn && !shell.externalShell
-        z: 40
-    }
 
 }
