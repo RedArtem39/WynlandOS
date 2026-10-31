@@ -643,6 +643,33 @@ static bool fault_in_file(Process *proc, VMA *v, uint64_t page)
    (the loop); held, nothing here sleeps any more. */
 extern KMutex g_fs_mutex;
 
+/* A user page fault resolved without the big kernel lock (kernel/idt.c),
+   under the process's mm_lock only: a fresh zeroed page in an anonymous
+   lazy region, or a copy-on-write write. Anything else -- a file page, a
+   page in swap, no memory without reclaiming, a real fault -- is false:
+   the full path (vma_fault_in and the rest, under the big lock) decides. */
+bool vma_fault_fast(Process *proc, uint64_t addr, uint32_t access, uint64_t err)
+{
+    if (!proc || !proc->pml4) return false;
+    uint64_t page = addr & ~(uint64_t)(PAGE_SIZE - 1);
+    if (!(err & 1)) {
+        VMA *v = vma_find(proc, addr);
+        if (!v || (v->flags & VMA_GUARD) || (v->prot & access) != access) return false;
+        uint64_t raw = vmm_get_pte_raw(proc->pml4, page);
+        if (raw & PAGE_PRESENT) return true;            /* another thread of it was first */
+        if (pte_swapped(raw) || !(v->flags & VMA_LAZY) || ((v->flags & VMA_FILE) && v->file)) return false;
+        void *frame = pmm_alloc_page();                  /* (no reclaim here: that is the big lock's) */
+        if (!frame) return false;
+        uint64_t *z = (uint64_t *)P2V((uint64_t)(uintptr_t)frame);
+        for (uint32_t i = 0; i < PAGE_SIZE / 8; i++) z[i] = 0;
+        vmm_map_page(proc->pml4, page, (uint64_t)(uintptr_t)frame, pte_flags_for(v));
+        return true;
+    }
+    if ((err & 3) == 3 && (vmm_get_page_flags(proc->pml4, page) & PAGE_COW))
+        return vmm_resolve_cow_page(proc->pml4, page);
+    return false;
+}
+
 bool vma_fault_in(Process *proc, uint64_t addr, uint32_t access)
 {
     if (!proc || !proc->pml4) return false;

@@ -16,6 +16,7 @@
 #include <wynland/vmm.h>
 #include <wynland/vfs.h>
 #include <wynland/vma.h>
+#include <wynland/kmutex.h>
 
 /* Linux's default soft limit: a desktop shell (Wayland, dmabufs, threads'
    eventfds) with Qt Multimedia (sound streams, their memfds) passes 128 */
@@ -55,6 +56,12 @@ typedef struct Process {
                           convention). Never updated afterward (this OS has
                           no reparent-to-init-on-parent-exit behavior). */
     PageTable *pml4;
+    /* The address space's own lock (its VMAs, its page tables): taken by
+       the calls that change them (kernel/syscall.c, syscall_dispatcher),
+       by every page fault's resolution -- the anonymous and copy-on-write
+       ones without the big kernel lock -- by teardown, /proc and swap
+       (trylock). Order: the big lock, then this, then the filesystem's. */
+    KMutex     mm_lock;
     VfsFile   *fd_table[MAX_OPEN_FILES];
     uint32_t   fd_flags[MAX_OPEN_FILES];   /* Per-fd flags (FD_CLOEXEC etc.) */
     uint32_t   fd_oflags[MAX_OPEN_FILES];  /* Per-fd open status flags */

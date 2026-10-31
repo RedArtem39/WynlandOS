@@ -248,6 +248,34 @@ void exception_handler(InterruptRegisters *regs)
         regs->rip = (uint64_t)(uintptr_t)uaccess_nofault_fixup;   /* no resolving at all */
         return;
     }
+    /* A user page fault: a fresh anonymous page or a copy-on-write
+       resolved under the process's own mm_lock, without the big lock (the
+       entry stub left it for here); anything else takes the big lock, as
+       every other exception from user mode. */
+    if (regs->int_no == 14 && (regs->cs & 3) == 3) {
+        uint64_t cr2;
+        __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+        Thread *ut = sched_current();
+        Process *up = ut ? ut->proc : NULL;
+        if (up && cr2 < 0x0000800000000000ULL) {
+            uint32_t access = (regs->err_code & 0x10) ? VMA_PROT_EXEC :
+                              (regs->err_code & 0x2) ? VMA_PROT_WRITE : VMA_PROT_READ;
+            uint64_t t0 = __builtin_ia32_rdtsc();
+            kmutex_lock(&up->mm_lock);
+            bool done = vma_fault_fast(up, cr2, access, regs->err_code);
+            kmutex_unlock(&up->mm_lock);
+            if (done) {
+                up->st_faults++;
+                up->st_fault_tsc += __builtin_ia32_rdtsc() - t0;
+                return;
+            }
+        }
+        bkl_lock();
+        took = true;
+        /* (a sleep on either lock let another fault on this core change
+           CR2: the full path below reads it again) */
+        __asm__ volatile("mov %0, %%cr2" :: "r"(cr2) : "memory");
+    }
     if (regs->int_no == 14 && (regs->cs & 3) != 3) {
         uint64_t cr2;
         __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
@@ -291,6 +319,11 @@ static void exception_handler_main(InterruptRegisters *regs)
        user half of the address space. */
     uint64_t pf_cr2 = 0;
     if (regs->int_no == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(pf_cr2));
+    /* the address space's lock over the resolutions below (the fast path's
+       is taken without the big lock: they exclude each other by it) */
+    Thread *pf_t = sched_current();
+    Process *pf_mm = (regs->int_no == 14 && pf_cr2 < 0x0000800000000000ULL && pf_t) ? pf_t->proc : NULL;
+    if (pf_mm) kmutex_lock(&pf_mm->mm_lock);
 
     /* Demand paging: a not-present fault (err bit 0 clear) in a lazy
        anonymous region gets its zeroed frame now, and the instruction
@@ -308,7 +341,7 @@ static void exception_handler_main(InterruptRegisters *regs)
             bool ok = vma_fault_in(ft->proc, pf_cr2, access);
             ft->proc->st_faults++;
             ft->proc->st_fault_tsc += __builtin_ia32_rdtsc() - t0;
-            if (ok) return;
+            if (ok) { if (pf_mm) kmutex_unlock(&pf_mm->mm_lock); return; }
         }
     }
     if (regs->int_no == 14 && (regs->err_code & 0x3) == 0x3 &&
@@ -322,6 +355,7 @@ static void exception_handler_main(InterruptRegisters *regs)
                a still-shared page; fall through to the fatal path below
                rather than spin re-faulting forever in that case. */
             if (vmm_resolve_cow_page(pml4, cr2)) {
+                if (pf_mm) kmutex_unlock(&pf_mm->mm_lock);
                 return;
             }
         }
@@ -349,10 +383,12 @@ static void exception_handler_main(InterruptRegisters *regs)
             ft->spurious_tsc = now;
             if (ft->spurious_n <= 4) {
                 __asm__ volatile("invlpg (%0)" :: "r"(pf_cr2) : "memory");
+                if (pf_mm) kmutex_unlock(&pf_mm->mm_lock);
                 return;
             }
         }
     }
+    if (pf_mm) kmutex_unlock(&pf_mm->mm_lock);
 
     if (uaccess_fault_fixup(regs)) return;   /* a lock-free copy: -EFAULT */
 

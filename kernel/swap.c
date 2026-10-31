@@ -257,7 +257,9 @@ uint32_t swap_reclaim(uint32_t want)
             Process *p = process_list_head();
             while (p && j < idx) { p = p->next; j++; }
             if (!p || p->pid == 0 || !p->pml4 || p->exited || p->vfork_shared) continue;
+            if (!kmutex_trylock(&p->mm_lock)) continue;   /* its pages are on the move: next */
             freed += reclaim_process(p, want - freed);
+            kmutex_unlock(&p->mm_lock);
         }
         s_turn++;
     }

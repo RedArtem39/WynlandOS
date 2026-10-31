@@ -158,6 +158,10 @@ isr_common_stub:
     swapgs
     mov rbx, [gs:CPU_FX_USER]
     FPU_SAVE rbx
+    ; a page fault: the C handler decides whether it needs the big lock
+    ; (kernel/idt.c: anonymous and copy-on-write faults do not)
+    cmp qword [rsp + 120], 14
+    je .exception_handler_nosave
     call bkl_lock
 .exception_handler_nosave:
 

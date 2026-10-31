@@ -140,7 +140,9 @@ bool procfs_file(Process *p, const char *leaf, char *buf, uint32_t cap, uint32_t
     if (mem) {
         bool had = g_bkl_owner == (int32_t)this_cpu()->id;
         if (!had) bkl_lock();
+        kmutex_lock(&p->mm_lock);
         if (!p->exited && p->pml4) { rss = vmm_count_user_pages(p->pml4); vsz = vsize_of(p); }
+        kmutex_unlock(&p->mm_lock);
         if (!had) bkl_drop();
     }
     int nice = 0;   /* (per thread here; main_thread may be gone already) */

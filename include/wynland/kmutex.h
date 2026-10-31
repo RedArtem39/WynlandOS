@@ -29,3 +29,4 @@ typedef struct KMutex {
 void kmutex_lock(KMutex *m);
 void kmutex_unlock(KMutex *m);
 bool kmutex_held(const KMutex *m);   /* by the current thread */
+bool kmutex_trylock(KMutex *m);      /* taken (or already ours) now, or false: never sleeps */

@@ -51,6 +51,19 @@ void kmutex_unlock(KMutex *m)
     if (last) waitqueue_wake_all(&m->wq);
 }
 
+bool kmutex_trylock(KMutex *m)
+{
+    Thread *me = sched_current();
+    if (!me) return true;
+    uint64_t f = spin_lock_irqsave(&m->lock);
+    bool ok = true;
+    if (m->owner == me) m->depth++;
+    else if (!m->owner) { m->owner = me; m->depth = 1; }
+    else ok = false;
+    spin_unlock_irqrestore(&m->lock, f);
+    return ok;
+}
+
 bool kmutex_held(const KMutex *m)
 {
     Thread *me = sched_current();

@@ -2772,6 +2772,7 @@ void process_teardown(Process *proc) {
        (kernel/procfs.c) look at it under it */
     bool had_bkl = g_bkl_owner == (int32_t)this_cpu()->id;
     if (!had_bkl) bkl_lock();
+    kmutex_lock(&proc->mm_lock);
     vma_free_list(proc);
 
     /* Real address-space teardown: walks the actual page tables (never a
@@ -2785,6 +2786,7 @@ void process_teardown(Process *proc) {
         vmm_destroy_process_pml4(proc->pml4);
         proc->pml4 = NULL;
     }
+    kmutex_unlock(&proc->mm_lock);
     if (!had_bkl) bkl_drop();
 }
 
@@ -2916,9 +2918,24 @@ uint64_t syscall_dispatcher(uint64_t num, uint64_t a1, uint64_t a2, uint64_t a3,
     uint64_t tpid = tr ? sched_current()->proc->pid : 0;
     if (tr && (num == 0 || num == 7 || num == 23 || num == 270 || num == 271 || num == 61 || num == 202 || num == 232 || num == 281))
         strace_line(tpid, num, a1, a2, a3, (uint64_t)-1000);   /* blocking calls: also on entry */
+    /* a call that changes the address space holds its lock throughout
+       (the anonymous and copy-on-write faults resolve under it alone,
+       without the big lock -- kernel/idt.c):
+       mmap, mprotect, munmap, brk, mremap, mincore, madvise, shmat, clone,
+       fork, vfork, execve, shmdt, execveat, pkey_mprotect, clone3. Not
+       exit: the reaper takes it to tear the space down. */
+    Process *mmp = NULL;
+    if (!gate->in_syscall && gate->proc &&
+        (num == 9 || num == 10 || num == 11 || num == 12 || num == 25 || num == 27 || num == 28 ||
+         num == 30 || num == 56 || num == 57 || num == 58 || num == 59 || num == 67 ||
+         num == 322 || num == 329 || num == 435)) {
+        mmp = gate->proc;
+        kmutex_lock(&mmp->mm_lock);
+    }
     gate->in_syscall++;
     uint64_t r = syscall_dispatch(num, a1, a2, a3, a4, a5, regs);
     gate->in_syscall--;
+    if (mmp) kmutex_unlock(&mmp->mm_lock);
     if (tr) strace_line(tpid, num, a1, a2, a3, r);
     Process *p = sched_current()->proc;   /* after execve: the new image's */
     if (p) { p->st_syscalls++; p->st_sys_tsc += __builtin_ia32_rdtsc() - t0; }

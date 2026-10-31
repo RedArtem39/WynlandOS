@@ -491,6 +491,10 @@ void tlb_shootdown(void *pml4)
                 pending &= ~(1u << i);
         if (!pending) break;
         __builtin_ia32_pause();
+        /* (another core may be shooting down at this one meanwhile -- page
+           faults resolve outside the big lock, two at once: answer it, or
+           both wait for each other with interrupts off) */
+        tlb_poll(me);
         if (__builtin_ia32_rdtsc() - t0 > 4000000000ULL) {   /* > ~1 s: a core with interrupts off for good */
             serial_write_string("SMP: TLB shootdown: a core does not answer\r\n");
             break;

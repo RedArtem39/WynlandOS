@@ -94,6 +94,7 @@ void vma_print_stack(struct Process *proc, uint64_t rsp);
    frame if it lies in a VMA_LAZY region that allows `access` (VMA_PROT_*).
    True when the page is now mapped -- the faulting access can be retried.
    Called by the page fault handler and by the user-copy checks. */
+bool vma_fault_fast(struct Process *proc, uint64_t addr, uint32_t access, uint64_t err);
 bool vma_fault_in(struct Process *proc, uint64_t addr, uint32_t access);
 
 /* Update the prot field of every VMA overlapping [start,end), splitting
