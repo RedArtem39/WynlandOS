@@ -606,6 +606,8 @@ LIVE_CONSOLE ?= 0
 LIVE_RESOLUTION ?= native
 # LIVE_DESKTOP=xvlet (or caelestia...): the live account's desktop
 LIVE_DESKTOP ?=
+# LIVE_USER=0: no live account -- the first boot makes the first one
+LIVE_USER ?= 1
 # make devkernel: the current kernel for a live stick's slot, served by
 # tools/devhost.py; on the machine `test-wyn k` (or leaf update -eK) writes
 # it there and the next boot runs it -- no flashing (boot/boot.c SlotKernel)
@@ -633,7 +635,7 @@ $(BUILD)/livepack: tools/livepack.c
 	@gcc -O2 -Wall -o $@ $<
 
 live: $(BUILD)/livepack
-	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)$(if $(NETLOG),netlog=$(NETLOG)\n,)$(if $(filter 1,$(LIVE_GPU)),gpu=1\n,)$(if $(LIVE_DESKTOP),desktop=$(LIVE_DESKTOP)\n,)live=1' \
+	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)$(if $(NETLOG),netlog=$(NETLOG)\n,)$(if $(filter 1,$(LIVE_GPU)),gpu=1\n,)$(if $(LIVE_DESKTOP),desktop=$(LIVE_DESKTOP)\n,)$(if $(filter 1,$(LIVE_USER)),liveuser=1\n,)live=1' \
 	    DISK_IMAGE=$(IMG_DIR)/wynland-live.img ESP_PART_IMG=$(IMG_DIR)/esp_live.img \
 	    EXT2_PART_IMG=$(IMG_DIR)/ext2_live.img BOOT_CFG=$(BUILD)/boot-live.cfg \
 	    EXT2_MANIFEST_FULL=$(BUILD)/ext2_manifest_live.txt image

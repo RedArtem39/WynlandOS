@@ -278,6 +278,18 @@ static int evdevKey(bool e0, int code)
 }
 int zerpEvdevKey(bool e0, int code) { return evdevKey(e0, code); }
 
+// a raw key to a surface that is not a window (a shell's layer surface)
+void zerpKeyToSurface(QWaylandSurface *surf, bool e0, uint8_t scancode, Qt::KeyboardModifiers mods)
+{
+    const int key = evdevKey(e0, scancode & 0x7F);
+    if (!surf || !surf->compositor() || !key) return;
+    QWaylandSeat *seat = surf->compositor()->defaultSeat();
+    if (!seat) return;
+    if (seat->keyboardFocus() != surf) seat->setKeyboardFocus(surf);
+    QKeyEvent ke((scancode & 0x80) ? QEvent::KeyRelease : QEvent::KeyPress, Qt::Key_unknown, mods, quint32(key + 8), 0, 0);
+    seat->sendFullKeyEvent(&ke);
+}
+
 void ZClient::sendKey(bool e0, uint8_t scancode, Qt::KeyboardModifiers mods)
 {
     if (m_wayland) {

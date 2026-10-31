@@ -110,6 +110,11 @@ public:
     QMargins reserved() const { return m_reserved; }
     void updateReserved();
     void forget(ZLayerSurface *s);
+    static ZLayerShell *instance();
+    // the layer surface the keys belong to now, or none: an exclusive one
+    // in the top or overlay layer (a launcher, a shell's settings; the
+    // highest), else an on-demand one that has the seat's focus (clicked)
+    QWaylandSurface *keyboardSurface() const;
 
 signals:
     void outputSizeChanged();

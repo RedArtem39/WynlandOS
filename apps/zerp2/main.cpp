@@ -301,9 +301,12 @@ private:
         // to the lock screen (without one: Zerp's own password field)
         // (a password is never typed with Super held: Super+T is no "t")
         if (locked && m_super && !(e0 && (code == 0x5B || code == 0x5C))) return;
-        ZClient *c = locked ? nullptr : m_srv->focused();
+        // a shell's layer that takes the keyboard (its launcher, its
+        // settings; or one clicked into) has them before any window
+        QWaylandSurface *layerKb = (!locked && ZLayerShell::instance()) ? ZLayerShell::instance()->keyboardSurface() : nullptr;
+        ZClient *c = (locked || layerKb) ? nullptr : m_srv->focused();
         ZSessionLock *lk = locked ? ZSessionLock::instance() : nullptr;
-        if (c || (lk && lk->lockSurface() && lk->lockSurface()->mapped())) {
+        if (c || layerKb || (lk && lk->lockSurface() && lk->lockSurface()->mapped())) {
             // the modifiers held, for Wayland clients
             Qt::KeyboardModifier m = Qt::NoModifier;
             if (code == 0x2A || code == 0x36) m = e0 ? Qt::NoModifier : Qt::ShiftModifier;
@@ -311,7 +314,9 @@ private:
             else if (code == 0x38) m = Qt::AltModifier;
             else if (e0 && (code == 0x5B || code == 0x5C)) m = Qt::MetaModifier;
             if (m != Qt::NoModifier) { if (release) m_mods &= ~m; else m_mods |= m; }
+            extern void zerpKeyToSurface(QWaylandSurface *, bool, uint8_t, Qt::KeyboardModifiers);
             if (c) c->sendKey(e0, sc, m_mods);
+            else if (layerKb) zerpKeyToSurface(layerKb, e0, sc, m_mods);
             else lk->sendKey(e0, sc, m_mods);
             return;
         }
@@ -394,6 +399,8 @@ static QString loginTheme()
         }
     for (const QByteArray &raw : bootCfg().split('\n'))
         if (raw.trimmed().startsWith("logintheme=")) name = raw.trimmed().mid(11);
+    // none chosen: the installed shell's own (xvlet's), else ours
+    if (name.isEmpty() && QFile::exists(QStringLiteral("/usr/share/wynlogin/themes/xvlet/Greeter.qml"))) name = "xvlet";
     if (name.isEmpty() || name == "default" || name.contains('/') || name.startsWith('.')) return QString();
     const QString path = QStringLiteral("/usr/share/wynlogin/themes/") + QString::fromUtf8(name) + QStringLiteral("/Greeter.qml");
     if (!QFile::exists(path)) { fprintf(stderr, "[zerp2] no login theme %s\n", name.constData()); return QString(); }

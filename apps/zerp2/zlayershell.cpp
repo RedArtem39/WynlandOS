@@ -3,6 +3,7 @@
 
 #include <QtWaylandCompositor/QWaylandCompositor>
 #include <QtWaylandCompositor/QWaylandResource>
+#include <QtWaylandCompositor/QWaylandSeat>
 #include <QtWaylandCompositor/QWaylandSurfaceRole>
 
 #include <cstdio>
@@ -121,8 +122,27 @@ void ZLayerSurface::zwlr_layer_surface_v1_destroy_resource(Resource *)
 
 // ---------------------------------------------------------------- shell
 
-ZLayerShell::ZLayerShell() : QWaylandCompositorExtensionTemplate<ZLayerShell>() {}
-ZLayerShell::ZLayerShell(QWaylandCompositor *compositor) : QWaylandCompositorExtensionTemplate<ZLayerShell>(compositor) {}
+static ZLayerShell *s_layerShell = nullptr;
+
+ZLayerShell::ZLayerShell() : QWaylandCompositorExtensionTemplate<ZLayerShell>() { s_layerShell = this; }
+ZLayerShell::ZLayerShell(QWaylandCompositor *compositor) : QWaylandCompositorExtensionTemplate<ZLayerShell>(compositor) { s_layerShell = this; }
+
+ZLayerShell *ZLayerShell::instance() { return s_layerShell; }
+
+QWaylandSurface *ZLayerShell::keyboardSurface() const
+{
+    ZLayerSurface *best = nullptr;
+    for (ZLayerSurface *l : m_surfaces)
+        if (l->mapped() && l->surface() && l->keyboard() == 1 && l->layer() >= 2 && (!best || l->layer() > best->layer()))
+            best = l;
+    if (best) return best->surface();
+    auto *compositor = static_cast<QWaylandCompositor *>(extensionContainer());
+    QWaylandSeat *seat = compositor ? compositor->defaultSeat() : nullptr;
+    QWaylandSurface *f = seat ? seat->keyboardFocus() : nullptr;
+    for (ZLayerSurface *l : m_surfaces)
+        if (f && l->surface() == f && l->mapped() && l->keyboard() == 2) return f;
+    return nullptr;
+}
 
 void ZLayerShell::initialize()
 {
