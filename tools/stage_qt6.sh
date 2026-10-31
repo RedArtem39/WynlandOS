@@ -142,6 +142,14 @@ LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-heade
 LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "$GS" > "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp"
 gcc -O2 -fPIC -c -o "$B/hyprland-global-shortcuts-protocol.o" "$B/wayland-hyprland-global-shortcuts-v1-protocol.c"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zglobalshortcuts.cpp" apps/zerp2/zglobalshortcuts.h
+# the session lock (ext-session-lock-v1, wayland-protocols): the same way
+SL=apps/zerp2/protocols/ext-session-lock-v1.xml
+wayland-scanner server-header "$SL" "$B/wayland-ext-session-lock-v1-server-protocol.h"
+wayland-scanner private-code "$SL" "$B/wayland-ext-session-lock-v1-protocol.c"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-header "$SL" > "$B/qwayland-server-ext-session-lock-v1.h"
+LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "$SL" > "$B/qwayland-server-ext-session-lock-v1.cpp"
+gcc -O2 -fPIC -c -o "$B/ext-session-lock-protocol.o" "$B/wayland-ext-session-lock-v1-protocol.c"
+"$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zsessionlock.cpp" apps/zerp2/zsessionlock.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
 gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
 # wlcompat's two libwayland-server functions must win over the library's
@@ -150,6 +158,7 @@ g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
     apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp apps/zerp2/hypripc.cpp apps/zerp2/zlayershell.cpp     "$B/qwayland-server-wlr-layer-shell-unstable-v1.cpp" "$B/wlr-layer-shell-protocol.o" "$B/xdg-shell-protocol.o" -I"$B"     "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" "$B/moc_hypripc.cpp" "$B/moc_zlayershell.cpp" \
     apps/zerp2/zglobalshortcuts.cpp apps/zerp2/keybinds.cpp "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp" \
     "$B/hyprland-global-shortcuts-protocol.o" "$B/moc_zglobalshortcuts.cpp" \
+    apps/zerp2/zsessionlock.cpp "$B/qwayland-server-ext-session-lock-v1.cpp" "$B/ext-session-lock-protocol.o" "$B/moc_zsessionlock.cpp" \
     "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
     -Wl,--export-dynamic-symbol=mkstemp -Wl,--export-dynamic-symbol=wl_resource_create \
     "$LIB/libwayland-server.so.0" \

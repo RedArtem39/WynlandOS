@@ -71,6 +71,11 @@ Window {
             id: layerShell
             outputSize: Qt.size(shell.width, shell.height)
         }
+        // ext-session-lock: a lock screen the compositor enforces
+        SessionLock {
+            id: sessionLock
+            outputSize: Qt.size(shell.width, shell.height)
+        }
         // Hyprland's global shortcuts: Caelestia's launcher and the rest,
         // fired by the key bindings (keybinds.conf, `global` dispatcher)
         GlobalShortcuts {}
@@ -859,6 +864,63 @@ Window {
             focusOnClick: ls.keyboard > 0
             // exclusive keyboard (a launcher, a lock): it takes the keys while there
             onVisibleChanged: if (visible && ls.keyboard === 1) takeFocus()
+        }
+    }
+
+    // ---- the session locked (zsessionlock.h): black over everything, the
+    // lock screen alone on it, every click and key its. Its client gone
+    // with the session locked: still black, and our own password field.
+    Rectangle {
+        id: lockCover
+        anchors.fill: parent
+        z: 1000
+        color: "black"
+        visible: opacity > 0
+        opacity: sessionLock.locked ? 1 : 0
+        // (on: at once -- nothing may show; off: a short fade)
+        Behavior on opacity { enabled: !sessionLock.locked; NumberAnimation { duration: 250 } }
+        MouseArea {
+            anchors.fill: parent
+            enabled: sessionLock.locked
+            hoverEnabled: true
+            acceptedButtons: Qt.AllButtons
+            onWheel: w => w.accepted = true
+            onPressed: if (sessionLock.abandoned) lockPass.forceActiveFocus()
+        }
+        WaylandQuickItem {
+            id: lockItem
+            anchors.fill: parent
+            surface: sessionLock.surface ? sessionLock.surface.surface : null
+            visible: !!sessionLock.surface && sessionLock.surface.mapped
+            onVisibleChanged: if (visible) takeFocus()
+        }
+        Connections {
+            target: sessionLock
+            function onLockedChanged() { if (sessionLock.abandoned) { lockPass.text = ""; lockPass.forceActiveFocus(); } }
+            function onPasswordChecked(ok) { lockPass.text = ""; lockFail.visible = !ok; lockBusy.visible = false; }
+        }
+        Column {
+            anchors.centerIn: parent
+            spacing: 16
+            visible: sessionLock.abandoned
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Сеанс заблокирован"; color: "#eef2f8"; font.pixelSize: 28; font.bold: true }
+            Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Экран блокировки закрылся. Пароль " + userName + ":"; color: "#8b95a6"; font.pixelSize: 15 }
+            Rectangle {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: 320; height: 44; radius: 22
+                color: "#1d2129"
+                border.width: 2; border.color: lockFail.visible ? "#e0707a" : "#3d7eff"
+                TextInput {
+                    id: lockPass
+                    anchors.fill: parent; anchors.margins: 12
+                    verticalAlignment: TextInput.AlignVCenter
+                    echoMode: TextInput.Password
+                    color: "#eef2f8"; font.pixelSize: 16
+                    onAccepted: { if (text) { lockBusy.visible = true; lockFail.visible = false; sessionLock.tryPassword(text); } }
+                }
+            }
+            Text { id: lockBusy; visible: false; anchors.horizontalCenter: parent.horizontalCenter; text: "Проверка…"; color: "#8b95a6"; font.pixelSize: 13 }
+            Text { id: lockFail; visible: false; anchors.horizontalCenter: parent.horizontalCenter; text: "Неверный пароль"; color: "#e0707a"; font.pixelSize: 13 }
         }
     }
 

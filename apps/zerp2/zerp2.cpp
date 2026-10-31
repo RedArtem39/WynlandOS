@@ -274,6 +274,7 @@ static int evdevKey(bool e0, int code)
     }
     return 0;
 }
+int zerpEvdevKey(bool e0, int code) { return evdevKey(e0, code); }
 
 void ZClient::sendKey(bool e0, uint8_t scancode, Qt::KeyboardModifiers mods)
 {

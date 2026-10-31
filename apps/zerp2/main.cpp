@@ -36,6 +36,7 @@
 #include "greeter.h"
 #include "hypripc.h"
 #include "zlayershell.h"
+#include "zsessionlock.h"
 #include "zglobalshortcuts.h"
 #include "keybinds.h"
 
@@ -287,14 +288,22 @@ private:
         if (!e0 && (code == 0x2A || code == 0x36)) m_shift = !release;
         const int kid = code + (e0 ? 128 : 0);
         if (layoutToggle(e0, code, release)) { m_swallow[kid] = true; return; }
-        if (!m_greeter && m_binds.key(kid, release)) return;
+        // the session locked (zsessionlock.h): no bindings, no global
+        // shortcuts, no window -- the keys go to the lock screen alone
+        const bool locked = zerpSessionLocked();
+        if (!m_greeter && !locked && m_binds.key(kid, release)) return;
         if (release && m_swallow[kid]) { m_swallow[kid] = false; return; }
-        if (!m_greeter && !release && (m_alt || m_altR || m_super) && binding(e0, code)) {
+        if (!m_greeter && !locked && !release && (m_alt || m_altR || m_super) && binding(e0, code)) {
             m_swallow[kid] = true;   // its release must not reach the client either
             return;
         }
-        // everything else: raw scancodes to the focused client
-        if (ZClient *c = m_srv->focused()) {
+        // everything else: raw scancodes to the focused client -- locked,
+        // to the lock screen (without one: Zerp's own password field)
+        // (a password is never typed with Super held: Super+T is no "t")
+        if (locked && m_super && !(e0 && (code == 0x5B || code == 0x5C))) return;
+        ZClient *c = locked ? nullptr : m_srv->focused();
+        ZSessionLock *lk = locked ? ZSessionLock::instance() : nullptr;
+        if (c || (lk && lk->lockSurface() && lk->lockSurface()->mapped())) {
             // the modifiers held, for Wayland clients
             Qt::KeyboardModifier m = Qt::NoModifier;
             if (code == 0x2A || code == 0x36) m = e0 ? Qt::NoModifier : Qt::ShiftModifier;
@@ -302,7 +311,8 @@ private:
             else if (code == 0x38) m = Qt::AltModifier;
             else if (e0 && (code == 0x5B || code == 0x5C)) m = Qt::MetaModifier;
             if (m != Qt::NoModifier) { if (release) m_mods &= ~m; else m_mods |= m; }
-            c->sendKey(e0, sc, m_mods);
+            if (c) c->sendKey(e0, sc, m_mods);
+            else lk->sendKey(e0, sc, m_mods);
             return;
         }
 
@@ -500,6 +510,8 @@ int main(int argc, char **argv)
     qmlRegisterType<ZLayerShellQuickExtension>("Zerp", 1, 0, "LayerShell");
     qmlRegisterType<ZGlobalShortcutsQuickExtension>("Zerp", 1, 0, "GlobalShortcuts");
     qmlRegisterUncreatableType<ZLayerSurface>("Zerp", 1, 0, "LayerSurface", QStringLiteral("made by the layer shell"));
+    qmlRegisterType<ZSessionLockQuickExtension>("Zerp", 1, 0, "SessionLock");
+    qmlRegisterUncreatableType<ZLockSurface>("Zerp", 1, 0, "LockSurface", QStringLiteral("made by the session lock"));
     const QSize scr = app.primaryScreen() ? app.primaryScreen()->size() : QSize(1920, 1080);
     fprintf(stderr, "[zerp2] screen %s %dx%d (mode %s)\n",
             app.primaryScreen() ? qPrintable(app.primaryScreen()->name()) : "?", scr.width(), scr.height(),
