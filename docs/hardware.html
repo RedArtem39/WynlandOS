@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru" data-lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WynlandOS · Железо и сборка / Hardware and build</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;650&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><img src="icon.png" alt="" aria-hidden="true">WynlandOS</a>
+    <nav class="nav" aria-label="Pages">
+      <a href="index.html"><span data-l="ru">Главная</span><span data-l="en">Overview</span></a>
+      <a href="features.html"><span data-l="ru">Возможности</span><span data-l="en">Features</span></a>
+      <a href="hardware.html" aria-current="page"><span data-l="ru">Железо и сборка</span><span data-l="en">Hardware and build</span></a>
+    </nav>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-setlang="ru" aria-pressed="true">RU</button>
+      <button type="button" data-setlang="en" aria-pressed="false">EN</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="s" style="padding-top:36px">
+    <h1><span data-l="ru">Где работает и как собрать</span><span data-l="en">Where it runs and how to build it</span></h1>
+    <p class="lede" style="margin-top:12px"><span data-l="ru">Разработка идёт в QEMU: он эмулирует ПК (процессор x86_64, GPU, диск, USB), и на нём автотесты загружают ОС. Ноутбук ASUS VivoBook 15 (Intel i3-1115G4) — настоящее железо: система загружается с USB-флешки и работает на его собственных деталях.</span><span data-l="en">Development happens in QEMU, which emulates a PC (x86_64 CPU, GPU, disk, USB). Automatic tests boot the OS there. The ASUS VivoBook 15 (Intel i3-1115G4) is real hardware: the system boots from a USB stick and runs on the laptop's own parts.</span></p>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">QEMU и ноутбук</span><span data-l="en">QEMU and the laptop</span></h2>
+    <div class="tbl">
+      <table>
+        <thead><tr><th><span data-l="ru">Часть</span><span data-l="en">Part</span></th><th>QEMU</th><th>ASUS VivoBook 15</th></tr></thead>
+        <tbody>
+          <tr><td><span data-l="ru">Загрузка</span><span data-l="en">Boot</span></td><td><span data-l="ru">OVMF, образ диска</span><span data-l="en">OVMF, disk image</span></td><td><span data-l="ru">флешка USB; вся система работает из RAM</span><span data-l="en">USB stick; the whole system runs from RAM</span></td></tr>
+          <tr><td>GPU</td><td>virtio-gpu, virgl (OpenGL)</td><td><span data-l="ru">Intel Gen12: драйвер, совместимый с i915; Mesa iris (OpenGL ES 3.2) и anv (Vulkan)</span><span data-l="en">Intel Gen12: i915-compatible driver; Mesa iris (OpenGL ES 3.2) and anv (Vulkan)</span></td></tr>
+          <tr><td><span data-l="ru">Накопители</span><span data-l="en">Storage</span></td><td>AHCI, NVMe</td><td><span data-l="ru">не нужны: NVMe за Intel VMD, драйвера для него нет</span><span data-l="en">none needed: the NVMe sits behind Intel VMD, which has no driver</span></td></tr>
+          <tr><td>USB</td><td><span data-l="ru">xHCI: клавиатура, мышь, флешка</span><span data-l="en">xHCI: keyboard, mouse, stick</span></td><td><span data-l="ru">xHCI: клавиатура, мышь (колеса пока нет), флешка</span><span data-l="en">xHCI: keyboard, mouse (no wheel yet), stick</span></td></tr>
+          <tr><td><span data-l="ru">Сеть</span><span data-l="en">Network</span></td><td>virtio-net</td><td><span data-l="ru">USB-модем телефона (RNDIS), пока единственный интернет</span><span data-l="en">phone USB tethering (RNDIS), for now the only internet</span></td></tr>
+          <tr><td><span data-l="ru">Звук</span><span data-l="en">Sound</span></td><td>Intel HD Audio</td><td><span data-l="ru">пока не проверяли</span><span data-l="en">not checked yet</span></td></tr>
+          <tr><td><span data-l="ru">Питание</span><span data-l="en">Power</span></td><td><span data-l="ru">ACPI: выключение и перезагрузка</span><span data-l="en">ACPI power-off and reset</span></td><td><span data-l="ru">ACPI: выключение и перезагрузка</span><span data-l="en">ACPI power-off and reset</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note"><span data-l="ru">Пока не работает: Wi-Fi, Bluetooth, карты Ethernet, тачпад, сон, статус батареи, IPv6, GPU AMD и NVIDIA. На других настоящих машинах не проверялось.</span><span data-l="en">Not yet: Wi-Fi, Bluetooth, Ethernet cards, touchpads, sleep, battery status, IPv6, AMD and NVIDIA GPUs. Not tried on other real machines.</span></p>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Сборка</span><span data-l="en">Build</span></h2>
+    <p class="lede"><span data-l="ru">Нужна Ubuntu 26.04 (нативно или в WSL2) с KVM.</span><span data-l="en">You need Ubuntu 26.04 (native or WSL2) with KVM.</span></p>
+    <pre><code># toolchain, QEMU and OVMF
+./setup.sh
+
+# kernel, bootloader and the disk image
+make
+
+# boot it in QEMU with virgl 3D
+make run-gl
+
+# a USB stick image (dd, or Rufus in DD mode)
+make live</code></pre>
+    <p style="margin-top:14px"><span data-l="ru">Пользовательское окружение (Qt, WebKit, GStreamer, PipeWire, Python, fish, coreutils) берётся из пакетов Ubuntu и Debian и собирается скриптами <code>tools/stage_*.sh</code>. Части можно отключить: <code>WITH_QT6=0</code>, <code>WITH_GST=0</code>, <code>WITH_WPE=0</code>, <code>WITH_BASE=0</code>.</span><span data-l="en">The userland (Qt, WebKit, GStreamer, PipeWire, Python, fish, coreutils) comes from Ubuntu's and Debian's packages, staged by <code>tools/stage_*.sh</code>. Leave parts out with <code>WITH_QT6=0</code>, <code>WITH_GST=0</code>, <code>WITH_WPE=0</code> or <code>WITH_BASE=0</code>.</span></p>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Тесты</span><span data-l="en">Tests</span></h2>
+    <p class="lede"><code>make run-gl AUTOTEST=1</code> — <span data-l="ru">загружает тестовые программы вместо рабочего стола: жизненный цикл процессов, оболочка и утилиты, Python, Node, учётные записи, пакеты, песочница, OpenGL, KMS, звук и PipeWire, политика памяти JIT, GStreamer, страницы WebKit, включая YouTube.</span><span data-l="en">boots the test programs instead of the desktop: process lifecycle, the shell and tools, Python, Node, accounts, packages, sandboxing, OpenGL, KMS, sound and PipeWire, the JIT memory policy, GStreamer, WebKit pages including YouTube.</span></p>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Ссылки</span><span data-l="en">Links</span></h2>
+    <div class="spec"><div>WynlandOS</div><div><a href="https://github.com/RedArtem39/WynlandOS">github.com/RedArtem39/WynlandOS</a></div></div>
+    <div class="spec"><div>xvlet shell</div><div><a href="https://github.com/RedArtem39/xvlet-shell">github.com/RedArtem39/xvlet-shell</a></div></div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>WynlandOS · GPL-2.0-or-later · © 2026 Red_Artem39</span>
+    <a href="index.html"><span data-l="ru">На главную</span><span data-l="en">Back to overview</span></a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var saved = null;
+  try { saved = localStorage.getItem('wynland-lang'); } catch (e) {}
+  var start = saved || ((navigator.language || '').slice(0, 2) === 'en' ? 'en' : 'ru');
+  function setLang(l) {
+    root.setAttribute('data-lang', l);
+    root.lang = l;
+    document.querySelectorAll('[data-setlang]').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-setlang') === l));
+    });
+    try { localStorage.setItem('wynland-lang', l); } catch (e) {}
+  }
+  document.querySelectorAll('[data-setlang]').forEach(function (b) {
+    b.addEventListener('click', function () { setLang(b.getAttribute('data-setlang')); });
+  });
+  setLang(start);
+})();
+</script>
+</body>
+</html>

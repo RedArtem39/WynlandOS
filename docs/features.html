@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru" data-lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>WynlandOS · Возможности / Features</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@500;600;650&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600&display=swap">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="index.html"><img src="icon.png" alt="" aria-hidden="true">WynlandOS</a>
+    <nav class="nav" aria-label="Pages">
+      <a href="index.html"><span data-l="ru">Главная</span><span data-l="en">Overview</span></a>
+      <a href="features.html" aria-current="page"><span data-l="ru">Возможности</span><span data-l="en">Features</span></a>
+      <a href="hardware.html"><span data-l="ru">Железо и сборка</span><span data-l="en">Hardware and build</span></a>
+    </nav>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-setlang="ru" aria-pressed="true">RU</button>
+      <button type="button" data-setlang="en" aria-pressed="false">EN</button>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="s" style="padding-top:36px">
+    <h1><span data-l="ru">Что работает сейчас</span><span data-l="en">What works today</span></h1>
+    <p class="lede" style="margin-top:12px"><span data-l="ru">Рабочий стол, оболочки, учётные записи, браузер с видео, звук, инструменты и ядро, которое запускает программы Linux без изменений.</span><span data-l="en">A desktop, shells, accounts, a browser that plays video, sound, tools, and a kernel that runs Linux programs unmodified.</span></p>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Рабочий стол</span><span data-l="en">Desktop</span></h2>
+    <p class="lede"><span data-l="ru">Zerp 2.0 рисует только окна. Панели, запуск программ и уведомления рисует оболочка. Окна раскладываются плиткой или на бесконечном холсте для каждого рабочего стола (Alt+G).</span><span data-l="en">Zerp 2.0 draws only windows. Panels, launchers and notices are drawn by the shell. Windows tile, or sit on an infinite canvas per workspace (Alt+G).</span></p>
+    <div class="spec"><div><span data-l="ru">Протоколы</span><span data-l="en">Protocols</span></div><div><span data-l="ru">xdg-shell, layer-shell, linux-dmabuf, глобальные горячие клавиши</span><span data-l="en">xdg-shell, layer-shell, linux-dmabuf, global shortcuts</span></div></div>
+    <div class="spec"><div>X11</div><div><span data-l="ru">через Xwayland: <code>xrun xterm</code></span><span data-l="en">via Xwayland: <code>xrun xterm</code></span></div></div>
+    <div class="spec"><div>IPC</div><div><span data-l="ru">отвечает на IPC Hyprland, поэтому оболочки для Hyprland могут работать</span><span data-l="en">answers Hyprland's IPC, so Hyprland shells can run</span></div></div>
+    <div class="spec"><div><span data-l="ru">Графика</span><span data-l="en">Graphics</span></div><div><span data-l="ru">virtio-gpu с virgl в QEMU; Intel GPU на ноутбуке</span><span data-l="en">virtio-gpu with virgl in QEMU; Intel GPU on the laptop</span></div></div>
+    <div class="spec"><div><span data-l="ru">Анимации</span><span data-l="en">Motion</span></div><div><span data-l="ru">появление и исчезновение окон по кривой Hyprland, скруглённые углы, тени, градиентная рамка активного окна</span><span data-l="en">windows animate in and out on Hyprland's curve; rounded corners, shadows, gradient border on the focused window</span></div></div>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Оболочки и вход</span><span data-l="en">Shells and accounts</span></h2>
+    <div class="spec"><div>xvlet</div><div><span data-l="ru">панель, док, запуск, дашборд, быстрые настройки, уведомления, обои с динамическими цветами, виджеты, экран блокировки. Исходники: <a href="https://github.com/RedArtem39/xvlet-shell">xvlet-shell</a></span><span data-l="en">bar, dock, launcher, dashboard, quick settings, notifications, wallpapers with dynamic colours, widgets, lock screen. Source: <a href="https://github.com/RedArtem39/xvlet-shell">xvlet-shell</a></span></div></div>
+    <div class="spec"><div>Caelestia</div><div><span data-l="ru">Linux-оболочка, портированная на WynlandOS; работает на Zerp</span><span data-l="en">Linux shell ported to WynlandOS; runs on Zerp</span></div></div>
+    <div class="spec"><div>wynlogin</div><div><span data-l="ru">вход в систему: настоящие учётные записи в <code>/etc/passwd</code>, хеши yescrypt, скины в <code>/etc/wynland/login.conf</code></span><span data-l="en">login: real accounts in <code>/etc/passwd</code>, yescrypt hashes, skins in <code>/etc/wynland/login.conf</code></span></div></div>
+    <div class="spec"><div>ary</div><div><span data-l="ru">члены группы <code>wheel</code> становятся root по своему паролю; экраны блокировки проверяют его через <code>chkpwd</code></span><span data-l="en">members of the <code>wheel</code> group become root with their own password; lock screens check it with <code>chkpwd</code></span></div></div>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Браузер, звук, инструменты</span><span data-l="en">Browser, sound, tools</span></h2>
+    <div class="spec"><div><span data-l="ru">Браузер</span><span data-l="en">Browser</span></div><div><span data-l="ru">WPE WebKit 2.54 с JIT JavaScriptCore в оболочке на Qt Quick: вертикальные вкладки, HTTPS, YouTube с видео (H.264 через GStreamer)</span><span data-l="en">WPE WebKit 2.54 with the JavaScriptCore JIT in a Qt Quick shell: vertical tabs, HTTPS, YouTube video (H.264 through GStreamer)</span></div></div>
+    <div class="spec"><div><span data-l="ru">Звук</span><span data-l="en">Sound</span></div><div><span data-l="ru">PipeWire 1.6 с WirePlumber и pipewire-pulse на нашем драйвере Intel HD Audio; GStreamer 1.28</span><span data-l="en">PipeWire 1.6 with WirePlumber and pipewire-pulse on our Intel HD Audio driver; GStreamer 1.28</span></div></div>
+    <div class="spec"><div><span data-l="ru">Оболочка</span><span data-l="en">Shell</span></div><div><span data-l="ru">fish 4.2 по умолчанию, dash как <code>/bin/sh</code>, GNU coreutils, текстовая консоль <code>wynvt</code></span><span data-l="en">fish 4.2 by default, dash as <code>/bin/sh</code>, GNU coreutils, the <code>wynvt</code> text console</span></div></div>
+    <div class="spec"><div><span data-l="ru">Разработка</span><span data-l="en">Development</span></div><div><span data-l="ru">Python 3.14 с pip и venv, Node.js 22 с npm, clang, make, CMake, git, curl, nano</span><span data-l="en">Python 3.14 with pip and venv, Node.js 22 with npm, clang, make, CMake, git, curl, nano</span></div></div>
+    <div class="spec"><div>leaf</div><div><span data-l="ru">установка программ из архива Ubuntu с проверкой подписей и контрольных сумм: <code>leaf install htop</code></span><span data-l="en">installs programs from Ubuntu's archive with signatures and checksums verified: <code>leaf install htop</code></span></div></div>
+  </section>
+
+  <section class="s">
+    <h2><span data-l="ru">Ядро</span><span data-l="en">Kernel</span></h2>
+    <div class="spec"><div><span data-l="ru">Загрузка</span><span data-l="en">Boot</span></div><div><span data-l="ru">UEFI через собственный загрузчик, higher-half ядро, SMP на всех ядрах с планировщиком EEVDF</span><span data-l="en">UEFI through our own loader, higher-half kernel, SMP on every core with an EEVDF scheduler</span></div></div>
+    <div class="spec"><div><span data-l="ru">Память</span><span data-l="en">Memory</span></div><div><span data-l="ru">demand paging, copy-on-write <code>fork()</code>, общие и файловые <code>mmap</code>, кэш страниц, swap, W^X с исключением для JIT</span><span data-l="en">demand paging, copy-on-write <code>fork()</code>, shared and file-backed <code>mmap</code>, page cache, swap, W^X with an opt-in for JITs</span></div></div>
+    <div class="spec"><div><span data-l="ru">Процессы</span><span data-l="en">Processes</span></div><div><span data-l="ru">потоки, futex с наследованием приоритета, сигналы POSIX, группы и сессии, PTY с настоящей дисциплиной линии, <code>/proc</code> для процессов</span><span data-l="en">threads, futexes with priority inheritance, POSIX signals, process groups and sessions, PTYs with a real line discipline, <code>/proc</code> per process</span></div></div>
+    <div class="spec"><div><span data-l="ru">Файлы и песочница</span><span data-l="en">Files and sandbox</span></div><div><span data-l="ru">ext2 с кэшем записи. Песочница как у браузеров: seccomp-bpf, capabilities, chroot и пространства имён, поэтому работает bubblewrap из Ubuntu</span><span data-l="en">ext2 with a write-back cache. Browser-style sandboxing: seccomp-bpf, capabilities, chroot and namespaces, so Ubuntu's bubblewrap runs</span></div></div>
+    <div class="spec"><div><span data-l="ru">Сеть</span><span data-l="en">Network</span></div><div><span data-l="ru">IPv4, TCP, UDP, DHCP, DNS, Unix-сокеты с передачей fd, <code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>memfd</code></span><span data-l="en">IPv4, TCP, UDP, DHCP, DNS, Unix sockets with fd passing, <code>epoll</code>, <code>eventfd</code>, <code>timerfd</code>, <code>memfd</code></span></div></div>
+    <div class="spec"><div><span data-l="ru">Модули и init</span><span data-l="en">Modules and init</span></div><div><span data-l="ru">загружаемые модули (<code>insmod</code>, <code>rmmod</code>, <code>lsmod</code>); <code>wynrc</code> — init в стиле OpenRC с наблюдением за сервисами</span><span data-l="en">loadable modules (<code>insmod</code>, <code>rmmod</code>, <code>lsmod</code>); <code>wynrc</code> is an OpenRC-style init with supervision</span></div></div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>WynlandOS · GPL-2.0-or-later · © 2026 Red_Artem39</span>
+    <a href="https://github.com/RedArtem39/WynlandOS">github.com/RedArtem39/WynlandOS</a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var saved = null;
+  try { saved = localStorage.getItem('wynland-lang'); } catch (e) {}
+  var start = saved || ((navigator.language || '').slice(0, 2) === 'en' ? 'en' : 'ru');
+  function setLang(l) {
+    root.setAttribute('data-lang', l);
+    root.lang = l;
+    document.querySelectorAll('[data-setlang]').forEach(function (b) {
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-setlang') === l));
+    });
+    try { localStorage.setItem('wynland-lang', l); } catch (e) {}
+  }
+  document.querySelectorAll('[data-setlang]').forEach(function (b) {
+    b.addEventListener('click', function () { setLang(b.getAttribute('data-setlang')); });
+  });
+  setLang(start);
+})();
+</script>
+</body>
+</html>
