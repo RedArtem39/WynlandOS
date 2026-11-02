@@ -29,6 +29,7 @@ h3 { font-size: 1rem; font-weight: 600; margin-bottom: 4px; }
 p { margin: 0 0 10px; max-width: 70ch; }
 code, pre { font-family: var(--mono); font-size: 13.5px; }
 code { background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+pre code { background: none; border: 0; padding: 0; color: inherit; font-size: inherit; }
 pre { background: #101217; color: #e6e8ee; padding: 14px 16px; overflow-x: auto; line-height: 1.55; border-radius: 6px; margin: 0; }
 .wrap { max-width: 1160px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
 
