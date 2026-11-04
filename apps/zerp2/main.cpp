@@ -206,15 +206,17 @@ private:
         }
         if (d == QLatin1String("workspace") || d == QLatin1String("movetoworkspace") ||
             d == QLatin1String("movetoworkspacesilent")) {
-            // a number (1-10), or relative: +1, -1, e+1, r-1
+            // a number (1-9), or relative: +1, -1, e+1, r-1
             QString w = a.trimmed();
             if (w.startsWith('e') || w.startsWith('r') || w.startsWith('m')) w = w.mid(1);
             int target;
             bool ok = false;
             if (w.startsWith('+') || w.startsWith('-')) target = m_srv->workspace() + w.toInt(&ok);
-            else target = w.toInt(&ok) - 1;
+            else target = w.toInt(&ok);
             if (!ok) return;
-            target = qBound(0, target, 9);
+            // Zerp's workspaces are 1..9, as Hyprland's (and the IPC's): wrap
+            if (target < 1) target = 9;
+            if (target > 9) target = 1;
             if (d == QLatin1String("workspace")) m_srv->setWorkspace(target);
             else m_srv->moveFocusedTo(target);
             return;

@@ -32,7 +32,7 @@ Item {
     // held by the hand on the canvas: a little bigger about its middle
     property real lift: 1
     Behavior on lift { NumberAnimation { duration: 360; easing.type: Easing.OutBack; easing.overshoot: 2.2 } }
-    property real lean: 0               // degrees: it leans with its speed when thrown or held
+    property var jelly: [0, 0]          // [sx, sy]: stretched with its speed when thrown or held (the canvas)
 
     readonly property bool fx: typeof gpuEffects === "undefined" || gpuEffects
     readonly property bool active: client && client.focused
@@ -83,7 +83,7 @@ Item {
     transform: [
         Scale { origin.x: tile.width / 2; origin.y: tile.height / 2; xScale: .8 + .2 * tile.shown; yScale: .8 + .2 * tile.shown },
         Scale { origin.x: tile.width / 2; origin.y: tile.height / 2; xScale: tile.lift; yScale: tile.lift },
-        Rotation { origin.x: tile.width / 2; origin.y: tile.height / 2; angle: tile.lean },
+        Scale { origin.x: tile.width / 2; origin.y: tile.height / 2; xScale: 1 + tile.jelly[0]; yScale: 1 + tile.jelly[1] },
         Scale { xScale: tile.zoom; yScale: tile.zoom }
     ]
 

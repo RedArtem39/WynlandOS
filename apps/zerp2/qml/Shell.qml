@@ -459,7 +459,7 @@ Window {
         physics.start();
     }
     property var springV: ({})           // client id -> the spring's speed [x, y, w, h]
-    property var tilt: ({})              // client id -> its lean, degrees
+    property var tilt: ({})              // client id -> its stretch [sx, sy]: jelly with its speed
     readonly property var feels: ({ soft: [.075, .80], normal: [.12, .74], crisp: [.22, .62] })
     Timer {
         id: physics
@@ -488,11 +488,15 @@ Window {
                       (s_[2] + (g.width - r.width) * K * n) * damp, (s_[3] + (g.height - r.height) * K * n) * damp];
                 var nr = Qt.rect(r.x + s_[0] * n, r.y + s_[1] * n, r.width + s_[2] * n, r.height + s_[3] * n);
                 var held = mover.client && mover.group.indexOf(Number(id)) >= 0;
-                // the lean: with the sideways speed while held or flying
-                var lean = held && !mover.resize || vv[0] ? Math.max(-7, Math.min(7, s_[0] * shell.camZ * .5)) : 0;
-                tl[id] = (tl[id] || 0) + (lean - (tl[id] || 0)) * Math.min(1, .25 * n);
+                // jelly, not a lean: stretched along its speed, squashed
+                // across it (the spring's own speed: it wobbles as it settles)
+                var moving = !mover.resize || !held;
+                var ex = moving ? Math.min(.08, Math.abs(s_[0]) * shell.camZ * .004) : 0;
+                var ey = moving ? Math.min(.08, Math.abs(s_[1]) * shell.camZ * .004) : 0;
+                var old = tl[id] || [0, 0], a = Math.min(1, .35 * n);
+                tl[id] = [old[0] + (ex - ey * .5 - old[0]) * a, old[1] + (ey - ex * .5 - old[1]) * a];
                 var far = Math.abs(g.x - nr.x) + Math.abs(g.y - nr.y) + Math.abs(g.width - nr.width) + Math.abs(g.height - nr.height)
-                        + Math.abs(s_[0]) + Math.abs(s_[1]) > .4 || Math.abs(tl[id]) > .05;
+                        + Math.abs(s_[0]) + Math.abs(s_[1]) > .4 || Math.abs(tl[id][0]) + Math.abs(tl[id][1]) > .002;
                 if (held || far || vv[0] || vv[1]) { w[id] = nr; sv[id] = s_; busy = true; }
                 else { w[id] = g; delete t[id]; delete v[id]; delete sv[id]; delete tl[id]; }
             }
@@ -578,38 +582,45 @@ Window {
         if (best) zerp.focus(best);
     }
 
-    // ---- wallpaper (blur source for the bar and the dock)
+    // ---- what is under the windows: our wallpaper, and the shell's
+    // background and bottom layers over it (its wallpaper, its desk) --
+    // the glass blurs this, so it shows what really is behind
     Item {
-        id: desktop
+        id: backdrop
         anchors.fill: parent
-        Rectangle {
+        z: 0.5
+        Item {
+            id: desktop
             anchors.fill: parent
-            visible: wallpaperUrl === ""
-            gradient: Gradient {
-                GradientStop { position: 0.0; color: "#0d1015" }
-                GradientStop { position: 1.0; color: "#07090c" }
+            Rectangle {
+                anchors.fill: parent
+                visible: wallpaperUrl === ""
+                gradient: Gradient {
+                    GradientStop { position: 0.0; color: "#0d1015" }
+                    GradientStop { position: 1.0; color: "#07090c" }
+                }
             }
-        }
-        Image {
-            anchors.fill: parent
-            source: wallpaperUrl
+            Image {
+                anchors.fill: parent
+                source: wallpaperUrl
 
-            fillMode: Image.PreserveAspectCrop
-            visible: wallpaperUrl !== ""
-            asynchronous: true
-            sourceSize.width: shell.width
+                fillMode: Image.PreserveAspectCrop
+                visible: wallpaperUrl !== ""
+                asynchronous: true
+                sourceSize.width: shell.width
+            }
         }
     }
 
-    // ---- frosted glass: the wallpaper through ONE blur for the whole
-    // screen, live (a wallpaper that moves -- a video -- shows through as it
-    // changes), re-rendered only when the wallpaper does. The bar, the dock
+    // ---- frosted glass: what is under the windows (the backdrop: the
+    // shell's wallpaper and desk, or ours) through ONE blur for the whole
+    // screen, live, re-rendered only when the backdrop changes. The bar, the dock
     // and see-through windows (ZERP_MSG_ALPHA) each show their slice of it
     // (Glass.qml); blurring in each of them redid the blur per item.
     MultiEffect {
         id: blurredWall
         anchors.fill: parent
-        source: desktop
+        source: backdrop
         blurEnabled: true
         blur: 1.0
         blurMax: 64
@@ -757,7 +768,7 @@ Window {
                 zoom: onCanvas ? cam.z : 1
                 animate: !onCanvas || shell.morphing
                 lift: shell.liftId === client.id ? 1.045 : 1
-                lean: shell.tilt[client.id] || 0
+                jelly: shell.tilt[client.id] || [0, 0]
                 target: shell.rects[client.id] !== undefined ? shell.rects[client.id] : Qt.rect(0, 0, 0, 0)
                 wsOffset: (client.workspace - zerp.workspace) * shell.width
                 borderWidth: shell.border
@@ -774,6 +785,8 @@ Window {
         delegate: WaylandQuickItem {
             required property var modelData
             readonly property var ls: modelData
+            // background and bottom: into the backdrop (under the windows, blurred by the glass)
+            parent: ls.layer < 2 ? backdrop : shell
             readonly property int a: ls.anchors
             surface: ls.surface
             visible: ls.mapped && (!shell.fullscreenOn || ls.layer === 3)
