@@ -36,10 +36,13 @@
 
 /* Limits */
 /* A browser keeps dozens of connections open, and an 8 KB window made
-   every download crawl: more slots, and a 64 KB buffer whose free space
-   is the window we advertise. */
+   every download crawl: more slots, and a 256 KB ring whose free space is
+   the window we advertise (window scaling: past 64 KB, which at a mobile
+   link's 100 ms round trip held one connection to ~0.6 MB/s). */
 #define TCP_MAX_CONNECTIONS    32
-#define TCP_RX_BUF_SIZE        65536
+#define TCP_RX_BUF_SIZE        262144
+#define TCP_RCV_WSCALE         3         /* our window in units of 8 bytes (a 256 KB one fits 16 bits) */
+#define TCP_OOO_MAX            4         /* out-of-order ranges kept (and SACKed) */
 #define TCP_WINDOW_SIZE        65535
 #define TCP_MSS                1460  /* Max Segment Size (ETH_MTU - IP_HDR - TCP_HDR) */
 #define TCP_CONNECT_TIMEOUT    5000000   /* Poll iterations for connect */
@@ -48,7 +51,7 @@
 /* Wall-clock limits (net_deadline_ms). Both run with interrupts off, so
    they stall the whole system while they wait: keep them short. A close
    only waits for the peer's FIN/ACK as a courtesy. */
-#define TCP_CONNECT_TIMEOUT_MS 5000
+#define TCP_CONNECT_TIMEOUT_MS 15000     /* the SYN sent again at 1, 3 and 7 s */
 #define TCP_CLOSE_TIMEOUT_MS   300
 #define TCP_RETRANSMIT_MAX     5
 #define TCP_EPHEMERAL_BASE     49152     /* Ephemeral port range start */
@@ -84,7 +87,13 @@ typedef struct {
     uint32_t snd_una;        /* Oldest unacknowledged sequence number */
     uint32_t snd_nxt;        /* Next sequence number to send */
     uint32_t snd_iss;        /* Initial send sequence number */
-    uint16_t snd_wnd;        /* Send window (from receiver) */
+    uint16_t snd_wnd;        /* Send window (from receiver), as sent */
+    uint32_t snd_wnd32;      /* ... scaled: in bytes */
+    uint32_t snd_max;        /* the highest sequence number sent (an ACK up to it is good) */
+    uint16_t snd_mss;        /* the peer's MSS (536 when it says none) */
+    uint8_t  snd_wscale;     /* the peer's window shift */
+    bool     wscale_ok;      /* both sides scale their windows */
+    bool     sack_ok;        /* the peer takes SACK blocks */
 
     /* Receive sequence variables */
     uint32_t rcv_nxt;        /* Next expected sequence number */
@@ -95,9 +104,17 @@ typedef struct {
     uint8_t  state;
     bool     in_use;
 
-    /* Receive buffer */
-    uint8_t  rx_buf[TCP_RX_BUF_SIZE];
-    uint32_t rx_len;         /* Bytes available in rx_buf */
+    /* Receive ring (TCP_RX_BUF_SIZE bytes, allocated once per slot and
+       kept): rx_len bytes in order from rx_head, then -- at their places
+       relative to rcv_nxt -- what came past a gap, its ranges in ooo_* */
+    uint8_t *rx_buf;
+    uint32_t rx_head;
+    uint32_t rx_len;         /* Bytes available, in order */
+    uint32_t ooo_s[TCP_OOO_MAX], ooo_e[TCP_OOO_MAX];   /* [start, end) sequence numbers */
+    uint8_t  ooo_n;
+    bool     fin_pending;    /* the peer's FIN came past a gap: taken at fin_seq */
+    uint32_t fin_seq;
+    uint32_t adv_wnd;        /* the window last advertised (bytes) */
     bool     wnd_small;      /* advertised less than an MSS: tell the peer when it opens */
 
     /* Synchronisation flags (volatile for busy-wait loops) */
