@@ -33,8 +33,17 @@
  *   transfers) are heap-allocated and parked on a pending list, freed once
  *   their ticket completes.
  *
- * Runs in syscall context (interrupts off, under the kernel lock --
- * include/wynland/smp.h): no locking of its own.
+ * Locking: the driver's own sleeping mutex (g_drm_mtx) over its tables --
+ * clients, buffer objects, framebuffers, the screen -- taken by every
+ * entry from a thread (ioctl, mmap, read, open, close). The per-frame
+ * ioctls (drm_fast_ok()) come without the big kernel lock: from
+ * kernel/syscall.c's fast path, holding only this mutex. The rest come
+ * with the big lock taken first: the order is always BKL, then g_drm_mtx
+ * -- never the other way (a thread holding g_drm_mtx never takes the
+ * BKL; one sleeping on it gives the BKL back meanwhile, kernel/kmutex.c).
+ * The timer IRQ (drm_tick) only reads the events (their `used` is set
+ * last) and wakes readers. Fds' references to a client and dma-bufs'
+ * references to a BO are atomic counts.
  *
  * Without virtio-gpu (a real machine: no GPU driver of ours yet) the same
  * node is a "simpledrm": the screen the firmware set up (GOP) is the one
@@ -57,6 +66,7 @@
 #include <wynland/mouse.h>
 #include <wynland/spinlock.h>
 #include <wynland/boot_info.h>
+#include <wynland/kmutex.h>
 
 extern void serial_write_string(const char *str);
 extern uint64_t timer_get_ms(void);
@@ -344,6 +354,7 @@ typedef struct {
     VgpuTicket t;
 } DrmPending;
 
+static KMutex     g_drm_mtx = KMUTEX_INIT("drm");
 static DrmClient  g_clients[DRM_MAX_CLIENTS];
 static DrmBo      g_bos[DRM_MAX_BOS];       /* GEM handle = index + 1 */
 static DrmPending g_pending[DRM_MAX_PENDING];
@@ -918,7 +929,7 @@ static int64_t ioctl_prime_fd_to_handle(uint32_t slot, DrmClient *c, uint64_t ar
 void drm_prime_get(uint32_t idx)
 {
     if (idx & I915_CLIENT_BIT) { i915_prime_get(idx); return; }
-    if (idx && idx <= DRM_MAX_BOS && g_bos[idx - 1].used) g_bos[idx - 1].refs++;
+    if (idx && idx <= DRM_MAX_BOS && g_bos[idx - 1].used) __atomic_add_fetch(&g_bos[idx - 1].refs, 1, __ATOMIC_ACQ_REL);
 }
 
 void drm_prime_put(uint32_t idx)
@@ -926,20 +937,27 @@ void drm_prime_put(uint32_t idx)
     if (idx & I915_CLIENT_BIT) { i915_prime_put(idx); return; }
     if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used) return;
     DrmBo *bo = &g_bos[idx - 1];
-    if (bo->refs) bo->refs--;
-    bo_put(bo);
+    uint32_t r = __atomic_load_n(&bo->refs, __ATOMIC_ACQUIRE);
+    while (r && !__atomic_compare_exchange_n(&bo->refs, &r, r - 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {}
+    bo_put(bo);   /* (only marks it: destroyed by pending_gc(), under the mutex) */
 }
 
 int drm_prime_mmap_lookup(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *phys)
 {
     if (idx & I915_CLIENT_BIT) return i915_prime_mmap(idx, offset, len, phys);
-    if (!idx || idx > DRM_MAX_BOS || !g_bos[idx - 1].used || g_bos[idx - 1].zombie) return -EINVAL;
-    DrmBo *bo = &g_bos[idx - 1];
-    /* offset + len could wrap past 2^64 and pass a plain sum check,
-       mapping physical memory below the BO */
-    if (offset & (PAGE_SZ - 1) || offset > bo->size || len > bo->size - offset) return -EINVAL;
-    *phys = bo->phys + offset;
-    return 0;
+    kmutex_lock(&g_drm_mtx);
+    int r = -EINVAL;
+    if (idx && idx <= DRM_MAX_BOS && g_bos[idx - 1].used && !g_bos[idx - 1].zombie) {
+        DrmBo *bo = &g_bos[idx - 1];
+        /* offset + len could wrap past 2^64 and pass a plain sum check,
+           mapping physical memory below the BO */
+        if (!(offset & (PAGE_SZ - 1)) && offset <= bo->size && len <= bo->size - offset) {
+            *phys = bo->phys + offset;
+            r = 0;
+        }
+    }
+    kmutex_unlock(&g_drm_mtx);
+    return r;
 }
 
 /* ============================================================
@@ -1695,7 +1713,6 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
     if (!kms_present(fb, 0, 0, fb->width, fb->height, &t)) return -ENOMEM;
     g_scan_owner = slot;
     if (ev) {
-        ev->used = true;
         ev->user_data = p.user_data;
         ev->t = t;
         /* simpledrm: done at the next 60 Hz "vblank" (a compositor drawing
@@ -1712,6 +1729,7 @@ static int64_t ioctl_page_flip(uint32_t slot, DrmClient *c, uint64_t argp)
                 ev->due_ms = now + (g_flip_surf == SURF_PENDING ? 1100 : 50);   /* (waiting for the GPU: drm_tick) */
             }
         }
+        __atomic_store_n(&ev->used, true, __ATOMIC_RELEASE);   /* last: drm_tick() reads it from the IRQ */
     }
     return 0;
 }
@@ -1761,6 +1779,7 @@ int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
         waitqueue_wait_ms(&c->ev_wq, timer_get_ms() + 5);
     }
     uint64_t done = 0;
+    kmutex_lock(&g_drm_mtx);
     for (uint32_t i = 0; i < DRM_MAX_EVENTS && done + sizeof(struct drm_event_vblank_u) <= len; i++) {
         DrmEvent *e = &c->events[i];
         if (!e->used || !ev_done(e)) continue;
@@ -1773,11 +1792,12 @@ int64_t drm_read(uint32_t slot, uint64_t ubuf, uint64_t len, bool nonblock)
         v.tv_usec = (uint32_t)((ms % 1000) * 1000);
         v.sequence = ++c->ev_seq;
         v.crtc_id = KMS_CRTC_ID;
-        if (copy_to_user((void *)(ubuf + done), &v, sizeof(v))) return done ? (int64_t)done : -EFAULT;
+        if (copy_to_user((void *)(ubuf + done), &v, sizeof(v))) { kmutex_unlock(&g_drm_mtx); return done ? (int64_t)done : -EFAULT; }
         done += sizeof(v);
         if (e->done_ms) { extern void lag_event_read(uint64_t done_ms); lag_event_read(e->done_ms); }
         e->used = false;
     }
+    kmutex_unlock(&g_drm_mtx);
     return (int64_t)done;
 }
 
@@ -1874,9 +1894,13 @@ static int64_t card0_i915(uint32_t *slot, uint32_t partner, uint64_t request, ui
 int64_t drm_ioctl(uint32_t *slot, uint64_t request, uint64_t argp)
 {
     if (*slot & I915_CLIENT_BIT) return i915_ioctl(*slot, request, argp);   /* the Intel GPU's render node */
+    kmutex_lock(&g_drm_mtx);
+    int64_t r;
     if (*slot && *slot <= DRM_MAX_CLIENTS && g_clients[*slot - 1].used && g_clients[*slot - 1].i915)
-        return card0_i915(slot, g_clients[*slot - 1].i915, request, argp);
-    int64_t r = drm_ioctl_inner(slot, request, argp);
+        r = card0_i915(slot, g_clients[*slot - 1].i915, request, argp);
+    else
+        r = drm_ioctl_inner(slot, request, argp);
+    kmutex_unlock(&g_drm_mtx);
 #if DRM_DEBUG
     uint32_t nr = request & 0xFF;
     /* EXECBUFFER/WAIT/TRANSFER are per-frame: only log them on error */
@@ -1981,9 +2005,19 @@ static int64_t drm_ioctl_inner(uint32_t *slot, uint64_t request, uint64_t argp)
     }
 }
 
+static int drm_mmap_lookup_locked(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys);
+
 int drm_mmap_lookup(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys)
 {
     if (slot & I915_CLIENT_BIT) return i915_mmap_lookup(slot, offset, len, phys);
+    kmutex_lock(&g_drm_mtx);
+    int r = drm_mmap_lookup_locked(slot, offset, len, phys);
+    kmutex_unlock(&g_drm_mtx);
+    return r;
+}
+
+static int drm_mmap_lookup_locked(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys)
+{
     if (slot && slot <= DRM_MAX_CLIENTS && g_clients[slot - 1].i915)
         return i915_mmap_lookup(g_clients[slot - 1].i915, offset, len, phys);
     uint32_t handle = (uint32_t)(offset >> 32);
@@ -2029,17 +2063,22 @@ static void client_free(uint32_t slot)
 uint32_t drm_open_client(void)
 {
     uint32_t slot = 0;
-    return client_get(&slot) ? slot : 0;
+    kmutex_lock(&g_drm_mtx);
+    bool ok = client_get(&slot) != NULL;
+    kmutex_unlock(&g_drm_mtx);
+    return ok ? slot : 0;
 }
 
 /* card0: with the Intel GPU up, a client with an i915 partner */
 uint32_t drm_open_card(void)
 {
+    kmutex_lock(&g_drm_mtx);   /* (recursive: drm_open_client, drm_release take it again) */
     uint32_t slot = drm_open_client();
     if (slot && i915_ready()) {
         g_clients[slot - 1].i915 = i915_open_client();
-        if (!g_clients[slot - 1].i915) { drm_release(slot, 0, true); return 0; }
+        if (!g_clients[slot - 1].i915) { drm_release(slot, 0, true); slot = 0; }
     }
+    kmutex_unlock(&g_drm_mtx);
     return slot;
 }
 
@@ -2048,7 +2087,55 @@ void drm_client_ref(uint32_t slot)
 {
     if (slot & I915_CLIENT_BIT) { i915_client_ref(slot); return; }
     if (slot == 0 || slot > DRM_MAX_CLIENTS || !g_clients[slot - 1].used) return;
-    g_clients[slot - 1].refs++;
+    __atomic_add_fetch(&g_clients[slot - 1].refs, 1, __ATOMIC_ACQ_REL);
+}
+
+/* An ioctl kernel/syscall.c may run without the big kernel lock: the
+   per-frame ones, which touch only the driver's own state (no fds, no
+   page tables, no files) -- on virtio-gpu with 3D (the Intel GPU's
+   paths are still the big lock's). */
+bool drm_fast_ok(uint64_t request)
+{
+    if (((request >> 8) & 0xFF) != DRM_IOCTL_TYPE || !virtio_gpu_is_active() || !g_virgl) return false;
+    switch (request & 0xFF) {
+    case DRM_COMMAND_BASE + VIRTGPU_EXECBUFFER:
+    case DRM_COMMAND_BASE + VIRTGPU_WAIT:
+    case DRM_COMMAND_BASE + VIRTGPU_TRANSFER_TO_HOST:
+    case DRM_COMMAND_BASE + VIRTGPU_TRANSFER_FROM_HOST:
+    case DRM_COMMAND_BASE + VIRTGPU_RESOURCE_CREATE:
+    case DRM_COMMAND_BASE + VIRTGPU_RESOURCE_INFO:
+    case DRM_COMMAND_BASE + VIRTGPU_MAP:
+    case DRM_COMMAND_BASE + VIRTGPU_GETPARAM:
+    case DRM_COMMAND_BASE + VIRTGPU_GET_CAPS:
+    case DRM_NR_GEM_CLOSE:
+    case DRM_NR_MODE_PAGE_FLIP:
+    case DRM_NR_MODE_DIRTYFB:
+    case DRM_NR_MODE_ADDFB:
+    case DRM_NR_MODE_ADDFB2:
+    case DRM_NR_MODE_RMFB:
+    case DRM_NR_MODE_CREATE_DUMB:
+    case DRM_NR_MODE_MAP_DUMB:
+    case DRM_NR_MODE_DESTROY_DUMB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* The fast path's hold on a client (under kernel/syscall.c's fd-table
+   lock, the fd still there): one more reference unless it is already
+   going (no references left: the close's slow path frees it). A client
+   with an Intel partner: not here. drm_release() lets it go. */
+bool drm_fast_take(uint32_t slot)
+{
+    if (slot == 0 || slot > DRM_MAX_CLIENTS) return false;
+    DrmClient *c = &g_clients[slot - 1];
+    if (!__atomic_load_n(&c->used, __ATOMIC_ACQUIRE) || c->i915) return false;
+    uint32_t r = __atomic_load_n(&c->refs, __ATOMIC_ACQUIRE);
+    do {
+        if (!r) return false;
+    } while (!__atomic_compare_exchange_n(&c->refs, &r, r + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    return true;
 }
 
 void drm_release(uint32_t slot, uint64_t pid, bool can_sleep)
@@ -2057,10 +2144,15 @@ void drm_release(uint32_t slot, uint64_t pid, bool can_sleep)
     if (slot & I915_CLIENT_BIT) { i915_release(slot); return; }
     if (slot == 0 || slot > DRM_MAX_CLIENTS) return;
     DrmClient *c = &g_clients[slot - 1];
-    if (!c->used) return;
-    /* only the last fd's close ends the client (it used to be the opener
+    if (!__atomic_load_n(&c->used, __ATOMIC_ACQUIRE)) return;
+    /* only the last reference ends the client (it used to be the opener
        pid's first close, even with copies still open) */
-    if (c->refs > 1) { c->refs--; return; }
-    if (can_sleep) client_free(slot);
-    else c->orphaned = true; /* process teardown: can't wait for the host there */
+    if (__atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (can_sleep) {
+        kmutex_lock(&g_drm_mtx);
+        if (c->used) client_free(slot);
+        kmutex_unlock(&g_drm_mtx);
+    } else {
+        __atomic_store_n(&c->orphaned, true, __ATOMIC_RELEASE);   /* process teardown: can't wait for the host there */
+    }
 }

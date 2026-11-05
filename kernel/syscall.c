@@ -2467,6 +2467,27 @@ struct linux_cmsghdr { uint64_t cmsg_len; int32_t cmsg_level; int32_t cmsg_type;
    itself. What needs the fd table -- passing fds (SCM_RIGHTS) both ways --
    or the filesystem -- a destination name -- takes the big lock there. */
 
+/* ioctl() on a DRM node without the big kernel lock: the per-frame ones
+   (drivers/video/virtgpu_drm.c: drm_fast_ok(), under the driver's own
+   mutex). The client is held across the call (a close() meanwhile on
+   another thread frees it only after). false: not one of those. */
+static bool drm_fast(uint64_t fd, uint64_t request, uint64_t argp, int64_t *out) {
+    extern bool drm_fast_ok(uint64_t request);
+    extern bool drm_fast_take(uint32_t slot);
+    Process *proc = sched_current()->proc;
+    if (!proc || fd >= MAX_OPEN_FILES || !drm_fast_ok(request)) return false;
+    uint32_t slot = 0;
+    uint64_t f = spin_lock_irqsave(&g_fdtab_lock);
+    VfsFile *vf = proc->fd_table[fd];
+    if (vf && IS_DRM_DEV(vf->node.first_cluster) && drm_fast_take(vf->current_cluster)) slot = vf->current_cluster;
+    spin_unlock_irqrestore(&g_fdtab_lock, f);
+    if (!slot) return false;
+    uint32_t s = slot;
+    *out = drm_ioctl(&s, request, argp);
+    drm_release(slot, proc->pid, true);
+    return true;
+}
+
 /* fd's Unix socket, held (usock_ref()); false: no such fd or not one */
 static bool usock_fd_take(uint64_t fd, int *idx, uint32_t *oflags) {
     Process *proc = sched_current()->proc;
@@ -2860,6 +2881,8 @@ static void lockfree_init(void)
         96,   /* gettimeofday */
         201,  /* time */
         202,  /* futex (its own lock: kernel/futex.c) */
+        16,   /* ioctl: a DRM node's per-frame ones (drm_fast(), the
+                 driver's own mutex); anything else takes the big lock */
         0,    /* read, write: on a pipe or an eventfd (pipe_fast()) */
         1,    /*   or a Unix socket (usock_fast()); anything else takes */
         44,   /*   the big lock there -- so do sendto, recvfrom, sendmsg, */
@@ -5316,6 +5339,11 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
 
         case 16: // SYS_ioctl (Linux standard) — stub for terminal/device control
+            {   /* a DRM node's per-frame ioctls: outside the big lock (drm_fast()) */
+                int64_t dr;
+                if (drm_fast(a1, a2, a3, &dr)) return (uint64_t)dr;
+                bkl_lock();
+            }
             {
                 int fd = (int)a1;
                 uint64_t request = a2;
