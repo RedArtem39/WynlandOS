@@ -44,9 +44,10 @@ Item {
     readonly property var curveOut: [0.3, 0, 0.8, 0.15, 1, 1]
 
     // the colours: the focused border two hues turning, the rest quiet
-    readonly property color accentA: "#6fb3ff"
-    readonly property color accentB: "#b38bff"
-    readonly property color idle: "#2a2f3a"
+    // the shell's colours (hyprctl keyword general:col.active_border ...)
+    readonly property color accentA: zerp.activeBorder.length ? zerp.activeBorder[0] : "#6fb3ff"
+    readonly property color accentB: zerp.activeBorder.length > 1 ? zerp.activeBorder[1] : accentA
+    readonly property color idle: zerp.inactiveBorder
 
     // where it is: the layout's target, held while the window closes (the
     // layout has forgotten it already)

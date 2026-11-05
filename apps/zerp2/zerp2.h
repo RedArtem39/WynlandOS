@@ -164,6 +164,11 @@ class ZServer : public QObject
     Q_PROPERTY(QObject *focusedClient READ focusedClient NOTIFY focusChanged)
     Q_PROPERTY(int workspace READ workspace WRITE setWorkspace NOTIFY workspaceChanged)
     Q_PROPERTY(bool showFps READ showFps WRITE setShowFps NOTIFY showFpsChanged)
+    // the windows' borders (Hyprland's general:col.active_border /
+    // inactive_border, set by the shell for its colours): the focused one's
+    // gradient (one colour or more), the others' colour
+    Q_PROPERTY(QVariantList activeBorder READ activeBorder NOTIFY styleChanged)
+    Q_PROPERTY(QColor inactiveBorder READ inactiveBorder NOTIFY styleChanged)
     // where the pointer is (the canvas pans when it is pushed at an edge)
     Q_PROPERTY(QPoint cursor READ cursor NOTIFY cursorChanged)
     // the keyboard layout: "EN", "RU" (the bar's indicator)
@@ -233,6 +238,10 @@ public:
     Q_INVOKABLE int countOn(int workspace) const;
     bool showFps() const { return m_showFps; }
     void setShowFps(bool s) { if (s != m_showFps) { m_showFps = s; emit showFpsChanged(); } }
+    QVariantList activeBorder() const { return m_activeBorder; }
+    QColor inactiveBorder() const { return m_inactiveBorder; }
+    // `hyprctl keyword NAME VALUE`: false for a keyword Zerp has no use for
+    bool keyword(const QString &name, const QString &value);
 
 signals:
     void clientsChanged();
@@ -247,6 +256,7 @@ signals:
     void altUp();
     void cursorChanged();
     void showFpsChanged();
+    void styleChanged();
     void keyboardLayoutChanged();
     void reloadRequested();   // hyprctl reload: the key bindings and layouts again
     void ipcEventRequested(const QString &name, const QString &data);
@@ -262,6 +272,8 @@ private:
     int m_nextId = 1;
     int m_workspace = 1;
     bool m_showFps = false;
+    QVariantList m_activeBorder{ QColor(0x6f, 0xb3, 0xff), QColor(0xb3, 0x8b, 0xff) };
+    QColor m_inactiveBorder{ 0x2a, 0x2f, 0x3a };
     QPoint m_cursor;
     QVector<ZClient *> m_clients;
     ZClientModel m_model;

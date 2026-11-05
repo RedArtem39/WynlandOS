@@ -824,3 +824,34 @@ bool ZServer::writeFile(const QString &path, const QString &text) const
     f.write(text.toUtf8());
     return f.commit();
 }
+
+// Hyprland's colours: rgba(rrggbbaa), rgb(rrggbb), 0xaarrggbb; a gradient
+// is several of them (and an angle, "45deg", not used: ours turns)
+static bool hyprColor(const QString &t, QColor *c)
+{
+    QString h;
+    bool alphaLast = true;
+    if (t.startsWith(QLatin1String("rgba(")) && t.endsWith(')')) h = t.mid(5, t.size() - 6);
+    else if (t.startsWith(QLatin1String("rgb(")) && t.endsWith(')')) h = t.mid(4, t.size() - 5) + QLatin1String("ff");
+    else if (t.startsWith(QLatin1String("0x"))) { h = t.mid(2); alphaLast = false; }
+    else return false;
+    bool ok = false;
+    const uint v = h.toUInt(&ok, 16);
+    if (!ok || h.size() != 8) return false;
+    *c = alphaLast ? QColor((v >> 24) & 255, (v >> 16) & 255, (v >> 8) & 255, v & 255)
+                   : QColor((v >> 16) & 255, (v >> 8) & 255, v & 255, (v >> 24) & 255);
+    return true;
+}
+
+bool ZServer::keyword(const QString &name, const QString &value)
+{
+    const QString n = name.trimmed().toLower();
+    if (n != QLatin1String("general:col.active_border") && n != QLatin1String("general:col.inactive_border")) return false;
+    QVariantList cs;
+    for (const QString &t : value.split(' ', Qt::SkipEmptyParts)) { QColor c; if (hyprColor(t, &c)) cs.append(c); }
+    if (cs.isEmpty()) return false;
+    if (n.endsWith(QLatin1String("active_border")) && !n.contains(QLatin1String("inactive"))) m_activeBorder = cs;
+    else m_inactiveBorder = cs.first().value<QColor>();
+    emit styleChanged();
+    return true;
+}

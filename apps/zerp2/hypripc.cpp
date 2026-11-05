@@ -215,7 +215,14 @@ QByteArray HyprIpc::command(QByteArray cmd, bool json)
     }
     // the configuration again: key bindings, keyboard layouts (keyboard(1))
     if (name == "reload") { emit m_srv->reloadRequested(); return "ok"; }
-    if (name == "keyword" || name == "setcursor" ||
+    if (name == "keyword") {
+        // "keyword NAME VALUE..." (the line's rest: name, then the value)
+        const QString rest = QString::fromUtf8(args);
+        const int sp = rest.indexOf(' ');
+        if (sp > 0) m_srv->keyword(rest.left(sp), rest.mid(sp + 1));
+        return "ok";
+    }
+    if (name == "setcursor" ||
         name == "notify" || name == "dismissnotify" || name == "seterror" || name == "eval")
         return "ok";
 
