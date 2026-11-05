@@ -423,8 +423,10 @@ void ZClientModel::remove(ZClient *c)
 
 ZServer::ZServer(uint32_t shmBytes, QObject *parent) : QObject(parent), m_shmBytes(shmBytes)
 {
+    // Zerp's own clients' messages, read every 4 ms -- only while there
+    // are any (Wayland windows come by the compositor's own events: the
+    // timer ran for nothing, 250 wakeups a second)
     connect(&m_pump, &QTimer::timeout, this, &ZServer::pumpAll);
-    m_pump.start(4);
     connect(&m_reaper, &QTimer::timeout, this, &ZServer::reap);
     m_reaper.start(500);
 }
@@ -450,6 +452,7 @@ int ZServer::spawn(const QString &path)
     m_model.add(c);
     emit clientsChanged();
     focus(c);
+    if (!m_pump.isActive()) m_pump.start(4);
     return c->id();
 }
 
@@ -616,10 +619,14 @@ void ZServer::pumpAll()
 {
     QVector<QString> spawns;
     QVector<ZClient *> gone;
-    for (ZClient *c : m_clients)
+    bool own = false;
+    for (ZClient *c : m_clients) {
         if (!c->pump(&spawns)) gone.append(c);
+        else if (!c->wayland()) own = true;
+    }
     remove(gone, "closed");
     for (const QString &p : spawns) spawn(p);
+    if (!own && spawns.isEmpty()) m_pump.stop();   // (spawn() starts it again)
 }
 
 void ZServer::reap()
