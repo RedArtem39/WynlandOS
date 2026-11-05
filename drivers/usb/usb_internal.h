@@ -47,6 +47,9 @@ typedef struct UsbDev {
     /* a mouse in report protocol: where its report descriptor puts the
        fields (bit offsets after the report ID; size 0: absent) */
     bool     hid_parsed;
+    uint8_t  hid_iface;                      /* its interface (SET_PROTOCOL) */
+    uint16_t hid_dead;                       /* report protocol: reports in a row that said nothing */
+    volatile bool hid_to_boot;               /* back to the boot protocol (the poll thread does it) */
     uint8_t  hid_rid;                        /* its report ID, 0: none */
     uint16_t hid_bo, hid_bn;                 /* buttons: first bit, how many */
     uint16_t hid_xo, hid_yo, hid_wo;         /* X, Y, the wheel */
@@ -97,6 +100,7 @@ bool usb_bulk_xfer(UsbDev *d, uint8_t ep_id, UsbRing *ring, uint64_t phys,
 bool usb_hid_setup(UsbDev *d, uint8_t iface, uint8_t proto, uint8_t ep_addr,
                    uint16_t maxp, uint8_t interval);
 void usb_hid_event(UsbDev *d, uint32_t code, uint32_t resid);
+void usb_hid_poll(void);
 
 /* ---- usb_net.c ---------------------------------------------------- */
 typedef struct {

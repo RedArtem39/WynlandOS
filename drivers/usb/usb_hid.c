@@ -139,30 +139,51 @@ static bool mouse_parse_desc(UsbDev *d, const uint8_t *p, uint32_t n)
 }
 
 /* The report protocol (the mouse's own format, read from its report
-   descriptor: the wheel) is OFF: on the laptop's plain wired mouse it left
-   the cursor still, where the boot protocol moves it and clicks. Until a
-   real mouse's descriptor and reports have been looked at (the first
-   reports are logged below), mice stay on the boot protocol. */
-bool g_usb_hid_report = false;
+   descriptor: the wheel). It once left the laptop's wired mouse still:
+   SET_PROTOCOL always asked for boot reports. Should a mouse still say
+   nothing readable in it (40 reports in a row), it goes back to the boot
+   protocol by itself (usb_hid_poll); its descriptor and first reports
+   are on the kernel log. */
+bool g_usb_hid_report = true;
+
+static void hid_hex_line(const char *pre, const uint8_t *b, uint32_t n)
+{
+    static const char hx[] = "0123456789abcdef";
+    char line[220]; uint32_t k = 0;
+    while (*pre && k < 64) line[k++] = *pre++;
+    for (uint32_t i = 0; i < n && k + 4 < sizeof line; i++) { line[k++] = ' '; line[k++] = hx[b[i] >> 4]; line[k++] = hx[b[i] & 15]; }
+    line[k++] = '\r'; line[k++] = '\n'; line[k] = 0;
+    serial_write_string(line);
+}
+
+/* the poll thread, outside the event ring's lock: control transfers */
+void usb_hid_poll(void)
+{
+    for (uint32_t i = 0; i < USB_MAX_DEVS; i++) {
+        UsbDev *d = &g_usb_devs[i];
+        if (!d->used || d->hid_kind != 2 || !d->hid_to_boot) continue;
+        d->hid_to_boot = false;
+        d->hid_parsed = false;
+        usb_set_protocol(d, d->hid_iface, 0);
+        serial_write_string("USB HID: mouse said nothing readable in its report protocol: boot protocol (no wheel)\r\n");
+    }
+}
 
 static void mouse_report(UsbDev *d, const uint8_t *rep, uint32_t len)
 {
     int dx, dy, wheel, buttons;
     /* the first reports, raw, on the kernel log: what a real mouse sends */
     static int logged;
-    if (logged < 6) {
-        static const char hx[] = "0123456789abcdef";
-        char line[96]; int n = 0;
-        const char *pre = "USB HID: mouse report:";
-        while (*pre) line[n++] = *pre++;
-        for (uint32_t i = 0; i < len && i < 16; i++) { line[n++] = ' '; line[n++] = hx[rep[i] >> 4]; line[n++] = hx[rep[i] & 15]; }
-        line[n++] = '\r'; line[n++] = '\n'; line[n] = 0;
-        serial_write_string(line);
-        logged++;
-    }
+    if (logged < 12) { hid_hex_line("USB HID: mouse report:", rep, len < 16 ? len : 16); logged++; }
     if (d->hid_parsed) {
+        /* something in it (a mouse at rest sends nothing at all) */
+        bool any = false;
+        for (uint32_t i = 0; i < len; i++) if (rep[i]) any = true;
         if (d->hid_rid) {
-            if (!len || rep[0] != d->hid_rid) return;   /* another report (a keyboard's, consumer keys) */
+            if (!len || rep[0] != d->hid_rid) {         /* another report (consumer keys)... or not ours at all */
+                if (any && ++d->hid_dead >= 40) d->hid_to_boot = true;
+                return;
+            }
             rep++; len--;
         }
         dx = report_bits(rep, len, d->hid_xo, d->hid_xs);
@@ -171,6 +192,8 @@ static void mouse_report(UsbDev *d, const uint8_t *rep, uint32_t len)
         buttons = 0;
         for (uint32_t b = 0; b < d->hid_bn; b++)
             if (rep[(d->hid_bo + b) / 8] & (1u << ((d->hid_bo + b) % 8))) buttons |= 1 << b;
+        if (dx || dy || wheel || buttons || buttons != d->hid_buttons) d->hid_dead = 0;
+        else if (any && ++d->hid_dead >= 40) d->hid_to_boot = true;
     } else {
         if (len < 3) return;
         dx = (int8_t)rep[1];
@@ -245,6 +268,9 @@ bool usb_hid_setup(UsbDev *d, uint8_t iface, uint8_t proto, uint8_t ep_addr,
     /* a mouse: its own report (report protocol, the wheel in it) when its
        report descriptor reads; else the boot protocol, without a wheel */
     d->hid_parsed = false;
+    d->hid_iface = iface;
+    d->hid_dead = 0;
+    d->hid_to_boot = false;
     if (proto == 2 && g_usb_hid_report) {
         /* its length from the HID descriptor (bytes 7-8), then exactly that */
         static uint8_t hidd[9], desc[512];
@@ -255,12 +281,23 @@ bool usb_hid_setup(UsbDev *d, uint8_t iface, uint8_t proto, uint8_t ep_addr,
            for plenty -- a short answer leaves the rest zero, no items) */
         if (!dlen || dlen > sizeof desc) dlen = sizeof desc;
         memset(desc, 0, sizeof desc);
-        if (dlen && usb_control(d, 0x81, 6, 0x2200, iface, desc, (uint16_t)dlen, true) &&
-            mouse_parse_desc(d, desc, dlen)) {
+        bool got = dlen && usb_control(d, 0x81, 6, 0x2200, iface, desc, (uint16_t)dlen, true);
+        if (got) {
+            /* the descriptor on the kernel log (what the parse made of it after) */
+            uint32_t m = hidd[7] | (uint32_t)hidd[8] << 8;
+            if (!m || m > dlen) m = dlen > 128 ? 128 : dlen;
+            for (uint32_t o = 0; o < m && o < 256; o += 32) hid_hex_line("USB HID: mouse descriptor:", desc + o, m - o < 32 ? m - o : 32);
+        }
+        if (got && mouse_parse_desc(d, desc, dlen)) {
             usb_set_protocol(d, iface, 1);
             d->hid_parsed = true;
             serial_write_string(d->hid_ws ? "USB HID: mouse, report protocol, a wheel\r\n"
                                           : "USB HID: mouse, report protocol, no wheel\r\n");
+            {   /* where it found what: report ID, X, Y, the wheel, the buttons (bit offset, size) */
+                uint8_t f[11] = { d->hid_rid, (uint8_t)d->hid_xo, d->hid_xs, (uint8_t)d->hid_yo, d->hid_ys,
+                                  (uint8_t)d->hid_wo, d->hid_ws, (uint8_t)d->hid_bo, (uint8_t)d->hid_bn, (uint8_t)d->hid_maxp, 0 };
+                hid_hex_line("USB HID: mouse layout rid/x/xs/y/ys/w/ws/b/bn/maxp:", f, 10);
+            }
         }
     }
     if ((proto == 1 || proto == 2) && !d->hid_parsed)

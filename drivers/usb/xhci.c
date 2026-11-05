@@ -260,6 +260,7 @@ void usb_poll_thread(void *arg)
     (void)arg;
     for (uint32_t n = 0;; n++) {
         usb_drain();
+        usb_hid_poll();
         if (n % 64 == 0) port_scan();           /* ~8 times a second: plugged in, pulled out (a phone
                                                    switching mode gives up after a second or two) */
         sched_sleep_ms(2);
@@ -370,10 +371,12 @@ bool usb_set_config(UsbDev *d, uint8_t value)
     return usb_control(d, 0x00, 9, value, 0, NULL, 0, false);
 }
 
+/* SET_PROTOCOL (0 boot, 1 report), then SET_IDLE 0. (It always asked for
+   the boot protocol: a mouse read by its report descriptor sent boot
+   reports -- with a report ID, every one was thrown away: a still cursor.) */
 bool usb_set_protocol(UsbDev *d, uint8_t iface, uint8_t proto)
 {
-    (void)proto;
-    return usb_control(d, 0x21, 0x0B, 0, iface, NULL, 0, false) &&
+    return usb_control(d, 0x21, 0x0B, proto ? 1 : 0, iface, NULL, 0, false) &&
            usb_control(d, 0x21, 0x0A, 0, iface, NULL, 0, false);
 }
 
