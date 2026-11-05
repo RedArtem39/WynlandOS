@@ -3,6 +3,8 @@
 
 #include <QtCore/QCoreApplication>
 #include <QtCore/QFile>
+#include <QtCore/QFileInfo>
+#include <QtCore/QJsonDocument>
 #include <QtCore/QVariantMap>
 
 #include <fcntl.h>
@@ -23,6 +25,15 @@ Greeter::Greeter(int reqFd, int repFd, bool firstBoot, QObject *parent)
             u[QStringLiteral("name")] = QString::fromUtf8(p[0]);
             const QString full = QString::fromUtf8(p[4]).split(',').first().trimmed();
             u[QStringLiteral("fullName")] = full.isEmpty() ? QString::fromUtf8(p[0]) : full;
+            // how the account looks here (the shell's settings, "Экран входа"):
+            // /var/lib/wynlogin/looks/<name>.json -- a world-writable sticky
+            // folder, so only a file the account itself owns counts
+            const QString look = QStringLiteral("/var/lib/wynlogin/looks/") + QString::fromUtf8(p[0]) + QStringLiteral(".json");
+            QFile lf(look);
+            if (QFileInfo(look).ownerId() == uid && lf.size() < 4096 && lf.open(QIODevice::ReadOnly)) {
+                const QJsonDocument d = QJsonDocument::fromJson(lf.readAll());
+                if (d.isObject()) u[QStringLiteral("look")] = d.toVariant();
+            }
             m_users.append(u);
         }
     }

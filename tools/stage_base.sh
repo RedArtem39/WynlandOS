@@ -236,6 +236,11 @@ L=$REPO/apps/leaf
     for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
+    # each account's look on the login screen (xvlet's settings write it,
+    # the login screen reads it): anyone writes, only their own (sticky)
+    echo "D /var/lib/wynlogin"
+    echo "D /var/lib/wynlogin/looks"
+    echo "P /var/lib/wynlogin/looks 0 41777"
     echo "F /usr/bin/leaf $L/leaf"
     echo "F /etc/leaf/sources $L/shims/sources"
     echo "F /var/lib/leaf/base $OUT/leaf_base.txt"
