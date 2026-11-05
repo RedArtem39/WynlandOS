@@ -216,22 +216,48 @@ static TcpConnection *find_connection(uint32_t src_ip, uint16_t src_port,
  * segment to net_send_ipv4.
  * ============================================================ */
 
-static bool tcp_send_segment_locked(TcpConnection *conn, uint8_t flags,
-                                    const void *data, uint32_t data_len);
+#define TCP_SEG_MAX (sizeof(TcpHeader) + 40 + NET_PKT_BUF)
 
+static uint32_t tcp_build_segment(TcpConnection *conn, uint8_t flags,
+                                  const void *data, uint32_t data_len, uint8_t *seg_buf);
+
+/* Built under the lock, sent without it: sending may wait (the first
+   packet to a host waits for its ARP answer, polling the network -- and
+   this core's own packets come in through tcp_handle_packet, which takes
+   the lock). A wait with the spinlock held also slept with it and woke on
+   another core ("released by a core that does not hold 'tcp'"). */
 static bool tcp_send_segment(TcpConnection *conn, uint8_t flags,
                              const void *data, uint32_t data_len)
 {
+    uint8_t seg_buf[TCP_SEG_MAX];
     uint64_t fl = spin_lock_irqsave(&g_tcp_lock);
-    bool ok = tcp_send_segment_locked(conn, flags, data, data_len);
+    uint32_t n = tcp_build_segment(conn, flags, data, data_len, seg_buf);
+    uint32_t ip = conn->remote_ip;
     spin_unlock_irqrestore(&g_tcp_lock, fl);
-    return ok;
+    return n && net_send_ipv4(ip, IP_PROTO_TCP, seg_buf, n);
 }
 
+/* From the receive path (the lock held): the ACK it answers with is only
+   built here; tcp_handle_packet sends it once the lock is gone. One a
+   packet -- a later one replaces it (it acknowledges as much or more). */
+static uint8_t  g_ack_buf[sizeof(TcpHeader) + 40];
+static uint32_t g_ack_len, g_ack_ip;
 static bool tcp_send_segment_locked(TcpConnection *conn, uint8_t flags,
                                     const void *data, uint32_t data_len)
 {
-    uint8_t seg_buf[sizeof(TcpHeader) + 40 + NET_PKT_BUF];
+    if (data_len) return false;                        /* (only bare ACKs come this way) */
+    uint8_t seg_buf[sizeof(TcpHeader) + 40 + 64];
+    uint32_t n = tcp_build_segment(conn, flags, data, 0, seg_buf);
+    if (!n || n > sizeof g_ack_buf) return false;
+    memcpy(g_ack_buf, seg_buf, n);
+    g_ack_len = n;
+    g_ack_ip = conn->remote_ip;
+    return true;
+}
+
+static uint32_t tcp_build_segment(TcpConnection *conn, uint8_t flags,
+                                  const void *data, uint32_t data_len, uint8_t *seg_buf)
+{
     TcpHeader *tcp;
     uint32_t tcp_total;
     uint16_t cksum;
@@ -257,7 +283,7 @@ static bool tcp_send_segment_locked(TcpConnection *conn, uint8_t flags,
 
     tcp_total = sizeof(TcpHeader) + ol + data_len;
     if (data_len > NET_PKT_BUF)
-        return false;
+        return 0;
 
     tcp = (TcpHeader *)seg_buf;
     tcp->src_port   = htons(conn->local_port);
@@ -283,7 +309,7 @@ static bool tcp_send_segment_locked(TcpConnection *conn, uint8_t flags,
                          seg_buf, tcp_total);
     tcp->checksum = htons(cksum);
 
-    return net_send_ipv4(conn->remote_ip, IP_PROTO_TCP, seg_buf, tcp_total);
+    return tcp_total;
 }
 
 /* ============================================================
@@ -847,9 +873,15 @@ static void tcp_handle_packet_locked(uint32_t src_ip, uint32_t dst_ip,
 void tcp_handle_packet(uint32_t src_ip, uint32_t dst_ip,
                        const uint8_t *data, uint32_t len)
 {
+    uint8_t ack[sizeof g_ack_buf];
     uint64_t fl = spin_lock_irqsave(&g_tcp_lock);
+    g_ack_len = 0;
     tcp_handle_packet_locked(src_ip, dst_ip, data, len);
+    uint32_t n = g_ack_len, ip = g_ack_ip;
+    if (n) memcpy(ack, g_ack_buf, n);
+    g_ack_len = 0;
     spin_unlock_irqrestore(&g_tcp_lock, fl);
+    if (n) net_send_ipv4(ip, IP_PROTO_TCP, ack, n);
 }
 
 static void tcp_handle_packet_locked(uint32_t src_ip, uint32_t dst_ip,

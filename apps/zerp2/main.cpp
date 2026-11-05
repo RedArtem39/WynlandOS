@@ -31,6 +31,7 @@
 #include <QtWaylandCompositor/QWaylandCompositor>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "zerp2.h"
 #include "greeter.h"
@@ -471,7 +472,20 @@ int main(int argc, char **argv)
     // eglBindWaylandDisplayWL for the plugin to wait on
     qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "linux-dmabuf-unstable-v1");
     qputenv("QT_WAYLAND_IGNORE_BIND_DISPLAY", "1");
-    const QByteArray driver = drmDriver();
+    // boot.cfg "gpu=1": the Intel GPU's driver comes up on its own thread
+    // while userspace starts, and the login screen is there in ~20 ms --
+    // card0 still the firmware's framebuffer (simpledrm). Its driver
+    // waited for (a few seconds at most), not llvmpipe for the session.
+    QByteArray driver = drmDriver();
+    bool gpuCfg = false;
+    for (const QByteArray &l : bootCfg().split('\n')) gpuCfg |= l.trimmed() == "gpu=1";
+    if (driver == "simpledrm" && gpuCfg) {
+        for (int i = 0; i < 100 && driver == "simpledrm"; i++) {
+            usleep(50 * 1000);
+            driver = drmDriver();
+        }
+        fprintf(stderr, "[zerp2] waited for the GPU's driver: %s\n", driver.constData());
+    }
     const bool software = driver == "simpledrm";
     // The Intel GPU (drivers/gpu/i915_uapi.c): its depth (HiZ) and colour
     // compression (CCS) surfaces don't work on our driver yet -- depth

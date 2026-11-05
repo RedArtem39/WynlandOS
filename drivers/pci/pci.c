@@ -3,6 +3,7 @@
  */
 
 #include <wynland/pci.h>
+#include <wynland/spinlock.h>
 
 static inline void outl(uint16_t port, uint32_t val) {
     __asm__ volatile("outl %0, %1" :: "a"(val), "Nd"(port));
@@ -17,18 +18,29 @@ static inline uint32_t inl(uint16_t port) {
 /* The standard 256 bytes of configuration space through ports CF8/CFC:
    every PC has them. (ECAM -- drivers/acpi/acpi.c, MCFG -- is for the
    extended space past 256, which nothing here reads yet.) */
+/* One address register for the whole machine: its write and the data
+   access after it are one step, or another core's access in between
+   (the GPU driver's thread setting MSI up while /sys answers Mesa's PCI
+   questions) sends the data to the wrong device's register. */
+static Spinlock g_pci_lock = SPINLOCK_INIT("pci");
+
 uint32_t pci_read_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
     uint32_t address = (uint32_t)((bus << 16) | (slot << 11) |
                                   (func << 8) | (offset & 0xfc) | ((uint32_t)0x80000000));
+    uint64_t f = spin_lock_irqsave(&g_pci_lock);
     outl(0xCF8, address);
-    return inl(0xCFC);
+    uint32_t v = inl(0xCFC);
+    spin_unlock_irqrestore(&g_pci_lock, f);
+    return v;
 }
 
 void pci_write_config(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset, uint32_t value) {
     uint32_t address = (uint32_t)((bus << 16) | (slot << 11) |
                                   (func << 8) | (offset & 0xfc) | ((uint32_t)0x80000000));
+    uint64_t f = spin_lock_irqsave(&g_pci_lock);
     outl(0xCF8, address);
     outl(0xCFC, value);
+    spin_unlock_irqrestore(&g_pci_lock, f);
 }
 
 bool pci_find_device(uint8_t class_code, uint8_t subclass, PciDevice *out_dev) {
