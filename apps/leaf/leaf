@@ -36,7 +36,9 @@ import tarfile
 import tempfile
 import time
 import http.client
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.environ.get("LEAF_ROOT", "/")
@@ -602,22 +604,135 @@ def install_deb(state, rec, path, conffiles_keep=True):
     return scripts, old
 
 
+class KeepAlive:
+    """one HTTP connection kept open across requests to the same mirror (a
+    new one per package cost a name lookup, a TCP handshake and a slow
+    start each -- most of the time with many small packages)"""
+
+    def __init__(self):
+        self.conn = None
+        self.key = None
+
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = None
+
+    def get(self, url, hops=0):
+        u = urllib.parse.urlsplit(url)
+        key = (u.scheme, u.netloc)
+        if self.conn is None or self.key != key:
+            self.close()
+            cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+            self.conn, self.key = cls(u.netloc, timeout=60), key
+        path = (u.path or "/") + ("?" + u.query if u.query else "")
+        self.conn.request("GET", path, headers={"User-Agent": "leaf/1 (WynlandOS)"})
+        r = self.conn.getresponse()
+        if r.status in (301, 302, 303, 307, 308) and hops < 5:
+            loc = r.getheader("Location") or ""
+            r.read()
+            return self.get(urllib.parse.urljoin(url, loc), hops + 1)
+        if r.status != 200:
+            r.read()
+            raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+        if r.getheader("Connection", "").lower() == "close":
+            self.key = None                    # (read to the end, then a new one next time)
+        return r
+
+
+DOWNLOADERS = 4                                # packages fetched at once
+
+
 def download(recs):
+    """the packages not in the cache yet, DOWNLOADERS at once, each worker
+    keeping its connection to the mirror; one progress line for all"""
     os.makedirs(CACHE, exist_ok=True)
-    paths = {}
-    total = sum(int(r.get("Size", 0)) for r in recs)
-    say(f"downloading {len(recs)} package(s), {total / 1e6:.1f} MB")
+    paths, todo = {}, []
     for r in recs:
         path = os.path.join(CACHE, os.path.basename(r["Filename"]))
-        ok = False
-        if os.path.exists(path):
-            ok = sha256_file(path) == r["SHA256"]
-        if not ok:
-            fetch(f"{r['_url']}/{r['Filename']}", path)
-            if sha256_file(path) != r["SHA256"]:
-                os.unlink(path)
-                die(f"{r['Package']}: checksum mismatch -- not installing")
         paths[r["Package"]] = path
+        if path in (t[1] for t in todo):
+            continue                           # (one file, once: two workers on one .part would mix it)
+        if not (os.path.exists(path) and sha256_file(path) == r["SHA256"]):
+            todo.append((r, path))
+    total = sum(int(r.get("Size", 0)) for r, _ in todo)
+    say(f"downloading {len(todo)} package(s), {total / 1e6:.1f} MB" +
+        (f" ({len(recs) - len(todo)} already here)" if len(todo) < len(recs) else ""))
+    if not todo:
+        return paths
+
+    lock = threading.Lock()
+    st = {"got": 0, "done": 0, "next": 0, "errors": []}
+
+    def one(conn, r, path):
+        url = f"{r['_url']}/{r['Filename']}"
+        for attempt in range(3):
+            got = 0
+            try:
+                resp = conn.get(url)
+                with open(path + ".part", "wb") as f:
+                    while True:
+                        chunk = resp.read(1 << 17)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        with lock:
+                            st["got"] += len(chunk)
+                os.replace(path + ".part", path)
+                if sha256_file(path) != r["SHA256"]:
+                    os.unlink(path)
+                    return f"{r['Package']}: checksum mismatch -- not installing"
+                return None
+            except (OSError, http.client.HTTPException, urllib.error.URLError) as e:
+                conn.close()
+                with lock:
+                    st["got"] -= got           # (counted again from the start)
+                if isinstance(e, urllib.error.HTTPError) and e.code < 500:
+                    return f"{url}: {e}"
+                if attempt == 2:
+                    return f"{url}: {e}"
+                time.sleep(2)
+
+    def worker():
+        conn = KeepAlive()
+        try:
+            while True:
+                with lock:
+                    if st["errors"] or st["next"] >= len(todo):
+                        return
+                    r, path = todo[st["next"]]
+                    st["next"] += 1
+                err = one(conn, r, path)
+                with lock:
+                    st["done"] += 1
+                    if err:
+                        st["errors"].append(err)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(min(DOWNLOADERS, len(todo)))]
+    t0 = time.monotonic()
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        for t in threads:
+            t.join(0.25)
+        if USE_COLOR:
+            with lock:
+                got, done = st["got"], st["done"]
+            rate = got / max(time.monotonic() - t0, 0.001)
+            print(f"\r   {done}/{len(todo)} packages  {got / 1e6:6.1f} of {total / 1e6:.1f} MB  {rate / 1e6:5.2f} MB/s ",
+                  end="", flush=True)
+    if USE_COLOR:
+        print("\r" + " " * 78 + "\r", end="", flush=True)
+    if st["errors"]:
+        die(st["errors"][0])
+    secs = time.monotonic() - t0
+    say(f"downloaded {total / 1e6:.1f} MB in {secs:.1f} s ({total / 1e6 / max(secs, 0.001):.2f} MB/s)")
     return paths
 
 
