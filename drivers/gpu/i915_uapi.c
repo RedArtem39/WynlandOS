@@ -21,6 +21,21 @@
  *
  * Anything else is logged with its number ("i915: unknown ioctl"): Mesa
  * shows what it still wants.
+ *
+ * Locking: the driver's own sleeping mutex (g_mtx) over its tables --
+ * clients, objects, handles, VMs, contexts, syncobjs, the engines' queues
+ * -- taken by every entry from a thread and by the engines' threads for
+ * their bookkeeping (taking a request off the queue, its objects, the
+ * client's count of queued work, its fences). Never held while waiting:
+ * a wait (for the GPU, another engine, a fence) gives it back meanwhile
+ * (mtx_sleep_ms, mtx_wait), so the engines' threads can finish what is
+ * waited for. The per-frame ioctls (i915_fast_ok) come without the big
+ * kernel lock (kernel/syscall.c's fast path); the rest with it, taken
+ * first (BKL, then g_mtx -- a thread holding g_mtx never takes the BKL).
+ * Before it, the engines' threads -- which never held the big lock --
+ * took requests off the queue while execbuffer appended to it under the
+ * big lock: a request could be lost (never run: its waiter stuck) and the
+ * client's count of queued work go wrong.
  */
 #include <wynland/types.h>
 #include <wynland/i915.h>
@@ -30,6 +45,8 @@
 #include <wynland/waitqueue.h>
 #include <wynland/heap.h>
 #include <wynland/usercopy.h>
+#include <wynland/kmutex.h>
+#include <wynland/smp.h>
 
 extern void serial_write_string(const char *s);
 extern void uint_to_hex(uint64_t v, char *buf);
@@ -119,6 +136,30 @@ static Bo g_bos[MAX_BOS];
 static uint32_t g_resets;                             /* GPU resets since boot (GET_RESET_STATS) */
 static Client *g_clients[MAX_CLIENTS];
 static Spinlock g_lock = SPINLOCK_INIT("i915-uapi");
+static KMutex g_mtx = KMUTEX_INIT("i915");
+
+/* a wait with the driver's mutex given back meanwhile (all its depth),
+   taken again after -- held or not, as before */
+static uint32_t mtx_give(void)
+{
+    uint32_t d = 0;
+    while (kmutex_held(&g_mtx)) { kmutex_unlock(&g_mtx); d++; }
+    return d;
+}
+static void mtx_take(uint32_t d) { while (d--) kmutex_lock(&g_mtx); }
+static void mtx_sleep_ms(uint64_t ms)
+{
+    extern void sched_sleep_ms(uint64_t ms);
+    uint32_t d = mtx_give();
+    sched_sleep_ms(ms);
+    mtx_take(d);
+}
+static void mtx_wait(WaitQueue *wq, uint64_t until, uint64_t seq)
+{
+    uint32_t d = mtx_give();
+    waitqueue_wait_ms_seq(wq, until, seq);
+    mtx_take(d);
+}
 
 static Client *client(uint32_t slot)
 {
@@ -213,7 +254,16 @@ static bool vm_new(Client *c, uint32_t *id)
     return false;
 }
 
+static uint32_t open_client_locked(void);
 uint32_t i915_open_client(void)
+{
+    kmutex_lock(&g_mtx);
+    uint32_t s = open_client_locked();
+    kmutex_unlock(&g_mtx);
+    return s;
+}
+
+static uint32_t open_client_locked(void)
 {
     if (!i915_ready()) return 0;
     Client *c = (Client *)kmalloc(sizeof(Client));
@@ -242,18 +292,33 @@ uint32_t i915_open_client(void)
 void i915_client_ref(uint32_t slot)
 {
     Client *c = client(slot);
-    if (c) c->refs++;
+    if (c) __atomic_add_fetch(&c->refs, 1, __ATOMIC_ACQ_REL);
 }
 
-/* the last fd: its objects, contexts and VMs given back */
+/* kernel/syscall.c's fast path: one more reference to the client of an
+   fd still in the table (under its lock) -- unless it is already going */
+bool i915_fast_take(uint32_t slot)
+{
+    Client *c = client(slot);
+    if (!c || !__atomic_load_n(&c->used, __ATOMIC_ACQUIRE)) return false;
+    uint32_t r = __atomic_load_n(&c->refs, __ATOMIC_ACQUIRE);
+    do {
+        if (!r) return false;
+    } while (!__atomic_compare_exchange_n(&c->refs, &r, r + 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    return true;
+}
+
+/* the last reference: its objects, contexts and VMs given back */
 void i915_release(uint32_t slot)
 {
     Client *c = client(slot);
-    if (!c || --c->refs) return;
+    if (!c || __atomic_sub_fetch(&c->refs, 1, __ATOMIC_ACQ_REL)) return;
+    kmutex_lock(&g_mtx);
     g_clients[(slot & ~I915_CLIENT_BIT) - 1] = NULL;
     c->used = false;
-    if (c->busy) { c->dying = true; return; }         /* requests still queued: the last one frees it */
-    client_free(c);
+    if (c->busy) c->dying = true;                     /* requests still queued: the last one frees it */
+    else client_free(c);
+    kmutex_unlock(&g_mtx);
 }
 
 /* its objects closed (once the GPU is done with them), the client gone */
@@ -268,12 +333,13 @@ static void client_free(Client *c)
 
 int i915_mmap_lookup(uint32_t slot, uint64_t offset, uint64_t len, uint64_t *phys)
 {
+    kmutex_lock(&g_mtx);
+    int r = -EINVAL;
     Client *c = client(slot);
-    if (!c) return -EINVAL;
-    Bo *bo = bo_of(c, (uint32_t)(offset >> 32));
-    if (!bo || (offset & 0xFFFFFFFFull) || len > bo->size) return -EINVAL;
-    *phys = bo->phys;
-    return 0;
+    Bo *bo = c ? bo_of(c, (uint32_t)(offset >> 32)) : NULL;
+    if (bo && !(offset & 0xFFFFFFFFull) && len <= bo->size) { *phys = bo->phys; r = 0; }
+    kmutex_unlock(&g_mtx);
+    return r;
 }
 
 /* ---- facts: GETPARAM and QUERY ------------------------------------------ */
@@ -565,7 +631,7 @@ static bool bo_wait(const Bo *bo, uint64_t ms)
         uint64_t seq = waitqueue_seq();
         if (bo_idle(bo)) break;
         uint32_t e = bo->last[0] > g_q[0].done ? 0 : 1;
-        waitqueue_wait_ms_seq(&g_q[e].done_wq, timer_get_ms() + 5, seq);
+        mtx_wait(&g_q[e].done_wq, timer_get_ms() + 5, seq);
     }
     return true;
 }
@@ -590,7 +656,7 @@ static void client_idle(Client *c)
     extern void sched_sleep_ms(uint64_t ms);
     uint32_t n = 0;
     while (c->busy) {
-        sched_sleep_ms(1);
+        mtx_sleep_ms(1);
         if (++n % 1000 == 0) {
             say("waiting for a client's queued requests: still ", c->busy);
             for (int e = 0; e < 2; e++) {
@@ -687,7 +753,9 @@ static void eng_run(Req *r)
     }
     g_eng_at[r->cls] = "signaling";
     /* its fences signaled even when it failed: no waiter stuck */
+    kmutex_lock(&g_mtx);
     for (uint32_t i = 0; i < r->nout; i++) sync_signal(c, r->fh[r->nin + i], r->fp[r->nin + i]);
+    kmutex_unlock(&g_mtx);
 }
 
 static void eng_thread(void *arg)
@@ -696,10 +764,13 @@ static void eng_thread(void *arg)
     Queue *q = &g_q[(uintptr_t)arg];
     for (;;) {
         uint64_t seq = waitqueue_seq();
-        Req *r = q->head;
+        kmutex_lock(&g_mtx);
+        Req *r = q->head;                             /* (stays the head while it runs: only this thread takes it off) */
+        kmutex_unlock(&g_mtx);
         uint32_t me = (uint32_t)(q - g_q);
         if (!r) { g_eng_at[me] = "idle"; waitqueue_wait_ms_seq(&q->wq, timer_get_ms() + 1000, seq); continue; }
         eng_run(r);
+        kmutex_lock(&g_mtx);
         q->head = r->next;
         if (!q->head) q->tail = NULL;
         q->done = r->num;
@@ -708,6 +779,7 @@ static void eng_thread(void *arg)
         req_free(r);
         g_eng_at[me] = "freeing a client";
         if (!--c->busy && c->dying) client_free(c);   /* its last fd went while this ran */
+        kmutex_unlock(&g_mtx);
         g_eng_at[me] = "after a request";
         waitqueue_wake_all(&q->done_wq);
         if (g_sf_live) waitqueue_wake_all(&g_poll_any_wq);   /* sync files polled with other fds */
@@ -808,6 +880,10 @@ static int64_t execbuffer(Client *c, uint64_t argp)
         uint64_t cliprects_ptr, flags, rsvd1, rsvd2;
     } eb;
     if (copy_from_user(&eb, (void *)argp, sizeof eb)) return -EFAULT;
+    /* a sync file in or out is an fd (the process's table, the big
+       kernel lock's): from the fast path, again by the slow one -- decided
+       on this copy of the flags, before anything is done */
+    if ((eb.flags & (3ull << 16)) && g_bkl_owner != (int32_t)this_cpu()->id) return I915_NEEDS_BKL;
     if (!eb.buffer_count || eb.buffer_count > EXEC_MAX) return -EINVAL;
     uint32_t ctx_id = (uint32_t)eb.rsvd1;
     if (ctx_id >= MAX_CTXS || !c->ctxs[ctx_id].used) return -ENOENT;
@@ -917,7 +993,7 @@ static int64_t execbuffer(Client *c, uint64_t argp)
            other's (rare: a copy before a draw) waited for here */
         extern void sched_sleep_ms(uint64_t ms);
         uint32_t oc = cls ^ 1;
-        for (int k = 0; k < 3000 && g_q[oc].done < in[oc]; k++) sched_sleep_ms(1);
+        for (int k = 0; k < 3000 && g_q[oc].done < in[oc]; k++) mtx_sleep_ms(1);
     }
 #undef EB_FAIL
 
@@ -1029,7 +1105,7 @@ static int64_t sync_wait(Client *c, uint64_t handles, uint64_t points, uint32_t 
                 say("  flags ", flags);
             }
         }
-        waitqueue_wait_ms_seq(&g_q[0].done_wq, timer_get_ms() + 2, wseq);   /* (the render engine's ends wake it) */
+        mtx_wait(&g_q[0].done_wq, timer_get_ms() + 2, wseq);   /* (the render engine's ends wake it) */
     }
 }
 
@@ -1125,7 +1201,7 @@ static int64_t syncobj(Client *c, uint32_t nr, uint64_t argp)
         /* one fence a syncobj here: the copy engine's part (rare) waited for */
         extern void sched_sleep_ms(uint64_t ms);
         if (n[0] > g_q[0].done && n[1] > g_q[1].done)
-            for (int k = 0; k < 3000 && g_q[1].done < n[1]; k++) sched_sleep_ms(1);
+            for (int k = 0; k < 3000 && g_q[1].done < n[1]; k++) mtx_sleep_ms(1);
         __typeof__(c->sync[0]) *s = &c->sync[a.handle - 1];
         s->fnum = 0;
         s->signaled = true;
@@ -1301,23 +1377,30 @@ static int64_t prime_from_fd(Client *c, uint64_t argp)
 void i915_prime_get(uint32_t idx)
 {
     uint32_t b = idx & ~I915_CLIENT_BIT;
+    kmutex_lock(&g_mtx);
     if (b && b <= MAX_BOS && g_bos[b - 1].used) g_bos[b - 1].refs++;
+    kmutex_unlock(&g_mtx);
 }
 
 void i915_prime_put(uint32_t idx)
 {
     uint32_t b = idx & ~I915_CLIENT_BIT;
+    kmutex_lock(&g_mtx);
     if (b && b <= MAX_BOS && g_bos[b - 1].used) bo_unref(&g_bos[b - 1]);
+    kmutex_unlock(&g_mtx);
 }
 
 int i915_prime_mmap(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *phys)
 {
     uint32_t b = idx & ~I915_CLIENT_BIT;
-    if (!b || b > MAX_BOS || !g_bos[b - 1].used) return -EINVAL;
-    Bo *bo = &g_bos[b - 1];
-    if ((offset & 4095) || offset > bo->size || len > bo->size - offset) return -EINVAL;
-    *phys = bo->phys + offset;
-    return 0;
+    int r = -EINVAL;
+    kmutex_lock(&g_mtx);
+    if (b && b <= MAX_BOS && g_bos[b - 1].used) {
+        Bo *bo = &g_bos[b - 1];
+        if (!(offset & 4095) && offset <= bo->size && len <= bo->size - offset) { *phys = bo->phys + offset; r = 0; }
+    }
+    kmutex_unlock(&g_mtx);
+    return r;
 }
 
 /* for the display (simpledrm, drivers/video/virtgpu_drm.c): an object a
@@ -1325,24 +1408,37 @@ int i915_prime_mmap(uint32_t idx, uint64_t offset, uint64_t len, uint64_t *phys)
    for as long as the framebuffer lives */
 int i915_bo_info(uint32_t slot, uint32_t handle, uint64_t *phys, uint64_t *size, uint32_t *tiling, uint32_t *ref)
 {
+    kmutex_lock(&g_mtx);
     Client *c = client(slot);
     Bo *bo = c ? bo_of(c, handle) : NULL;
-    if (!bo) return -ENOENT;
+    if (!bo) { kmutex_unlock(&g_mtx); return -ENOENT; }
     *phys = bo->phys;
     *size = bo->size;
     *tiling = bo->tiling;
     *ref = c->bo[handle - 1];
     bo->refs++;
+    kmutex_unlock(&g_mtx);
     return 0;
 }
 
 void i915_bo_unref(uint32_t ref)
 {
+    kmutex_lock(&g_mtx);
     if (ref && ref <= MAX_BOS && g_bos[ref - 1].used) bo_unref(&g_bos[ref - 1]);
+    kmutex_unlock(&g_mtx);
 }
 
 /* dumb buffers on card0 (KMS clients drawing with the CPU): our objects */
+static int64_t dumb_locked(uint32_t slot, uint32_t nr, uint64_t argp);
 int64_t i915_dumb(uint32_t slot, uint32_t nr, uint64_t argp)
+{
+    kmutex_lock(&g_mtx);
+    int64_t r = dumb_locked(slot, nr, argp);
+    kmutex_unlock(&g_mtx);
+    return r;
+}
+
+static int64_t dumb_locked(uint32_t slot, uint32_t nr, uint64_t argp)
 {
     Client *c = client(slot);
     if (!c) return -ENODEV;
@@ -1377,7 +1473,47 @@ int64_t i915_dumb(uint32_t slot, uint32_t nr, uint64_t argp)
 
 /* ---- the ioctls ---------------------------------------------------------- */
 
+/* An ioctl kernel/syscall.c may run without the big kernel lock: the
+   per-frame ones, which touch only the driver's own state -- not the
+   PRIME and sync-file ones (fds); execbuffer with a sync file sends
+   itself back (I915_NEEDS_BKL). */
+bool i915_fast_ok(uint64_t request)
+{
+    if (((request >> 8) & 0xFF) != 'd' || !i915_ready()) return false;
+    uint32_t nr = request & 0xFF;
+    switch (nr) {
+    case 0x09:                                        /* GEM_CLOSE */
+    case 0xBF: case 0xC0: case 0xC3: case 0xC4: case 0xC5:
+    case 0xCA: case 0xCB: case 0xCC: case 0xCD:       /* syncobjs, not to/from fds */
+        return true;
+    default: break;
+    }
+    if (nr < 0x40 || nr > 0x9F) return false;
+    switch (nr - 0x40) {
+    case 0x06:                                        /* GETPARAM */
+    case 0x1b: case 0x3c:                             /* GEM_CREATE(_EXT) */
+    case 0x24:                                        /* MMAP_OFFSET */
+    case 0x1f: case 0x20: case 0x18:                  /* SET_DOMAIN, SW_FINISH, THROTTLE */
+    case 0x17: case 0x2c: case 0x26:                  /* GEM_BUSY, GEM_WAIT, GEM_MADVISE */
+    case 0x21: case 0x22: case 0x2f: case 0x30:       /* tiling, caching */
+    case 0x31: case 0x32:                             /* REG_READ, GET_RESET_STATS */
+    case 0x29:                                        /* GEM_EXECBUFFER2(_WR) */
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int64_t ioctl_locked(uint32_t slot, uint64_t request, uint64_t argp);
 int64_t i915_ioctl(uint32_t slot, uint64_t request, uint64_t argp)
+{
+    kmutex_lock(&g_mtx);
+    int64_t r = ioctl_locked(slot, request, argp);
+    kmutex_unlock(&g_mtx);
+    return r;
+}
+
+static int64_t ioctl_locked(uint32_t slot, uint64_t request, uint64_t argp)
 {
     Client *c = client(slot);
     if (!c) return -ENODEV;

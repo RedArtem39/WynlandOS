@@ -22,6 +22,7 @@
 #include <wynland/waitqueue.h>
 #include <wynland/usercopy.h>
 #include <wynland/virtgpu_drm.h>
+#include <wynland/i915.h>
 #include <wynland/mouse.h>
 #include <wynland/kfile.h>
 #include <wynland/unix_socket.h>
@@ -2474,18 +2475,25 @@ struct linux_cmsghdr { uint64_t cmsg_len; int32_t cmsg_level; int32_t cmsg_type;
 static bool drm_fast(uint64_t fd, uint64_t request, uint64_t argp, int64_t *out) {
     extern bool drm_fast_ok(uint64_t request);
     extern bool drm_fast_take(uint32_t slot);
+    extern bool i915_fast_ok(uint64_t request);
+    extern bool i915_fast_take(uint32_t slot);
     Process *proc = sched_current()->proc;
-    if (!proc || fd >= MAX_OPEN_FILES || !drm_fast_ok(request)) return false;
+    if (!proc || fd >= MAX_OPEN_FILES || ((request >> 8) & 0xFF) != 'd') return false;
     uint32_t slot = 0;
     uint64_t f = spin_lock_irqsave(&g_fdtab_lock);
     VfsFile *vf = proc->fd_table[fd];
-    if (vf && IS_DRM_DEV(vf->node.first_cluster) && drm_fast_take(vf->current_cluster)) slot = vf->current_cluster;
+    if (vf && IS_DRM_DEV(vf->node.first_cluster)) {
+        uint32_t s = vf->current_cluster;
+        bool ok = (s & I915_CLIENT_BIT) ? i915_fast_ok(request) && i915_fast_take(s)    /* the Intel GPU's render node */
+                                        : drm_fast_ok(request) && drm_fast_take(s);      /* virtio-gpu */
+        if (ok) slot = s;
+    }
     spin_unlock_irqrestore(&g_fdtab_lock, f);
     if (!slot) return false;
     uint32_t s = slot;
     *out = drm_ioctl(&s, request, argp);
     drm_release(slot, proc->pid, true);
-    return true;
+    return *out != I915_NEEDS_BKL;   /* (that one: again, with the big lock) */
 }
 
 /* fd's Unix socket, held (usock_ref()); false: no such fd or not one */

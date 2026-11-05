@@ -77,6 +77,9 @@ void     i915_disp_cursor_move(int32_t x, int32_t y);
 
 /* the uAPI (i915_uapi.c): DRM render node clients carry this bit */
 #define I915_CLIENT_BIT 0x80000000u
+/* an ioctl from the fast path that needs the big kernel lock after all
+   (an execbuffer with a sync file): kernel/syscall.c runs it again with it */
+#define I915_NEEDS_BKL  (-100000)
 uint32_t i915_open_client(void);
 void     i915_client_ref(uint32_t slot);
 void     i915_release(uint32_t slot);
