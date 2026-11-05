@@ -713,6 +713,18 @@ static int get_free_fd(VfsFile **fd_table) {
     return -1;
 }
 
+/* The fd number an open() took with get_free_fd() before opening the file,
+   at the moment the file goes in: still free -- or, when another thread of
+   the process took it meanwhile, the next free one. Opening can sleep on
+   the filesystem's mutex, which gives the big kernel lock back: a second
+   open() then found the same number free, both stored their files there,
+   and both threads read one file (a parallel download's packages, PNGs
+   decoded at once, came out as another file's bytes). -1: none free. */
+static int fd_claim(VfsFile **fd_table, int hint) {
+    if (hint >= 0 && hint < MAX_OPEN_FILES && fd_table[hint] == NULL) return hint;
+    return get_free_fd(fd_table);
+}
+
 /* is fd 0-2 the console (never opened, never closed)? */
 static bool std_console(Process *p, uint64_t fd) {
     return fd <= 2 && p->fd_table[fd] == NULL && !(p->std_closed & (1u << fd));
@@ -3415,6 +3427,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                 }
 
+                fd = fd_claim(fd_table, fd);   /* (opening may have slept: the number re-checked) */
+                if (fd < 0) { vfs_close(file); return (uint64_t)-24; }   /* -EMFILE */
                 fd_table[fd] = file;
                 fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
                 remember_path(file, path_kbuf);
@@ -6247,6 +6261,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     vfs_fchmod(file, m);
                 }
                 if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path) : -2);
+                fd = fd_claim(fd_table, fd);   /* (opening may have slept: the number re-checked) */
+                if (fd < 0) { vfs_close(file); return (uint64_t)-24; }   /* -EMFILE */
                 fd_table[fd] = file;
                 fd_set_open_flags(fd_flags, fd_oflags, fd, linux_flags);
                 remember_path(file, path);
