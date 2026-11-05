@@ -51,6 +51,7 @@
 #define AT_EGID        14
 #define AT_SECURE      23
 #define AT_RANDOM      25
+#define AT_SYSINFO_EHDR 33
 
 typedef struct {
     unsigned char e_ident[16];
@@ -606,6 +607,12 @@ bool elf_load(const char *path, uint64_t *out_entry, uint64_t *out_stack_top, Pa
     auxv[ac++] = (Elf64_Auxv){AT_EGID, 0};
     auxv[ac++] = (Elf64_Auxv){AT_SECURE, 0};
     auxv[ac++] = (Elf64_Auxv){AT_RANDOM, random_addr};
+    {
+        /* the vDSO (kernel/vdso.c): glibc tells the time without the kernel */
+        extern uint64_t vdso_map(PageTable *pml4, struct Process *proc);
+        uint64_t vdso = vdso_map(pml4, proc);
+        if (vdso) auxv[ac++] = (Elf64_Auxv){AT_SYSINFO_EHDR, vdso};
+    }
     auxv[ac++] = (Elf64_Auxv){AT_NULL, 0};
 
     /* envp: NULL preserves the historical hardcoded 5-var default every

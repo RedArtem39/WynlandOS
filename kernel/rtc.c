@@ -162,6 +162,12 @@ uint64_t rtc_get_unix_time_ms(void) {
     return g_boot_unix_time * 1000 + elapsed_ms;
 }
 
+/* the wall clock's numbers, for the vDSO (kernel/vdso.c) */
+void rtc_vdso_params(uint64_t *boot_unix, uint64_t *base_ns) {
+    *boot_unix = g_boot_unix_time;
+    *base_ns = g_boot_tick_baseline * 10 * 1000000ULL;
+}
+
 uint64_t rtc_get_unix_time_ns(void) {
     extern uint64_t sched_clock_ns(void);
     uint64_t base = g_boot_tick_baseline * 10 * 1000000ULL;   /* the 1 kHz count at the RTC read, in ns */

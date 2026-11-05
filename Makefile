@@ -128,8 +128,12 @@ DRIVER_ASM_SRC = $(shell find $(SRC_DRIVERS) -name '*.asm' 2>/dev/null)
 DRIVER_C_OBJ   = $(patsubst $(SRC_DRIVERS)/%.c, $(BUILD_DRIVERS)/%.o, $(DRIVER_C_SRC))
 DRIVER_ASM_OBJ = $(patsubst $(SRC_DRIVERS)/%.asm, $(BUILD_DRIVERS)/%.o, $(DRIVER_ASM_SRC))
 
+# The vDSO (vdso/vdso.c): a user-space shared object, linked into the
+# kernel as bytes (kernel/vdso.c maps it into every process)
+VDSO_OBJ       = $(BUILD_KERNEL)/vdso_image.o
+
 # All kernel-side objects
-KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ)
+KERNEL_ALL_OBJ = $(KERNEL_ASM_OBJ) $(KERNEL_C_OBJ) $(KERNEL_CPP_OBJ) $(DRIVER_C_OBJ) $(DRIVER_ASM_OBJ) $(VDSO_OBJ)
 
 # ============================================================================
 # Output Files
@@ -202,6 +206,19 @@ $(BOOTLOADER_EFI): $(BOOT_OBJ)
 	@echo "  => BOOTX64.EFI created"
 
 # ---------- Kernel ----------
+
+$(BUILD)/vdso.so: vdso/vdso.c vdso/vdso.lds include/wynland/vdso.h
+	@mkdir -p $(BUILD)
+	@echo "  CC(VDSO)   $<"
+	@gcc -O2 -fPIC -fno-stack-protector -fno-asynchronous-unwind-tables -mno-red-zone -nostdlib -shared \
+	    -Wl,-T,vdso/vdso.lds -Wl,--hash-style=both -Wl,-soname=linux-vdso.so.1 \
+	    -Wl,-z,max-page-size=4096 -Wl,--no-undefined -o $@ $<
+	@if readelf -r $@ | grep -q "Relocation section"; then echo "vdso.so has relocations"; exit 1; fi
+
+$(VDSO_OBJ): $(BUILD)/vdso.so
+	@mkdir -p $(dir $@)
+	@python3 -c "import sys; b=open(sys.argv[1],'rb').read(); print('const unsigned char g_vdso_image[] __attribute__((aligned(4096))) = {' + ','.join(str(x) for x in b) + '};'); print('const unsigned long g_vdso_image_len = %d;' % len(b))" $< > $(BUILD)/vdso_image.c
+	@$(CC_KERNEL) $(CFLAGS_KERNEL) -c $(BUILD)/vdso_image.c -o $@
 
 kernel: dirs $(KERNEL_ELF)
 

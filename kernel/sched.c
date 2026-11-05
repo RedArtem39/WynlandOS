@@ -179,6 +179,12 @@ void sched_clock_calibrate(void)
     g_tsc_per_ms = per;
 }
 
+/* the clock's numbers, for the vDSO (kernel/vdso.c) */
+void sched_clock_params(uint64_t *tsc0, uint64_t *ms0, uint64_t *per)
+{
+    *tsc0 = g_tsc0; *ms0 = g_ms0; *per = g_tsc_per_ms;
+}
+
 uint64_t sched_clock_ns(void)
 {
     extern uint64_t timer_get_ms(void);
