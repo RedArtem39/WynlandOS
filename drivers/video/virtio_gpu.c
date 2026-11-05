@@ -483,7 +483,7 @@ static void ctrlq_submit_locked(const CtrlSeg *segs, int n, CtrlTicket *out)
     __asm__ volatile("mfence" ::: "memory");
     ctrl_q.avail->idx = (uint16_t)(avail + 1);
     __asm__ volatile("mfence" ::: "memory");
-    *ctrl_q_notify = CTRL_QUEUE;
+    /* (the device is told after the lock is let go: ctrlq_submit2) */
 
     out->head = head;
     out->seq = ctrl_seq;
@@ -502,6 +502,12 @@ static bool ctrlq_submit2(const CtrlSeg *segs, int n, CtrlTicket *out,
     ctrlq_submit_locked(segs, n, out);
     if (n2) ctrlq_submit_locked(segs2, n2, out2);
     spin_unlock_irqrestore(&g_ctrlq_lock, fl);
+    /* the device told outside the lock: in QEMU the notify is a VM exit
+       that may run the virgl commands right there, milliseconds -- with
+       the ring's lock held and interrupts off, the timer IRQ on the boot
+       core (ctrlq_reap) spun on it and the clock stopped, once DRM
+       submitted from several cores at once (no big kernel lock between) */
+    *ctrl_q_notify = CTRL_QUEUE;
     return true;
 }
 
@@ -1523,7 +1529,12 @@ void virtio_gpu_tick(void)
 
     /* Retire finished control requests even when nobody is waiting on
        them (async 3D submissions, a flush the tick sent). */
-    ctrlq_reap();
+    /* (only if the ring is free now: the clock's IRQ never waits for a
+       submitter on another core -- the next tick reaps) */
+    if (spin_trylock(&g_ctrlq_lock)) {
+        ctrlq_reap_locked();
+        spin_unlock(&g_ctrlq_lock);
+    }
     {
         extern void drm_tick(void); /* wake page-flip event readers */
         drm_tick();

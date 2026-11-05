@@ -81,9 +81,18 @@ void lag_report(void)
 {
     extern void stall_report(void);
     stall_report();
-    if (timer_ms - g_since < 2000) return;
+    /* one core at a time (it is called without the big kernel lock now:
+       DRM's page flips, console writes from several cores) */
+    static volatile int busy;
+    if (timer_ms - g_since < 2000 || __atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return;
+    if (timer_ms - g_since < 2000) { __atomic_store_n(&busy, 0, __ATOMIC_RELEASE); return; }
     g_since = timer_ms;
-    if (!g_key.n) { Step z = { 0, 0, 0 }; g_draw = g_flip = g_evt = g_run_all = g_run_zerp = g_poll_late = z; return; }
+    if (!g_key.n) {
+        Step z = { 0, 0, 0 };
+        g_draw = g_flip = g_evt = g_run_all = g_run_zerp = g_poll_late = z;
+        __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
+        return;
+    }
     serial_write_string("LAG (ms):");
     line("key", &g_key); line("draw", &g_draw); line("flip", &g_flip); line("evt", &g_evt);
     line("poll-late(zerp)", &g_poll_late);
@@ -92,4 +101,5 @@ void lag_report(void)
     serial_write_string("\r\n");
     Step z = { 0, 0, 0 };
     g_key = g_draw = g_flip = g_evt = g_run_all = g_run_zerp = g_poll_late = z;
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }

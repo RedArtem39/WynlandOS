@@ -83,6 +83,12 @@ static void name(uint64_t a)
 /* from a syscall: what the NMIs caught */
 void stall_report(void)
 {
+    /* one core prints, the others go on: called without the big kernel
+       lock now (DRM's page flips, console writes), several cores at once
+       printed the same samples interleaved -- the printing itself, at
+       serial speed, then stopped the clock again and again */
+    static volatile int busy;
+    if (g_tail == g_head || __atomic_exchange_n(&busy, 1, __ATOMIC_ACQUIRE)) return;
     while (g_tail != g_head) {
         Sample *s = &g_s[g_tail % NSAMPLE];
         serial_write_string("STALL cpu0 30+ ms at ");
@@ -92,4 +98,5 @@ void stall_report(void)
         serial_write_string("\r\n");
         g_tail++;
     }
+    __atomic_store_n(&busy, 0, __ATOMIC_RELEASE);
 }

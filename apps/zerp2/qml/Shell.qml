@@ -786,7 +786,7 @@ Window {
             required property var modelData
             readonly property var ls: modelData
             // background and bottom: into the backdrop (under the windows, blurred by the glass)
-            parent: ls.layer < 2 ? backdrop : shell
+            parent: ls.layer < 2 ? backdrop : shell.contentItem
             readonly property int a: ls.anchors
             surface: ls.surface
             visible: ls.mapped && (!shell.fullscreenOn || ls.layer === 3)
