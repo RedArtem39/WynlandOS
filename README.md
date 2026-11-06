@@ -20,6 +20,16 @@ all — load and run on it as they are. It is developed in QEMU, where
 automatic tests boot the OS and drive the real programs, and it boots on one
 real laptop (an Intel Tiger Lake machine) from a USB stick.
 
+### WNL — Wynland is Not Linux
+
+The way GNU is "GNU's Not Unix" and Darwin is the system under macOS,
+**WNL** is the name of the system layer of WynlandOS: the Canopy kernel and
+the base system around it — the init (wynrc), the login manager, `ary`,
+the leaf package manager, the system tools. It is not Linux and contains
+none of it; it only answers Linux programs in their own language, so they
+run on it unchanged. The desktop (Zerp, the xvlet shell) sits on top of
+WNL, and WynlandOS is the whole of it together.
+
 ## What it does today
 
 **Desktop — Zerp 2.0.** Our Wayland compositor, written in Qt Quick and drawn
