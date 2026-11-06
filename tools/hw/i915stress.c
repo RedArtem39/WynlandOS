@@ -261,7 +261,11 @@ int main(int argc, char **argv)
     if (workers < 1) workers = 1;
     if (workers > 64) workers = 64;
     setvbuf(stdout, NULL, _IOLBF, 0);
-    g_sh = mmap(NULL, sizeof *g_sh, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    /* a memfd, not MAP_SHARED|MAP_ANONYMOUS: on WynlandOS that one is
+       still copied at fork() (the children's counts never came back) */
+    int mfd = memfd_create("i915stress", 0);
+    if (mfd < 0 || ftruncate(mfd, sizeof *g_sh) < 0) { printf("[i915stress] memfd failed\n"); return 1; }
+    g_sh = mmap(NULL, sizeof *g_sh, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
     if (g_sh == MAP_FAILED) { printf("[i915stress] mmap failed\n"); return 1; }
     printf("[i915stress] %d s a phase, %d programs x 2 GL threads, phases %s\n", secs, workers, phases);
     if (set_fast(0) < 0) return 1;

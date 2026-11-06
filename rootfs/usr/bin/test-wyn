@@ -10,17 +10,34 @@
 # The tests are a manifest on the developer's machine (tools/devhost.py
 # serves build/devhost/tests.txt: "N program [arguments]" a line); that
 # machine is the one boot.cfg's netlog= names. Only on a live stick.
+#
+# No network: the copies in the image (/usr/lib/wynland/hwtests, what
+# build/devhost held when the image was made), and the report into the
+# kernel log (/dev/kmsg) -- onto the stick with it: after the next boot
+# it is in \logs\klog-N.log there, between "== test-wyn" lines.
 HOST=$(sed -n 's/^netlog=\([0-9.]*\):.*/\1/p' /etc/wynland/boot.cfg 2>/dev/null | head -n 1)
 [ -n "$HOST" ] || HOST=192.168.0.239
 H=http://$HOST:8765
 
-get() { curl -sS --retry 5 --retry-all-errors -o "$2" "$H/$1"; }
+LOCAL=/usr/lib/wynland/hwtests
+OFFLINE=0
+get() {
+    if [ "$OFFLINE" = 1 ]; then cp "$LOCAL/$1" "$2" 2>/dev/null; return $?; fi
+    curl -sS --connect-timeout 3 --retry 2 --retry-all-errors -o "$2" "$H/$1"
+}
 
-if ! get tests.txt /tmp/test-wyn.list; then
-    echo "test-wyn: no answer from $H -- is the network up? (dmesg | grep -i -e network -e dhcp)"
-    exit 1
+if ! get tests.txt /tmp/test-wyn.list 2>/dev/null; then
+    if [ -f "$LOCAL/tests.txt" ]; then
+        OFFLINE=1
+        echo "test-wyn: no answer from $H -- the image's own tests; the report goes to the stick's log"
+        get tests.txt /tmp/test-wyn.list
+    else
+        echo "test-wyn: no answer from $H and no tests in the image -- is the network up?"
+        exit 1
+    fi
 fi
 if [ "$1" = k ]; then
+    [ "$OFFLINE" = 1 ] && { echo "test-wyn k: needs the network"; exit 1; }
     # a kernel into the stick's slot (partition 4, type 0x7E): the next boot
     # runs it (boot/boot.c SlotKernel; a key at boot: the stick's own)
     get kernel.hdr /tmp/kernel.hdr && get kernel.elf /tmp/kernel.elf || { echo "test-wyn: no kernel on $H (make devkernel)"; exit 1; }
@@ -64,15 +81,34 @@ get "$P" "/tmp/$P" && chmod +x "/tmp/$P" || { echo "test-wyn: could not fetch $P
 
 OUT=/tmp/test-wyn.$N.out
 echo "== test $N: $P $*" > "$OUT"
+# one script, run as root: the test, its output kept -- and without a
+# network also into the kernel log as it comes (a line at a time: what a
+# test printed before it hung the machine is on the stick all the same)
+R=/tmp/test-wyn.$N.sh
+{
+    echo 'OUT="$1"; OFF="$2"; N="$3"; shift 3'
+    echo '[ "$OFF" = 1 ] && printf "== test-wyn report %s begin: %s\r\n" "$N" "$*" > /dev/kmsg'
+    echo '{ "$@"; echo $? > "$OUT.rc"; } 2>&1 | tee -a "$OUT" |'
+    echo '  if [ "$OFF" = 1 ]; then while IFS= read -r l; do printf "[test-wyn] %s\r\n" "$l" > /dev/kmsg; done; else cat > /dev/null; fi'
+    echo '[ "$OFF" = 1 ] && printf "== test-wyn report %s end: exit %s\r\n" "$N" "$(cat "$OUT.rc")" > /dev/kmsg'
+    echo 'exit 0'
+} > "$R"
+tail -n +2 -f "$OUT" 2>/dev/null &     # shown as it comes (ary may ask a password: the run itself in front)
+TAILER=$!
 if [ "$(id -u)" = 0 ]; then
-    "/tmp/$P" "$@" >> "$OUT" 2>&1
+    sh "$R" "$OUT" "$OFFLINE" "$N" "/tmp/$P" "$@"
 elif [ "$(id -un)" = live ]; then
-    echo live | ary -S "/tmp/$P" "$@" >> "$OUT" 2>&1     # the live stick's account
+    echo live | ary -S sh "$R" "$OUT" "$OFFLINE" "$N" "/tmp/$P" "$@"     # the live stick's account
 else
-    ary "/tmp/$P" "$@" >> "$OUT" 2>&1
+    ary sh "$R" "$OUT" "$OFFLINE" "$N" "/tmp/$P" "$@"
 fi
-echo "== exit $?" >> "$OUT"
-cat "$OUT"
+sleep 1; kill $TAILER 2>/dev/null
+echo "== exit $(cat "$OUT.rc" 2>/dev/null)" >> "$OUT"
+echo "== exit $(cat "$OUT.rc" 2>/dev/null)"
+if [ "$OFFLINE" = 1 ]; then
+    echo "(in the kernel log: boot once more from the stick, then \\logs\\klog-N.log on it -- the newest)"
+    exit 0
+fi
 if curl -sS --retry 5 --retry-all-errors --data-binary "@$OUT" "$H/report" >/dev/null; then
     echo "(sent to $HOST)"
 else

@@ -3781,6 +3781,42 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return virt_addr;
                 }
 
+                /* MAP_SHARED | MAP_ANONYMOUS: shared with the children a
+                   fork() makes (a parent reading counters its workers
+                   write) -- it went down the private path and fork()
+                   copied it. The memfd way: frames now, zeroed, marked
+                   shared (fork() keeps them shared), the mapping holding
+                   each one's reference (PAGE_SHARED_REF: munmap()/teardown
+                   drop it). Up to 64 MB; bigger ones stay as they were. */
+                if ((flags & 0x01) && (flags & 0x20) && size_aligned <= (64ull << 20)) {
+                    PageTable *pml4 = vmm_get_current_pml4();
+                    Process *mproc = sched_current()->proc;
+                    uint64_t virt_addr = addr & ~(PAGE_SIZE - 1);
+                    if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10
+                        virt_addr = mmap_bump(MMAP_SLOT_MEMFD, size_aligned);
+                        if (!virt_addr) return (uint64_t)-12;
+                    } else {
+                        for (uint64_t off = 0; off < size_aligned; off += PAGE_SIZE)
+                            user_unmap_page(pml4, virt_addr + off);
+                        vma_unmap_range(mproc, virt_addr, virt_addr + size_aligned);
+                    }
+                    uint64_t pflags = PAGE_USER | PAGE_SHARED_MAP | PAGE_SHARED_REF;
+                    if (prot & 0x2) pflags |= PAGE_WRITE;
+                    if (!(prot & 0x4)) pflags |= PAGE_NX;
+                    for (uint64_t i = 0; i < pages; i++) {
+                        void *pg = pmm_alloc_page();
+                        if (!pg) {
+                            for (uint64_t j = 0; j < i; j++) user_unmap_page(pml4, virt_addr + j * PAGE_SIZE);
+                            return (uint64_t)-12;
+                        }
+                        memset(P2V((uint64_t)(uintptr_t)pg), 0, PAGE_SIZE);
+                        vmm_map_page(pml4, virt_addr + i * PAGE_SIZE, (uint64_t)(uintptr_t)pg, pflags);
+                    }
+                    vma_insert(mproc, virt_addr, virt_addr + size_aligned,
+                               (uint32_t)prot & (VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC), 0);
+                    return virt_addr;
+                }
+
                 // Determine virtual address
                 uint64_t virt_addr = addr;
                 if (!(flags & 0x10) || virt_addr == 0) { // MAP_FIXED is 0x10

@@ -572,6 +572,13 @@ $(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/m
 	$(if $(MY_WALLS),@grep -vE '^F +/usr/share/wynland/wallpapers/(peaks|fuji|summit|spiral)\.png |^F +/usr/share/wynland/wallpapers/CREDITS |^[FD] +/usr/share/xvlet/assets/walls' $@ > $@.w && mv $@.w $@)
 	@printf 'D /etc/wynland\nF /etc/wynland/boot.cfg $(BOOT_CFG)\nF /etc/wynland/jit.allow rootfs/etc/wynland/jit.allow\n' >> $@
 	$(if $(filter 1,$(LIVE)),@printf 'F /usr/bin/test-wyn rootfs/usr/bin/test-wyn\nP /usr/bin/test-wyn 0 100755\n' >> $@)
+	@# the live stick: the hardware tests too (build/devhost: tests.txt and
+	@# its programs) -- test-wyn runs them from here without a network
+	@if [ "$(LIVE)" = 1 ] && [ -f $(BUILD)/devhost/tests.txt ]; then echo 'D /usr/lib/wynland/hwtests' >> $@; \
+	  for f in $(BUILD)/devhost/*; do b=$$(basename $$f); \
+	  case $$b in kernel.*|*.d|*.py|*.ko) continue;; esac; \
+	  [ -f $$f ] || continue; echo "F /usr/lib/wynland/hwtests/$$b $$f" >> $@; \
+	  [ $$b = tests.txt ] || echo "P /usr/lib/wynland/hwtests/$$b 0 100755" >> $@; done; fi
 
 $(EXT2_PART_IMG): build_ext2_image.py $(EXT2_MANIFEST_FULL) $(BUILD)/wall.png $(BUILD)/wall-spiral.png $(wildcard rootfs/usr/share/wynland/wallpapers/*) $(BUILD)/wynrc.elf $(BUILD)/rc.elf $(wildcard rootfs/etc/wynrc/*/*) $(BUILD)/card0 $(BUILD)/renderD128 $(BUILD)/sysfile $(ZERP_ELFS) $(BUILD)/gltest.elf $(BUILD)/dlsymtest.elf $(BUILD)/forktest.elf $(BUILD)/kmstest.elf $(BUILD)/test_afunix.elf $(BUILD)/sndtest.elf $(BUILD)/jittest.elf $(BUILD)/sandboxtest.elf $(BUILD)/swaptest.elf $(BUILD)/nopietest.elf $(BUILD)/nopietest-static.elf
 	@python3 build_ext2_image.py $@ $$(( ($(TOTAL_IMG_MB) - 1 - $(ESP_SIZE_MB)) )) $(EXT2_MANIFEST_FULL)
