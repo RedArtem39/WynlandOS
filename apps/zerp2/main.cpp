@@ -475,12 +475,12 @@ int main(int argc, char **argv)
     // boot.cfg "gpu=1": the Intel GPU's driver comes up on its own thread
     // while userspace starts, and the login screen is there in ~20 ms --
     // card0 still the firmware's framebuffer (simpledrm). Its driver
-    // waited for (a few seconds at most), not llvmpipe for the session.
+    // waited for (15 s at most), not llvmpipe for the session.
     QByteArray driver = drmDriver();
     bool gpuCfg = false;
     for (const QByteArray &l : bootCfg().split('\n')) gpuCfg |= l.trimmed() == "gpu=1";
     if (driver == "simpledrm" && gpuCfg) {
-        for (int i = 0; i < 100 && driver == "simpledrm"; i++) {
+        for (int i = 0; i < 300 && driver == "simpledrm"; i++) {
             usleep(50 * 1000);
             driver = drmDriver();
         }

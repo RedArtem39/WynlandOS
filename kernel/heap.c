@@ -27,17 +27,43 @@ typedef struct HeapHeader {
 #define HEAP_MAGIC_SMALL 0x4B4D534Du  /* "KMSM": a size-class object, in use */
 #define HEAP_MAGIC_SMALLFREE 0x4B4D5346u  /* "KMSF": one on its class's free list */
 
-/* b absorbs the free block right after it */
+static HeapHeader *heap_first = NULL;
+static HeapHeader *heap_last = NULL;   /* the block at the top (heap_grow appends after it) */
+
+/* The free blocks (not the size-class objects) on a list of their own,
+   linked through their data (every block holds 16 bytes or more):
+   kmalloc() of more than 512 bytes walked EVERY block, used and free,
+   with interrupts off -- with the shell up, tens of thousands of them,
+   30+ ms each time, and the boot core (the clock) stood still meanwhile. */
+static HeapHeader *g_free_head = NULL;
+#define FL_NEXT(b) (((HeapHeader **)((b) + 1))[0])
+#define FL_PREV(b) (((HeapHeader **)((b) + 1))[1])
+
+static void fl_insert(HeapHeader *b)
+{
+    FL_PREV(b) = NULL;
+    FL_NEXT(b) = g_free_head;
+    if (g_free_head) FL_PREV(g_free_head) = b;
+    g_free_head = b;
+}
+
+static void fl_remove(HeapHeader *b)
+{
+    if (FL_PREV(b)) FL_NEXT(FL_PREV(b)) = FL_NEXT(b);
+    else g_free_head = FL_NEXT(b);
+    if (FL_NEXT(b)) FL_PREV(FL_NEXT(b)) = FL_PREV(b);
+}
+
+/* b absorbs the block right after it (free, and already off the free list) */
 static void merge_next(HeapHeader *b)
 {
     HeapHeader *n = b->next;
     b->size += sizeof(HeapHeader) + n->size;
     b->next = n->next;
     if (b->next) b->next->prev = b;
+    else heap_last = b;
     n->magic = 0;
 }
-
-static HeapHeader *heap_first = NULL;
 uint64_t heap_end_addr = HEAP_START;
 static uint64_t heap_max_limit = HEAP_START + (HEAP_MAX_PAGES * PAGE_SIZE);
 
@@ -70,6 +96,8 @@ void heap_init(void)
     heap_first->magic = HEAP_MAGIC_FREE;
     heap_first->next = NULL;
     heap_first->prev = NULL;
+    heap_last = heap_first;
+    fl_insert(heap_first);
 
     heap_end_addr = HEAP_START + (HEAP_INITIAL_PAGES * PAGE_SIZE);
 
@@ -113,17 +141,17 @@ static bool heap_grow(size_t size_needed)
     new_block->next = NULL;
 
     /* Append to the end of the block list */
-    HeapHeader *curr = heap_first;
-    while (curr->next != NULL) {
-        curr = curr->next;
-    }
+    HeapHeader *curr = heap_last;
     curr->next = new_block;
     new_block->prev = curr;
+    heap_last = new_block;
 
     heap_end_addr = new_end;
 
-    /* merge with the last block if that one is free */
+    /* merge with the last block if that one is free (it stays on the
+       free list, larger); otherwise the new one goes on it */
     if (curr->is_free) merge_next(curr);
+    else fl_insert(new_block);
 
     return true;
 }
@@ -223,12 +251,12 @@ static void *kmalloc_general_locked(size_t size)
     */
 
     /* Search for first free block that fits */
-    HeapHeader *curr = heap_first;
+    HeapHeader *curr = g_free_head;
     while (curr != NULL) {
-        if (curr->is_free && curr->size >= aligned_size) {
+        if (curr->size >= aligned_size) {
             break;
         }
-        curr = curr->next;
+        curr = FL_NEXT(curr);
     }
 
     /* If no block is found, grow the heap */
@@ -237,18 +265,19 @@ static void *kmalloc_general_locked(size_t size)
             goto cleanup; /* Out of memory */
         }
         /* Search again from the start (should succeed now) */
-        curr = heap_first;
+        curr = g_free_head;
         while (curr != NULL) {
-            if (curr->is_free && curr->size >= aligned_size) {
+            if (curr->size >= aligned_size) {
                 break;
             }
-            curr = curr->next;
+            curr = FL_NEXT(curr);
         }
         if (curr == NULL) {
             goto cleanup;
         }
     }
 
+    fl_remove(curr);
     /* If we have enough remaining space in the block, split it cleanly */
     if (curr->size >= aligned_size + sizeof(HeapHeader) + 32) {
         HeapHeader *next_block = (HeapHeader *)((uintptr_t)curr + sizeof(HeapHeader) + aligned_size);
@@ -258,9 +287,11 @@ static void *kmalloc_general_locked(size_t size)
         next_block->next = curr->next;
         next_block->prev = curr;
         if (next_block->next) next_block->next->prev = next_block;
+        else heap_last = next_block;
 
         curr->size = aligned_size;
         curr->next = next_block;
+        fl_insert(next_block);
     }
 
     curr->is_free = false;
@@ -299,8 +330,9 @@ void kfree(void *ptr)
             block->is_free = true;
             block->magic = HEAP_MAGIC_FREE;
             /* merge with the neighbours only: O(1) */
-            if (block->next && block->next->is_free) merge_next(block);
-            if (block->prev && block->prev->is_free) merge_next(block->prev);
+            if (block->next && block->next->is_free) { fl_remove(block->next); merge_next(block); }
+            if (block->prev && block->prev->is_free) merge_next(block->prev);   /* (the earlier one stays listed) */
+            else fl_insert(block);
         }
     }
 

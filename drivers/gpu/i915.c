@@ -832,9 +832,23 @@ static void irq_setup(void)
 /* (the log, a while after: did they come?) */
 uint64_t i915_irq_count(void) { return g_irqs; }
 
+static void i915_bringup(void);
+static volatile bool g_settling;                      /* the driver's thread still at work */
 static void i915_thread(void *arg)
 {
     (void)arg;
+    i915_bringup();
+    __atomic_store_n(&g_settling, false, __ATOMIC_RELEASE);
+}
+
+/* the kernel's main path, before userspace starts: the GPU's bring-up
+   finished (or given up on). Userspace started meanwhile froze the
+   laptop at the interrupts' setup, with the login screen up ~20 ms
+   after init; in October Zerp came later and it never met them. */
+bool i915_settled(void) { return !__atomic_load_n(&g_settling, __ATOMIC_ACQUIRE); }
+
+static void i915_bringup(void)
+{
     int dev = -1;
     for (int d = 0; d < 32; d++) {
         uint32_t id = pci_read_config(0, (uint8_t)d, 0, 0);
@@ -870,7 +884,6 @@ static void i915_thread(void *arg)
     gt_setup();
     step("engines");
     if (!engine_init(&g_rcs) || !engine_init(&g_bcs)) { serial_write_string("i915: engines not set up\r\n"); fw_put(); return; }
-    g_up = true;
     step("self-test: blitter");
     bool ok = selftest(&g_bcs);
     step("self-test: render");
@@ -883,6 +896,11 @@ static void i915_thread(void *arg)
     extern void i915_uapi_start(void);
     i915_uapi_start();                                /* the engines' queue threads: the kernel's, no process's */
     fw_put();
+    /* only now for userspace: the login screen opens the GPU ~20 ms after
+       init, and a client (its VM, its GGTT places) made while the
+       self-tests ran, before the interrupts and the engines' threads,
+       left the laptop hung at the login screen */
+    __atomic_store_n(&g_up, true, __ATOMIC_RELEASE);
     serial_write_string(ok ? "i915: ready (render-only)\r\n" : "i915: SELF-TEST FAILED\r\n");
 }
 
@@ -905,13 +923,14 @@ void i915_start(const char *cfg)
         if ((i == 0 || cfg[i - 1] == '\n') && cfg[i] == 'g' && cfg[i + 1] == 'p' && cfg[i + 2] == 'u' &&
             cfg[i + 3] == '=' && cfg[i + 4] == '1') {
             extern Thread *thread_create(void (*entry)(void *), void *arg);
-            thread_create(i915_thread, NULL);
+            g_settling = true;
+            if (!thread_create(i915_thread, NULL)) g_settling = false;
             return;
         }
     }
 }
 
-bool i915_ready(void) { return g_up; }
+bool i915_ready(void) { return __atomic_load_n(&g_up, __ATOMIC_ACQUIRE); }
 
 /* ---- for the uAPI (drivers/gpu/i915_uapi.c) --------------------------- */
 

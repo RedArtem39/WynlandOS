@@ -1257,6 +1257,16 @@ void kernel_main(BootInfo *boot_info_loader)
        early during its own dynamic-loader mmap, well before drawing
        anything, so it doesn't race with Zerp's /dev/fb0 writes in
        practice. */
+    {
+        /* boot.cfg gpu=1: the Intel GPU's bring-up done before userspace
+           (10 s at most) -- see i915_settled() */
+        extern bool i915_settled(void);
+        extern void sched_sleep_ms(uint64_t ms);
+        sched_sleep_ms(1);                   /* (always once: every boot goes through this path) */
+        for (int i = 0; i < 1000 && !i915_settled(); i++) sched_sleep_ms(10);
+        if (!i915_settled()) serial_write_string("i915: still coming up after 10 s; userspace starts anyway\r\n");
+        boot_mark("the GPU settled");
+    }
     console_print_string(boot_info, "Auto-launching Zerp...\n", 0x0000FF00, term_bg_color);
     boot_mark("starting userspace");
     {

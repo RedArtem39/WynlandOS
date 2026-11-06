@@ -157,6 +157,11 @@ static void mtx_sleep_ms(uint64_t ms)
 static void mtx_wait(WaitQueue *wq, uint64_t until, uint64_t seq)
 {
     uint32_t d = mtx_give();
+    /* giving the mutex back moved the wake count (every unlock wakes):
+       with the caller's `seq` this would never sleep. The count from
+       after it instead -- an engine's end in between is then caught by
+       `until`, a few ms at most at every caller. */
+    if (d) seq = waitqueue_seq();
     waitqueue_wait_ms_seq(wq, until, seq);
     mtx_take(d);
 }
@@ -764,9 +769,12 @@ static void eng_thread(void *arg)
     Queue *q = &g_q[(uintptr_t)arg];
     for (;;) {
         uint64_t seq = waitqueue_seq();
-        kmutex_lock(&g_mtx);
-        Req *r = q->head;                             /* (stays the head while it runs: only this thread takes it off) */
-        kmutex_unlock(&g_mtx);
+        /* the head read without the mutex: only this thread takes requests
+           off, execbuffer only sets a NULL head (under the mutex). Taking
+           the mutex here moved the wake count (every unlock wakes) after
+           `seq` -- the wait below never slept, and the two engine threads
+           spun from the GPU's bring-up on: the laptop froze. */
+        Req *r = __atomic_load_n(&q->head, __ATOMIC_ACQUIRE);   /* (stays the head while it runs) */
         uint32_t me = (uint32_t)(q - g_q);
         if (!r) { g_eng_at[me] = "idle"; waitqueue_wait_ms_seq(&q->wq, timer_get_ms() + 1000, seq); continue; }
         eng_run(r);
@@ -1015,7 +1023,7 @@ static int64_t execbuffer(Client *c, uint64_t argp)
         if (copy_to_user((void *)(argp + 60), &hi, 4)) { err = -EFAULT; goto fail_queued; }
     }
     c->busy++;
-    if (q->tail) q->tail->next = r; else q->head = r;
+    if (q->tail) q->tail->next = r; else __atomic_store_n(&q->head, r, __ATOMIC_RELEASE);   /* (read unlocked by eng_thread) */
     q->tail = r;
     if (!q->thread) say("execbuffer: no thread for the engine (i915_uapi_start not run): queued only, class ", cls);
     waitqueue_wake_all(&q->wq);
@@ -1024,7 +1032,7 @@ static int64_t execbuffer(Client *c, uint64_t argp)
 fail_queued:
     /* (its number taken: the request still runs, without its sync file) */
     c->busy++;
-    if (q->tail) q->tail->next = r; else q->head = r;
+    if (q->tail) q->tail->next = r; else __atomic_store_n(&q->head, r, __ATOMIC_RELEASE);   /* (read unlocked by eng_thread) */
     q->tail = r;
     waitqueue_wake_all(&q->wq);
     return err;
@@ -1477,31 +1485,54 @@ static int64_t dumb_locked(uint32_t slot, uint32_t nr, uint64_t argp)
    per-frame ones, which touch only the driver's own state -- not the
    PRIME and sync-file ones (fds); execbuffer with a sync file sends
    itself back (I915_NEEDS_BKL). */
+/* Which of them, by group (I915_FAST_*): none by default -- with all of
+   them on, Zerp and the shell on the GPU at once, the laptop's whole USB
+   died. Root sets it at run time (/proc/sysrq-trigger "G<mask>", "g":
+   none) so tools/hw/i915stress.c can find the group on the laptop
+   without a new image. */
+#define I915_FAST_EXEC   1u                           /* GEM_EXECBUFFER2 */
+#define I915_FAST_BO     2u                           /* GEM_CREATE(_EXT), GEM_CLOSE, MMAP_OFFSET, MADVISE */
+#define I915_FAST_WAIT   4u                           /* GEM_WAIT, GEM_BUSY, SET_DOMAIN, SW_FINISH, THROTTLE */
+#define I915_FAST_SYNC   8u                           /* syncobjs (not to/from fds) */
+#define I915_FAST_INFO  16u                           /* GETPARAM, tiling, caching, REG_READ, GET_RESET_STATS */
+static volatile uint32_t g_fast_mask;
+
+void i915_set_fast(uint32_t mask)
+{
+    __atomic_store_n(&g_fast_mask, mask & 31u, __ATOMIC_RELEASE);
+    say("the fast path (outside the big lock), groups ", mask & 31u);
+}
+
+static uint32_t fast_group(uint32_t nr)
+{
+    switch (nr) {
+    case 0x09: return I915_FAST_BO;                   /* GEM_CLOSE */
+    case 0xBF: case 0xC0: case 0xC3: case 0xC4: case 0xC5:
+    case 0xCA: case 0xCB: case 0xCC: case 0xCD:       /* syncobjs, not to/from fds */
+        return I915_FAST_SYNC;
+    default: break;
+    }
+    if (nr < 0x40 || nr > 0x9F) return 0;
+    switch (nr - 0x40) {
+    case 0x29: return I915_FAST_EXEC;                 /* GEM_EXECBUFFER2(_WR) */
+    case 0x1b: case 0x3c: case 0x24: case 0x26:       /* GEM_CREATE(_EXT), MMAP_OFFSET, GEM_MADVISE */
+        return I915_FAST_BO;
+    case 0x1f: case 0x20: case 0x18:                  /* SET_DOMAIN, SW_FINISH, THROTTLE */
+    case 0x17: case 0x2c:                             /* GEM_BUSY, GEM_WAIT */
+        return I915_FAST_WAIT;
+    case 0x06:                                        /* GETPARAM */
+    case 0x21: case 0x22: case 0x2f: case 0x30:       /* tiling, caching */
+    case 0x31: case 0x32:                             /* REG_READ, GET_RESET_STATS */
+        return I915_FAST_INFO;
+    default: return 0;
+    }
+}
+
 bool i915_fast_ok(uint64_t request)
 {
     if (((request >> 8) & 0xFF) != 'd' || !i915_ready()) return false;
-    uint32_t nr = request & 0xFF;
-    switch (nr) {
-    case 0x09:                                        /* GEM_CLOSE */
-    case 0xBF: case 0xC0: case 0xC3: case 0xC4: case 0xC5:
-    case 0xCA: case 0xCB: case 0xCC: case 0xCD:       /* syncobjs, not to/from fds */
-        return true;
-    default: break;
-    }
-    if (nr < 0x40 || nr > 0x9F) return false;
-    switch (nr - 0x40) {
-    case 0x06:                                        /* GETPARAM */
-    case 0x1b: case 0x3c:                             /* GEM_CREATE(_EXT) */
-    case 0x24:                                        /* MMAP_OFFSET */
-    case 0x1f: case 0x20: case 0x18:                  /* SET_DOMAIN, SW_FINISH, THROTTLE */
-    case 0x17: case 0x2c: case 0x26:                  /* GEM_BUSY, GEM_WAIT, GEM_MADVISE */
-    case 0x21: case 0x22: case 0x2f: case 0x30:       /* tiling, caching */
-    case 0x31: case 0x32:                             /* REG_READ, GET_RESET_STATS */
-    case 0x29:                                        /* GEM_EXECBUFFER2(_WR) */
-        return true;
-    default:
-        return false;
-    }
+    uint32_t g = fast_group(request & 0xFF);
+    return g && (__atomic_load_n(&g_fast_mask, __ATOMIC_ACQUIRE) & g);
 }
 
 static int64_t ioctl_locked(uint32_t slot, uint64_t request, uint64_t argp);

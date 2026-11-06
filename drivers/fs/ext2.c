@@ -2618,9 +2618,23 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     /* Linux's crash on request (root's): the panic path -- its screen, the
        boot log marked, the warm reset -- tried without waiting for a bug */
     if (file->node.first_cluster == DEV_SYSRQ) {
-        if (size && ((const char *)buf)[0] == 'c') {
+        char k[16] = {0};
+        uint32_t n = size < sizeof k - 1 ? size : (uint32_t)sizeof k - 1;
+        if (n) memcpy(k, buf, n);                     /* (a kernel copy here) */
+        if (n && k[0] == 'c') {
             serial_write_string("sysrq: a kernel crash, as asked\r\n");
             __asm__ volatile("ud2");
+        }
+        /* "G[mask]" / "g": the Intel GPU's fast path on (those groups, all
+           by default) / off -- drivers/gpu/i915_uapi.c i915_set_fast() */
+        if (n && (k[0] == 'G' || k[0] == 'g')) {
+            uint32_t m = k[0] == 'g' ? 0 : 31;
+            if (k[0] == 'G' && k[1] >= '0' && k[1] <= '9') {
+                m = 0;
+                for (uint32_t i = 1; i < n && k[i] >= '0' && k[i] <= '9'; i++) m = m * 10 + (uint32_t)(k[i] - '0');
+            }
+            extern void i915_set_fast(uint32_t mask);
+            i915_set_fast(m);
         }
         return (int)size;
     }
