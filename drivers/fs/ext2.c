@@ -220,6 +220,8 @@ static uint32_t        g_inode_size = 128;
 #define DEV_BACKLIGHT  0xFFFFFFB2   /* /sys/class/backlight/intel_backlight/(actual_)brightness */
 #define DEV_KMSG       0xFFFFFFB4   /* /dev/kmsg: root writes lines into the kernel log (a test's report -> the stick) */
 #define DEV_BL_MAX     0xFFFFFFB3   /* .../max_brightness */
+#define DEV_THERM      0xFFFFFFB5   /* /sys/class/thermal/thermal_zone0/temp: the CPU's (kernel/cputemp.c) */
+#define DEV_THERM_TYPE 0xFFFFFFB6   /* .../type: "x86_pkg_temp" */
 #define DEV_USB0       0xFFFFFFB0   /* USB mass storage (drivers/usb); outside 0xFFFFFFF0+, whose
                                        0xFFFFFFF4.. are sysfs's PCI files */
 
@@ -2289,6 +2291,17 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         return alloc_device_file(mx ? "max_brightness" : "brightness", 0, false, mx ? DEV_BL_MAX : DEV_BACKLIGHT, flags);
     }
 
+    /* the CPU's temperature (kernel/cputemp.c) as Linux's first thermal
+       zone: temp in millidegrees, type. Not there without a sensor. */
+    if (str_compare(path, "/sys/class/thermal/thermal_zone0/temp") == 0 ||
+        str_compare(path, "/sys/class/thermal/thermal_zone0/type") == 0) {
+        extern bool cpu_temp_mdeg(int32_t *out);
+        int32_t t;
+        if (!cpu_temp_mdeg(&t)) return NULL;
+        bool ty = path[33] == 't' && path[34] == 'y';   /* ".../thermal_zone0/" is 33 characters */
+        return alloc_device_file(ty ? "type" : "temp", 0, false, ty ? DEV_THERM_TYPE : DEV_THERM, flags);
+    }
+
     /* /dev/dsp: the HD Audio output (drivers/sound/hda.c), OSS style */
     if (str_compare(path, "/dev/dsp") == 0) {
         extern bool hda_present(void);
@@ -2481,6 +2494,28 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
         do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
         while (k) t[n++] = d[--k];
         t[n++] = '\n';
+        if (file->offset >= (uint32_t)n) return 0;
+        uint32_t c = (uint32_t)n - file->offset;
+        if (c > size) c = size;
+        memcpy(buf, t + file->offset, c);
+        file->offset += c;
+        return (int)c;
+    }
+    if (file->node.first_cluster == DEV_THERM || file->node.first_cluster == DEV_THERM_TYPE) {
+        extern bool cpu_temp_mdeg(int32_t *out);
+        char t[24]; int n = 0;
+        if (file->node.first_cluster == DEV_THERM_TYPE) {
+            const char *ty = "x86_pkg_temp\n";
+            while (ty[n]) { t[n] = ty[n]; n++; }
+        } else {
+            int32_t v = 0;
+            if (!cpu_temp_mdeg(&v)) return -1;
+            if (v < 0) { t[n++] = '-'; v = -v; }
+            char d[12]; int k = 0;
+            do { d[k++] = (char)('0' + v % 10); v /= 10; } while (v);
+            while (k) t[n++] = d[--k];
+            t[n++] = '\n';
+        }
         if (file->offset >= (uint32_t)n) return 0;
         uint32_t c = (uint32_t)n - file->offset;
         if (c > size) c = size;
