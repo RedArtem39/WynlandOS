@@ -18,6 +18,8 @@
  *     0 off  1 execbuffer  2 objects  4 waits  8 syncobjs  16 parameters  31 all
  *     c<mask>: a new texture every frame, read back whole -- blocks left
  *     undrawn are the laptop's "locust" on the widgets
+ *     f<mask>: a glyph atlas the CPU writes pieces into, every byte checked
+ *     -- the laptop's "broken font"
  *
  * Built on the developer's machine (glibc, the image's Mesa ABI):
  *   gcc -O2 -pthread -o i915stress i915stress.c -lEGL -lGLESv2 -lgbm
@@ -67,7 +69,11 @@ static const char *group_name(int m)
 static int set_fast(int mask)
 {
     int fd = open("/proc/sysrq-trigger", O_WRONLY);
-    if (fd < 0) { printf("[i915stress] cannot open /proc/sysrq-trigger (%s): run as root\n", strerror(errno)); return -1; }
+    if (fd < 0) {   /* (not root: the fast path stays as it is, the rest still runs) */
+        static int said;
+        if (!said++) printf("[i915stress] cannot open /proc/sysrq-trigger (%s): the fast path is not switched (root's)\n", strerror(errno));
+        return 0;
+    }
     char b[16];
     int n = mask ? snprintf(b, sizeof b, "G%d", mask) : snprintf(b, sizeof b, "g");
     int r = (int)write(fd, b, (size_t)n);
@@ -86,6 +92,7 @@ struct shared {                     /* in a MAP_SHARED page: the parent reads it
 static struct shared *g_sh;
 static volatile int g_stop;
 static int g_churn;                 /* this phase: a new texture every frame */
+static int g_atlas;                 /* this phase: a glyph atlas updated from the CPU, as Qt's text */
 static EGLDisplay g_dpy;
 static int g_worker;
 
@@ -130,6 +137,77 @@ static void *gl_thread(void *arg)
     memset(junk, 0x5A, 256 * 256 * 4);
     unsigned seed = (unsigned)(w * 977 + t * 131 + 7);
     for (long f = 0; !g_stop; f++) {
+        if (g_atlas) {
+            /* the "broken font": a one-byte atlas (Qt's glyph cache) that
+               the CPU keeps writing small pieces into, drawn by the GPU,
+               every byte compared with what was written */
+            enum { AW = 512, AH = 512 };
+            static __thread unsigned char *shadow; static __thread GLuint at, ap, afbo, atex; static __thread int ready;
+            if (!ready) {
+                shadow = calloc(AW * AH, 1);
+                glGenTextures(1, &at);
+                glBindTexture(GL_TEXTURE_2D, at);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, AW, AH, 0, GL_ALPHA, GL_UNSIGNED_BYTE, shadow);
+                glGenTextures(1, &atex);
+                glBindTexture(GL_TEXTURE_2D, atex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, AW, AH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                glGenFramebuffers(1, &afbo);
+                glBindFramebuffer(GL_FRAMEBUFFER, afbo);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, atex, 0);
+                ap = glCreateProgram();
+                glAttachShader(ap, shader(GL_VERTEX_SHADER, "attribute vec2 p; varying vec2 uv; void main() { uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }"));
+                glAttachShader(ap, shader(GL_FRAGMENT_SHADER, "precision mediump float; varying vec2 uv; uniform sampler2D t; void main() { gl_FragColor = vec4(texture2D(t, uv).a, 0.0, 0.0, 1.0); }"));
+                glBindAttribLocation(ap, 0, "p");
+                glLinkProgram(ap);
+                ready = 1;
+            }
+            /* 40 pieces of 4..44 px, bytes of their own, written from the CPU */
+            glBindTexture(GL_TEXTURE_2D, at);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            unsigned char piece[48 * 48];
+            for (int k = 0; k < 40; k++) {
+                seed = seed * 1103515245u + 12345u;
+                int pw = 4 + (int)(seed >> 8) % 41, ph = 4 + (int)(seed >> 16) % 41;
+                seed = seed * 1103515245u + 12345u;
+                int px0 = (int)(seed >> 8) % (AW - pw), py0 = (int)(seed >> 16) % (AH - ph);
+                for (int i = 0; i < pw * ph; i++) { seed = seed * 1103515245u + 12345u; piece[i] = (unsigned char)(seed >> 16); }
+                for (int r = 0; r < ph; r++) memcpy(shadow + (py0 + r) * AW + px0, piece + r * pw, (size_t)pw);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, px0, py0, pw, ph, GL_ALPHA, GL_UNSIGNED_BYTE, piece);
+            }
+            /* drawn whole by the GPU, read back, compared */
+            glBindFramebuffer(GL_FRAMEBUFFER, afbo);
+            glViewport(0, 0, AW, AH);
+            glUseProgram(ap);
+            glUniform1i(glGetUniformLocation(ap, "t"), 0);
+            static const GLfloat quad[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, quad);
+            glEnableVertexAttribArray(0);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            unsigned char *rb = malloc(AW * AH * 4);
+            glReadPixels(0, 0, AW, AH, GL_RGBA, GL_UNSIGNED_BYTE, rb);
+            long wrong = 0, first = -1;
+            for (int i = 0; i < AW * AH; i++)
+                if (abs(rb[i * 4] - shadow[i]) > 1) { if (first < 0) first = i; wrong++; }
+            free(rb);
+            if (wrong) {
+                g_sh->bad[w][t]++;
+                if (g_sh->bad[w][t] <= 3)
+                    printf("[i915stress]   program %d thread %d frame %ld: %ld of %d atlas bytes WRONG (first at x %ld y %ld)\n",
+                           w, t, f, wrong, AW * AH, first % AW, first / AW);
+            }
+            glUseProgram(prog);
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glViewport(0, 0, W, H);
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, tri);
+            if (glGetError() != GL_NO_ERROR) { g_sh->dead[w][t] = 5; break; }
+            g_sh->objs[w][t]++;
+            g_sh->frames[w][t]++;
+            continue;
+        }
         if (g_churn) {
             /* "locust" on the laptop's widgets: whole pages of a buffer
                left transparent -- the GPU's writes went elsewhere (a stale
@@ -277,11 +355,13 @@ int main(int argc, char **argv)
     snprintf(list, sizeof list, "%s", phases);
     for (char *tok = strtok(list, ","); tok; tok = strtok(NULL, ",")) {
         g_churn = tok[0] == 'c';                     /* "c<mask>": the texture-churn phase */
-        int mask = atoi(tok + g_churn);
+        g_atlas = tok[0] == 'f';                     /* "f<mask>": the glyph-atlas phase */
+        int mask = atoi(tok + (g_churn || g_atlas));
         memset((void *)g_sh, 0, sizeof *g_sh);
         g_usb_worst = 0; g_usb_reads = g_usb_errs = 0;
         printf("\n[i915stress] === phase: fast path %d -- %s%s\n", mask, group_name(mask),
-               g_churn ? "; a new texture every frame, each checked whole" : "");
+               g_churn ? "; a new texture every frame, each checked whole" :
+               g_atlas ? "; a glyph atlas written from the CPU, every byte checked" : "");
         if (set_fast(mask) < 0) { failed = 1; break; }
         pid_t pid[64];
         for (int w = 0; w < workers; w++) {

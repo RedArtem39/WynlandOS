@@ -56,6 +56,8 @@ bool     i915_mem(GpuMem *m, uint32_t pages);          /* + a GGTT place */
 bool     i915_vm_create(GpuVm *vm);
 bool     i915_vm_map(GpuVm *vm, uint64_t va, uint64_t phys, uint32_t pages, uint32_t pat);
 void     i915_vm_unmap(GpuVm *vm, uint64_t va, uint32_t pages);
+uint32_t i915_vm_unmap_owned(GpuVm *vm, uint64_t va, uint32_t pages, uint64_t phys);
+bool     i915_vm_lookup(GpuVm *vm, uint64_t va, uint64_t *phys);
 bool     i915_ctx_create(GpuCtx *c, Engine *e, uint64_t pml4);
 void     i915_ctx_destroy(GpuCtx *c);                  /* its pages back once the engine is off it */
 void     i915_vm_destroy(GpuVm *vm);                   /* its page tables back (no context on it) */

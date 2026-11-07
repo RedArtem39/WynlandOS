@@ -108,6 +108,7 @@ typedef struct {
     GpuCtx   hw[8];
     bool     hw_made[8];
     uint32_t hangs;                                   /* batches of it that hung the GPU */
+    uint64_t hang_ms[3];                              /* when its last three hangs were */
     bool     banned;                                  /* after a hang: refused (-EIO), as Linux
                                                          does to unrecoverable contexts -- Mesa
                                                          then makes a new one and sets it up */
@@ -213,9 +214,35 @@ static int64_t bo_new(Client *c, uint64_t size, uint32_t *handle)
     return 0;
 }
 
+/* Its last reference gone: its pages back -- unless something still names
+   it. The laptop showed pages of buffers on the screen (the widgets, the
+   wallpaper) turned into other buffers' contents ("locust", the settings'
+   "phantom" smeared over the wallpaper): a reference counted short
+   somewhere. A client still holding a handle to it, or a framebuffer still
+   made of it, is said on the log, and the pages are KEPT (a leak, not a
+   corruption) -- the count set back to what holds it. */
 static void bo_unref(Bo *bo)
 {
+    if (!bo->refs) { say("an object unreferenced once too often: ", (uint64_t)(bo - g_bos) + 1); return; }
     if (--bo->refs) return;
+    uint32_t b = (uint32_t)(bo - g_bos) + 1, holders = 0;
+    for (uint32_t i = 0; i < MAX_CLIENTS; i++) {
+        Client *c = g_clients[i];
+        if (!c) continue;
+        for (uint32_t h = 0; h < MAX_HANDLES; h++)
+            if (c->bo[h] == b) {
+                if (!holders) say("AN OBJECT WOULD BE FREED WHILE STILL HELD: ", b);
+                say("  client, handle ", ((uint64_t)(i + 1) << 32) | (h + 1));
+                holders++;
+            }
+    }
+    extern bool drm_fb_uses_i915(uint32_t ref);
+    if (drm_fb_uses_i915(b)) {
+        if (!holders) say("AN OBJECT WOULD BE FREED WHILE STILL HELD: ", b);
+        say("  by a framebuffer (on the screen)", 0);
+        holders++;
+    }
+    if (holders) { bo->refs = holders; return; }
     for (uint64_t o = 0; o < bo->size; o += 4096) pmm_free_page((void *)(uintptr_t)(bo->phys + o));
     bo->used = false;
 }
@@ -231,7 +258,10 @@ static void handle_close(Client *c, uint32_t h)
     if (c->busy) client_idle(c);                      /* (its own queued work may still use it) */
     if (c->map_vm[h - 1]) {                           /* out of the GPU's view before the pages go */
         Vm *v = &c->vms[c->map_vm[h - 1] - 1];
-        if (v->used) i915_vm_unmap(&v->vm, c->map_va[h - 1], (uint32_t)(bo->size / 4096));
+        if (v->used && i915_vm_unmap_owned(&v->vm, c->map_va[h - 1], (uint32_t)(bo->size / 4096), bo->phys)) {
+            say("GEM_CLOSE: another object mapped over this one's place, left there; handle ", h);
+            say("  at (low) ", (uint32_t)c->map_va[h - 1]);
+        }
         c->map_vm[h - 1] = 0;
     }
     c->bo[h - 1] = 0;
@@ -729,6 +759,19 @@ static void eng_run(Req *r)
                 say("batches in 5 s ", n_eb);
                 say("  the GPU on them, ms ", busy_ns / 1000000);
                 say("  GPU interrupts so far ", i915_irq_count());
+                /* the objects alive and their memory, and the RAM left:
+                   growing while nothing new is open is a leak (the
+                   widgets' "locust": pages of buffers never drawn) */
+                {
+                    extern uint64_t pmm_get_free_memory(void);
+                    uint64_t nb = 0, bytes = 0, ncl = 0;
+                    for (uint32_t i = 0; i < MAX_BOS; i++) if (g_bos[i].used) { nb++; bytes += g_bos[i].size; }
+                    for (uint32_t i = 0; i < MAX_CLIENTS; i++) if (g_clients[i]) ncl++;
+                    say("  objects alive ", nb);
+                    say("  their memory, MB ", bytes >> 20);
+                    say("  clients ", ncl);
+                    say("  free RAM, MB ", pmm_get_free_memory() >> 20);
+                }
                 n_eb = busy_ns = 0;
                 since = w1;
             }
@@ -749,10 +792,38 @@ static void eng_run(Req *r)
             }
             say("  EIR ", i915_rd(e->base + 0xB0));
             say("  ESR ", i915_rd(e->base + 0xB8));
+            /* what the engine was on: the units still busy, and the batch
+               around where it stopped (the commands, to decode) */
+            say("  INSTDONE ", i915_rd(e->base + 0x6C));
+            say("  RING_MODE / CTL ", ((uint64_t)i915_rd(e->base + 0x29C) << 32) | i915_rd(e->base + 0x3C));
+            {
+                uint64_t at = ((uint64_t)(i915_rd(e->base + 0x5C) & 0xFFFF) << 32) | (i915_rd(e->base + 0x74) & ~3u);
+                Vm *hv = (x->vm && x->vm <= MAX_VMS) ? &c->vms[x->vm - 1] : NULL;
+                say("  batch dwords from ACTHD - 0x40 (low), each line 4: ", (uint32_t)(at - 0x40));
+                for (uint64_t va = at - 0x40; hv && hv->used && va < at + 0x20; va += 16) {
+                    uint64_t ph;
+                    if (!i915_vm_lookup(&hv->vm, va, &ph) || (ph & 4095) > 4096 - 16) { say("    (not mapped / page edge) at ", (uint32_t)va); continue; }
+                    const volatile uint32_t *d = (const volatile uint32_t *)P2V(ph);
+                    say("    ", ((uint64_t)d[0] << 32) | d[1]);
+                    say("    ", ((uint64_t)d[2] << 32) | d[3]);
+                }
+            }
             i915_engine_reset(e);                     /* (forcewake still held) */
             g_resets++;
+            /* refused from now on only when it keeps hanging the GPU (a
+               third hang within 30 s), as Linux bans: banned at the first,
+               Mesa's replacement of it failed (CONTEXT_GETPARAM 7 unknown
+               here) and the window drawing through it stood still for
+               good -- the bar that no longer changed, the settings left
+               as a "phantom", the workspaces that died. Now only the
+               batch that hung is lost; the next frame draws again. */
+            uint64_t now = timer_get_ms();
+            x->hang_ms[x->hangs % 3] = now;
             x->hangs++;
-            x->banned = true;                         /* later batches -EIO: Mesa replaces the context */
+            if (x->hangs >= 3 && now - x->hang_ms[x->hangs % 3] < 30000) {
+                x->banned = true;                     /* later batches -EIO: Mesa replaces the context */
+                say("a context banned: its third GPU hang in 30 s, hangs ", x->hangs);
+            }
         }
         i915_fw_put();
     }
@@ -940,14 +1011,37 @@ static int64_t execbuffer(Client *c, uint64_t argp)
         if (c->map_vm[h - 1] != x->vm || c->map_va[h - 1] != va) {
             /* moved: not while queued work still uses the old place */
             if (c->map_vm[h - 1] && !bo_wait(bo, 3000)) EB_FAIL(-5);
-            if (c->map_vm[h - 1]) i915_vm_unmap(&c->vms[c->map_vm[h - 1] - 1].vm, c->map_va[h - 1], (uint32_t)(bo->size / 4096));
+            if (c->map_vm[h - 1]) i915_vm_unmap_owned(&c->vms[c->map_vm[h - 1] - 1].vm, c->map_va[h - 1], (uint32_t)(bo->size / 4096), bo->phys);
             c->map_vm[h - 1] = 0;
+            {
+                uint64_t p0;                          /* someone else's place? (told, then taken) */
+                static uint32_t told;
+                if (i915_vm_lookup(&v->vm, va, &p0) && p0 != bo->phys && told++ < 20) {
+                    say("execbuffer: MAPPED OVER ANOTHER OBJECT'S PAGE; handle ", h);
+                    say("  at (low) ", (uint32_t)va);
+                }
+            }
             if (!i915_vm_map(&v->vm, va, bo->phys, (uint32_t)(bo->size / 4096), 0)) {
-                i915_vm_unmap(&v->vm, va, (uint32_t)(bo->size / 4096));   /* (none of it left half-made) */
+                i915_vm_unmap_owned(&v->vm, va, (uint32_t)(bo->size / 4096), bo->phys);   /* (none of it left half-made) */
                 EB_FAIL(-ENOMEM);
             }
             c->map_vm[h - 1] = x->vm;
             c->map_va[h - 1] = va;
+        } else {
+            /* still there? (the GPU jumping into a place no longer mapped
+               -- a chained batch's -- hung it on the laptop): its first and
+               last pages looked up, the whole put back if either is gone */
+            uint64_t p0, p1, last = va + bo->size - 4096;
+            if (!i915_vm_lookup(&v->vm, va, &p0) || p0 != bo->phys ||
+                !i915_vm_lookup(&v->vm, last, &p1) || p1 != bo->phys + bo->size - 4096) {
+                static uint32_t told;
+                if (told++ < 20) {
+                    say("execbuffer: AN OBJECT'S PLACE WAS LOST, mapped again; handle ", h);
+                    say("  at (low) ", (uint32_t)va);
+                    say("  pages ", bo->size / 4096);
+                }
+                if (!i915_vm_map(&v->vm, va, bo->phys, (uint32_t)(bo->size / 4096), 0)) EB_FAIL(-ENOMEM);
+            }
         }
         if (i == batch_idx) r->batch_va = va + eb.batch_start_offset;
     }

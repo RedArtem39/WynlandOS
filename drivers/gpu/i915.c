@@ -950,6 +950,21 @@ uint32_t i915_ctx_submit(GpuCtx *c, const uint32_t *cmds, uint32_t n) { return c
 bool i915_wait_seqno(Engine *e, uint32_t seq, uint32_t ms) { return wait_seqno(e, seq, ms); }
 void i915_engine_reset(Engine *e) { engine_reset(e); }
 
+/* where GPU address `va` is in memory (a hang's report reads the batch
+   there): its page walked, nothing made on the way; false if not mapped */
+bool i915_vm_lookup(GpuVm *vm, uint64_t va, uint64_t *phys)
+{
+    volatile uint64_t *t = (volatile uint64_t *)vm->pml4.v;
+    static const int shift[4] = { 39, 30, 21, 12 };
+    for (int lvl = 0; lvl < 4; lvl++) {
+        uint64_t e = t[(va >> shift[lvl]) & 511];
+        if (!(e & 1)) return false;
+        if (lvl == 3) { *phys = (e & 0x7FFFFFF000ull) | (va & 4095); return true; }
+        t = (volatile uint64_t *)P2V(e & 0x7FFFFFF000ull);
+    }
+    return false;
+}
+
 /* the pages at `va` gone from the address space (their PTEs cleared) */
 void i915_vm_unmap(GpuVm *vm, uint64_t va, uint32_t pages)
 {
@@ -966,6 +981,31 @@ void i915_vm_unmap(GpuVm *vm, uint64_t va, uint32_t pages)
         t[(va >> 12) & 511] = 0;
         flush(&t[(va >> 12) & 511], 8);
     }
+}
+
+/* as i915_vm_unmap, but only the pages still pointing into the object at
+   `phys` (another object's mapping over the range is left alone); the
+   number of pages found belonging to someone else */
+uint32_t i915_vm_unmap_owned(GpuVm *vm, uint64_t va, uint32_t pages, uint64_t phys)
+{
+    uint32_t foreign = 0;
+    for (uint32_t k = 0; k < pages; k++, va += 4096) {
+        volatile uint64_t *t = (volatile uint64_t *)vm->pml4.v;
+        static const int shift[3] = { 39, 30, 21 };
+        int lvl = 0;
+        for (; lvl < 3; lvl++) {
+            uint64_t e = t[(va >> shift[lvl]) & 511];
+            if (!(e & 1)) break;
+            t = (volatile uint64_t *)P2V(e & 0x7FFFFFF000ull);
+        }
+        if (lvl < 3) continue;
+        volatile uint64_t *pte = &t[(va >> 12) & 511];
+        if (!(*pte & 1)) continue;
+        if ((*pte & 0x7FFFFFF000ull) != phys + (uint64_t)k * 4096) { foreign++; continue; }
+        *pte = 0;
+        flush(pte, 8);
+    }
+    return foreign;
 }
 
 /* the command streamer's timestamp rate: RPM_CONFIG0's crystal and its

@@ -1375,6 +1375,15 @@ static void kms_restore_console(void)
     virtio_gpu_flush(0, 0, comp_get_width(), comp_get_height());
 }
 
+/* an Intel GPU object a live framebuffer is made of (i915_uapi.c checks
+   before it frees one) */
+bool drm_fb_uses_i915(uint32_t ref)
+{
+    for (uint32_t i = 0; i < DRM_MAX_FBS; i++)
+        if (g_fbs[i].used && g_fbs[i].ext_ref == ref) return true;
+    return false;
+}
+
 static void fb_remove(DrmFb *fb)
 {
     if (g_scan_fb == fb->id) kms_restore_console();
@@ -1384,7 +1393,9 @@ static void fb_remove(DrmFb *fb)
         if (dropped) g_pend.on = false;               /* (its pages go) */
         spin_unlock_irqrestore(&g_simple_lock, pf);
         if (dropped) pend_resolve(0);
-        i915_bo_unref(fb->ext_ref);
+        uint32_t ref = fb->ext_ref;
+        fb->ext_ref = 0;                              /* (no longer a holder: drm_fb_uses_i915) */
+        i915_bo_unref(ref);
     } else {
         DrmBo *bo = &g_bos[fb->bo - 1];
         if (bo->refs) bo->refs--;
