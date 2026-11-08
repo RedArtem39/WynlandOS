@@ -445,7 +445,7 @@ $(BUILD)/sysfile:
 WITH_QT6 ?= 1
 ifeq ($(WITH_QT6),1)
 QT6_MANIFEST = $(BUILD)/qt6_manifest.txt
-$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml apps/zerp2/protocols/*.xml) tools/zerp2-dmabuf/apply.py rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
+$(QT6_MANIFEST): tools/stage_qt6.sh apps/qml/qmldemo.cpp apps/qml/demo.qml $(wildcard apps/files/*.cpp apps/files/*.h apps/files/qml/*.qml apps/music/*.cpp apps/music/*.h apps/music/qml/* apps/music/*.desktop apps/term/*.cpp) $(wildcard apps/zerp2/*.c apps/zerp2/*.cpp apps/zerp2/*.h apps/zerp2/*.json apps/zerp2/qml/*.qml apps/zerp2/protocols/*.xml) tools/zerp2-dmabuf/apply.py rootfs/usr/bin/qt.conf $(wildcard qt_qpa/*.cpp qt_qpa/*.h) $(EXT2_MANIFEST)
 	@bash tools/stage_qt6.sh
 else
 QT6_MANIFEST =

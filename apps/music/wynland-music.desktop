@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Музыка
+GenericName=Music player
+Comment=Маленький плеер в стиле Material 3: цвета из обложки
+Exec=/usr/bin/music %F
+Icon=multimedia-audio-player
+Categories=AudioVideo;Audio;Player;
+MimeType=audio/mpeg;audio/mp4;audio/ogg;audio/flac;audio/x-wav;audio/opus;
+Keywords=music;player;audio;музыка;плеер;

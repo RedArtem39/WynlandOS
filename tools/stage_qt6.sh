@@ -21,7 +21,7 @@ QTVER=$(ls "$INC/QtCore" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -1 || true)
 OUT=$REPO/build
 MAN=$OUT/qt6_manifest.txt
 
-PKGS="qt6-base-dev qt6-base-private-dev qt6-base-dev-tools qt6-declarative-dev
+PKGS="qt6-base-dev qt6-base-private-dev qt6-base-dev-tools qt6-declarative-dev qt6-multimedia-dev
  qt6-declarative-private-dev libqt6core6t64 libqt6gui6 libqt6dbus6 libqt6network6
  libqt6opengl6 libqt6qml6 libqt6qmlmodels6 libqt6qmlmeta6 libqt6qmlworkerscript6
  libqt6quick6 libqt6quickcontrols2-6 libqt6quicktemplates2-6 libqt6quickshapes6
@@ -103,6 +103,13 @@ g++ $CXXFLAGS -Iapps/files -o "$OUT/files.elf" \
     "$B/moc_qwynlandfbinput.cpp" \
     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core
 echo "  QT6        built build/files.elf"
+
+# Music (apps/music): the player -- QMediaPlayer (FFmpeg), MPRIS over QtDBus
+MCXX="$CXXFLAGS"
+for m in QtMultimedia QtDBus; do MCXX="$MCXX -I$INC/$m"; done
+"$ROOT/usr/lib/qt6/libexec/moc" $MOCINC -I"$INC/QtMultimedia" -I"$INC/QtDBus" -o "$B/moc_music.cpp" apps/music/music.h
+g++ $MCXX -Iapps/music -o "$OUT/music.elf"     apps/music/main.cpp "$B/moc_music.cpp" qt_qpa/qwynlandfbmain.cpp qt_qpa/qwynlandfb_zerpargs.cpp     qt_qpa/qwynlandfbintegration.cpp qt_qpa/qwynlandfbscreen.cpp qt_qpa/qwynlandfbinput.cpp     "$B/moc_qwynlandfbinput.cpp"     -L"$LIB" -Wl,-rpath-link,"$LIB" -Wl,-rpath,/lib64 -lQt6Quick -lQt6Qml -lQt6Multimedia -lQt6DBus -lQt6Gui -lQt6Core
+echo "  QT6        built build/music.elf"
 
 # Terminal (apps/term): libvterm in a QRasterWindow, the same QPA plugin
 g++ $CXXFLAGS -I"$ROOT/usr/include" -o "$OUT/term.elf" \
@@ -217,6 +224,27 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
     echo "D /usr/share/zerp/qml/files"
     for q in apps/files/qml/*.qml; do echo "F /usr/share/zerp/qml/files/$(basename "$q") $q"; done
     echo "F /usr/bin/files build/files.elf"
+    echo "D /usr/share/zerp/qml/music"
+    for q in apps/music/qml/*; do echo "F /usr/share/zerp/qml/music/$(basename "$q") $q"; done
+    echo "F /usr/bin/music build/music.elf"
+    echo "F /usr/share/applications/wynland-music.desktop apps/music/wynland-music.desktop"
+    # music to start with (local, not in the repository): MUSIC_FILES, or
+    # what is in MUSIC_DIR
+    MUSIC_DIR=${MUSIC_DIR:-/mnt/c/Users/User/Music/Resonance}
+    # (the user's pick: one track and what lies beside it -- its tags and cover)
+    MFILES=${MUSIC_FILES:-$MUSIC_DIR/GfUqp8gKFuQ.m4a}
+    if [ -n "$MFILES" ]; then
+        echo "D /usr/share/wynland"
+        echo "D /usr/share/wynland/music"
+        for f in $MFILES; do
+            [ -f "$f" ] || continue
+            echo "F /usr/share/wynland/music/$(basename "$f") $f"
+            b=${f%.*}
+            for side in "$b.meta.json" "$b.info.json" "$b.webp" "$b.jpg" "$b.png"; do
+                [ -f "$side" ] && echo "F /usr/share/wynland/music/$(basename "$side") $side"
+            done
+        done
+    fi
     echo "F /usr/bin/term build/term.elf"
     # fontconfig configuration and fonts, from the packages (symlinks in
     # conf.d are stored as copies of their targets)
@@ -259,7 +287,7 @@ QMLDST=/usr/lib/x86_64-linux-gnu/qt6/qml
 
 # libraries: everything the app and the QML plugins load, by soname into
 # /lib64 -- skipping what the base manifest already ships there
-{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; echo "$OUT/files.elf"; echo "$OUT/term.elf"; find "$QMLSRC" -name "*.so";
+{ echo "$OUT/qmldemo.elf"; echo "$OUT/zerp2.elf"; echo "$OUT/files.elf"; echo "$OUT/music.elf"; echo "$OUT/term.elf"; find "$QMLSRC" -name "*.so";
   echo "$LIB/qt6/plugins/platforms/libqeglfs.so"; echo "$LIB/qt6/plugins/egldeviceintegrations/libqeglfs-kms-integration.so";
   echo "$LIB/qt6/plugins/platforms/libqwayland.so"; for d in $WLPLUG; do ls "$LIB/qt6/plugins/$d"/*.so; done; } | while read f; do
     ldd "$f" | awk '/=>/ && $3 ~ /^\// {print $1, $3}'
