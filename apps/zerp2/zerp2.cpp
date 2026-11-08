@@ -483,6 +483,12 @@ bool ZServer::run(const QString &command)
     // kernel's spawn starts ELF programs only
     const QByteArray cmd = command.toLocal8Bit();
     if (cmd.trimmed().isEmpty()) return false;
+    // our own terminal as a Zerp client of its own (as the first one): its
+    // see-through window gets the frosted glass behind it -- through the
+    // shell it inherited QT_QPA_PLATFORM=wayland and came up as a plain
+    // Wayland window, opaque, every terminal but the first
+    const QString c = command.trimmed();
+    if (c == QLatin1String("/usr/bin/term") || c == QLatin1String("term")) return spawn(QStringLiteral("/usr/bin/term")) >= 0;
     const char *argv[] = { "/bin/sh", "-c", cmd.constData(), nullptr };
     const long pid = sys_spawn_argv("/bin/sh", argv);
     fprintf(stderr, "[zerp2] run %s: pid %ld\n", cmd.constData(), pid);

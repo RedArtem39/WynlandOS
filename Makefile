@@ -561,10 +561,21 @@ $(BOOT_CFG): FORCE
 # When there are any, the image has only them, the first is the default.
 MY_WALLS := $(shell for f in rootfs/usr/share/wynland/wallpapers/*.png rootfs/usr/share/wynland/wallpapers/*.jpg rootfs/usr/share/wynland/wallpapers/*.webp; do [ -f "$$f" ] && ! grep -q " $$f$$" ext2_manifest.txt && echo "$$f"; done)
 
+# Freedoom on Chocolate Doom (Ubuntu's packages; tools/stage_doom.sh).
+# WITH_DOOM=0 builds the image without it.
+WITH_DOOM ?= 1
+ifeq ($(WITH_DOOM),1)
+DOOM_MANIFEST = $(BUILD)/doom_manifest.txt
+$(DOOM_MANIFEST): tools/stage_doom.sh $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST)
+	@bash tools/stage_doom.sh
+else
+DOOM_MANIFEST =
+endif
+
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
 	@# your own wallpapers (MY_WALLS): in, and then the only ones -- the
 	@# stock photos, the generated spiral and xvlet's generated ones out
