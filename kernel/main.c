@@ -1180,6 +1180,8 @@ void kernel_main(BootInfo *boot_info_loader)
             VfsFile *cf = vfs_open("/etc/wynland/boot.cfg");
             if (cf) { vfs_read(cf, cfg, sizeof(cfg) - 1); vfs_close(cf); }
             i915_start(cfg);
+            extern void iwx_start(const char *cfg);
+            iwx_start(cfg);                  /* Intel Wi-Fi (drivers/net/iwx.c); boot.cfg wifi=0: off */
         }
     }
 

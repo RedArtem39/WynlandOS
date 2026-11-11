@@ -572,10 +572,21 @@ else
 DOOM_MANIFEST =
 endif
 
+# Intel Wi-Fi firmware for drivers/net/iwx.c (Ubuntu's
+# linux-firmware-intel-wireless; tools/stage_wifi.sh). WITH_WIFI=0: without.
+WITH_WIFI ?= 1
+ifeq ($(WITH_WIFI),1)
+WIFI_MANIFEST = $(BUILD)/wifi_manifest.txt
+$(WIFI_MANIFEST): tools/stage_wifi.sh
+	@bash tools/stage_wifi.sh
+else
+WIFI_MANIFEST =
+endif
+
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(WIFI_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
-	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) > $@
+	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(WIFI_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
 	@# your own wallpapers (MY_WALLS): in, and then the only ones -- the
 	@# stock photos, the generated spiral and xvlet's generated ones out
