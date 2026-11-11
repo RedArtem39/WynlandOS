@@ -28,6 +28,11 @@
  * command queue live; the driver kicks it and waits for the ALIVE
  * interrupt, then for the ALIVE notification on the RX queue.
  *
+ * Step 2: commands to the firmware (the command queue: a TFD per command,
+ * the reply matched by its slot), the NVM read (MAC address, bands,
+ * antennas, channels), the radio configured as iwx_init_hw does, then one
+ * passive scan of every channel; the beacons heard are listed in the log.
+ *
  * No interrupts yet: the cause register is polled (INTx kept off, MSI not
  * enabled -- nothing reaches the CPU). Every step goes to the stick's log
  * at once, so a hang shows where. A thread of its own, a few seconds
@@ -125,6 +130,10 @@ extern void sticklog_panic_flush(void);
 #define TLV_SEC_RT                  19
 #define TLV_PHY_SKU                 23
 #define TLV_FW_VERSION              36
+#define TLV_API_CHANGES_SET         29
+#define TLV_ENABLED_CAPABILITIES    30
+#define TLV_N_SCAN_CHANNELS         31
+#define TLV_CMD_VERSIONS            48
 #define SEP_CPU1_CPU2               0xFFFFCCCCu
 #define SEP_PAGING                  0xAAAABBBBu
 #define MAX_SECT                    69
@@ -180,6 +189,19 @@ static char g_fwver[48];
 static Dma g_ctxt, g_rx_free, g_rx_used, g_rx_stat, g_txq;
 static Dma g_rxbuf[RX_RING];
 static int g_rx_cur;
+static Dma g_cmdbuf[TX_RING];                   /* one 4K buffer per command slot */
+static uint32_t g_api[8], g_capa[8];            /* the firmware's API / capability bits */
+static uint32_t g_n_scan_channels = 67;
+static uint8_t g_cmdver[256][4];                /* cmd, group, cmd_ver, notif_ver */
+static int g_ncmdver;
+static inline bool has_api(int b) { return (g_api[b / 32] >> (b % 32)) & 1; }
+static inline bool has_capa(int b) { return (g_capa[b / 32] >> (b % 32)) & 1; }
+static int cmd_ver(uint8_t grp, uint8_t cmd)
+{
+    for (int i = 0; i < g_ncmdver; i++)
+        if (g_cmdver[i][1] == grp && g_cmdver[i][0] == cmd) return g_cmdver[i][2];
+    return 99;                                  /* IWX_FW_CMD_VER_UNKNOWN */
+}
 
 /* ---- the log -------------------------------------------------------- */
 static void say(const char *s, uint64_t v)
@@ -420,6 +442,15 @@ static bool read_firmware(const char *path)
             g_nsect++;
         } else if (type == TLV_PHY_SKU && tl == 4) {
             g_phy_config = *(const uint32_t *)d;
+        } else if ((type == TLV_API_CHANGES_SET || type == TLV_ENABLED_CAPABILITIES) && tl == 8) {
+            uint32_t idx = ((const uint32_t *)d)[0], bits = ((const uint32_t *)d)[1];
+            if (idx < 8) (type == TLV_API_CHANGES_SET ? g_api : g_capa)[idx] |= bits;
+        } else if (type == TLV_N_SCAN_CHANNELS && tl == 4) {
+            g_n_scan_channels = *(const uint32_t *)d;
+        } else if (type == TLV_CMD_VERSIONS) {
+            g_ncmdver = 0;
+            for (uint32_t o = 0; o + 4 <= tl && g_ncmdver < 256; o += 4, g_ncmdver++)
+                memcpy(g_cmdver[g_ncmdver], d + o, 4);
         } else if (type == TLV_FW_VERSION && tl == 12) {
             const uint32_t *v = (const uint32_t *)d;
             say("firmware version TLV: major ", v[0]);
@@ -445,6 +476,8 @@ static bool alloc_queues(void)
     }
     for (int i = 0; i < RX_RING; i++)
         if (!dma_alloc(&g_rxbuf[i], RBUF_SIZE)) { say("no memory for RX buffer ", i); return false; }
+    for (int i = 0; i < TX_RING; i++)
+        if (!dma_alloc(&g_cmdbuf[i], 4096)) { say("no memory for command buffer ", i); return false; }
     return true;
 }
 
@@ -518,33 +551,213 @@ static void nic_config(void)
     wr(CSR_HW_IF_CONFIG_REG, (rd(CSR_HW_IF_CONFIG_REG) & ~HWIF_MSK) | v);
 }
 
+/* ---- a line for the log, built in a buffer ----------------------------- */
+static char *put_s(char *p, const char *s) { while (*s) *p++ = *s++; return p; }
+static char *put_u(char *p, uint32_t v)
+{
+    char t[12];
+    int n = 0;
+    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
+static char *put_i(char *p, int v) { if (v < 0) { *p++ = '-'; v = -v; } return put_u(p, (uint32_t)v); }
+static char *put_x2(char *p, uint8_t v)
+{
+    static const char h[] = "0123456789abcdef";
+    *p++ = h[v >> 4];
+    *p++ = h[v & 15];
+    return p;
+}
+static char *put_pad(char *p, char *start, int width) { while (p - start < width) *p++ = ' '; return p; }
+static void put_line(char *b, char *end) { *end = 0; serial_write_string(b); serial_write_string("\r\n"); }
+static inline uint16_t ld16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+static inline uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static bool same6(const uint8_t *a, const uint8_t *b)
+{
+    for (int i = 0; i < 6; i++) if (a[i] != b[i]) return false;
+    return true;
+}
+
 /* ---- the RX queue: what the firmware says ---------------------------- */
-static bool g_alive_irq, g_alive_ok;
+#define HBUS_TARG_MEM_RADDR         0x40c
+#define HBUS_TARG_MEM_RDAT          0x41c
+#define HBUS_TARG_WRPTR             0x460
+#define FW_ADDR_CACHE_CONTROL       0xC0000000u
+#define CMD_FAILED_MSK              0x40
+#define GRP_LONG                    0x1
+#define GRP_SYSTEM                  0x2
+#define GRP_PHY_OPS                 0x4
+#define GRP_DATA_PATH               0x5
+#define GRP_NVM                     0xc
+#define WIDE(g, c)                  (((uint32_t)(g) << 8) | (c))
+
+static bool g_alive_irq, g_alive_ok, g_fw_error, g_init_complete, g_scan_done;
+static uint32_t g_lmac_err, g_umac_err;
+static int g_wait_idx = -1;                     /* the command slot waited for */
+static bool g_cmd_done;
+static uint8_t g_resp[4096];                    /* its reply's payload */
+static uint32_t g_resp_len;
+static uint8_t g_resp_flags;
+static int g_tx_cur;
+static int g_unknown_said;
+
+/* the networks seen */
+typedef struct { uint8_t bssid[6]; char ssid[33]; uint8_t ch; int rssi; const char *sec; } Bss;
+#define MAX_BSS 64
+static Bss g_bss[MAX_BSS];
+static int g_nbss;
+static uint32_t g_frames;
+
+/* a beacon or a probe response: the network into the table */
+static void handle_frame(const uint8_t *p, uint32_t plen)
+{
+    if (plen < 48) return;                      /* struct iwx_rx_mpdu_desc, v1 (22000) */
+    uint32_t flen = ld16(p), status = ld32(p + 12);
+    uint8_t flags2 = p[3], ea = p[32], eb = p[33], chan = p[34];
+    if (!(status & 1) || !(status & 2)) return; /* CRC_OK, OVERRUN_OK */
+    if (flen < 24 + 12 || 48 + flen > plen) return;
+    const uint8_t *f = p + 48;
+    g_frames++;
+    if (f[0] != 0x80 && f[0] != 0x50) return;   /* beacon, probe response */
+    uint32_t body = 24 + ((flags2 & 0x20) ? 2 : 0);   /* (the firmware's pad after the header) */
+    if (body + 12 > flen) return;
+    uint16_t cap = ld16(f + body + 10);
+    int a = ea ? -(int)ea : -256, b = eb ? -(int)eb : -256;
+    int rssi = a > b ? a : b;
+    char ssid[33];
+    int sl = -1;
+    uint8_t ds = 0;
+    const char *sec = (cap & 0x10) ? "WEP" : "open";
+    bool rsn = false;
+    for (uint32_t o = body + 12; o + 2 <= flen;) {
+        uint8_t id = f[o], l = f[o + 1];
+        if (o + 2 + l > flen) break;
+        const uint8_t *e = f + o + 2;
+        if (id == 0 && sl < 0 && l <= 32) {
+            sl = l;
+            for (int i = 0; i < l; i++) ssid[i] = (e[i] < 0x20 || e[i] == 0x7f) ? '?' : (char)e[i];
+        } else if (id == 3 && l == 1) {
+            ds = e[0];
+        } else if (id == 48 && l >= 8) {        /* RSN: WPA2, or WPA3 when SAE is there */
+            rsn = true;
+            sec = "WPA2";
+            uint32_t q = 8 + 4 * (uint32_t)ld16(e + 6);
+            if (q + 2 <= l) {
+                uint16_t nakm = ld16(e + q);
+                bool sae = false, psk = false, eap = false;
+                for (uint32_t k = 0; k < nakm && q + 2 + 4 * k + 4 <= l; k++) {
+                    const uint8_t *s = e + q + 2 + 4 * k;
+                    if (s[0] != 0x00 || s[1] != 0x0f || s[2] != 0xac) continue;
+                    if (s[3] == 8) sae = true;
+                    else if (s[3] == 2 || s[3] == 6) psk = true;
+                    else if (s[3] == 1 || s[3] == 5) eap = true;
+                }
+                if (sae && psk) sec = "WPA2/3";
+                else if (sae) sec = "WPA3";
+                else if (eap && !psk) sec = "WPA2-EAP";
+            }
+        } else if (id == 221 && l >= 4 && !rsn && e[0] == 0x00 && e[1] == 0x50 && e[2] == 0xf2 && e[3] == 1) {
+            sec = "WPA";
+        }
+        o += 2 + l;
+    }
+    if (sl < 0) sl = 0;
+    ssid[sl] = 0;
+    const uint8_t *bssid = f + 16;
+    int i;
+    for (i = 0; i < g_nbss; i++)
+        if (same6(g_bss[i].bssid, bssid)) break;
+    if (i == g_nbss) {
+        if (g_nbss >= MAX_BSS) return;
+        g_nbss++;
+        memcpy(g_bss[i].bssid, bssid, 6);
+        g_bss[i].rssi = -999;
+    }
+    Bss *n = &g_bss[i];
+    memcpy(n->ssid, ssid, (size_t)sl + 1);
+    n->ch = ds ? ds : chan;
+    n->sec = sec;
+    if (rssi > n->rssi) n->rssi = rssi;
+}
+
+static void say_notif(uint8_t grp, uint8_t code, uint32_t plen)
+{
+    if (g_unknown_said++ >= 24) return;
+    char b[96], *q = put_s(b, "wifi: notification group 0x");
+    q = put_x2(q, grp);
+    q = put_s(q, " code 0x");
+    q = put_x2(q, code);
+    q = put_s(q, " length ");
+    q = put_u(q, plen);
+    put_line(b, q);
+}
+
+static void handle_pkt(uint8_t grp, uint8_t code, uint8_t idx, uint8_t qid, const uint8_t *p, uint32_t plen)
+{
+    if (qid == 0 && idx == g_wait_idx && !g_cmd_done) {    /* the reply to our command */
+        uint32_t n = plen > sizeof g_resp ? sizeof g_resp : plen;
+        memcpy(g_resp, p, n);
+        g_resp_len = n;
+        g_resp_flags = grp;
+        g_cmd_done = true;
+        return;
+    }
+    if ((grp & 0x3f) > GRP_LONG) { say_notif(grp, code, plen); return; }
+    switch (code) {
+    case CMD_ALIVE:
+        if (plen >= 2) {
+            uint16_t status = ld16(p);
+            say("ALIVE notification, status ", status);
+            if (status == ALIVE_STATUS_OK) g_alive_ok = true;
+        }
+        if (plen >= 112) {                      /* alive_resp v4..v6: the error tables */
+            g_lmac_err = ld32(p + 20) & ~FW_ADDR_CACHE_CONTROL;
+            g_umac_err = ld32(p + 108) & ~FW_ADDR_CACHE_CONTROL;
+        }
+        break;
+    case 0x04:                                  /* INIT_COMPLETE_NOTIF */
+        g_init_complete = true;
+        break;
+    case 0xc1:                                  /* REPLY_RX_MPDU_CMD */
+        handle_frame(p, plen);
+        break;
+    case 0x0f:                                  /* SCAN_COMPLETE_UMAC */
+    case 0xb5:                                  /* SCAN_ITERATION_COMPLETE_UMAC */
+        if (!g_scan_done)
+            say(code == 0x0f ? "scan complete, status " : "scan iteration complete, status ",
+                plen >= 7 ? p[code == 0x0f ? 6 : 5] : 0xff);
+        g_scan_done = true;
+        break;
+    case 0x02:                                  /* REPLY_ERROR */
+        if (plen >= 5) {
+            say("FIRMWARE REPLY_ERROR, type ", ld32(p));
+            say("  for command ", p[4]);
+        }
+        break;
+    case 0xb1: case 0xf7: case 0x9d: case 0xc9:
+        break;                                  /* MFUART, debug log, statistics, MCC from the chub */
+    default:
+        say_notif(grp, code, plen);
+    }
+}
 
 static void rx_drain(void)
 {
     uint16_t hw = *(volatile uint16_t *)g_rx_stat.virt & 0xfff;
     hw &= RX_RING - 1;
+    if (hw == g_rx_cur) return;
     int seen = 0;
     while (g_rx_cur != hw && seen++ < RX_RING) {
         const uint8_t *b = (const uint8_t *)g_rxbuf[g_rx_cur].virt;
         uint32_t off = 0;
         while (off + 8 < RBUF_SIZE) {
-            uint32_t lnf = *(const uint32_t *)(b + off);
+            uint32_t lnf = ld32(b + off);
             uint8_t code = b[off + 4], grp = b[off + 5], idx = b[off + 6], qid = b[off + 7];
             if ((qid == 0 && idx == 0 && code == 0 && grp == 0) || lnf == FH_FRAME_INVALID) break;
             uint32_t len = 4 + (lnf & FH_FRAME_SIZE_MSK);
-            serial_write_string("wifi: notification group ");
-            char t[20]; uint_to_hex(grp, t); serial_write_string(t);
-            serial_write_string(" code "); uint_to_hex(code, t); serial_write_string(t);
-            serial_write_string(" length "); uint_to_hex(len, t); serial_write_string(t);
-            serial_write_string("\r\n");
-            if (grp == 0 && code == CMD_ALIVE && len >= 10) {
-                uint16_t status = *(const uint16_t *)(b + off + 8);
-                say("ALIVE notification, status ", status);
-                if (status == ALIVE_STATUS_OK) g_alive_ok = true;
-            }
             if (len < 8 || len > RBUF_SIZE - off) break;
+            handle_pkt(grp, code, idx, qid, b + off + 8, len - 8);
             off += (len + FH_FRAME_ALIGN - 1) & ~(uint32_t)(FH_FRAME_ALIGN - 1);
         }
         g_rx_cur = (g_rx_cur + 1) % RX_RING;
@@ -554,31 +767,393 @@ static void rx_drain(void)
     wr(RFH_Q0_FRBDCB_WIDX_TRG, back & ~7u);
 }
 
-/* the cause register, polled: ALIVE, RX, errors */
+/* the firmware's error tables (SRAM), after a firmware error */
+static void dump_table(const char *name, uint32_t base)
+{
+    if (!base || !nic_lock()) return;
+    say(name, base);
+    for (int i = 0; i < 12; i++) {
+        wr(HBUS_TARG_MEM_RADDR, base + 4 * (uint32_t)i);
+        uint32_t v = rd(HBUS_TARG_MEM_RDAT);
+        char b[48], *q = put_s(b, "  word ");
+        q = put_u(q, (uint32_t)i);
+        q = put_s(q, ": ");
+        *q = 0;
+        say(b, v);
+    }
+    nic_unlock();
+}
+
+/* the cause register, polled: ALIVE, errors; then the RX queue */
+static void service(void)
+{
+    uint32_t r1 = rd(CSR_INT);
+    if (r1 == 0xffffffffu || (r1 & 0xfffffff0u) == 0xa5a5a5a0u) {
+        if (!g_fw_error) say("the card is gone, CSR_INT ", r1);
+        g_fw_error = true;
+        return;
+    }
+    uint32_t r2 = rd(CSR_FH_INT_STATUS);
+    if (r1 || r2) {
+        wr(CSR_INT, r1);
+        wr(CSR_FH_INT_STATUS, r2);
+    }
+    if (r1 & INT_ALIVE) {
+        step("ALIVE interrupt: the firmware runs");
+        g_alive_irq = true;
+        /* the firmware has set the RX queue up: the buffers to it */
+        uint64_t *desc = (uint64_t *)g_rx_free.virt;
+        for (int i = 0; i < RX_RING; i++) desc[i] = g_rxbuf[i].phys | (uint64_t)(i & 0x0fff);
+        __asm__ volatile("mfence" ::: "memory");
+        wr(RFH_Q0_FRBDCB_WIDX_TRG, 8);
+    }
+    if (g_alive_irq) rx_drain();
+    if ((r1 & (INT_SW_ERR | INT_HW_ERR)) && !g_fw_error) {
+        say("FIRMWARE / HARDWARE ERROR, CSR_INT ", r1);
+        g_fw_error = true;
+        dump_table("LMAC error table at ", g_lmac_err);
+        dump_table("UMAC error table at ", g_umac_err);
+        sticklog_panic_flush();
+    }
+    if (r1 & INT_RF_KILL) say("RF-kill switch changed, GP_CNTRL ", rd(CSR_GP_CNTRL));
+}
+
 static void poll_causes(uint64_t until)
 {
-    while (timer_get_ms() < until && !g_alive_ok) {
-        uint32_t r1 = rd(CSR_INT);
-        if (r1 == 0xffffffffu || (r1 & 0xfffffff0u) == 0xa5a5a5a0u) { say("the card is gone, CSR_INT ", r1); return; }
-        uint32_t r2 = rd(CSR_FH_INT_STATUS);
-        if (r1 || r2) {
-            wr(CSR_INT, r1);
-            wr(CSR_FH_INT_STATUS, r2);
-            if (r1 & INT_ALIVE) {
-                step("ALIVE interrupt: the firmware runs");
-                g_alive_irq = true;
-                /* the firmware has set the RX queue up: the buffers to it */
-                uint64_t *desc = (uint64_t *)g_rx_free.virt;
-                for (int i = 0; i < RX_RING; i++) desc[i] = g_rxbuf[i].phys | (uint64_t)(i & 0x0fff);
-                __asm__ volatile("mfence" ::: "memory");
-                wr(RFH_Q0_FRBDCB_WIDX_TRG, 8);
-            }
-            if (r1 & (INT_SW_ERR | INT_HW_ERR)) { say("FIRMWARE / HARDWARE ERROR, CSR_INT ", r1); return; }
-            if (r1 & INT_RF_KILL) say("RF-kill switch changed, GP_CNTRL ", rd(CSR_GP_CNTRL));
-            if ((r1 & (INT_FH_RX | INT_SW_RX)) || r2) rx_drain();
-        }
+    while (timer_get_ms() < until && !g_alive_ok && !g_fw_error) {
+        service();
         sched_sleep_ms(1);
     }
+}
+
+/* ---- commands (iwx_send_cmd): a TFD on the command queue, the reply waited for */
+static bool send_cmd(const char *what, uint32_t id, const void *data, uint32_t len)
+{
+    if (g_fw_error) return false;
+    uint8_t op = id & 0xff, grp = (id >> 8) & 0xff, ver = (id >> 16) & 0xff;
+    if (grp == 0) grp = GRP_LONG;               /* API >= 50: the old commands in the LONG group */
+    if (len > 4096 - 8) return false;
+    int idx = g_tx_cur;
+    uint8_t *c = (uint8_t *)g_cmdbuf[idx].virt;
+    c[0] = op; c[1] = grp; c[2] = (uint8_t)idx; c[3] = 0;      /* struct iwx_cmd_header_wide */
+    c[4] = (uint8_t)len; c[5] = (uint8_t)(len >> 8); c[6] = 0; c[7] = ver;
+    if (len) memcpy(c + 8, data, len);
+    uint8_t *t = (uint8_t *)g_txq.virt + idx * TFD_SIZE;       /* struct iwx_tfh_tfd */
+    memset(t, 0, TFD_SIZE);
+    uint32_t tot = 8 + len;
+    uint16_t l0 = (uint16_t)(tot < 20 ? tot : 20), n = 1;
+    uint64_t a = g_cmdbuf[idx].phys;
+    memcpy(t + 2, &l0, 2);
+    memcpy(t + 4, &a, 8);
+    if (tot > 20) {
+        uint16_t l1 = (uint16_t)(tot - 20);
+        uint64_t a1 = a + 20;
+        memcpy(t + 12, &l1, 2);
+        memcpy(t + 14, &a1, 8);
+        n = 2;
+    }
+    memcpy(t, &n, 2);
+    __asm__ volatile("mfence" ::: "memory");
+    g_cmd_done = false;
+    g_resp_len = 0;
+    g_resp_flags = 0;
+    g_wait_idx = idx;
+    g_tx_cur = (g_tx_cur + 1) % TX_RING;
+    wr(HBUS_TARG_WRPTR, (uint32_t)g_tx_cur);    /* queue 0 << 16 | the write pointer */
+    uint64_t until = timer_get_ms() + 1500;
+    while (!g_cmd_done && !g_fw_error && timer_get_ms() < until) {
+        service();
+        if (!g_cmd_done) sched_sleep_ms(1);
+    }
+    g_wait_idx = -1;
+    if (!g_cmd_done) {
+        sayx(g_fw_error ? "command failed (firmware error):" : "NO REPLY to the command:");
+        sayx(what);
+        sticklog_panic_flush();
+        return false;
+    }
+    if (g_resp_flags & CMD_FAILED_MSK) { sayx("the firmware REFUSED the command:"); sayx(what); return false; }
+    step(what);
+    return true;
+}
+
+/* ---- the radio up (iwx_run_init_mvm_ucode, iwx_nvm_get, iwx_init_hw) -- */
+static const uint8_t nvm_channels[51] = {
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92,
+    96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
+    149, 153, 157, 161, 165, 169, 173, 177, 181
+};
+typedef struct { uint8_t num, band; bool active; } Chan;
+static Chan g_chan[64];
+static int g_nchan;
+static uint8_t g_mac[6];
+static bool g_band5, g_lar;
+static uint8_t g_tx_ant, g_rx_ant;
+
+static void channel_map(const uint8_t *prof, uint32_t n, bool v4)
+{
+    g_nchan = 0;
+    for (uint32_t i = 0; i < n && i < 51 && g_nchan < 64; i++) {
+        uint32_t fl = v4 ? ld32(prof + 4 * i) : ld16(prof + 2 * i);
+        bool is5 = i >= 14;
+        if ((is5 && !g_band5) || !(fl & 1)) continue;        /* NVM_CHANNEL_VALID */
+        g_chan[g_nchan].num = nvm_channels[i];
+        g_chan[g_nchan].band = is5 ? 0 : 1;                   /* PHY_BAND_5 / _24 */
+        g_chan[g_nchan].active = (fl & 8) != 0;               /* NVM_CHANNEL_ACTIVE */
+        g_nchan++;
+    }
+    char b[220], *q = put_s(b, "wifi: channels ");
+    q = put_u(q, (uint32_t)g_nchan);
+    q = put_s(q, ":");
+    for (int i = 0; i < g_nchan && q < b + 210; i++) { *q++ = ' '; q = put_u(q, g_chan[i].num); }
+    put_line(b, q);
+}
+
+static bool read_nvm(void)
+{
+    uint32_t zero = 0;
+    if (!send_cmd("NVM_GET_INFO", WIDE(GRP_NVM, 0x02), &zero, 4)) return false;
+    bool v4 = has_api(48);                      /* REGULATORY_NVM_INFO */
+    uint32_t want = v4 ? 468 : 128;
+    if (g_resp_len != want) { say("NVM reply of an unexpected length ", g_resp_len); return false; }
+    const uint8_t *r = g_resp;
+    uint32_t mac_flags = ld32(r + 8);
+    g_band5 = (mac_flags & 2) != 0;
+    uint8_t ntx = (uint8_t)ld32(r + 12), nrx = (uint8_t)ld32(r + 16);
+    g_lar = ld32(r + 20) && has_capa(1);        /* LAR_SUPPORT */
+    say("NVM version ", ld16(r + 4));
+    say("  SKU flags (1 2.4 GHz, 2 5 GHz, 4 11n, 8 11ac, 0x10 11ax) ", mac_flags);
+    say("  antennas TX ", ntx);
+    say("  antennas RX ", nrx);
+    say("  location-aware regulatory ", g_lar);
+    g_tx_ant = (uint8_t)((g_phy_config >> 16) & 0xf);
+    g_rx_ant = (uint8_t)((g_phy_config >> 20) & 0xf);
+    if (ntx) g_tx_ant &= ntx;
+    if (nrx) g_rx_ant &= nrx;
+    if (v4) channel_map(r + 28, ld32(r + 24), true);
+    else channel_map(r + 24, 51, false);
+
+    /* the MAC address: the OEM's strap, else the OTP (iwx_set_mac_addr_from_csr) */
+    for (int pass = 0; pass < 2; pass++) {
+        uint32_t m0 = rd(0x380 + (pass ? 0x00 : 0x08)), m1 = rd(0x380 + (pass ? 0x04 : 0x0c));
+        const uint8_t *h0 = (const uint8_t *)&m0, *h1 = (const uint8_t *)&m1;
+        g_mac[0] = h0[3]; g_mac[1] = h0[2]; g_mac[2] = h0[1]; g_mac[3] = h0[0];
+        g_mac[4] = h1[1]; g_mac[5] = h1[0];
+        bool zero6 = true, ones = true;
+        for (int i = 0; i < 6; i++) { if (g_mac[i]) zero6 = false; if (g_mac[i] != 0xff) ones = false; }
+        static const uint8_t reserved[6] = { 0x02, 0xcc, 0xaa, 0xff, 0xee, 0x00 };
+        if (!zero6 && !ones && !same6(g_mac, reserved) && !(g_mac[0] & 1)) break;
+    }
+    char b[64], *q = put_s(b, "wifi: MAC address ");
+    for (int i = 0; i < 6; i++) { if (i) *q++ = ':'; q = put_x2(q, g_mac[i]); }
+    put_line(b, q);
+    return true;
+}
+
+static bool update_mcc(void)
+{
+    uint8_t cmd[28];
+    memset(cmd, 0, sizeof cmd);
+    uint16_t mcc = ('Z' << 8) | 'Z';            /* "ZZ": the NVM's own profile */
+    memcpy(cmd, &mcc, 2);
+    cmd[2] = (has_api(9) || has_capa(29)) ? 0x10 : 0;   /* MCC_SOURCE_GET_CURRENT : OLD_FW */
+    if (!send_cmd("MCC_UPDATE (ZZ)", 0xc8, cmd, sizeof cmd)) return false;
+    if (g_resp_len < 20) return true;
+    uint32_t n = ld32(g_resp + 16);
+    char b[64], *q = put_s(b, "wifi: regulatory domain ");
+    *q++ = (char)g_resp[5];
+    *q++ = (char)g_resp[4];
+    put_line(b, q);
+    if (g_resp_len == 20 + 4 * n) channel_map(g_resp + 20, n, true);
+    return true;
+}
+
+static bool radio_up(void)
+{
+    uint32_t v;
+    /* (the card stays awake: the access request held from here) */
+    if (!nic_lock()) return false;
+    v = 2;                                      /* IWX_INIT_NVM */
+    if (!send_cmd("INIT_EXTENDED_CFG", WIDE(GRP_SYSTEM, 0x03), &v, 4)) return false;
+    v = 0;
+    if (!send_cmd("NVM_ACCESS_COMPLETE", WIDE(GRP_NVM, 0x00), &v, 4)) return false;
+    for (uint64_t until = timer_get_ms() + 2000; !g_init_complete && !g_fw_error && timer_get_ms() < until;) {
+        service();
+        sched_sleep_ms(1);
+    }
+    if (!g_init_complete) { sayx("NO INIT_COMPLETE from the firmware"); sticklog_panic_flush(); return false; }
+    step("init complete");
+    if (!read_nvm()) return false;
+
+    v = g_tx_ant;
+    if (!send_cmd("TX_ANT_CONFIGURATION", 0x98, &v, 4)) return false;
+    uint32_t bt[2] = { 3, 0 };                  /* BT_COEX_WIFI */
+    if (!send_cmd("BT_CONFIG", 0x9b, bt, 8)) return false;
+    /* integrated (CNVi), the long-latency crystal of Tiger Lake's (Linux:
+       iwl_qu_long_latency_trans_cfg for 0xA0F0) */
+    int scanver = cmd_ver(GRP_LONG, 0x0d);
+    uint32_t soc[2] = { (2u << 2) | ((scanver != 99 && scanver >= 2) ? 2u : 0u), 12000 };
+    if (!send_cmd("SOC_CONFIGURATION", WIDE(GRP_SYSTEM, 0x01), soc, 8)) return false;
+    if (has_capa(12)) {                         /* DQA_SUPPORT */
+        v = 0;
+        if (!send_cmd("DQA_ENABLE", WIDE(GRP_DATA_PATH, 0x00), &v, 4)) return false;
+    }
+    if (has_capa(74)) {                         /* CT_KILL_BY_FW: the firmware's thermal duty */
+        uint8_t th[20];
+        memset(th, 0, sizeof th);
+        if (!send_cmd("TEMP_REPORTING_THRESHOLDS", WIDE(GRP_PHY_OPS, 0x04), th, sizeof th)) return false;
+    }
+    v = 0;                                      /* device power: no power save */
+    if (!send_cmd("POWER_TABLE", 0x77, &v, 4)) return false;
+    if (g_lar && !update_mcc()) return false;
+    if (!has_api(56)) { sayx("the firmware has no reduced scan config"); return false; }
+    uint8_t sc[12];
+    memset(sc, 0, sizeof sc);
+    int cfgver = cmd_ver(GRP_LONG, 0x0c);
+    if (cfgver == 99 || cfgver < 5) sc[2] = 0xff;
+    sc[4] = g_tx_ant;
+    sc[8] = g_rx_ant;
+    if (!send_cmd("SCAN_CONFIG", WIDE(GRP_LONG, 0x0c), sc, sizeof sc)) return false;
+    uint8_t bf[60];
+    memset(bf, 0, sizeof bf);
+    if (!send_cmd("BEACON_FILTERING (off)", 0xd2, bf, sizeof bf)) return false;
+    return true;
+}
+
+/* ---- the scan (iwx_umac_scan_v14 / _v17): passive, every channel ------ */
+static uint8_t g_scancmd[1940];
+
+static void fill_probe(uint8_t *pp)
+{
+    /* struct iwx_scan_probe_req: five segments, then the frame */
+    uint8_t *f = pp + 20, *q = f;
+    *q++ = 0x40; *q++ = 0;                      /* probe request */
+    q += 2;
+    for (int i = 0; i < 6; i++) *q++ = 0xff;
+    memcpy(q, g_mac, 6);
+    q += 6;
+    for (int i = 0; i < 6; i++) *q++ = 0xff;
+    q += 2;
+    *q++ = 0; *q++ = 0;                         /* the SSID (the firmware's) */
+    uint16_t v = (uint16_t)(q - f), start;
+    memcpy(pp + 2, &v, 2);                      /* mac_header: offset 0, this long */
+    start = v;
+    memcpy(pp + 4, &start, 2);                  /* band_data[0] (2.4 GHz) */
+    static const uint8_t r24[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 50, 4, 0x30, 0x48, 0x60, 0x6c };
+    memcpy(q, r24, sizeof r24);
+    q += sizeof r24;
+    if (has_capa(9)) { *q++ = 3; *q++ = 1; *q++ = 0; }     /* DS_PARAM_SET_IE_SUPPORT */
+    v = (uint16_t)((q - f) - start);
+    memcpy(pp + 6, &v, 2);
+    if (g_band5) {
+        static const uint8_t r5[] = { 1, 8, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c };
+        v = (uint16_t)(q - f);
+        memcpy(pp + 8, &v, 2);
+        memcpy(q, r5, sizeof r5);
+        q += sizeof r5;
+        v = sizeof r5;
+        memcpy(pp + 10, &v, 2);
+    }
+    v = (uint16_t)(q - f);
+    memcpy(pp + 16, &v, 2);                     /* common_data: empty */
+}
+
+static bool start_scan(void)
+{
+    int ver = cmd_ver(GRP_LONG, 0x0d);
+    say("scan command version ", (uint64_t)ver);
+    uint8_t *c = g_scancmd;
+    memset(c, 0, sizeof g_scancmd);
+    uint32_t prio = 6;                          /* SCAN_PRIORITY_EXT_6 */
+    memcpy(c + 4, &prio, 4);
+    uint8_t *g = c + 8;                         /* general params v10 / v11 */
+    uint16_t flags = (1u << 11) | (1u << 1) | (1u << 2) | (1u << 7);   /* FORCE_PASSIVE PASS_ALL NTFY_ITER ADAPTIVE_DWELL */
+    memcpy(g, &flags, 2);
+    g[4] = 10; g[5] = 10;                       /* active dwell */
+    g[6] = 2; g[7] = 8; g[8] = 10;              /* adaptive dwell: APs on 2.4, 5, social */
+    uint16_t budget = 300;
+    memcpy(g + 10, &budget, 2);
+    memcpy(g + 28, &prio, 4);
+    g[32] = 110; g[33] = 110;                   /* passive dwell */
+    uint8_t *ch = c + 44;                       /* channel params v6 / v7 */
+    ch[0] = 1u << 5;                            /* ENABLE_CHAN_ORDER */
+    ch[2] = 10; ch[3] = 2;
+    int n = 0;
+    for (int i = 0; i < g_nchan && n < 67 && (uint32_t)n < g_n_scan_channels; i++, n++) {
+        uint8_t *e = ch + 4 + 8 * n;
+        if (ver == 17) {
+            uint32_t fl = (uint32_t)g_chan[i].band << 30;
+            memcpy(e, &fl, 4);
+            e[4] = g_chan[i].num; e[5] = 0x80; e[6] = 1; e[7] = 0;
+        } else if (has_api(58)) {               /* SCAN_EXT_CHAN_VER */
+            e[4] = g_chan[i].num; e[5] = g_chan[i].band; e[6] = 1; e[7] = 0;
+        } else {
+            e[4] = g_chan[i].num; e[5] = 1; e[6] = 0; e[7] = 0;
+        }
+    }
+    ch[1] = (uint8_t)n;
+    uint8_t *per = c + 584;                     /* periodic: one iteration */
+    per[2] = 1;
+    fill_probe(c + 596);
+    g_scan_done = false;
+    g_nbss = 0;
+    g_frames = 0;
+    say("scanning channels: ", (uint64_t)n);
+    return send_cmd("SCAN_REQ_UMAC", WIDE(GRP_LONG, 0x0d), c, sizeof g_scancmd);
+}
+
+static void list_networks(void)
+{
+    /* by signal, the strongest first */
+    for (int i = 1; i < g_nbss; i++)
+        for (int j = i; j > 0 && g_bss[j].rssi > g_bss[j - 1].rssi; j--) {
+            Bss t = g_bss[j]; g_bss[j] = g_bss[j - 1]; g_bss[j - 1] = t;
+        }
+    say("frames received ", g_frames);
+    say("NETWORKS FOUND: ", (uint64_t)g_nbss);
+    for (int i = 0; i < g_nbss; i++) {
+        Bss *n = &g_bss[i];
+        char b[160], *q = put_s(b, "wifi:   "), *s = q;
+        q = put_i(q, n->rssi);
+        q = put_s(q, " dBm");
+        q = put_pad(q, s, 9);
+        s = q;
+        q = put_s(q, "ch ");
+        q = put_u(q, n->ch);
+        q = put_pad(q, s, 7);
+        s = q;
+        q = put_s(q, n->sec);
+        q = put_pad(q, s, 10);
+        for (int k = 0; k < 6; k++) { if (k) *q++ = ':'; q = put_x2(q, n->bssid[k]); }
+        q = put_s(q, "  ");
+        q = put_s(q, n->ssid[0] ? n->ssid : "(hidden)");
+        put_line(b, q);
+    }
+    sticklog_panic_flush();
+}
+
+static void wifi_up(void)
+{
+    say("firmware API bits ", ((uint64_t)g_api[1] << 32) | g_api[0]);
+    say("firmware capability bits ", ((uint64_t)g_capa[1] << 32) | g_capa[0]);
+    say("  more capability bits ", ((uint64_t)g_capa[3] << 32) | g_capa[2]);
+    say("command versions ", (uint64_t)g_ncmdver);
+    say("scan channels at most ", g_n_scan_channels);
+    if (!radio_up()) { step("the radio did not come up -- step 2 stops here"); return; }
+    step("RADIO UP");
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!start_scan()) return;
+        for (uint64_t until = timer_get_ms() + 20000; !g_scan_done && !g_fw_error && timer_get_ms() < until;) {
+            service();
+            sched_sleep_ms(2);
+        }
+        if (!g_scan_done) sayx("the scan did not finish in 20 s");
+        list_networks();
+        if (g_nbss || g_fw_error) break;
+        sched_sleep_ms(2000);
+    }
+    step(g_nbss ? "SCAN DONE -- step 2 done" : "the scan found nothing");
 }
 
 /* ---- the thread ------------------------------------------------------ */
@@ -674,7 +1249,7 @@ static void wifi_thread(void *arg)
     if (!ctxt_info_init()) { sayx("the context info failed"); return; }
     step("waiting for the firmware");
     poll_causes(timer_get_ms() + 3000);
-    if (g_alive_ok) step("FIRMWARE ALIVE -- step 1 done");
+    if (g_alive_ok) { step("FIRMWARE ALIVE -- step 1 done"); wifi_up(); }
     else if (g_alive_irq) step("the ALIVE interrupt came, its notification not (or not OK)");
     else {
         say("NO ALIVE in 3 s, CSR_INT ", rd(CSR_INT));
