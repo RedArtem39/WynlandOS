@@ -1,0 +1,4 @@
+description=Wi-Fi: WPA2 for the card (/dev/wifi); the network is /etc/wynland/wifi.conf or boot.cfg wifi_ssid / wifi_psk
+type=daemon
+exec=/usr/lib/wynland/wifid
+restart=always

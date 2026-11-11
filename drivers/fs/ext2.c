@@ -222,6 +222,7 @@ static uint32_t        g_inode_size = 128;
 #define DEV_BL_MAX     0xFFFFFFB3   /* .../max_brightness */
 #define DEV_THERM      0xFFFFFFB5   /* /sys/class/thermal/thermal_zone0/temp: the CPU's (kernel/cputemp.c) */
 #define DEV_THERM_TYPE 0xFFFFFFB6   /* .../type: "x86_pkg_temp" */
+#define DEV_WIFI       0xFFFFFFB7   /* /dev/wifi: root's wifid <-> the Wi-Fi card (drivers/net/iwx.c) */
 #define DEV_USB0       0xFFFFFFB0   /* USB mass storage (drivers/usb); outside 0xFFFFFFF0+, whose
                                        0xFFFFFFF4.. are sysfs's PCI files */
 
@@ -2202,7 +2203,8 @@ bool vfs_display_device_denied(const char *path) {
     FS_GUARD();
     if (str_compare(path, "/dev/input/kbd") != 0 && str_compare(path, "/dev/input/mice") != 0 &&
         str_compare(path, "/dev/fb0") != 0 && str_compare(path, "/dev/usb0") != 0 &&
-        str_compare(path, "/proc/sysrq-trigger") != 0 && str_compare(path, "/dev/kmsg") != 0) return false;
+        str_compare(path, "/proc/sysrq-trigger") != 0 && str_compare(path, "/dev/kmsg") != 0 &&
+        str_compare(path, "/dev/wifi") != 0) return false;
     Thread *t = sched_current();
     Process *p = t ? t->proc : NULL;
     return p && p->pid != 0 && !(p->uid == 0 && !p->userns);
@@ -2309,6 +2311,13 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
         if (!hda_present()) return NULL;
         hda_dsp_open();
         return alloc_device_file("dsp", 0, false, DEV_DSP, flags);
+    }
+
+    /* /dev/wifi: the Wi-Fi card's commands and events (root's: the keys go through it) */
+    if (str_compare(path, "/dev/wifi") == 0) {
+        extern bool iwx_dev_present(void);
+        if (!iwx_dev_present()) return NULL;
+        return alloc_device_file("wifi", 0, false, DEV_WIFI, flags);
     }
 
     if (str_compare(path, "/dev/zero") == 0) {
@@ -2487,6 +2496,10 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_DSP) return -1;  /* playback only */
+    if (file->node.first_cluster == DEV_WIFI) {          /* one event per read, 0 when there is none */
+        extern int iwx_dev_read(void *buf, uint32_t size);
+        return iwx_dev_read(buf, size);
+    }
     if (file->node.first_cluster == DEV_BACKLIGHT || file->node.first_cluster == DEV_BL_MAX) {
         extern uint32_t i915_backlight_max(void), i915_backlight_get(void);
         uint32_t v = file->node.first_cluster == DEV_BL_MAX ? i915_backlight_max() : i915_backlight_get();
@@ -2637,6 +2650,10 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
         extern int64_t hda_dsp_write(const void *buf, uint32_t len, const uint32_t *fmt);
         int64_t r = hda_dsp_write(buf, size, &file->current_cluster);   /* (its format: hda.c) */
         return r < 0 ? -1 : (int)r;
+    }
+    if (file->node.first_cluster == DEV_WIFI) {          /* one command per write */
+        extern int iwx_dev_write(const void *buf, uint32_t len);
+        return iwx_dev_write(buf, size);
     }
     if (IS_DRM_DEV(file->node.first_cluster)) return -1; /* ioctl/mmap only */
     if (file->node.first_cluster == DEV_ZERO) return (int)size;

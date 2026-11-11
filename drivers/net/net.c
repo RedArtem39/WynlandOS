@@ -148,25 +148,33 @@ extern bool usb_net_send(const void *data, uint32_t len);
 extern int  usb_net_receive(void *buf, uint32_t max);
 extern void usb_net_get_mac(uint8_t *mac);
 
+/* ... or the Wi-Fi card (drivers/net/iwx.c): once it has the keys of an access point */
+extern bool iwx_net_ready(void);
+extern bool iwx_net_send(const void *data, uint32_t len);
+extern int  iwx_net_receive(void *buf, uint32_t max);
+extern void iwx_net_get_mac(uint8_t *mac);
+
 static bool nic_send(const void *data, uint32_t len)
 {
     if (g_virtio_nic) return virtio_net_send(data, len);
-    return usb_net_send(data, len);
+    if (usb_net_ready()) return usb_net_send(data, len);
+    return iwx_net_send(data, len);
 }
 
 static int nic_receive(void *buf, uint32_t max)
 {
     if (g_virtio_nic) return virtio_net_receive(buf, max);
-    return usb_net_receive(buf, max);
+    if (usb_net_ready()) return usb_net_receive(buf, max);
+    return iwx_net_receive(buf, max);
 }
 
-/* a NIC is there; a USB one's address becomes ours */
+/* a NIC is there; a USB or Wi-Fi one's address becomes ours */
 bool net_nic_present(void)
 {
     if (g_virtio_nic) return true;
-    if (!usb_net_ready()) return false;
-    usb_net_get_mac(our_mac);
-    return true;
+    if (usb_net_ready()) { usb_net_get_mac(our_mac); return true; }
+    if (iwx_net_ready()) { iwx_net_get_mac(our_mac); return true; }
+    return false;
 }
 
 /* the NIC went away: no address, no routes, nothing cached */

@@ -119,6 +119,8 @@ gcc -O2 -Wall -o "$OUT/modtools" apps/modtools/modtools.c
 gcc -O2 -Wall -o "$OUT/wynlogin" apps/accounts/wynlogin.c apps/accounts/accounts.c -lcrypt
 # bluez-stub: a STAND-IN for BlueZ (no Bluetooth here), apps/bluez-stub
 gcc -O2 -Wall -o "$OUT/bluez-stub" apps/bluez-stub/bluez-stub.c $(pkg-config --cflags --libs dbus-1)
+# wifid: WPA2 for the Wi-Fi card (/dev/wifi, drivers/net/iwx.c), keys with libcrypto
+gcc -O2 -Wall -o "$OUT/wifid" apps/wifid/wifid.c -lcrypto
 
 # the .pycs made above are in no package
 find $PYDIRS -type d -name __pycache__ | sed "s|^$ROOT||" >> "$dirs"
@@ -227,13 +229,14 @@ L=$REPO/apps/leaf
     echo "F /usr/lib/wynland/mkliveuser $REPO/rootfs/usr/lib/wynland/mkliveuser"
     echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
     echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
+    echo "F /usr/lib/wynland/wifid $OUT/wifid"
     # lock screens check the user's own password with it (unix_chkpwd)
     echo "F /usr/lib/wynland/chkpwd $OUT/chkpwd"
     echo "P /usr/lib/wynland/chkpwd 0 104755"
     echo "D /etc/dbus-1"
     echo "D /etc/dbus-1/system.d"
     echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"
-    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub wifid; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     # each account's look on the login screen (xvlet's settings write it,
