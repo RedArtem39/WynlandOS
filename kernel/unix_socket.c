@@ -923,3 +923,45 @@ uint32_t usock_poll(int idx, uint32_t events, WaitQueue **wq) {
     uunlock(f);
     return rev & (events | UPOLLERR | UPOLLHUP);
 }
+
+/* The loopback TCP sockets (stream sockets named "\0inet:PORT", see
+   tcp_make_local() in kernel/syscall.c) as TCP for netlink's sock_diag:
+   a listener on 0.0.0.0:PORT, a connection 127.0.0.1:A -> 127.0.0.1:B. */
+#include <wynland/inet_list.h>
+
+static bool inet_port(const USock *s, uint16_t *port) {
+    static const char pre[] = "\0inet:";
+    if (!s || s->name_len < 7) return false;     /* (an accepted end has its listener's name, unbound) */
+    for (int i = 0; i < 6; i++) if (s->name[i] != pre[i]) return false;
+    uint32_t v = 0;
+    for (uint32_t i = 6; i < s->name_len; i++) {
+        if (s->name[i] < '0' || s->name[i] > '9') return false;
+        v = v * 10 + (uint32_t)(s->name[i] - '0');
+    }
+    if (v > 65535) return false;
+    *port = (uint16_t)v;
+    return true;
+}
+
+int usock_inet_list(InetSockEnt *out, int max) {
+    int n = 0;
+    uint64_t f = ulock();
+    for (int i = 0; i < USOCK_SLOTS && n < max; i++) {
+        USock *s = g_usock[i];
+        uint16_t lp, rp = 0;
+        if (!s || s->type != USOCK_STREAM || !inet_port(s, &lp)) continue;
+        if (s->state == US_CONNECTED && !inet_port(s->peer, &rp)) continue;
+        if (s->state == US_UNCONNECTED && !s->was_connected) continue;   /* bound, not listening yet */
+        InetSockEnt *e = &out[n++];
+        e->lport = lp;
+        e->rport = rp;
+        e->lip = s->state == US_LISTENING ? 0 : 0x0100007F;
+        e->rip = s->state == US_LISTENING ? 0 : 0x0100007F;
+        e->state = s->state == US_LISTENING ? LTCP_LISTEN : s->state == US_CONNECTED ? LTCP_ESTABLISHED : LTCP_CLOSE_WAIT;
+        e->rq = s->state == US_LISTENING ? (uint32_t)s->npend : s->rx_bytes;
+        e->wq = s->state == US_LISTENING ? (uint32_t)s->backlog : 0;
+        e->uid = s->cred.uid;
+    }
+    uunlock(f);
+    return n;
+}

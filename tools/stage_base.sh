@@ -121,6 +121,7 @@ gcc -O2 -Wall -o "$OUT/wynlogin" apps/accounts/wynlogin.c apps/accounts/accounts
 gcc -O2 -Wall -o "$OUT/bluez-stub" apps/bluez-stub/bluez-stub.c $(pkg-config --cflags --libs dbus-1)
 # wifid: WPA2 for the Wi-Fi card (/dev/wifi, drivers/net/iwx.c), keys with libcrypto
 gcc -O2 -Wall -o "$OUT/wifid" apps/wifid/wifid.c -lcrypto
+gcc -O2 -Wall -o "$OUT/wifi" apps/wifid/wifi.c
 
 # the .pycs made above are in no package
 find $PYDIRS -type d -name __pycache__ | sed "s|^$ROOT||" >> "$dirs"
@@ -193,6 +194,8 @@ if [ -n "$missing" ]; then echo "  BASE       WARNING: unresolved:"; echo "$miss
     echo "F /etc/fish/conf.d/wynland.fish $REPO/rootfs/etc/fish/conf.d/wynland.fish"
     echo "F /shtest.elf $OUT/shtest.elf"
     echo "F /etc/wynrc/services/shtest $REPO/rootfs/etc/wynrc/services/shtest"
+    echo "F /nltest.elf $OUT/nltest.elf"
+    echo "F /etc/wynrc/services/nltest $REPO/rootfs/etc/wynrc/services/nltest"
 } >> "$MAN"
 grep -q '^D /etc/fish$' "$MAN" || echo "D /etc/fish" >> "$MAN"
 grep -q '^D /etc/fish/conf.d$' "$MAN" || echo "D /etc/fish/conf.d" >> "$MAN"
@@ -200,7 +203,7 @@ grep -q '^D /etc/fish/conf.d$' "$MAN" || echo "D /etc/fish/conf.d" >> "$MAN"
 # 4. leaf, the package manager (apps/leaf): the program, where it gets
 #    packages, what the image already has, and stand-ins for the dpkg and
 #    systemd helpers Debian's maintainer scripts call
-python3 tools/leaf_base.py "$OUT/leaf_base.txt" ext2_manifest.txt $OTHER "$MAN"
+# (/var/lib/leaf/base: written by the Makefile from the whole image's manifest)
 L=$REPO/apps/leaf
 {
     for d in /root /etc/leaf /var/lib /var/lib/leaf /var/cache/leaf; do
@@ -230,6 +233,7 @@ L=$REPO/apps/leaf
     echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
     echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
     echo "F /usr/lib/wynland/wifid $OUT/wifid"
+    echo "F /usr/bin/wifi $OUT/wifi"
     # lock screens check the user's own password with it (unix_chkpwd)
     echo "F /usr/lib/wynland/chkpwd $OUT/chkpwd"
     echo "P /usr/lib/wynland/chkpwd 0 104755"

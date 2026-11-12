@@ -903,6 +903,10 @@ static bool schedule_locked(bool yielding) {
         uint32_t low = val & 0xFFFFFFFF;
         uint32_t high = val >> 32;
         __asm__ volatile("wrmsr" :: "c"(msr), "a"(low), "d"(high));
+        /* and its GS base: in KERNEL_GS_BASE until swapgs on the way out */
+        val = next_thread->user_gs_base;
+        if ((uint64_t)((int64_t)(val << 16) >> 16) != val) val = 0;
+        __asm__ volatile("wrmsr" :: "c"(0xC0000102u), "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
     }
 
     /* the thread being switched away from ran off the bottom of its stack */

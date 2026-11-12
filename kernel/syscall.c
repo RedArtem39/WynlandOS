@@ -665,6 +665,15 @@ static bool range_has_kernel_pages(PageTable *pml4, uint64_t addr, uint64_t end)
     return false;
 }
 
+/* nothing of the process's in [a, end): no region recorded, no page mapped
+   (an mmap() address hint is taken only then) */
+static bool mmap_range_free(Process *p, PageTable *pml4, uint64_t a, uint64_t end)
+{
+    for (VMA *v = p->vma_list; v; v = v->next)
+        if (v->start < end && v->end > a) return false;
+    return vmm_next_mapped(pml4, a, end) >= end;
+}
+
 /* mmap() address slots, one PML4-sized region (1 TB here) per kind of
    mapping; addresses come from a per-process bump pointer. 0 when the
    slot is exhausted -- the caller fails with -ENOMEM instead of running
@@ -1653,6 +1662,18 @@ static uint64_t readlink_fallback(const char *path, uint64_t ubuf, uint64_t bufs
             if (copy_to_user((void *)ubuf, pr->exe_path, len) != 0) return (uint64_t)-14;
             return len;
         }
+        /* the process's directory, or a file or directory in it: there,
+           but not a symlink. glibc's realpath() readlinks every component
+           of /proc/self/exe -- "/proc/597" said ENOENT and it gave up
+           (wine finds ntdll.so from realpath("/proc/self/exe")). */
+        if (pr && rest) {
+            static const char *const plain[] = { "", "fd", "fdinfo", "ns", "task", "stat", "status", "statm",
+                "cmdline", "comm", "environ", "maps", "smaps", "mounts", "mountinfo", "limits", "cgroup",
+                "auxv", "attr", "io", "oom_score_adj", "loginuid", "sessionid", "uid_map", "gid_map",
+                "setgroups", "mem", "pagemap", "wchan", "personality", "schedstat", "net", NULL };
+            for (int k = 0; plain[k]; k++)
+                if (str_compare(rest, plain[k]) == 0) return (uint64_t)-22;   /* -EINVAL */
+        }
     }
     char target[MAX_PATH];
     int n = vfs_readlink(path, target, sizeof(target));
@@ -1890,8 +1911,28 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
    process_spawn()'s own failure path, kernel/process.c). */
 /* A new wrapper copied from another now references the same object
    (include/wynland/kfile.h). */
+/* the position of a regular file's open file description, shared from now
+   on by every copy of the wrapper (fork, dup, spawn): sh's "( a; b ) > f"
+   had each process write from its own offset 0, over the others */
+void kfile_share_pos(VfsFile *f) {
+    if (!f || f->node.first_cluster >= 0xFFFFFF00u || f->node.is_dir || f->pos) return;
+    VfsPos *p = (VfsPos *)kmalloc(sizeof(VfsPos));
+    if (!p) return;                       /* (each copy keeps its own then) */
+    p->refs = 1;
+    p->pos = f->offset;
+    f->pos = p;
+}
+
+static inline void pos_load(VfsFile *f) {
+    if (f->node.first_cluster < 0xFFFFFF00u && f->pos) f->offset = f->pos->pos;
+}
+static inline void pos_store(VfsFile *f) {
+    if (f->node.first_cluster < 0xFFFFFF00u && f->pos) f->pos->pos = f->offset;
+}
+
 void kfile_get(VfsFile *f) {
     uint32_t fc = f->node.first_cluster;
+    if (fc < 0xFFFFFF00u && f->pos) f->pos->refs++;
     if (fc == USOCK_FD) usock_ref((int)f->current_cluster);
     else if (fc == MEMFD_FD) memfd_ref((int)f->current_cluster);
     else if (fc == TIMERFD_FD) timerfd_ref((int)f->current_cluster);
@@ -1931,6 +1972,7 @@ void kfile_get(VfsFile *f) {
 VfsFile *kfile_dup(const VfsFile *f) {
     VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
     if (!copy) return NULL;
+    kfile_share_pos((VfsFile *)f);
     *copy = *f;
     kfile_get(copy);
     return copy;
@@ -2069,6 +2111,8 @@ static int64_t plock_fcntl(VfsFile *f, int cmd, uint64_t arg) {
 }
 
 void kfile_close(VfsFile *f) {
+    if (f->node.first_cluster < 0xFFFFFF00u && f->pos && --f->pos->refs == 0) kfree(f->pos);
+    f->pos = NULL;
     flock_drop(f);
     plock_drop_file(f);
     /* the slot is empty already: a lock-free reader that saw f is past
@@ -2186,6 +2230,40 @@ static bool is_kobj_fd(const VfsFile *f) {
    prepared (write). A socket gets the whole vector as ONE send/recv, so
    writev() on a seqpacket socket is one message. fds that arrive with a
    plain read() are closed, as on Linux. */
+/* a netlink socket's next reply datagram into a user buffer (flags:
+   MSG_PEEK 2, MSG_TRUNC 0x20 -- the datagram's whole length returned).
+   The slot is held while waiting (a close by another thread frees the
+   file, not the slot), and the user buffer is written with copy_to_user
+   (it may have been unmapped meanwhile). *trunc: it did not all fit. */
+static int64_t netlink_read_user(VfsFile *f, uint32_t oflags, uint8_t *ubase, uint64_t ulen,
+                                 int flags, bool *trunc) {
+    bool nonblock = (oflags & LINUX_O_NONBLOCK) != 0 || (flags & 0x40 /* MSG_DONTWAIT */);
+    int slot = (int)f->current_cluster;
+    netlink_ref(slot);
+    int64_t r;
+    for (;;) {
+        if (netlink_readable(slot)) {
+            uint32_t want = ulen < 65536 ? (uint32_t)ulen : 65536, full = 0;
+            uint8_t *kb = want ? (uint8_t *)kmalloc(want) : NULL;
+            if (want && !kb) { r = -12; break; }
+            r = netlink_recv(slot, kb, want, flags, &full);
+            if (r > 0 && copy_to_user(ubase, kb, (uint64_t)r) != 0) r = -14;
+            if (kb) kfree(kb);
+            if (r >= 0) {
+                if (trunc) *trunc = full > (uint32_t)r;
+                if (flags & 0x20) r = full;
+            }
+            if (r == -11 && !nonblock) continue;
+            break;
+        }
+        if (nonblock) { r = -11; break; }                      /* -EAGAIN */
+        if (sched_dying() || sleep_interrupted()) { r = -LNX_EINTR; break; }
+        waitqueue_wait_ms(&g_poll_any_wq, timer_get_ms() + 50);
+    }
+    netlink_unref(slot);
+    return r;
+}
+
 static int64_t kobj_readv(VfsFile *f, uint32_t oflags, const UIoVecW *iov, int iovcnt) {
     uint32_t fc = f->node.first_cluster;
     bool nonblock = (oflags & LINUX_O_NONBLOCK) != 0;
@@ -2218,30 +2296,8 @@ static int64_t kobj_readv(VfsFile *f, uint32_t oflags, const UIoVecW *iov, int i
         return 8;
     }
     if (fc == NETLINK_FD) {
-        /* replies waiting: a datagram's worth into the first buffer. The
-           slot is held while waiting (a close by another thread frees the
-           file, not the slot), and the user buffer is written with
-           copy_to_user (it may have been unmapped meanwhile). */
         if (iovcnt < 1) return 0;
-        int slot = (int)f->current_cluster;
-        uint8_t *ubase = iov[0].base;
-        uint64_t ulen = iov[0].len;
-        netlink_ref(slot);
-        int64_t r;
-        for (;;) {
-            if (netlink_readable(slot)) {
-                uint8_t kb[2048];
-                uint64_t want = ulen < sizeof(kb) ? ulen : sizeof(kb);
-                r = netlink_recv(slot, kb, (uint32_t)want);
-                if (r > 0 && copy_to_user(ubase, kb, (uint64_t)r) != 0) r = -14;
-                break;
-            }
-            if (nonblock) { r = -11; break; }                      /* -EAGAIN */
-            if (sched_dying() || sleep_interrupted()) { r = -LNX_EINTR; break; }
-            waitqueue_wait_ms(&g_poll_any_wq, timer_get_ms() + 50);
-        }
-        netlink_unref(slot);
-        return r;
+        return netlink_read_user(f, oflags, iov[0].base, iov[0].len, 0, NULL);
     }
     return -9;
 }
@@ -2711,6 +2767,7 @@ static int64_t file_rw(VfsFile *f, bool is_write, uint64_t ubuf, uint64_t len) {
     if (!kb) return -12;
     Thread *t = sched_current();
     kmutex_lock(&g_fs_mutex);
+    pos_load(f);                          /* the open file's position (another process may have moved it) */
     int64_t total = 0;
     while ((uint64_t)total < len) {
         uint32_t n = (uint32_t)(len - (uint64_t)total < cap ? len - (uint64_t)total : cap);
@@ -2730,6 +2787,7 @@ static int64_t file_rw(VfsFile *f, bool is_write, uint64_t ubuf, uint64_t len) {
         total += r;
         if ((uint32_t)r < n) break;
     }
+    pos_store(f);
     kmutex_unlock(&g_fs_mutex);
     kfree(kb);
     return total;
@@ -3552,6 +3610,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 /* the new offset is the result (vfs_seek says only ok or
                    not): programs check lseek(fd, off, SEEK_SET) == off */
                 VfsFile *f = fd_table[a1];
+                pos_load(f);
                 int64_t size = (int64_t)f->node.size, cur = (int64_t)f->offset, off = (int64_t)a2, pos;
                 switch (a3) {
                     case 0: pos = off; break;                       /* SEEK_SET */
@@ -3565,6 +3624,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 if (pos < 0 || pos > 0xFFFFFFFFLL) return (uint64_t)-22;
                 f->offset = (uint32_t)pos;
+                pos_store(f);
                 return (uint64_t)pos;
             }
 
@@ -3588,6 +3648,23 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if ((flags & 0x10) && (!user_map_range_ok(addr, size_aligned) ||
                     range_has_kernel_pages(vmm_get_current_pml4(), addr, addr + size_aligned)))
                     return (uint64_t)-22; /* -EINVAL */
+
+                /* An address without MAP_FIXED: taken when that range is
+                   free, as Linux does; MAP_FIXED_NOREPLACE (0x100000) fails
+                   with EEXIST when it is not. Wine lays out a Windows
+                   address space this way (its reserved areas, the shared
+                   user data at 0x7ffe0000) -- ignored, it said "failed to
+                   map the shared user data". Not inside the mmap slots
+                   (0x60.. - 0x67..): their bump pointers would later hand
+                   the same range out again. */
+                if (!(flags & 0x10) && addr) {
+                    uint64_t ha = addr & ~(uint64_t)(PAGE_SIZE - 1);
+                    bool free_ = user_map_range_ok(ha, size_aligned) &&
+                                 !(ha < 0x670000000000ULL && ha + size_aligned > 0x600000000000ULL) &&
+                                 mmap_range_free(sched_current()->proc, vmm_get_current_pml4(), ha, ha + size_aligned);
+                    if (free_) { flags |= 0x10; addr = ha; }
+                    else if (flags & 0x100000) return (uint64_t)-17;   /* -EEXIST */
+                }
 
                 /* Same W^X policy as mprotect()/the ELF loader (kernel/elf.c):
                    reject outright rather than silently granting a mapping
@@ -4535,6 +4612,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    arch_prctl). Without the flag the child keeps ours. */
                 if (a1 & 0x80000) t->tls_base = (a5 < 0x0000800000000000ULL) ? a5 : 0;
                 else              t->tls_base = sched_current()->tls_base;
+                t->user_gs_base = sched_current()->user_gs_base;   /* (as Linux: a new thread keeps it) */
                 /* This new thread shares the CALLER's process (thread_create()
                    -> thread_create_ex(..., NULL) defaults Thread.proc to
                    current_thread->proc, kernel/sched.c) -- keep a real live
@@ -4657,6 +4735,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     if (parent->fd_table[i]) {
                         VfsFile *copy = (VfsFile *)kmalloc(sizeof(VfsFile));
                         if (!copy) break; /* OOM partway through -- same best-effort tolerance as process_spawn()'s own fd-inheritance loop */
+                        kfile_share_pos(parent->fd_table[i]);   /* one position for both (Linux's fork) */
                         *copy = *parent->fd_table[i];
                         kfile_get(copy); /* sockets/memfds count their fds */
                         child->fd_table[i]  = copy;
@@ -4676,7 +4755,8 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
                 extern void fork_child_entry(void *arg);
                 Thread *child_thread = thread_create_ex_tls(fork_child_entry, regs_copy, child, sched_current()->tls_base);
-                if (child_thread) child_thread->id = child->pid; /* main thread: tid == pid */
+                if (child_thread) { child_thread->id = child->pid; /* main thread: tid == pid */
+                                    child_thread->user_gs_base = sched_current()->user_gs_base; }
                 child->main_thread = child_thread;
                 child->thread_count = 1;
 
@@ -4912,6 +4992,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 }
                 sandbox_exec(exec_proc);
                 signal_exec_reset(sched_current(), exec_proc);
+                /* a new image starts with no GS base (wine's TEB stays behind) */
+                sched_current()->user_gs_base = 0;
+                __asm__ volatile("wrmsr" :: "c"(0xC0000102u), "a"(0u), "d"(0u));
                 serial_write_string("SYS_execve: Successfully loaded ELF. Entry = ");
                 char buf[32];
                 uint_to_hex(entry_point, buf);
@@ -4950,7 +5033,19 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     }
                     return 0; // Success
                 }
-                return (uint64_t)-1;
+                if (a1 == 0x1001) { // ARCH_SET_GS: wine keeps the TEB there
+                    if (a2 >= 0x0000800000000000ULL) return (uint64_t)-1; /* -EPERM */
+                    sched_current()->user_gs_base = a2;
+                    /* the user's GS base waits in KERNEL_GS_BASE (swapgs) */
+                    __asm__ volatile("wrmsr" :: "c"(0xC0000102u), "a"((uint32_t)a2), "d"((uint32_t)(a2 >> 32)));
+                    return 0;
+                }
+                if (a1 == 0x1003 || a1 == 0x1004) { // ARCH_GET_FS, ARCH_GET_GS
+                    uint64_t v = a1 == 0x1003 ? sched_current()->tls_base : sched_current()->user_gs_base;
+                    if (!a2 || copy_to_user((void *)a2, &v, 8) != 0) return (uint64_t)-14;
+                    return 0;
+                }
+                return (uint64_t)-22; /* -EINVAL */
             }
 
         case 231: // SYS_exit_group (Linux standard) -- the whole process
@@ -6952,14 +7047,14 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     return (uint64_t)-97; // -EAFNOSUPPORT
                 }
 
-                /* AF_NETLINK: rtnetlink, in an isolated network namespace
-                   only (kernel/netlink.c: there is nothing to configure
-                   there). On the host's network it stays unavailable: glibc
-                   then takes every address family as configured, as before. */
+                /* AF_NETLINK (kernel/netlink.c): rtnetlink -- the machine's
+                   interfaces, addresses and routes (ip, getifaddrs, glibc's
+                   AI_ADDRCONFIG), or in an isolated network namespace only
+                   acknowledgements -- and sock_diag's TCP list (ss). */
                 if (domain == 16) {
-                    if (!proc->netns) return (uint64_t)-97;                         /* -EAFNOSUPPORT */
-                    if ((int)a3 != 0 /* NETLINK_ROUTE */) return (uint64_t)-93;   /* -EPROTONOSUPPORT */
-                    int s = netlink_create((uint32_t)pid_to_ns(proc->pid, proc));
+                    /* ROUTE everywhere, SOCK_DIAG (ss) on the machine's network */
+                    if ((int)a3 != 0 && ((int)a3 != 4 || proc->netns)) return (uint64_t)-93;   /* -EPROTONOSUPPORT */
+                    int s = netlink_create((uint32_t)pid_to_ns(proc->pid, proc), (int)a3, !proc->netns);
                     if (s < 0) return (uint64_t)s;
                     int fd = get_free_fd(fd_table);
                     if (fd < 0) { netlink_unref(s); return (uint64_t)-24; }
@@ -7164,9 +7259,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 if (a3 != 0 && !user_prepare_write(a2, a3)) return -14; // EFAULT
                 VfsFile *file = fd_table[fd];
                 if (file->node.first_cluster == NETLINK_FD) {
-                    UIoVecW v = { (uint8_t *)a2, a3 };
-                    uint32_t o = fd_oflags[fd] | ((a4 & 0x40 /* MSG_DONTWAIT */) ? LINUX_O_NONBLOCK : 0);
-                    int64_t n = kobj_readv(file, o, &v, 1);
+                    int64_t n = netlink_read_user(file, fd_oflags[fd], (uint8_t *)a2, a3, (int)a4, NULL);
                     if (n >= 0 && a5 && regs->r9) {                 /* from the kernel: sockaddr_nl, pid 0 */
                         uint8_t sa[12] = { 16, 0 };
                         uint32_t have, real = 12;
@@ -7271,9 +7364,16 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
 
                 if (!fd_is_usock(fd_table, (uint64_t)fd)) {
                     bool nl = fd_table[fd]->node.first_cluster == NETLINK_FD;
-                    int64_t n = (int64_t)syscall_dispatcher(19, a1, mh.msg_iov, mh.msg_iovlen, 0, 0, regs);
+                    bool trunc = false;
+                    int64_t n;
+                    if (nl) {   /* one datagram into the first buffer, the flags honoured */
+                        struct { uint8_t *base; uint64_t len; } v0 = { NULL, 0 };
+                        if (mh.msg_iovlen && copy_from_user(&v0, (const void *)mh.msg_iov, sizeof(v0)) != 0) return (uint64_t)-14;
+                        n = netlink_read_user(fd_table[fd], fd_oflags[fd], v0.base, v0.len, (int)a3, &trunc);
+                    } else
+                        n = (int64_t)syscall_dispatcher(19, a1, mh.msg_iov, mh.msg_iovlen, 0, 0, regs);
                     if (n >= 0) {
-                        mh.msg_controllen = 0; mh.msg_flags = 0; mh.msg_namelen = 0;
+                        mh.msg_controllen = 0; mh.msg_flags = trunc ? 0x20 /* MSG_TRUNC */ : 0; mh.msg_namelen = 0;
                         if (nl && mh.msg_name) {                  /* from the kernel: sockaddr_nl, port 0 */
                             uint8_t sa[12] = { 16, 0 };
                             if (copy_to_user((void *)mh.msg_name, sa, 12) != 0) return (uint64_t)-14;

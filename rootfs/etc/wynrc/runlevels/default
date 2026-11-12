@@ -18,5 +18,6 @@ pwtest
 kmstest
 wpetest
 shtest
+nltest
 sandboxtest
 swaptest

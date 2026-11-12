@@ -177,6 +177,15 @@ bool net_nic_present(void)
     return false;
 }
 
+/* which card is the NIC (netlink names it: eth0, or wlan0 for Wi-Fi) */
+int net_nic_kind(void)
+{
+    if (g_virtio_nic) return 1;
+    if (usb_net_ready()) return 2;
+    if (iwx_net_ready()) return 3;
+    return 0;
+}
+
 /* the NIC went away: no address, no routes, nothing cached */
 void net_link_down(void)
 {

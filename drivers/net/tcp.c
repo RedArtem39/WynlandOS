@@ -1061,3 +1061,35 @@ static void tcp_handle_packet_locked(uint32_t src_ip, uint32_t dst_ip,
        above instead of falling through to here. */
     waitqueue_wake_all(&conn->rx_wq); waitqueue_wake_all(&g_poll_any_wq);
 }
+
+/* ============================================================
+ * The connections as a list (netlink sock_diag: ss)
+ * ============================================================ */
+#include <wynland/inet_list.h>
+
+int tcp_inet_list(InetSockEnt *out, int max)
+{
+    static const uint8_t lstate[] = {
+        [TCP_STATE_CLOSED] = LTCP_CLOSE,           [TCP_STATE_LISTEN] = LTCP_LISTEN,
+        [TCP_STATE_SYN_SENT] = LTCP_SYN_SENT,      [TCP_STATE_SYN_RECEIVED] = LTCP_SYN_RECV,
+        [TCP_STATE_ESTABLISHED] = LTCP_ESTABLISHED, [TCP_STATE_FIN_WAIT_1] = LTCP_FIN_WAIT1,
+        [TCP_STATE_FIN_WAIT_2] = LTCP_FIN_WAIT2,   [TCP_STATE_CLOSING] = LTCP_CLOSING,
+        [TCP_STATE_TIME_WAIT] = LTCP_TIME_WAIT,    [TCP_STATE_CLOSE_WAIT] = LTCP_CLOSE_WAIT,
+        [TCP_STATE_LAST_ACK] = LTCP_LAST_ACK,
+    };
+    int n = 0;
+    uint64_t fl = spin_lock_irqsave(&g_tcp_lock);
+    for (uint32_t i = 0; i < TCP_MAX_CONNECTIONS && n < max; i++) {
+        TcpConnection *c = &connections[i];
+        if (!c->in_use) continue;
+        InetSockEnt *e = &out[n++];
+        e->lip = c->local_ip;     e->lport = c->local_port;
+        e->rip = c->remote_ip;    e->rport = c->remote_port;
+        e->state = c->state <= TCP_STATE_LAST_ACK ? lstate[c->state] : LTCP_CLOSE;
+        e->rq = c->rx_len;
+        e->wq = c->snd_nxt - c->snd_una;
+        e->uid = 0;
+    }
+    spin_unlock_irqrestore(&g_tcp_lock, fl);
+    return n;
+}

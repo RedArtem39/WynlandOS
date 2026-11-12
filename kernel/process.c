@@ -212,6 +212,7 @@ Process *process_spawn_env(const char *path, const char **argv, const char **env
                tolerance this loop already had for running out of memory
                entirely, just without the crash). */
             if (!copy) break;
+            kfile_share_pos(caller->fd_table[i]);   /* one position for both, as fork's */
             *copy = *caller->fd_table[i];
             kfile_get(copy); /* sockets/memfds count their fds (kfile.h) */
             p->fd_table[i]  = copy;

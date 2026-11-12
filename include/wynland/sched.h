@@ -42,6 +42,8 @@ typedef struct Thread {
     uint64_t *stack_orig;     // Pointer returned by kmalloc (for freeing)
     ThreadState state;
     uint64_t tls_base;        // Thread-Local Storage base address (FS segment base)
+    uint64_t user_gs_base;    // the user's GS base (arch_prctl ARCH_SET_GS: wine's TEB); in
+                              // IA32_KERNEL_GS_BASE while the kernel runs (swapgs)
     struct Process *proc;     // Process this thread belongs to (address space, fd table)
     struct Thread *next;
     /* ---- Phase 22a: real blocking (sleep/wake) support ---- */

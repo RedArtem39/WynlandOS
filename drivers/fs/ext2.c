@@ -2375,6 +2375,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     split_path(path, dn, bn);
     fill_node_from_inode(&file->node, inum, &inode, bn);
     file->flags = flags;
+    file->pos = NULL;
     /* current_cluster/current_cluster_offset go unused for this backend:
        ext2 block resolution takes an absolute byte offset directly
        (file->offset alone is sufficient state), unlike FAT32's mandatory
@@ -2757,9 +2758,15 @@ int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
     FS_GUARD();
     Ext2Inode inode;
     if (!ext2_read_inode(file->node.first_cluster, &inode)) return -1;
+    /* O_APPEND: every write at the end as it is now (only open() used to
+       go there: two writers of one log wrote over each other) */
+    if (file->flags & VFS_O_APPEND) file->offset = inode.i_size;
     uint32_t n = ext2_write_file_data(file->node.first_cluster, &inode, file->offset, size, buf);
     file->offset += n;
     file->node.size = inode.i_size;
+    /* nothing written: the disk is full. A 0 return made writers retry
+       forever (leaf hung unpacking wine onto a full disk). */
+    if (n == 0) return -28;   /* -ENOSPC */
     return (int)n;
 }
 

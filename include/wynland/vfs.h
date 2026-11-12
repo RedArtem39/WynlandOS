@@ -56,6 +56,11 @@ typedef struct {
     uint32_t mtime;         /* ext2 i_mtime (unix seconds) */
 } VfsNode;
 
+/* A file position shared by the fds of one open file (fork, dup, spawn
+   inherit it -- one process's write moves the others' position, as on
+   Linux). Regular ext2 files only; NULL until first shared. */
+typedef struct VfsPos { uint32_t refs; uint32_t pos; } VfsPos;
+
 typedef struct {
     VfsNode  node;
     uint32_t offset;
@@ -67,6 +72,7 @@ typedef struct {
     bool     dirty;
     char     path[256];              /* what it was opened as (readlink /proc/self/fd/N);
                                         "" when unknown or too long */
+    VfsPos  *pos;                    /* shared position (regular files), or NULL */
 } VfsFile;
 
 /* File statistics */

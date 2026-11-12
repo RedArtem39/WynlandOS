@@ -27,18 +27,19 @@
 #define PROCNS_FD   0xFFFFFFE4  /* /proc/self/{uid_map,gid_map,setgroups}; current_cluster = kind */
 #define PROCDIR_FD  0xFFFFFFE9  /* a /proc/PID directory (no inode): node.name holds its path,
                                    what the *at() calls resolve against */
-#define NETLINK_FD  0xFFFFFFEB  /* AF_NETLINK/NETLINK_ROUTE (kernel/netlink.c); current_cluster = slot */
+#define NETLINK_FD  0xFFFFFFEB  /* AF_NETLINK: ROUTE, SOCK_DIAG (kernel/netlink.c); current_cluster = slot */
 #define SIGNALFD_FD 0xFFFFFFEA  /* signalfd(): the signals it takes, kernel-numbered
                                    (bit N = signal N), in current_cluster (low 32) and
                                    current_cluster_offset (high 32) */
 
 /* kernel/netlink.c: the NETLINK_FD objects */
-int      netlink_create(uint32_t portid);
+void     kfile_share_pos(VfsFile *f);   /* kernel/syscall.c: fork/dup/spawn share a file's position */
+int      netlink_create(uint32_t portid, int proto, bool host);
 void     netlink_ref(int i);
 void     netlink_unref(int i);
 bool     netlink_readable(int i);
 int64_t  netlink_send(int i, const uint8_t *data, uint32_t len);
-int64_t  netlink_recv(int i, uint8_t *out, uint32_t len);
+int64_t  netlink_recv(int i, uint8_t *out, uint32_t len, int flags, uint32_t *full);
 
 void     kfile_get(VfsFile *f);
 VfsFile *kfile_dup(const VfsFile *f);   /* kmalloc'd copy + kfile_get(); NULL on OOM */

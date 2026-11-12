@@ -1,0 +1,7 @@
+description=Netlink check (ip, ss, getifaddrs, AI_ADDRCONFIG)
+type=oneshot
+exec=/nltest.elf
+when=autotest=1|nl
+after=display testuser
+user=tester
+need=testuser

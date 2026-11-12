@@ -397,6 +397,11 @@ $(BUILD)/shtest.elf: tests/shtest.c
 	@echo "  CC(HOST)   $< (glibc, shell + coreutils check)"
 	@gcc -O2 -o $@ $<
 
+$(BUILD)/nltest.elf: tests/nltest.c
+	@mkdir -p $(BUILD)
+	@echo "  CC(HOST)   $< (glibc, netlink check)"
+	@gcc -O2 -o $@ $<
+
 $(BUILD)/forktest.elf: tests/forktest.c
 	@mkdir -p $(BUILD)
 	@echo "  CC(HOST)   $< (glibc, process lifecycle test)"
@@ -475,7 +480,7 @@ endif
 WITH_BASE ?= 1
 ifeq ($(WITH_BASE),1)
 BASE_MANIFEST = $(BUILD)/base_manifest.txt
-$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c apps/wifid/wifid.c apps/modtools/modtools.c $(BUILD)/devhost/hello.ko $(wildcard apps/accounts/* apps/bluez-stub/* rootfs/etc/dbus-1/system.d/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
+$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c apps/wifid/wifid.c apps/wifid/wifi.c apps/modtools/modtools.c $(BUILD)/devhost/hello.ko $(wildcard apps/accounts/* apps/bluez-stub/* rootfs/etc/dbus-1/system.d/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf $(BUILD)/nltest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
 	@bash tools/stage_base.sh
 else
 BASE_MANIFEST =
@@ -584,10 +589,14 @@ WIFI_MANIFEST =
 endif
 
 EXT2_MANIFEST_FULL = $(BUILD)/ext2_manifest_full.txt
-$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(WIFI_MANIFEST) $(BOOT_CFG)
+$(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/multiarch_links.py tools/leaf_base.py rootfs/usr/bin/test-wyn rootfs/etc/wynland/jit.allow $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(WIFI_MANIFEST) $(BOOT_CFG)
 	@mkdir -p $(BUILD)
 	@cat $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST) $(BASE_MANIFEST) $(QS_MANIFEST) $(CAE_MANIFEST) $(PW_MANIFEST) $(XVLET_MANIFEST) $(DOOM_MANIFEST) $(WIFI_MANIFEST) > $@
 	@python3 tools/multiarch_links.py $@ >> $@
+	@# /var/lib/leaf/base (base_manifest names it): what leaf counts as the
+	@# system's own -- from the whole image, not just what the stages
+	@# before base had staged (pipewire, freedoom, libsoup were missed)
+	@python3 tools/leaf_base.py $(BUILD)/leaf_base.txt $@
 	@# your own wallpapers (MY_WALLS): in, and then the only ones -- the
 	@# stock photos, the generated spiral and xvlet's generated ones out
 	@$(foreach f,$(MY_WALLS),echo "F /usr/share/wynland/wallpapers/$(notdir $(f)) $(f)" >> $@;)
