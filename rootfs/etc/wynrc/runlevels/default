@@ -1,8 +1,10 @@
 # wynrc default runlevel (order matters for providers: console -- boot.cfg
 # console=1 -- before wynlogin before zerp)
+persist
 dbus
 bluez-stub
 wifid
+persistd
 liveuser
 xvdemouser
 console

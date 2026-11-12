@@ -1,0 +1,4 @@
+description=a live stick's kept things back: accounts, /home, Wi-Fi networks, leaf's packages (apps/persist)
+type=oneshot
+exec=/usr/lib/wynland/persistd restore
+when=live=1

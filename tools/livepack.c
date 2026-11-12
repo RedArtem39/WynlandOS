@@ -10,9 +10,11 @@
  *   stick.img = disk.img's LBA 0 up to its root partition (the MBR and the
  *               ESP the firmware boots from), then the pack where the root
  *               partition was (partition 2, type 0xDA: no file system),
- *               then 4 MB for the running kernel's log (partition 3, 0x7F)
- *               and 16 MB for a kernel sent over the network (partition 4,
- *               0x7E: boot/boot.c SlotKernel)
+ *               then 4 MB for the running kernel's log (partition 3, 0x7F);
+ *               partition 4 (0x7D) is the data area a live boot keeps its
+ *               things in (apps/persist): from 1 GiB on the stick, past
+ *               the image -- written to a stick again, the image leaves it
+ *               alone. 1 MB here; persistd grows it over the stick.
  *   pack      = sector 0: "WYNPACK2", u64 bytes (disk.img from LBA 0 to the
  *               end of its root partition), u32 chunks, u32 chunk size;
  *               from sector 1: per chunk its packed size, u32 (0: all zero,
@@ -30,7 +32,8 @@
 #define CHUNK   (4u << 20)          /* RAMDISK_CHUNK (include/wynland/boot_info.h) */
 #define HBITS   16
 #define KLOG_SECTORS 8192u            /* 4 MB: the kernel log area, partition 3 */
-#define SLOT_SECTORS 32768u           /* 16 MB: the kernel slot, partition 4 */
+#define DATA_LBA 2097152u             /* 1 GiB: the data area, partition 4 (apps/persist) */
+#define DATA_SECTORS 2048u            /* 1 MB until persistd grows it */
 
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
@@ -169,17 +172,22 @@ int main(int argc, char **argv)
     mbr[0x1DE + 4] = 0x7F;
     memcpy(mbr + 0x1DE + 8, &kstart, 4);
     memcpy(mbr + 0x1DE + 12, &kcount, 4);
-    /* partition 4: 16 MB for a kernel sent from the developer's machine
-       (type 0x7E; boot/boot.c SlotKernel boots it; empty: the ESP's) */
-    uint32_t sstart = kstart + kcount, scount = SLOT_SECTORS;
+    /* partition 4: the data area (type 0x7D, apps/persist), at 1 GiB --
+       nothing of it in the image, so writing a new one keeps what is there.
+       (It was a slot for a kernel sent over the network, never wanted.) */
+    if (kstart + kcount > DATA_LBA) {
+        fprintf(stderr, "livepack: the image reaches past 1 GiB, into the data area\n");
+        return 1;
+    }
+    uint32_t sstart = DATA_LBA, scount = DATA_SECTORS;
     memset(mbr + 0x1EE, 0, 16);
-    mbr[0x1EE + 4] = 0x7E;
+    mbr[0x1EE + 4] = 0x7D;
     memcpy(mbr + 0x1EE + 8, &sstart, 4);
     memcpy(mbr + 0x1EE + 12, &scount, 4);
     {
         static uint8_t zero[512];
         fseek(out, (long)((uint64_t)kstart * 512), SEEK_SET);
-        for (uint32_t i = 0; i < kcount + scount; i++) fwrite(zero, 1, 512, out);
+        for (uint32_t i = 0; i < kcount; i++) fwrite(zero, 1, 512, out);
     }
     fseek(out, 0, SEEK_SET);
     fwrite(mbr, 1, 512, out);

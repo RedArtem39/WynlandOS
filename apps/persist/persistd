@@ -1,0 +1,528 @@
+#!/usr/bin/python3
+# WynlandOS - persistd: what a live stick keeps from one boot to the next.
+#
+# A live boot runs from RAM (boot/boot.c copies the system off the stick),
+# so everything written was gone at the next boot: the account, the Wi-Fi
+# networks, the browser's cookies, the programs leaf installed. persistd
+# keeps them in the stick's data area -- partition 4, type 0x7D, from
+# 1 GiB (tools/livepack.c; past any image Rufus writes, so a new image
+# leaves it alone) up to the end of the stick or 4 GiB (/dev/usb0's
+# offsets are 32-bit), grown to that on the first boot.
+#
+#   persistd restore    at boot, before the login screen (wynrc "persist")
+#   persistd daemon     saves every 10 minutes when something changed, and
+#                       when asked: control socket "\0persistd" -- "save",
+#                       "status" (poweroff and reboot ask first, apps/power)
+#   persist save|status the same, from a terminal
+#
+# What is kept: /home (but every ~/.cache), the accounts made on it (merged
+# into the image's /etc/passwd, /etc/shadow, /etc/group: a newer image's
+# system accounts stay), Wi-Fi networks, the login screen's looks, and
+# leaf's packages with their files.
+#
+# The area: two header sectors (the newer valid one counts: a sector torn
+# by a pulled stick leaves the other), then archives -- tar, zstd. A save
+# writes its archive where the current one is not and only then a header:
+# the stick pulled in the middle of a save keeps the last one.
+#
+# Copyright (C) 2026 Red_Artem39. GPL-2.0-or-later.
+import io
+import json
+import os
+import socket
+import stat
+import struct
+import sys
+import tarfile
+import threading
+import time
+import zlib
+
+DEV = "/dev/usb0"
+DATA_LBA = 2097152                  # 1 GiB, as tools/livepack.c
+PART_TYPE = 0x7D
+MAGIC = b"WYNDATA1"
+LIMIT = 0xFFFFFFFF                  # /dev/usb0's offsets: 32-bit
+HDR = struct.Struct("<8sQQQII")     # magic, generation, offset, length, crc of the archive, crc of the header
+TREES = ["/home", "/var/lib/wifid", "/var/lib/wynlogin", "/var/lib/leaf"]
+ACCOUNTS = ["/etc/passwd", "/etc/shadow", "/etc/group"]
+ALLOWED = ("home/", "var/lib/wifid", "var/lib/wynlogin", "var/lib/leaf", "usr/", "etc/", "opt/", "@accounts/")
+SOCK = "\0persistd"
+PERIOD = 600
+CHUNK = 1 << 20
+
+
+def log(*a):
+    print("[persistd]", *a, file=sys.stderr, flush=True)
+
+
+# ------------------------------------------------------------ the stick
+
+class Stick:
+    def __init__(self):
+        self.fd = None
+        for _ in range(60):                     # the stick may still be enumerating
+            try:
+                self.fd = os.open(DEV, os.O_RDWR)
+                break
+            except OSError:
+                time.sleep(0.5)
+        if self.fd is None:
+            raise RuntimeError("no USB stick (/dev/usb0)")
+        mbr = self.pread(0, 512)
+        if mbr[:14] != b"WYNLANDOS-DISK" or mbr[510:512] != b"\x55\xaa":
+            raise RuntimeError("the USB stick is not a WynlandOS live stick")
+        e = mbr[0x1EE:0x1FE]
+        self.ptype = e[4]
+        self.pstart, self.pcount = struct.unpack("<II", e[8:16])
+        if self.ptype != PART_TYPE or self.pstart != DATA_LBA:
+            raise RuntimeError("this stick has no data area (an older image: partition 4 type 0x%02X)" % self.ptype)
+        self.mbr = bytearray(mbr)
+        size = os.lseek(self.fd, 0, os.SEEK_END)        # (the device says min(stick, 4 GiB))
+        self.start = DATA_LBA * 512
+        self.end = min(size, LIMIT) // 512 * 512
+        if self.end <= self.start + (64 << 20):
+            raise RuntimeError("the stick is too small for a data area (%d MB)" % (size >> 20))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def pread(self, off, n):
+        os.lseek(self.fd, off, os.SEEK_SET)
+        out = b""
+        while len(out) < n:
+            b = os.read(self.fd, n - len(out))
+            if not b:
+                break
+            out += b
+        return out
+
+    def pwrite(self, off, data):
+        os.lseek(self.fd, off, os.SEEK_SET)
+        mv = memoryview(data)
+        while mv:
+            n = os.write(self.fd, mv)
+            if n <= 0:
+                raise OSError("short write to the stick")
+            mv = mv[n:]
+
+    def grow(self):
+        """partition 4 over the whole area (livepack makes it 1 MB)"""
+        count = (self.end - self.start) // 512
+        if self.pcount != count:
+            self.mbr[0x1EE + 12:0x1EE + 16] = struct.pack("<I", count)
+            self.pwrite(0, bytes(self.mbr))
+            self.pcount = count
+            log("the data area: %d MB from 1 GiB" % ((self.end - self.start) >> 20))
+
+    def header(self):
+        best = None
+        for k in range(2):
+            s = self.pread(self.start + 512 * k, 512)
+            try:
+                magic, gen, off, ln, crc, hcrc = HDR.unpack(s[:HDR.size])
+            except struct.error:
+                continue
+            if magic != MAGIC or zlib.crc32(s[:HDR.size - 4]) != hcrc:
+                continue
+            if off < 1024 or off + ln > self.end - self.start:
+                continue
+            if best is None or gen > best[0]:
+                best = (gen, off, ln, crc)
+        return best
+
+    def put_header(self, gen, off, ln, crc):
+        body = HDR.pack(MAGIC, gen, off, ln, crc, 0)[:HDR.size - 4]
+        s = body + struct.pack("<I", zlib.crc32(body))
+        self.pwrite(self.start + 512 * (gen % 2), s + bytes(512 - len(s)))
+
+
+class Full(Exception):
+    pass
+
+
+class AreaWriter(io.RawIOBase):
+    """the archive compressed onto the stick from `off`, never past `limit`"""
+
+    def __init__(self, stick, off, limit):
+        import compression.zstd as zstd
+        self.stick, self.off, self.limit = stick, off, limit
+        self.z = zstd.ZstdCompressor(level=3)
+        self.buf = bytearray()
+        self.n = 0
+        self.crc = 0
+
+    def writable(self):
+        return True
+
+    def write(self, b):
+        self.buf += self.z.compress(bytes(b))
+        if len(self.buf) >= CHUNK:
+            self._out()
+        return len(b)
+
+    def _out(self):
+        if not self.buf:
+            return
+        if self.off + self.n + len(self.buf) > self.limit:
+            raise Full()
+        self.stick.pwrite(self.off + self.n, self.buf)
+        self.crc = zlib.crc32(self.buf, self.crc)
+        self.n += len(self.buf)
+        self.buf = bytearray()
+
+    def finish(self):
+        import compression.zstd as zstd
+        self.buf += self.z.flush(zstd.ZstdCompressor.FLUSH_FRAME)
+        self._out()
+
+
+class AreaReader(io.RawIOBase):
+    def __init__(self, stick, off, ln):
+        import compression.zstd as zstd
+        self.stick, self.off, self.left = stick, off, ln
+        self.d = zstd.ZstdDecompressor()
+        self.out = b""
+        self.crc = 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        while not self.out and (self.left or not self.d.eof):
+            if self.left == 0:
+                break
+            raw = self.stick.pread(self.off, min(CHUNK, self.left))
+            if not raw:
+                raise OSError("reading the stick failed")
+            self.crc = zlib.crc32(raw, self.crc)
+            self.off += len(raw)
+            self.left -= len(raw)
+            self.out = self.d.decompress(raw)
+        n = min(len(b), len(self.out))
+        b[:n] = self.out[:n]
+        self.out = self.out[n:]
+        return n
+
+
+# ------------------------------------------------------------ what is kept
+
+def leaf_files():
+    try:
+        db = json.load(open("/var/lib/leaf/installed.json"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for rec in db.values():
+        out += rec.get("dirs", []) + rec.get("files", [])
+    return out
+
+
+def entries():
+    """every path to keep, parents first"""
+    seen, out = set(), []
+
+    def add(p):
+        if p in seen:
+            return
+        seen.add(p)
+        out.append(p)
+
+    for top in TREES:
+        if not os.path.isdir(top):
+            continue
+        add(top)
+        for d, dirs, files in os.walk(top):
+            # a cache is not worth the stick (the browser's, pip's, ...)
+            dirs[:] = sorted(x for x in dirs if not (d.startswith("/home/") and x == ".cache" and d.count("/") == 2))
+            for x in dirs:
+                add(os.path.join(d, x))
+            for x in sorted(files):
+                add(os.path.join(d, x))
+    for p in leaf_files():
+        if p.startswith("/") and ".." not in p.split("/"):
+            add(p)
+    return out
+
+
+def fingerprint(paths):
+    h = 0
+    for p in paths + ACCOUNTS:
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        h = zlib.crc32(("%s %d %d %o" % (p, st.st_mtime_ns, st.st_size, st.st_mode)).encode(), h)
+    return h
+
+
+# ------------------------------------------------------------ the accounts
+
+def humans(lines, idx=2):
+    """names of people's entries (uid/gid 1000 .. 65533)"""
+    out = set()
+    for l in lines:
+        f = l.split(":")
+        if len(f) > idx and f[idx].isdigit() and 1000 <= int(f[idx]) < 65534:
+            out.add(f[0])
+    return out
+
+
+def merge_accounts(saved):
+    """the people's accounts kept on the stick into the image's files"""
+    if "passwd" not in saved:
+        return
+    sp = saved["passwd"].splitlines()
+    people = humans(sp)
+    if not people:
+        return
+    keep = {}
+    for name in ("passwd", "shadow", "group"):
+        try:
+            keep[name] = open("/etc/" + name).read().splitlines()
+        except OSError:
+            keep[name] = []
+    # passwd, shadow: the people's lines from the stick
+    for name in ("passwd", "shadow"):
+        mine = [l for l in keep[name] if l.split(":")[0] not in people]
+        mine += [l for l in saved.get(name, "").splitlines() if l.split(":")[0] in people]
+        keep[name] = mine
+    # group: their own groups from the stick; their memberships of the
+    # system's (wheel, audio, ...) added to the image's lines
+    sg = saved.get("group", "").splitlines()
+    own = humans(sg)
+    member = {}
+    for l in sg:
+        f = l.split(":")
+        if len(f) == 4 and f[0] not in own:
+            member[f[0]] = [m for m in f[3].split(",") if m in people]
+    out = []
+    for l in keep["group"]:
+        f = l.split(":")
+        if len(f) == 4 and f[0] in own:
+            continue
+        if len(f) == 4 and member.get(f[0]):
+            ms = [m for m in f[3].split(",") if m]
+            ms += [m for m in member[f[0]] if m not in ms]
+            f[3] = ",".join(ms)
+            l = ":".join(f)
+        out.append(l)
+    out += [l for l in sg if l.split(":")[0] in own]
+    keep["group"] = out
+    for name, mode in (("passwd", 0o644), ("group", 0o644), ("shadow", 0o600)):
+        path = "/etc/" + name
+        try:
+            st = os.stat(path)
+            mode, uid, gid = stat.S_IMODE(st.st_mode), st.st_uid, st.st_gid
+        except OSError:
+            uid = gid = 0
+        tmp = path + ".persist"
+        with open(tmp, "w") as f:
+            f.write("\n".join(keep[name]) + "\n")
+        os.chown(tmp, uid, gid)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    log("accounts back: " + ", ".join(sorted(people)))
+
+
+# ------------------------------------------------------------ save, restore
+
+LOCK = threading.Lock()
+STATE = {"saved": None, "bytes": 0, "print": None, "error": None, "area": 0}
+
+
+def save(force=False):
+    with LOCK:
+        stick = Stick()
+        try:
+            return _save(stick, force)
+        finally:
+            stick.close()
+
+
+def _save(stick, force):
+    if True:
+        stick.grow()
+        paths = entries()
+        fp = fingerprint(paths)
+        if not force and fp == STATE["print"]:
+            return "nothing changed"
+        cur = stick.header()
+        area = stick.end - stick.start
+        first = 1024                                      # after the two headers
+        if cur:
+            gen, coff, cln, _ = cur
+            places = [((coff + cln + 511) // 512 * 512, area), (first, coff)]
+        else:
+            gen = 0
+            places = [(first, area)]
+        t0 = time.monotonic()
+        for lo, hi in places:
+            if hi - lo < (1 << 20):
+                continue
+            w = AreaWriter(stick, stick.start + lo, stick.start + hi)
+            try:
+                with tarfile.open(fileobj=w, mode="w|", format=tarfile.PAX_FORMAT) as t:
+                    for name in ACCOUNTS:
+                        try:
+                            data = open(name, "rb").read()
+                        except OSError:
+                            continue
+                        ti = tarfile.TarInfo("@accounts/" + os.path.basename(name))
+                        ti.size = len(data)
+                        t.addfile(ti, io.BytesIO(data))
+                    for p in paths:
+                        try:
+                            t.add(p, arcname=p.lstrip("/"), recursive=False)
+                        except (OSError, tarfile.TarError):
+                            pass                          # (gone meanwhile, a socket)
+                w.finish()
+            except Full:
+                continue
+            stick.put_header(gen + 1, lo, w.n, w.crc)
+            STATE.update(saved=time.time(), bytes=w.n, print=fp, error=None, area=area)
+            msg = "saved %.1f MB (%d paths) in %.1f s" % (w.n / 1e6, len(paths), time.monotonic() - t0)
+            log(msg)
+            return msg
+        STATE["error"] = "the data area is full (%d MB)" % (area >> 20)
+        log(STATE["error"])
+        return "error: " + STATE["error"]
+
+
+def restore():
+    stick = Stick()
+    try:
+        _restore(stick)
+    finally:
+        stick.close()
+
+
+def _restore(stick):
+    stick.grow()
+    cur = stick.header()
+    if not cur:
+        log("nothing kept yet: a fresh start")
+        return
+    gen, off, ln, crc = cur
+    t0 = time.monotonic()
+    r = AreaReader(stick, stick.start + off, ln)
+    saved, n = {}, 0
+    with tarfile.open(fileobj=io.BufferedReader(r, CHUNK), mode="r|") as t:
+        for m in t:
+            name = m.name
+            if ".." in name.split("/") or name.startswith("/") or not name.startswith(ALLOWED):
+                continue
+            if name.startswith("@accounts/"):
+                saved[name[10:]] = t.extractfile(m).read().decode("utf-8", "replace")
+                continue
+            try:
+                t.extract(m, "/", set_attrs=True, numeric_owner=True, filter="fully_trusted")
+                n += 1
+            except (OSError, tarfile.TarError) as e:
+                log("not restored: %s (%s)" % (name, e))
+    if r.crc != crc:
+        log("warning: the kept archive's sum differs -- the stick may be failing")
+    merge_accounts(saved)
+    STATE.update(print=fingerprint(entries()), bytes=ln, area=stick.end - stick.start)
+    log("restored %d paths, %.1f MB, in %.1f s" % (n, ln / 1e6, time.monotonic() - t0))
+
+
+# ------------------------------------------------------------ the daemon
+
+def serve():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(SOCK)
+    s.listen(4)
+    while True:
+        c, _ = s.accept()
+        try:
+            req = c.recv(64).decode().strip()
+            if req == "save":
+                try:
+                    out = save(force=False)
+                except Exception as e:
+                    out = "error: %s" % e
+            elif req == "status":
+                out = json.dumps(STATE)
+            else:
+                out = "error: save | status"
+            c.sendall(out.encode() + b"\n")
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+
+def daemon():
+    try:
+        st = Stick()
+        STATE["area"] = st.end - st.start
+        st.close()
+    except Exception as e:
+        log("off: %s" % e)
+        return 0
+    if STATE["print"] is None:
+        STATE["print"] = fingerprint(entries())        # (restore ran in another process)
+    threading.Thread(target=serve, daemon=True).start()
+    while True:
+        time.sleep(PERIOD)
+        try:
+            save()
+        except Exception as e:
+            STATE["error"] = str(e)
+            log("save failed: %s" % e)
+
+
+def client(req):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(SOCK)
+    except OSError:
+        print("persist: the data area is off (not a live stick, or persistd not running)", file=sys.stderr)
+        return 1
+    s.settimeout(600)
+    s.sendall(req.encode())
+    out = b""
+    while not out.endswith(b"\n"):
+        b = s.recv(4096)
+        if not b:
+            break
+        out += b
+    text = out.decode().strip()
+    if req == "status" and text.startswith("{"):
+        st = json.loads(text)
+        when = time.strftime("%H:%M", time.localtime(st["saved"])) if st["saved"] else "not this boot"
+        print("data area: %d MB, last archive %.1f MB, saved: %s%s" %
+              (st["area"] >> 20, st["bytes"] / 1e6, when, (", error: " + st["error"]) if st["error"] else ""))
+    else:
+        print(text)
+    return 0 if not text.startswith("error") else 1
+
+
+def main():
+    me = os.path.basename(sys.argv[0])
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ("status" if me == "persist" else "")
+    if cmd in ("save", "status") and (me == "persist" or os.geteuid() != 0):
+        return client(cmd)
+    if os.geteuid() != 0:
+        print("persistd: root's", file=sys.stderr)
+        return 1
+    if cmd == "restore":
+        try:
+            restore()
+        except Exception as e:
+            log("restore: %s" % e)
+        return 0                                     # (never keeps the login screen waiting)
+    if cmd == "daemon":
+        return daemon()
+    if cmd == "save":
+        print(save(force=True))
+        return 0
+    print("usage: persistd restore | daemon | save; persist save | status", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

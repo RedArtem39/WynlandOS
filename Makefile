@@ -480,7 +480,7 @@ endif
 WITH_BASE ?= 1
 ifeq ($(WITH_BASE),1)
 BASE_MANIFEST = $(BUILD)/base_manifest.txt
-$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c apps/wifid/wifid.c apps/wifid/wifi.c apps/modtools/modtools.c $(BUILD)/devhost/hello.ko $(wildcard apps/accounts/* apps/bluez-stub/* rootfs/etc/dbus-1/system.d/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf $(BUILD)/nltest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
+$(BASE_MANIFEST): tools/stage_base.sh tools/python_launcher.c tools/leaf_base.py apps/ary/ary.c apps/power/power.c apps/wifid/wifid.c apps/wifid/wifi.c apps/persist/persistd apps/modtools/modtools.c $(BUILD)/devhost/hello.ko $(wildcard apps/accounts/* apps/bluez-stub/* rootfs/etc/dbus-1/system.d/* rootfs/etc/passwd rootfs/etc/group rootfs/etc/shadow rootfs/etc/shells rootfs/usr/lib/wynland/* rootfs/etc/wynrc/services/*) $(wildcard apps/leaf/leaf apps/leaf/shims/*) $(BUILD)/shtest.elf $(BUILD)/nltest.elf rootfs/etc/wynrc/services/shtest rootfs/etc/fish/conf.d/wynland.fish $(EXT2_MANIFEST) $(QT6_MANIFEST) $(GST_MANIFEST) $(WPE_MANIFEST)
 	@bash tools/stage_base.sh
 else
 BASE_MANIFEST =
@@ -690,7 +690,7 @@ $(BUILD)/livepack: tools/livepack.c
 	@gcc -O2 -Wall -o $@ $<
 
 live: $(BUILD)/livepack
-	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)$(if $(NETLOG),netlog=$(NETLOG)\n,)$(if $(filter 1,$(LIVE_GPU)),gpu=1\n,)$(if $(LIVE_DESKTOP),desktop=$(LIVE_DESKTOP)\n,)$(if $(filter 1,$(LIVE_USER)),liveuser=1\n,)$(if $(WIFI_SSID),wifi_ssid=$(WIFI_SSID)\n,)$(if $(WIFI_PSK),wifi_psk=$(WIFI_PSK)\n,)live=1' \
+	@$(MAKE) --no-print-directory LIVE=1 SWAP_SIZE_MB=0 RESOLUTION=$(LIVE_RESOLUTION) BOOT_EXTRA='$(if $(filter 1,$(LIVE_CONSOLE)),console=1\n,)$(if $(NETLOG),netlog=$(NETLOG)\n,)$(if $(filter 1,$(LIVE_GPU)),gpu=1\n,)$(if $(LIVE_DESKTOP),desktop=$(LIVE_DESKTOP)\n,)$(if $(filter 1,$(LIVE_USER)),liveuser=1\n,)$(if $(WIFI_SSID),wifi_ssid=$(WIFI_SSID)\n,)$(if $(WIFI_PSK),wifi_psk=$(WIFI_PSK)\n,)$(if $(LIVE_EXTRA),$(LIVE_EXTRA)\n,)live=1' \
 	    DISK_IMAGE=$(IMG_DIR)/wynland-live.img ESP_PART_IMG=$(IMG_DIR)/esp_live.img \
 	    EXT2_PART_IMG=$(IMG_DIR)/ext2_live.img BOOT_CFG=$(BUILD)/boot-live.cfg \
 	    EXT2_MANIFEST_FULL=$(BUILD)/ext2_manifest_live.txt image

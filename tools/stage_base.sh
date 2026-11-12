@@ -234,13 +234,16 @@ L=$REPO/apps/leaf
     echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
     echo "F /usr/lib/wynland/wifid $OUT/wifid"
     echo "F /usr/bin/wifi $OUT/wifi"
+    # a live stick's things kept from boot to boot (apps/persist)
+    echo "F /usr/lib/wynland/persistd $REPO/apps/persist/persistd"
+    echo "S /usr/bin/persist /usr/lib/wynland/persistd"
     # lock screens check the user's own password with it (unix_chkpwd)
     echo "F /usr/lib/wynland/chkpwd $OUT/chkpwd"
     echo "P /usr/lib/wynland/chkpwd 0 104755"
     echo "D /etc/dbus-1"
     echo "D /etc/dbus-1/system.d"
     echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"
-    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub wifid; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub wifid persist persistd; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     # each account's look on the login screen (xvlet's settings write it,

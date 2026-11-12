@@ -1,0 +1,6 @@
+description=a live stick's things saved: every 10 minutes when changed, and before poweroff/reboot (apps/persist)
+type=daemon
+exec=/usr/lib/wynland/persistd daemon
+after=persist
+when=live=1
+restart=on-failure

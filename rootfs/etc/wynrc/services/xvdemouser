@@ -2,3 +2,4 @@ description=the xvlet demo boot's account (live, as the live stick's): screensho
 type=oneshot
 exec=/usr/lib/wynland/mkliveuser
 when=xvdemo=1
+after=persist
