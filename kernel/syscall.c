@@ -438,9 +438,20 @@ static int64_t kpipe_io(KPipe *kp, uint32_t kind, bool is_write, uint64_t ubuf, 
     uint32_t n = len > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)len;
     if (!is_write) return n ? pipe_read(kp, ubuf, n, nonblock) : 0;
     if (n == 0) return 0;
-    int64_t w = pipe_write(kp, ubuf, n, nonblock);
-    if (w == -32) signal_raise_current(13 /* SIGPIPE */);
-    return w;
+    /* A blocking write writes it all, as Linux's: pipe_write() takes at
+       most a buffer's worth, and the rest was returned as a short write --
+       wine's requests to its server are longer ("wine client error:
+       partial write 4096"). Nonblocking: what fits. */
+    uint64_t done = 0;
+    for (;;) {
+        int64_t w = pipe_write(kp, ubuf + done, n - (uint32_t)done, nonblock);
+        if (w < 0) {
+            if (w == -32) signal_raise_current(13 /* SIGPIPE */);
+            return done ? (int64_t)done : w;
+        }
+        done += (uint64_t)w;
+        if (done >= n || nonblock || w == 0) return (int64_t)done;
+    }
 }
 
 /* Done with a KPipe taken by pipe_fast(): the last user of a closed one frees it */
@@ -1150,8 +1161,29 @@ static int proc_maps_memfd(Process *pr) {
     if (mi < 0) return mi;
     char line[96];
     uint64_t off = 0;
-    for (VMA *v = pr->vma_list; v; v = v->next) {
-        if (v->flags & VMA_GUARD) continue;
+    /* In address order, as Linux's, and the main stack's line last -- on
+       Linux it is the highest mapping, here it is not (0x6000.., ld.so at
+       0x7000..). glibc's pthread_getattr_np() stops reading at the stack's
+       line and fclose() lseek()s over what is left in its buffer: glycin's
+       sandbox forbids lseek, its image loaders died of SIGSYS (GTK 3
+       programs aborted on their first icon). The VMA list is unsorted:
+       each round takes the next start above the last. */
+    uint64_t last = 0;
+    bool any = false, stack_done = false;
+    for (;;) {
+        VMA *v = NULL;
+        for (VMA *c = pr->vma_list; c; c = c->next) {
+            if ((c->flags & VMA_GUARD) || c->start == 0x600000000000ULL) continue;
+            if (any && c->start <= last) continue;
+            if (!v || c->start < v->start) v = c;
+        }
+        if (!v && !stack_done) {
+            stack_done = true;
+            for (VMA *c = pr->vma_list; c; c = c->next)
+                if (!(c->flags & VMA_GUARD) && c->start == 0x600000000000ULL) { v = c; break; }
+        }
+        if (!v) break;
+        if (v->start != 0x600000000000ULL) { last = v->start; any = true; }
         int k = 0;
         for (int sh = 44; sh >= 0; sh -= 4) line[k++] = "0123456789abcdef"[(v->start >> sh) & 0xF];
         line[k++] = '-';
@@ -1552,7 +1584,13 @@ static int64_t create_errno(const char *path) {
     if (!vfs_stat(dir, &st)) return -2;
     if (!st.is_dir) return -20;
     if (!vfs_may_access(dir, 2 | 1)) return -13;
-    return -5;   /* -EIO: the filesystem said no (full?) */
+    {   /* a full disk is ENOSPC (mkdir said "Input/output error") */
+        extern void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *files, uint64_t *ffree);
+        uint64_t bs, bl, bf, fi, ff;
+        vfs_statfs(&bs, &bl, &bf, &fi, &ff);
+        if (bf == 0 || ff == 0) return -28;
+    }
+    return -5;   /* -EIO: the filesystem said no */
 }
 
 /* the umask in force (022 until umask() is called) */
@@ -4610,6 +4648,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 uint64_t vtid = pid_to_ns(t->id, sched_current()->proc);   /* as the process sees it */
                 /* CLONE_SETTLS (0x80000): tls = a5, user half only (see
                    arch_prctl). Without the flag the child keeps ours. */
+                t->alt_sp = t->alt_size = 0;   /* a new thread has no signal stack (Linux) */
                 if (a1 & 0x80000) t->tls_base = (a5 < 0x0000800000000000ULL) ? a5 : 0;
                 else              t->tls_base = sched_current()->tls_base;
                 t->user_gs_base = sched_current()->user_gs_base;   /* (as Linux: a new thread keeps it) */
@@ -4756,7 +4795,9 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 extern void fork_child_entry(void *arg);
                 Thread *child_thread = thread_create_ex_tls(fork_child_entry, regs_copy, child, sched_current()->tls_base);
                 if (child_thread) { child_thread->id = child->pid; /* main thread: tid == pid */
-                                    child_thread->user_gs_base = sched_current()->user_gs_base; }
+                                    child_thread->user_gs_base = sched_current()->user_gs_base;
+                                    child_thread->alt_sp = sched_current()->alt_sp;   /* fork keeps it */
+                                    child_thread->alt_size = sched_current()->alt_size; }
                 child->main_thread = child_thread;
                 child->thread_count = 1;
 
@@ -6638,17 +6679,31 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
-        case 131: // SYS_sigaltstack(ss, old_ss) -- accepted; delivery always
-                   // uses the normal stack (kernel/signal.c has no alt-stack
-                   // switch), so the old stack is always reported disabled.
+        case 131: // SYS_sigaltstack(ss, old_ss): the thread's signal stack --
+                   // handlers with SA_ONSTACK run on it (kernel/signal.c)
             {
+                Thread *st = sched_current();
+                uint64_t ursp = regs->rsp;
+                bool on = st->alt_size && ursp > st->alt_sp && ursp <= st->alt_sp + st->alt_size;
+                struct { uint64_t sp; int32_t flags; int32_t pad; uint64_t size; } ss;
+                if (a1 && copy_from_user(&ss, (const void *)a1, sizeof(ss)) != 0) return (uint64_t)-14;
                 if (a2) {
                     struct { uint64_t sp; int32_t flags; int32_t pad; uint64_t size; } old;
                     memset(&old, 0, sizeof(old));
-                    old.flags = 2; /* SS_DISABLE */
+                    old.sp = st->alt_sp; old.size = st->alt_size;
+                    old.flags = !st->alt_size ? 2 /* SS_DISABLE */ : on ? 1 /* SS_ONSTACK */ : 0;
                     if (copy_to_user((void *)a2, &old, sizeof(old)) != 0) return (uint64_t)-14;
                 }
-                if (a1 && !user_check_read(a1, 24)) return (uint64_t)-14;
+                if (a1) {
+                    if (on) return (uint64_t)-1;                       /* -EPERM: in use */
+                    int32_t fl = ss.flags & ~(int32_t)0x80000000;      /* (SS_AUTODISARM: taken as plain) */
+                    if (fl == 2) { st->alt_sp = st->alt_size = 0; return 0; }
+                    if (fl != 0) return (uint64_t)-22;                 /* -EINVAL */
+                    if (ss.size < 2048) return (uint64_t)-12;          /* -ENOMEM: under MINSIGSTKSZ */
+                    if (ss.sp >= 0x0000800000000000ULL || ss.sp + ss.size > 0x0000800000000000ULL || ss.sp + ss.size < ss.sp)
+                        return (uint64_t)-14;
+                    st->alt_sp = ss.sp; st->alt_size = ss.size;
+                }
                 return 0;
             }
 

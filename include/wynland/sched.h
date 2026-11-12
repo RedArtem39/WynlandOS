@@ -75,6 +75,7 @@ typedef struct Thread {
     uint64_t sig_pending;     /* bitmask, bit N = signal N pending */
     uint64_t sig_mask;        /* blocked-set (9 KILL / 19 STOP unblockable) */
     void *sig_frame;          /* kernel-side frame copy for SYS_rt_sigreturn (a stack) */
+    uint64_t alt_sp, alt_size; /* sigaltstack(): the signal stack (size 0: none) */
     uint64_t sig_saved_mask;  /* rt_sigsuspend(): the mask to go back to ... */
     bool sig_restore_mask;    /* ... once the signal it waited for is handled */
     /* Two FPU register images (x87/SSE/AVX: XSAVE, or FXSAVE on a CPU

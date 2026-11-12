@@ -1,7 +1,7 @@
 description=process lifecycle + network check
 type=oneshot
 exec=/forktest.elf
-when=autotest=1
+when=autotest=1|fork
 after=display testuser
 user=tester
 need=testuser

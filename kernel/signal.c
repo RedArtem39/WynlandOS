@@ -29,6 +29,8 @@ typedef struct SignalFrame {
                      rt_sigreturn so the code after the handler sees it */
     uint64_t mask;    /* the blocked set to go back to (rt_sigreturn) */
     struct SignalFrame *prev;   /* the frame of a handler this one interrupted */
+    uint64_t usp;               /* RSP when the handler returns (its RET popped the restorer):
+                                   rt_sigreturn takes the frame that matches it */
     uint64_t uc;                /* SA_SIGINFO: the ucontext on the user stack; rt_sigreturn
                                    takes the registers back from it (a handler may change
                                    them -- seccomp trap handlers set RAX, the result) */
@@ -37,6 +39,7 @@ typedef struct SignalFrame {
 } SignalFrame;
 
 #define SA_SIGINFO_   0x00000004u
+#define SA_ONSTACK_   0x08000000u
 #define SA_RESTART_   0x10000000u
 #define SA_NODEFER_   0x40000000u
 #define SA_RESETHAND_ 0x80000000u
@@ -123,6 +126,7 @@ void signal_exec_reset(Thread *t, Process *p) {
         kfree(f);
     }
     t->sig_restore_mask = false;
+    t->alt_sp = t->alt_size = 0;     /* a new image has no signal stack */
 }
 
 void signal_init(void) {
@@ -235,6 +239,12 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
        glibc saw it as "*** stack smashing detected ***" when a SIGCHLD
        handler ran on the way back from wait4(). */
     uint64_t sp = (regs->rsp - 128) & ~0xFULL;
+    /* SA_ONSTACK: on the thread's signal stack (sigaltstack), unless it is
+       already there -- wine gives every thread one and its handlers
+       count on running on it */
+    if ((act->flags & SA_ONSTACK_) && t->alt_size &&
+        !(regs->rsp > t->alt_sp && regs->rsp <= t->alt_sp + t->alt_size))
+        sp = (t->alt_sp + t->alt_size) & ~0xFULL;
     /* SA_SIGINFO: handler(sig, siginfo_t *, ucontext_t *), both on the
        user stack -- glibc-sized, zeroed, with what a handler may read:
        si_signo/si_code, uc_sigmask, and RIP/RSP in uc_mcontext */
@@ -256,6 +266,7 @@ int signal_deliver_check(void *regs_v, uint64_t sysret) {
     }
     *(uint64_t *)(uintptr_t)sp = restorer; /* handler's RET target */
     kf->uc = uc;
+    kf->usp = sp + 8;
     if (si) {
         memset((void *)(uintptr_t)si, 0, (size_t)(uc + 1024 - si));
         int32_t *sif = (int32_t *)(uintptr_t)si;
@@ -380,6 +391,22 @@ uint64_t signal_rt_return(void *regs_v) {
 
     Thread *t = sched_current();
     SignalFrame *f = (SignalFrame *)t->sig_frame;
+    /* The frame this rt_sigreturn returns from is the one whose handler
+       left RSP where the restorer runs -- as Linux, which reads it off the
+       user stack. A handler that never returned (wine's leave by jumping
+       elsewhere) left its frame here: taking the top one restored a
+       long-gone ucontext, all zeros -- RIP 0, RSP 0. The ones above the
+       match are such abandoned frames. */
+    for (SignalFrame *m = f; m; m = m->prev) {
+        if (m->usp != regs->rsp) continue;
+        while (f != m) {
+            SignalFrame *dead = f;
+            f = f->prev;
+            kfree(dead);
+        }
+        t->sig_frame = f;
+        break;
+    }
     if (!f) {
         /* rt_sigreturn with no frame: the program jumped somewhere hostile.
            Treat like a fatal signal -- terminate rather than corrupt. */

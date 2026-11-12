@@ -64,9 +64,9 @@ typedef struct {
     char description[96];
     char exec[256];
     int oneshot;
-    char need[MAX_LIST][32];  int n_need;
-    char use[MAX_LIST][32];   int n_use;
-    char after[MAX_LIST][32]; int n_after;
+    char need[MAX_LIST][64];  int n_need;
+    char use[MAX_LIST][64];   int n_use;
+    char after[MAX_LIST][64]; int n_after;
     char provide[32];
     char when[256];
     char user[32];            /* user=: "" = root */
@@ -113,13 +113,15 @@ static char *trim(char *s)
     return s;
 }
 
-static int split_words(const char *src, char out[][32], int max)
+// (a word is up to 63 characters: "autotest=1|sh|sandbox|pw|nl|fork" was
+// cut at 31 and its last value never matched)
+static int split_words(const char *src, char out[][64], int max)
 {
     int n = 0;
     char tmp[256];
     snprintf(tmp, sizeof tmp, "%s", src);
     for (char *t = strtok(tmp, " ,\t"); t && n < max; t = strtok(NULL, " ,\t"))
-        snprintf(out[n++], 32, "%s", t);
+        snprintf(out[n++], 64, "%s", t);
     return n;
 }
 
@@ -151,10 +153,10 @@ static const char *fact(const char *key)
 // "k=v k2=v2": all must hold; "k=a|b" takes either. A missing fact compares as "0".
 static int conditions_hold(const char *when, char *why, size_t whylen)
 {
-    char terms[MAX_LIST][32];
+    char terms[MAX_LIST][64];
     int n = split_words(when, terms, MAX_LIST);
     for (int i = 0; i < n; i++) {
-        char k[32], *eq;
+        char k[64], *eq;
         snprintf(k, sizeof k, "%s", terms[i]);
         eq = strchr(k, '=');
         const char *want = eq ? eq + 1 : "1";

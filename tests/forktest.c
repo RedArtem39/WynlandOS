@@ -33,6 +33,26 @@
 extern char **environ;
 static int g_pass, g_fail;
 
+/* signals as wine uses them: the handler on the thread's signal stack, and
+   a handler left by a jump (siglongjmp) -- the next one must still return */
+#include <setjmp.h>
+static char g_altstk[65536];
+static volatile int g_on_alt, g_usr2;
+static sigjmp_buf g_jb;
+static void on_alt(int s) { char here; (void)s; g_on_alt = &here >= g_altstk && &here < g_altstk + sizeof g_altstk; }
+static void on_jump(int s) { (void)s; siglongjmp(g_jb, 1); }
+static sigjmp_buf g_jb2;
+static void on_jump2(int s) { (void)s; siglongjmp(g_jb2, 1); }
+/* a handler that takes another signal whose handler jumps back into it,
+   then returns: its rt_sigreturn must take its own frame, not the jumped
+   one's (on top of the kernel's list) */
+static void on_usr2(int s, siginfo_t *si, void *uc)
+{
+    (void)s; (void)si; (void)uc;
+    if (sigsetjmp(g_jb2, 1) == 0) raise(SIGUSR1);
+    g_usr2++;
+}
+
 static void check(int ok, const char *what)
 {
     fprintf(stderr, "[forktest] %s %s\n", ok ? "PASS" : "FAIL", what);
@@ -536,6 +556,44 @@ int main(int argc, char **argv)
         }
         signal(SIGUSR1, SIG_DFL);
         check(ok, "nanosleep: a signal from another thread wakes it (20 times)");
+    }
+    {   /* sigaltstack + SA_ONSTACK: the handler runs on the signal stack */
+        stack_t ss = { .ss_sp = g_altstk, .ss_size = sizeof g_altstk, .ss_flags = 0 }, old;
+        int set = sigaltstack(&ss, NULL) == 0 && sigaltstack(NULL, &old) == 0 &&
+                  old.ss_sp == g_altstk && old.ss_size == sizeof g_altstk && !(old.ss_flags & SS_DISABLE);
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = on_alt;
+        sa.sa_flags = SA_ONSTACK;
+        sigaction(SIGUSR1, &sa, NULL);
+        g_on_alt = 0;
+        raise(SIGUSR1);
+        check(set && g_on_alt, "sigaltstack: an SA_ONSTACK handler runs on the signal stack");
+        /* a handler left by siglongjmp, three times; then one that returns
+           (SA_SIGINFO) -- its rt_sigreturn must take its own frame, not an
+           abandoned one (that restored RIP 0, RSP 0: wine's threads) */
+        sa.sa_handler = on_jump;
+        sa.sa_flags = 0;
+        sigaction(SIGUSR1, &sa, NULL);
+        int jumped = 0;
+        for (int i = 0; i < 3; i++)
+            if (sigsetjmp(g_jb, 1) == 0) raise(SIGUSR1); else jumped++;
+        sa.sa_handler = on_jump2;                 /* (the nested one: into SIGUSR2's handler) */
+        sigaction(SIGUSR1, &sa, NULL);
+        struct sigaction sb;
+        memset(&sb, 0, sizeof sb);
+        sb.sa_sigaction = on_usr2;
+        sb.sa_flags = SA_SIGINFO;
+        sigaction(SIGUSR2, &sb, NULL);
+        volatile long canary = 0x5157;
+        g_usr2 = 0;
+        raise(SIGUSR2);
+        raise(SIGUSR2);
+        check(jumped == 3 && g_usr2 == 2 && canary == 0x5157, "signals: handlers left by siglongjmp, one into another handler that then returns");
+        signal(SIGUSR1, SIG_DFL);
+        signal(SIGUSR2, SIG_DFL);
+        ss.ss_flags = SS_DISABLE;
+        sigaltstack(&ss, NULL);
     }
     /* re-exec'd by the posix_spawn test */
     if (argc > 1 && strcmp(argv[1], "child5") == 0) return 5;
