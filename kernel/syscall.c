@@ -25,6 +25,7 @@
 #include <wynland/i915.h>
 #include <wynland/mouse.h>
 #include <wynland/kfile.h>
+#include <wynland/inotify.h>
 #include <wynland/unix_socket.h>
 #include <wynland/tty.h>
 #include <wynland/sandbox.h>
@@ -905,10 +906,10 @@ static void fill_stat_from_fd(struct linux_stat *st, VfsFile *file) {
         st->st_mode = S_IFREG | 0600;
         st->st_size = (int64_t)memfd_size((int)file->current_cluster);
         st->st_ino  = 0x20000000ULL + file->current_cluster;
-    } else if (file->node.first_cluster == TIMERFD_FD) {
+    } else if (file->node.first_cluster == TIMERFD_FD || file->node.first_cluster == INOTIFY_FD) {
         st->st_mode = 0600; /* anon inode */
         st->st_size = 0;
-        st->st_ino  = 0x30000000ULL + file->current_cluster;
+        st->st_ino  = (file->node.first_cluster == TIMERFD_FD ? 0x30000000ULL : 0x38000000ULL) + file->current_cluster;
     }
     st->st_blocks = (st->st_size + 511) / 512;
 
@@ -1871,6 +1872,12 @@ static int do_poll(VfsFile **fd_table, struct wl_pollfd *fds, uint64_t nfds, int
                     single_wq = &conn->rx_wq;
                 }
             }
+            else if (file->node.first_cluster == INOTIFY_FD) {
+                /* readable with events queued; kernel/inotify.c wakes g_poll_any_wq */
+                if (inotify_readable((int)file->current_cluster) && fds && (fds[i].events & 0x0001)) {
+                    fds[i].revents |= 0x0001; ready++;
+                }
+            }
             else if (file->node.first_cluster == NETLINK_FD) {
                 short ev = fds ? fds[i].events : 0;
                 short rev = (short)(ev & 0x0004);
@@ -1976,6 +1983,7 @@ void kfile_get(VfsFile *f) {
     else if (fc == TIMERFD_FD) timerfd_ref((int)f->current_cluster);
     else if (fc == EPOLL_FD && f->current_cluster < MAX_EPOLL_INSTANCES) epoll_instances[f->current_cluster].refs++;
     else if (fc == NETLINK_FD) netlink_ref((int)f->current_cluster);
+    else if (fc == INOTIFY_FD) inotify_ref((int)f->current_cluster);
     else if ((f->flags & VFS_F_PINNED) && fc < 0xFFFFFF00u) {   /* an ext2 file: one more holder */
         /* the inode already has a slot (the original's): this only counts */
         extern bool ext2_pin_inode(uint32_t inum);
@@ -2185,6 +2193,9 @@ void kfile_close(VfsFile *f) {
     } else if (fc == NETLINK_FD) {
         netlink_unref((int)f->current_cluster);
         kfree(f);
+    } else if (fc == INOTIFY_FD) {
+        inotify_unref((int)f->current_cluster);
+        kfree(f);
     } else if (fc == EPOLL_FD) {
         if (f->current_cluster < MAX_EPOLL_INSTANCES && epoll_instances[f->current_cluster].refs > 0 &&
             --epoll_instances[f->current_cluster].refs == 0)
@@ -2260,7 +2271,7 @@ void kfile_close(VfsFile *f) {
 
 static bool is_kobj_fd(const VfsFile *f) {
     uint32_t fc = f->node.first_cluster;
-    return fc == USOCK_FD || fc == MEMFD_FD || fc == TIMERFD_FD || fc == NETLINK_FD;
+    return fc == USOCK_FD || fc == MEMFD_FD || fc == TIMERFD_FD || fc == NETLINK_FD || fc == INOTIFY_FD;
 }
 
 /* read()/write()/readv()/writev() on sockets, memfds and timerfds. The
@@ -2337,6 +2348,27 @@ static int64_t kobj_readv(VfsFile *f, uint32_t oflags, const UIoVecW *iov, int i
         if (iovcnt < 1) return 0;
         return netlink_read_user(f, oflags, iov[0].base, iov[0].len, 0, NULL);
     }
+    if (fc == INOTIFY_FD) {
+        /* whole events into the first iovec; blocks for the first one */
+        if (iovcnt < 1) return -22;
+        int slot = (int)f->current_cluster;
+        uint32_t cap = iov[0].len < 16384 ? (uint32_t)iov[0].len : 16384;
+        uint8_t *kb = (uint8_t *)kmalloc(cap ? cap : 1);
+        if (!kb) return -12;
+        inotify_ref(slot);
+        int64_t r;
+        for (;;) {
+            r = inotify_read(slot, kb, cap);
+            if (r != 0) break;
+            if (nonblock) { r = -11; break; }                      /* -EAGAIN */
+            if (sched_dying() || sleep_interrupted()) { r = -LNX_EINTR; break; }
+            waitqueue_wait_ms(&g_poll_any_wq, timer_get_ms() + 50);
+        }
+        inotify_unref(slot);
+        if (r > 0 && copy_to_user(iov[0].base, kb, (uint64_t)r) != 0) r = -14;
+        kfree(kb);
+        return r;
+    }
     return -9;
 }
 
@@ -2357,7 +2389,7 @@ static int64_t kobj_writev(VfsFile *f, uint32_t oflags, const UIoVecR *iov, int 
         }
         return total;
     }
-    if (fc == TIMERFD_FD) return -22; /* -EINVAL */
+    if (fc == TIMERFD_FD || fc == INOTIFY_FD) return -22; /* -EINVAL */
     if (fc == NETLINK_FD) {
         uint8_t kb[2048];
         uint32_t n = 0;
@@ -3498,7 +3530,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 VfsFile *file = vfs_open_flags(path_kbuf, vfs_flags);
                 if (file && (vfs_flags & 0x04) && !existed) {
                     uint32_t m = ((uint32_t)a3 & 07777) & ~proc_umask(proc);
-                    vfs_fchmod(file, m);
+                    vfs_fchmod_new(file, m);
                 }
                 if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path_kbuf) : -2);
 
@@ -3630,7 +3662,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
             }
             {
                 uint32_t sfc = fd_table[a1]->node.first_cluster;
-                if (sfc == USOCK_FD || sfc == TIMERFD_FD || sfc == 0xFFFFFFFA || sfc == 0xFFFFFFFB ||
+                if (sfc == USOCK_FD || sfc == TIMERFD_FD || sfc == INOTIFY_FD || sfc == 0xFFFFFFFA || sfc == 0xFFFFFFFB ||
                     sfc == 0xFFFFFFFC || sfc == SOCK_FD_TCP || sfc == SOCK_FD_UDP ||
                     sfc == PTY_FD_MASTER || sfc == PTY_FD_SLAVE) return (uint64_t)-29; /* -ESPIPE */
                 if (sfc == DEV_NULL || sfc == 0xFFFFFFED || sfc == DEV_URANDOM) return 0;
@@ -4226,7 +4258,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 VfsStat mst;
                 if (vfs_lstat(path, &mst)) return (uint64_t)-17;         /* -EEXIST */
                 if (!vfs_mkdir(path)) return (uint64_t)create_errno(path);
-                vfs_chmod(path, ((uint32_t)a3 & 07777) & ~proc_umask(proc));   /* the mode asked, less the umask */
+                vfs_chmod_new(path, ((uint32_t)a3 & 07777) & ~proc_umask(proc));   /* the mode asked, less the umask */
                 return 0;
             }
 
@@ -6430,7 +6462,7 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 VfsFile *file = vfs_open_flags(path, vfs_flags);
                 if (file && (vfs_flags & 0x04) && !existed) {
                     uint32_t m = ((uint32_t)a4 & 07777) & ~proc_umask(proc);
-                    vfs_fchmod(file, m);
+                    vfs_fchmod_new(file, m);
                 }
                 if (!file) return (uint64_t)((vfs_flags & 0x04) ? create_errno(path) : -2);
                 fd = fd_claim(fd_table, fd);   /* (opening may have slept: the number re-checked) */
@@ -8305,7 +8337,51 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
         case 197: case 198: case 199:   // remove/lremove/fremovexattr
             return (uint64_t)-95;       /* -EOPNOTSUPP: ext2 here keeps no extended attributes */
 
-        case 294: // SYS_inotify_init1
+        case 253: // SYS_inotify_init
+        case 294: // SYS_inotify_init1(flags)
+            {
+                uint64_t fl = num == 253 ? 0 : a1;
+                if (fl & ~(uint64_t)(04000 | 02000000)) return (uint64_t)-22;
+                int fd = get_free_fd(fd_table);
+                if (fd < 0) return (uint64_t)-24;
+                int ii = inotify_create();
+                if (ii < 0) return (uint64_t)(int64_t)ii;
+                VfsFile *f = (VfsFile *)kmalloc(sizeof(VfsFile));
+                if (!f) { inotify_unref(ii); return (uint64_t)-12; }
+                memset(f, 0, sizeof(VfsFile));
+                str_copy(f->node.name, "inotify");
+                f->node.first_cluster = INOTIFY_FD;
+                f->current_cluster = (uint32_t)ii;
+                fd_table[fd] = f;
+                fd_flags[fd]  = (fl & 02000000) ? FD_CLOEXEC : 0;
+                fd_oflags[fd] = LINUX_O_RDONLY | ((uint32_t)fl & LINUX_O_NONBLOCK);
+                return (uint64_t)fd;
+            }
+
+        case 254: // SYS_inotify_add_watch(fd, path, mask)
+            {
+                if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
+                if (fd_table[a1]->node.first_cluster != INOTIFY_FD) return (uint64_t)-22;
+                uint32_t mask = (uint32_t)a3;
+                if (!(mask & 0xfff)) return (uint64_t)-22;
+                char path_kbuf[MAX_PATH];
+                int64_t pe = user_path_at(AT_FDCWD_, a2, path_kbuf);
+                if (pe) return (uint64_t)pe;
+                VfsStat st;
+                bool ok = (mask & 0x02000000 /* IN_DONT_FOLLOW */) ? vfs_lstat(path_kbuf, &st) : vfs_stat(path_kbuf, &st);
+                if (!ok) return (uint64_t)-2;
+                if (!vfs_may_access(path_kbuf, 4 /* R_OK */)) return (uint64_t)-13;
+                if ((mask & 0x01000000 /* IN_ONLYDIR */) && !st.is_dir) return (uint64_t)-20;
+                if (st.first_cluster >= 0xFFFFFF00u || !st.first_cluster) return (uint64_t)-22;   /* /proc & co.: nothing to watch */
+                return (uint64_t)(int64_t)inotify_add((int)fd_table[a1]->current_cluster, st.first_cluster,
+                                                      mask & ~(0x01000000u | 0x02000000u));
+            }
+
+        case 255: // SYS_inotify_rm_watch(fd, wd)
+            if (a1 >= MAX_OPEN_FILES || !fd_table[a1]) return (uint64_t)-9;
+            if (fd_table[a1]->node.first_cluster != INOTIFY_FD) return (uint64_t)-22;
+            return (uint64_t)(int64_t)inotify_rm((int)fd_table[a1]->current_cluster, (int32_t)a2);
+
         case 326: // SYS_copy_file_range(in, off_in*, out, off_out*, len, flags)
         case 40:  // SYS_sendfile(out, in, off*, count)
             {

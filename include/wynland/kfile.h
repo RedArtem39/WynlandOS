@@ -27,6 +27,7 @@
 #define PROCNS_FD   0xFFFFFFE4  /* /proc/self/{uid_map,gid_map,setgroups}; current_cluster = kind */
 #define PROCDIR_FD  0xFFFFFFE9  /* a /proc/PID directory (no inode): node.name holds its path,
                                    what the *at() calls resolve against */
+#define INOTIFY_FD  0xFFFFFFEC  /* inotify_init(); current_cluster = instance slot (kernel/inotify.c) */
 #define NETLINK_FD  0xFFFFFFEB  /* AF_NETLINK: ROUTE, SOCK_DIAG (kernel/netlink.c); current_cluster = slot */
 #define SIGNALFD_FD 0xFFFFFFEA  /* signalfd(): the signals it takes, kernel-numbered
                                    (bit N = signal N), in current_cluster (low 32) and

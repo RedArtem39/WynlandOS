@@ -36,6 +36,7 @@
 #include <wynland/virtio_gpu.h>
 #include <wynland/virtgpu_drm.h>
 #include <wynland/vfs.h>
+#include <wynland/inotify.h>
 #include <wynland/ahci.h>
 #include <wynland/nvme.h>
 #include <wynland/usb.h>
@@ -2221,7 +2222,7 @@ void fb0_hold(int delta)
     g_quiet_console = n > 0;
 }
 
-VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
+static VfsFile *vfs_open_flags_raw(const char *path, uint32_t flags) {
     FS_GUARD();
     if (vfs_display_device_denied(path)) return NULL;
     /* Device nodes first -- exact or suffix match (handles relative
@@ -2418,7 +2419,7 @@ VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
     return file;
 }
 
-void vfs_close(VfsFile *file) {
+static void vfs_close_raw(VfsFile *file) {
     if (!file) return;
     if (file->node.first_cluster < 0xFFFFFF00u) {
         FS_GUARD();
@@ -2645,7 +2646,7 @@ int vfs_read(VfsFile *file, void *buf, uint32_t size) {
  * VFS API -- write
  * ============================================================ */
 
-int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
+static int vfs_write_raw(VfsFile *file, const void *buf, uint32_t size) {
     if (!file || !buf) return -1;
     if (file->node.first_cluster == DEV_DSP) {
         extern int64_t hda_dsp_write(const void *buf, uint32_t len, const uint32_t *fmt);
@@ -2800,13 +2801,13 @@ uint32_t vfs_tell(VfsFile *file) {
 
 static bool create_node(const char *path, uint16_t mode, uint8_t ft);
 
-bool vfs_create(const char *path) {
+static bool vfs_create_raw(const char *path) {
     FS_GUARD();
     return create_node(path, EXT2_S_IFREG | 0644, EXT2_FT_REG);
 }
 
 /* the name of a bound AF_UNIX socket: an inode of its own type, as on Linux */
-bool vfs_mksock(const char *path) {
+static bool vfs_mksock_raw(const char *path) {
     FS_GUARD();
     return create_node(path, EXT2_S_IFSOCK | 0755, EXT2_FT_SOCK);
 }
@@ -2898,7 +2899,7 @@ static int chown_inode(uint32_t inum, Ext2Inode *inode, uint32_t uid, uint32_t g
     return ext2_write_inode(inum, inode) ? 0 : -5;
 }
 
-int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
+static int vfs_chown_raw(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
     FS_GUARD();
     if (ro_path(path, !nofollow)) return -30;
     uint32_t inum;
@@ -2908,7 +2909,7 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
     return chown_inode(inum, &inode, uid, gid);
 }
 
-int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
+static int vfs_fchown_raw(VfsFile *file, uint32_t uid, uint32_t gid) {
     FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -9;
@@ -2922,7 +2923,7 @@ int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
 }
 
 /* chmod: the owner or root; only the permission bits change */
-bool vfs_chmod(const char *path, uint32_t mode) {
+static bool vfs_chmod_raw(const char *path, uint32_t mode) {
     FS_GUARD();
     if (ro_path(path, true)) return false;
     uint32_t inum;
@@ -2993,7 +2994,7 @@ static void ext2_free_blocks_from(Ext2Inode *inode, uint32_t first)
    past it and zeroes the rest of the last one (so growing again reads
    zeros), longer leaves a hole. SQLite truncates its WAL and journals with
    it (it was ENOSYS: those operations failed). 0 ok, -1 error. */
-int vfs_ftruncate(VfsFile *file, uint32_t len)
+static int vfs_ftruncate_raw(VfsFile *file, uint32_t len)
 {
     FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
@@ -3026,7 +3027,7 @@ int vfs_ftruncate(VfsFile *file, uint32_t len)
 
 /* fchmod(): the open file's inode, owner or root only. -1 not an ext2
    file, 0 not allowed, 1 done. */
-int vfs_fchmod(VfsFile *file, uint32_t mode) {
+static int vfs_fchmod_raw(VfsFile *file, uint32_t mode) {
     FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     if (!file) return -1;
@@ -3058,7 +3059,7 @@ bool vfs_set_readonly(const char *path) {
  * VFS API -- mkdir / delete
  * ============================================================ */
 
-bool vfs_mkdir(const char *path) {
+static bool vfs_mkdir_raw(const char *path) {
     FS_GUARD();
     if (ro_path(path, false)) return false;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
@@ -3073,7 +3074,7 @@ bool vfs_mkdir(const char *path) {
     return ext2_mkdir(dir_inum, &dir, basename);
 }
 
-bool vfs_delete(const char *path) {
+static bool vfs_delete_raw(const char *path) {
     FS_GUARD();
     if (ro_path(path, false)) return false;
     if (!path || str_compare(path, "/") == 0) return false; /* never delete root */
@@ -3170,7 +3171,7 @@ void vfs_statfs(uint64_t *bsize, uint64_t *blocks, uint64_t *bfree, uint64_t *fi
    nofollow. 0, or -errno. */
 static int utimes_inode(uint32_t inum, Ext2Inode inode, uint32_t atime, uint32_t mtime);
 
-int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) {
+static int vfs_utimes_raw(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) {
     FS_GUARD();
     if (ro_path(path, !nofollow)) return -30;
     uint32_t inum;
@@ -3181,7 +3182,7 @@ int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) 
     return utimes_inode(inum, inode, atime, mtime);
 }
 
-int vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime) {
+static int vfs_futimes_raw(VfsFile *file, uint32_t atime, uint32_t mtime) {
     FS_GUARD();
     if (file && (file->flags & VFS_F_ROMNT)) return -30;   /* -EROFS: opened on a read-only mount */
     Ext2Inode inode;
@@ -3278,7 +3279,7 @@ int vfs_readlink(const char *path, char *buf, uint32_t cap) {
     return (int)ext2_read_symlink(&inode, buf, cap);
 }
 
-bool vfs_symlink(const char *target, const char *linkpath) {
+static bool vfs_symlink_raw(const char *target, const char *linkpath) {
     FS_GUARD();
     if (ro_path(linkpath, false)) return false;
     char dirname[MAX_PATH], basename[MAX_FILENAME];
@@ -3292,7 +3293,7 @@ bool vfs_symlink(const char *target, const char *linkpath) {
     return ext2_create_symlink(dinum, &dir, basename, target);
 }
 
-int vfs_link(const char *oldpath, const char *newpath) {
+static int vfs_link_raw(const char *oldpath, const char *newpath) {
     FS_GUARD();
     if (ro_path(newpath, false) || ro_path(oldpath, false)) return -30;   /* -EROFS */
     if (dir_mount(oldpath) != dir_mount(newpath)) return -18;            /* -EXDEV: another mount */
@@ -3681,10 +3682,214 @@ bool ext2_unlink(uint32_t dir_inum, Ext2Inode *dir, const char *name) {
     return r;
 }
 
-bool vfs_rename(const char *oldpath, const char *newpath) {
+static bool vfs_rename_raw(const char *oldpath, const char *newpath) {
     FS_GUARD();
     dcache_invalidate();
     bool r = vfs_rename_impl(oldpath, newpath);
     dcache_invalidate();
     return r;
 }
+
+/* ============================================================
+ * inotify: what the calls above did, told (kernel/inotify.c).
+ * Each wrapper is the call under the filesystem lock (it nests), so
+ * the inodes looked up before and after are the ones it touched.
+ * Nothing at all happens while no one watches.
+ * ============================================================ */
+
+/* the directory a path is in, the inode it names, whether that is a
+   directory, its links, and its last name */
+typedef struct { uint32_t dir, inum, links; bool isdir; char name[MAX_FILENAME]; } InWhere;
+
+static bool in_where(const char *path, bool follow, InWhere *w) {
+    char parent[MAX_PATH];
+    Ext2Inode di, ci;
+    memset(w, 0, sizeof(*w));
+    if (!path || !path[0] || !split_path(path, parent, w->name)) return false;
+    if (!ext2_lookup_path(parent, &w->dir, &di)) w->dir = 0;
+    bool ok = follow ? ext2_lookup_path(path, &w->inum, &ci) : ext2_lookup_nofollow(path, &w->inum, &ci, NULL);
+    if (!ok) { w->inum = 0; return w->dir != 0; }
+    w->isdir = (ci.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR;
+    w->links = ci.i_links_count;
+    return true;
+}
+
+static void in_path(const char *path, bool follow, uint32_t mask) {
+    InWhere w;
+    if (!in_where(path, follow, &w)) return;
+    inotify_note(w.dir, w.inum, mask | (w.isdir ? IN_ISDIR : 0), 0, w.name);
+}
+
+/* an open file: its inode, and its directory found once from the path
+   it was opened as (kept in dir_entry_sector, unused by ext2 files) */
+static void in_file(VfsFile *f, uint32_t mask) {
+    if (!f) return;
+    uint32_t inum = f->node.first_cluster;
+    if (!inum || inum >= 0xFFFFFF00u) return;
+    const char *name = NULL;
+    if (f->path[0]) {
+        const char *b = f->path;
+        for (const char *q = f->path; *q; q++) if (*q == '/' && q[1]) b = q + 1;
+        name = b;
+        if (!f->dir_entry_sector) {
+            InWhere w;
+            if (in_where(f->path, true, &w) && w.inum == inum) f->dir_entry_sector = w.dir;
+        }
+    }
+    char nm[MAX_FILENAME];
+    uint32_t k = 0;
+    if (name) for (; name[k] && name[k] != '/' && k < MAX_FILENAME - 1; k++) nm[k] = name[k];
+    nm[k] = 0;
+    /* no name known: only the inode's own watches hear of it */
+    inotify_note(nm[0] ? f->dir_entry_sector : 0, inum, mask | (f->node.is_dir ? IN_ISDIR : 0), 0, nm);
+}
+
+VfsFile *vfs_open_flags(const char *path, uint32_t flags) {
+    FS_GUARD();
+    VfsFile *f = vfs_open_flags_raw(path, flags);
+    if (f && inotify_active() && f->node.first_cluster && f->node.first_cluster < 0xFFFFFF00u) {
+        InWhere w;
+        if (in_where(path, true, &w) && w.inum == f->node.first_cluster) {
+            f->dir_entry_sector = w.dir;
+            inotify_note(w.dir, w.inum, IN_OPEN | (w.isdir ? IN_ISDIR : 0), 0, w.name);
+        }
+    }
+    return f;
+}
+
+void vfs_close(VfsFile *file) {
+    if (file && inotify_active() && file->node.first_cluster && file->node.first_cluster < 0xFFFFFF00u) {
+        FS_GUARD();
+        in_file(file, (file->flags & VFS_O_WRITE) ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE);
+    }
+    vfs_close_raw(file);
+}
+
+int vfs_write(VfsFile *file, const void *buf, uint32_t size) {
+    int r = vfs_write_raw(file, buf, size);
+    if (r > 0 && inotify_active()) { FS_GUARD(); in_file(file, IN_MODIFY); }
+    return r;
+}
+
+int vfs_ftruncate(VfsFile *file, uint32_t len) {
+    FS_GUARD();
+    int r = vfs_ftruncate_raw(file, len);
+    if (r == 0 && inotify_active()) in_file(file, IN_MODIFY);
+    return r;
+}
+
+int vfs_fchown(VfsFile *file, uint32_t uid, uint32_t gid) {
+    FS_GUARD();
+    int r = vfs_fchown_raw(file, uid, gid);
+    if (r == 0 && inotify_active()) in_file(file, IN_ATTRIB);
+    return r;
+}
+
+int vfs_fchmod(VfsFile *file, uint32_t mode) {
+    FS_GUARD();
+    int r = vfs_fchmod_raw(file, mode);
+    if (r == 1 && inotify_active()) in_file(file, IN_ATTRIB);
+    return r;
+}
+
+int vfs_futimes(VfsFile *file, uint32_t atime, uint32_t mtime) {
+    FS_GUARD();
+    int r = vfs_futimes_raw(file, atime, mtime);
+    if (r == 0 && inotify_active()) in_file(file, IN_ATTRIB);
+    return r;
+}
+
+int vfs_chown(const char *path, uint32_t uid, uint32_t gid, bool nofollow) {
+    FS_GUARD();
+    int r = vfs_chown_raw(path, uid, gid, nofollow);
+    if (r == 0 && inotify_active()) in_path(path, !nofollow, IN_ATTRIB);
+    return r;
+}
+
+bool vfs_chmod(const char *path, uint32_t mode) {
+    FS_GUARD();
+    bool r = vfs_chmod_raw(path, mode);
+    if (r && inotify_active()) in_path(path, true, IN_ATTRIB);
+    return r;
+}
+
+int vfs_utimes(const char *path, uint32_t atime, uint32_t mtime, bool nofollow) {
+    FS_GUARD();
+    int r = vfs_utimes_raw(path, atime, mtime, nofollow);
+    if (r == 0 && inotify_active()) in_path(path, !nofollow, IN_ATTRIB);
+    return r;
+}
+
+bool vfs_create(const char *path) {
+    FS_GUARD();
+    bool r = vfs_create_raw(path);
+    if (r && inotify_active()) in_path(path, false, IN_CREATE);
+    return r;
+}
+
+bool vfs_mksock(const char *path) {
+    FS_GUARD();
+    bool r = vfs_mksock_raw(path);
+    if (r && inotify_active()) in_path(path, false, IN_CREATE);
+    return r;
+}
+
+bool vfs_mkdir(const char *path) {
+    FS_GUARD();
+    bool r = vfs_mkdir_raw(path);
+    if (r && inotify_active()) in_path(path, false, IN_CREATE);
+    return r;
+}
+
+bool vfs_symlink(const char *target, const char *linkpath) {
+    FS_GUARD();
+    bool r = vfs_symlink_raw(target, linkpath);
+    if (r && inotify_active()) in_path(linkpath, false, IN_CREATE);
+    return r;
+}
+
+int vfs_link(const char *oldpath, const char *newpath) {
+    FS_GUARD();
+    int r = vfs_link_raw(oldpath, newpath);
+    if (r == 0 && inotify_active()) {
+        in_path(newpath, false, IN_CREATE);
+        InWhere w;
+        if (in_where(newpath, false, &w) && w.inum) inotify_note(0, w.inum, IN_ATTRIB, 0, NULL);   /* its link count */
+    }
+    return r;
+}
+
+bool vfs_delete(const char *path) {
+    FS_GUARD();
+    InWhere w;
+    bool watched = inotify_active() && in_where(path, false, &w) && w.inum;
+    bool r = vfs_delete_raw(path);
+    if (r && watched) {
+        if (!w.isdir && w.links > 1) inotify_note(0, w.inum, IN_ATTRIB, 0, NULL);
+        inotify_note(w.dir, w.inum, IN_DELETE | (w.isdir ? IN_ISDIR : 0), 0, w.name);
+        if (w.isdir || w.links <= 1) inotify_note(0, w.inum, IN_DELETE_SELF, 0, NULL);
+    }
+    return r;
+}
+
+bool vfs_rename(const char *oldpath, const char *newpath) {
+    FS_GUARD();
+    InWhere from, over;
+    bool watched = inotify_active() && in_where(oldpath, false, &from) && from.inum;
+    if (watched && !in_where(newpath, false, &over)) over.inum = 0;
+    bool r = vfs_rename_raw(oldpath, newpath);
+    if (r && watched) {
+        InWhere to;
+        if (!in_where(newpath, false, &to)) { to.dir = 0; str_copy(to.name, from.name); }
+        uint32_t c = inotify_cookie(), d = from.isdir ? IN_ISDIR : 0;
+        inotify_note(from.dir, from.inum, IN_MOVED_FROM | d, c, from.name);
+        inotify_note(to.dir, from.inum, IN_MOVED_TO | d, c, to.name);
+        inotify_note(0, from.inum, IN_MOVE_SELF | d, 0, NULL);
+        if (over.inum && over.inum != from.inum)          /* the one it replaced is gone */
+            inotify_note(0, over.inum, IN_DELETE_SELF, 0, NULL);
+    }
+    return r;
+}
+
+bool vfs_chmod_new(const char *path, uint32_t mode) { return vfs_chmod_raw(path, mode); }
+int  vfs_fchmod_new(VfsFile *file, uint32_t mode) { return vfs_fchmod_raw(file, mode); }

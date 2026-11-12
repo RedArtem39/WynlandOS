@@ -142,6 +142,9 @@ bool vfs_dir_path(uint32_t inum, char *out, uint32_t cap);
 bool vfs_set_readonly(const char *path); /* clears all write bits in i_mode */
 bool vfs_chmod(const char *path, uint32_t mode); /* owner or root */
 int  vfs_fchmod(VfsFile *file, uint32_t mode);
+/* the mode of a node just made (open O_CREAT, mkdir): the same, told to no one (inotify) */
+bool vfs_chmod_new(const char *path, uint32_t mode);
+int  vfs_fchmod_new(VfsFile *file, uint32_t mode);
 int  vfs_ftruncate(VfsFile *file, uint32_t len);  /* 0 ok, -1 error */   /* same, an open file: -1 not ext2, 0 EPERM, 1 ok */
 bool vfs_may_access(const char *path, uint32_t want); /* 4 r, 2 w, 1 x; root always */
 

@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -614,6 +615,71 @@ int main(int argc, char **argv)
     }
     /* re-exec'd by the posix_spawn test */
     if (argc > 1 && strcmp(argv[1], "child5") == 0) return 5;
+    {   /* inotify: a watched directory tells what happens in it (dbus,
+           GLib/Qt file monitors, Node's fs.watch, dev servers' reloads) */
+        char dir[64], f1[96], f2[96], sub[96];
+        snprintf(dir, sizeof dir, "/tmp/inotest.%d", (int)getpid());
+        snprintf(f1, sizeof f1, "%s/a.txt", dir);
+        snprintf(f2, sizeof f2, "%s/b.txt", dir);
+        snprintf(sub, sizeof sub, "%s/sub", dir);
+        mkdir(dir, 0755);
+        int in = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        int wd = in >= 0 ? inotify_add_watch(in, dir, IN_CREATE | IN_MODIFY | IN_DELETE | IN_MOVED_FROM |
+                                                       IN_MOVED_TO | IN_CLOSE_WRITE | IN_ATTRIB) : -1;
+        char eb[4096];
+        int empty = in >= 0 && read(in, eb, sizeof eb) == -1 && errno == EAGAIN;
+        int fd = open(f1, O_WRONLY | O_CREAT, 0644);
+        if (fd >= 0) { (void)!write(fd, "hi", 2); close(fd); }
+        chmod(f1, 0600);
+        rename(f1, f2);
+        mkdir(sub, 0755);
+        rmdir(sub);
+        unlink(f2);
+        struct pollfd pf = { in, POLLIN, 0 };
+        int pr = poll(&pf, 1, 1000);
+        /* what came: create, modify, close_write, attrib, moved_from/to
+           (one cookie), create|isdir, delete|isdir, delete */
+        unsigned seen = 0, cookie_from = 0, cookie_to = 0, names_ok = 1;
+        ssize_t n = in >= 0 ? read(in, eb, sizeof eb) : -1;
+        for (ssize_t off = 0; n > 0 && off < n; ) {
+            struct inotify_event *e = (struct inotify_event *)(eb + off);
+            const char *nm = e->len ? e->name : "";
+            if (e->wd != wd) names_ok = 0;
+            if ((e->mask & IN_CREATE) && !(e->mask & IN_ISDIR) && !strcmp(nm, "a.txt")) seen |= 1;
+            if ((e->mask & IN_MODIFY) && !strcmp(nm, "a.txt")) seen |= 2;
+            if ((e->mask & IN_CLOSE_WRITE) && !strcmp(nm, "a.txt")) seen |= 4;
+            if ((e->mask & IN_ATTRIB) && !strcmp(nm, "a.txt")) seen |= 8;
+            if ((e->mask & IN_MOVED_FROM) && !strcmp(nm, "a.txt")) { seen |= 16; cookie_from = e->cookie; }
+            if ((e->mask & IN_MOVED_TO) && !strcmp(nm, "b.txt")) { seen |= 32; cookie_to = e->cookie; }
+            if ((e->mask & IN_CREATE) && (e->mask & IN_ISDIR) && !strcmp(nm, "sub")) seen |= 64;
+            if ((e->mask & IN_DELETE) && (e->mask & IN_ISDIR) && !strcmp(nm, "sub")) seen |= 128;
+            if ((e->mask & IN_DELETE) && !(e->mask & IN_ISDIR) && !strcmp(nm, "b.txt")) seen |= 256;
+            fprintf(stderr, "[forktest]   ev wd=%d mask=0x%x cookie=%u '%s'\n", e->wd, e->mask, e->cookie, nm);
+            off += sizeof(struct inotify_event) + e->len;
+        }
+        fprintf(stderr, "[forktest] inotify: fd=%d wd=%d poll=%d read=%zd seen=0x%x\n", in, wd, pr, n, seen);
+        check(in >= 0 && wd > 0 && empty && pr == 1 && seen == 0x1ff && cookie_from && cookie_from == cookie_to && names_ok,
+              "inotify: create/modify/close/attrib/move/mkdir/rmdir/unlink in a watched directory, poll wakes");
+        /* a watch on the file itself, and its end when the file goes */
+        int fd2 = open(f1, O_WRONLY | O_CREAT, 0644);
+        int wf = inotify_add_watch(in, f1, IN_MODIFY | IN_DELETE_SELF);
+        if (fd2 >= 0) { (void)!write(fd2, "x", 1); close(fd2); }
+        unlink(f1);
+        n = read(in, eb, sizeof eb);
+        unsigned self = 0;
+        for (ssize_t off = 0; n > 0 && off < n; ) {
+            struct inotify_event *e = (struct inotify_event *)(eb + off);
+            if (e->wd == wf && (e->mask & IN_MODIFY) && !e->len) self |= 1;
+            if (e->wd == wf && (e->mask & IN_DELETE_SELF)) self |= 2;
+            if (e->wd == wf && (e->mask & IN_IGNORED)) self |= 4;
+            off += sizeof(struct inotify_event) + e->len;
+        }
+        check(wf > 0 && wf != wd && self == 7, "inotify: a file's own watch -- modify, delete_self, ignored");
+        int rmok = inotify_rm_watch(in, wd) == 0 && inotify_rm_watch(in, wd) == -1 && errno == EINVAL;
+        check(rmok, "inotify_rm_watch, then EINVAL for a gone watch");
+        if (in >= 0) close(in);
+        rmdir(dir);
+    }
 
     int st;
     pid_t p;
