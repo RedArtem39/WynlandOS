@@ -32,6 +32,12 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <poll.h>
+#include <signal.h>
+#include <stddef.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -112,8 +118,8 @@ static bool load_config(void)
 static uint8_t g_pmk[32], g_ptk[48], g_snonce[32], g_anonce[32];
 static uint8_t g_mac[6], g_ap[6], g_rsn[24];
 static uint8_t g_last_rc[8];
-static int g_hs;                    /* 0: nothing yet, 1: message 2 sent, 2: keys in */
-static bool g_linkup;
+static int g_hs, g_hs_msg1;                    /* 0: nothing yet, 1: message 2 sent, 2: keys in */
+static bool g_linkup, g_wrong_mic;
 
 /* PRF-SHA1 (802.11i 8.5.1.1) */
 static void prf(const uint8_t *key, int klen, const char *label, const uint8_t *data, int dlen, uint8_t *out, int outlen)
@@ -270,6 +276,7 @@ static void handle_key(const uint8_t *f, int n)
         memcpy(g_last_rc, rc, 8);
         g_hs = 1;
         send_key_ptk(0x010a, rc, g_snonce, g_rsn, 22);
+        g_wrong_mic = g_hs_msg1++ > 0;               /* message 1 again: our message 2 was refused -- the password */
         logf_("wifid: handshake message 1 -> 2");
         return;
     }
@@ -277,7 +284,7 @@ static void handle_key(const uint8_t *f, int n)
     if (pairwise && ack && mic && install_) {           /* message 3: the keys, message 4 */
         if (memcmp(f + 17, g_anonce, 32)) { logf_("wifid: message 3 with another ANonce"); return; }
         if (memcmp(rc, g_last_rc, 8) <= 0 && g_hs == 2) { return; }      /* a replay of the last one */
-        if (!check_mic(f, n)) { logf_("wifid: message 3: WRONG MIC (the password?)"); return; }
+        if (!check_mic(f, n)) { logf_("wifid: message 3: WRONG MIC (the password?)"); g_wrong_mic = true; return; }
         uint8_t kd[256], gtk[16], gid = 0;
         int kl = kdlen;
         if (enc) {
@@ -337,95 +344,391 @@ static bool make_rsn(const Net *n)
     return true;
 }
 
-/* scan; the strongest network of that name */
-static bool find_network(Net *out)
+/* ---- the networks seen, the networks known ---------------------------------- */
+#define MAX_SEEN  64
+#define MAX_KNOWN 32
+typedef struct { char ssid[33]; Net n; char sec[12]; } Seen;
+typedef struct { char ssid[33]; char psk[64]; bool saved; bool bad; } Known;
+static Seen g_seen[MAX_SEEN], g_fresh[MAX_SEEN];  /* the last scan's; the one coming in */
+static int g_nseen, g_nfresh;
+static bool g_bgscan;                           /* a scan while connected */
+static uint64_t g_bg_deadline;
+static Known g_known[MAX_KNOWN];
+static int g_nknown;
+#define KNOWN_FILE "/var/lib/wifid/networks"
+
+static const char *sec_of(const uint8_t *rsn, int len)
 {
-    uint8_t cmd = 0x01, e[512];
-    dev_send(&cmd, 1);
-    bool found = false;
-    for (uint64_t until = now_ms() + 40000; now_ms() < until;) {
-        int n = ev_wait(e, sizeof e, 500);
-        if (n <= 0) continue;
-        if (e[0] == 0x82) break;
-        if (e[0] != 0x81 || n < 11) continue;
-        int sl = e[9];
-        if (10 + sl + 1 > n) continue;
-        if (sl == (int)strlen(g_ssid) && !memcmp(e + 10, g_ssid, (size_t)sl) && !found) {
-            memcpy(out->bssid, e + 1, 6);
-            out->ch = e[7];
-            out->rssi = (int8_t)e[8];
-            out->rsnlen = e[10 + sl];
-            if (10 + sl + 1 + out->rsnlen > n || out->rsnlen > 64) continue;
-            memcpy(out->rsn, e + 10 + sl + 1, (size_t)out->rsnlen);
-            found = true;                               /* (they come strongest first) */
+    if (len < 2) return "open";
+    bool psk = false, sae = false;
+    if (len >= 10) {
+        int np = (int)le16(rsn + 8), o = 10 + 4 * np;
+        if (o + 2 <= len) {
+            int na = (int)le16(rsn + o);
+            for (int i = 0; i < na && o + 2 + 4 * i + 4 <= len; i++) {
+                const uint8_t *a = rsn + o + 2 + 4 * i;
+                if (a[0] == 0 && a[1] == 0x0f && a[2] == 0xac) { if (a[3] == 2) psk = true; if (a[3] == 8) sae = true; }
+            }
         }
     }
-    return found;
+    return psk ? "wpa2" : sae ? "wpa3" : "other";
 }
 
-/* one go: scan, join, handshake, then watch the link; returns when it is over */
-static void session(void)
+static Known *known_find(const char *ssid)
 {
-    Net net;
-    if (!find_network(&net)) { logf_("wifid: network \"%s\" not seen", g_ssid); return; }
-    logf_("wifid: found \"%s\": channel %u, %d dBm", g_ssid, net.ch, net.rssi);
-    if (!make_rsn(&net)) return;
-    if (!PKCS5_PBKDF2_HMAC_SHA1(g_psk, (int)strlen(g_psk), (const unsigned char *)g_ssid, (int)strlen(g_ssid), 4096, 32, g_pmk)) {
-        logf_("wifid: PBKDF2 failed");
+    for (int i = 0; i < g_nknown; i++) if (!strcmp(g_known[i].ssid, ssid)) return &g_known[i];
+    return NULL;
+}
+
+static void known_save(void)
+{
+    mkdir("/var/lib/wifid", 0700);
+    FILE *f = fopen(KNOWN_FILE ".new", "w");
+    if (!f) { logf_("wifid: cannot write %s", KNOWN_FILE); return; }
+    fchmod(fileno(f), 0600);
+    for (int i = 0; i < g_nknown; i++)
+        if (g_known[i].saved) fprintf(f, "%s\t%s\n", g_known[i].ssid, g_known[i].psk);
+    fclose(f);
+    rename(KNOWN_FILE ".new", KNOWN_FILE);
+}
+
+static Known *known_set(const char *ssid, const char *psk, bool saved)
+{
+    Known *k = known_find(ssid);
+    if (!k) {
+        if (g_nknown >= MAX_KNOWN) return NULL;
+        k = &g_known[g_nknown++];
+        memset(k, 0, sizeof *k);
+        snprintf(k->ssid, sizeof k->ssid, "%s", ssid);
+    }
+    snprintf(k->psk, sizeof k->psk, "%s", psk);
+    k->bad = false;
+    if (saved) k->saved = true;
+    return k;
+}
+
+static void known_forget(const char *ssid)
+{
+    for (int i = 0; i < g_nknown; i++)
+        if (!strcmp(g_known[i].ssid, ssid)) {
+            memset(g_known[i].psk, 0, sizeof g_known[i].psk);
+            g_known[i] = g_known[--g_nknown];
+            break;
+        }
+    known_save();
+}
+
+/* the saved ones, then the configuration files' (not written back: boot.cfg stays the source) */
+static void known_load(void)
+{
+    FILE *f = fopen(KNOWN_FILE, "r");
+    char line[200];
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            size_t n = strlen(line);
+            while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+            char *t = strchr(line, '\t');
+            if (!t) continue;
+            *t = 0;
+            if (line[0] && strlen(t + 1) >= 8) known_set(line, t + 1, true);
+        }
+        fclose(f);
+    }
+    if (load_config() && !known_find(g_ssid)) known_set(g_ssid, g_psk, false);
+    memset(g_psk, 0, sizeof g_psk);
+}
+
+/* ---- the state ------------------------------------------------------------------ */
+enum { ST_IDLE, ST_SCANNING, ST_JOINING, ST_HANDSHAKE, ST_CONNECTED };
+static const char *st_name[] = { "idle", "scanning", "connecting", "connecting", "connected" };
+static int g_state = ST_IDLE;
+static uint64_t g_deadline, g_next_scan;
+static bool g_auto = true;                      /* off after "disconnect", on again with "connect" */
+static char g_cur[33], g_want[33], g_reason[80];
+static int g_cur_rssi, g_cur_ch;
+
+static void scan_start(void)
+{
+    uint8_t c = 0x01;
+    g_nfresh = 0;
+    dev_send(&c, 1);
+    g_state = ST_SCANNING;
+    g_deadline = now_ms() + 40000;
+}
+
+static void join(Seen *s, Known *k)
+{
+    if (!make_rsn(&s->n)) { snprintf(g_reason, sizeof g_reason, "unsupported security"); g_state = ST_IDLE; return; }
+    if (!PKCS5_PBKDF2_HMAC_SHA1(k->psk, (int)strlen(k->psk), (const unsigned char *)s->ssid, (int)strlen(s->ssid), 4096, 32, g_pmk)) {
+        g_state = ST_IDLE;
         return;
     }
-    memcpy(g_ap, net.bssid, 6);
+    snprintf(g_cur, sizeof g_cur, "%s", s->ssid);
+    g_cur_rssi = s->n.rssi;
+    g_cur_ch = s->n.ch;
+    memcpy(g_ap, s->n.bssid, 6);
     uint8_t j[1 + 6 + 1 + 22];
     j[0] = 0x02;
-    memcpy(j + 1, net.bssid, 6);
+    memcpy(j + 1, s->n.bssid, 6);
     j[7] = 22;
     memcpy(j + 8, g_rsn, 22);
-    dev_send(j, sizeof j);
     g_hs = 0;
+    g_hs_msg1 = 0;
+    g_wrong_mic = false;
     g_linkup = false;
+    dev_send(j, sizeof j);
+    g_state = ST_JOINING;
+    g_deadline = now_ms() + 12000;
+    g_reason[0] = 0;
+    logf_("wifid: joining \"%s\" (channel %u, %d dBm)", s->ssid, s->n.ch, s->n.rssi);
+}
 
-    uint8_t e[1800];
-    bool assoc = false;
-    uint64_t until = now_ms() + 12000;                  /* association, then the handshake */
-    while (now_ms() < until || g_linkup) {
-        int n = ev_wait(e, sizeof e, 200);
-        if (n <= 0) continue;
-        switch (e[0]) {
-        case 0x83:
-            assoc = true;
-            logf_("wifid: associated; waiting for the handshake");
-            until = now_ms() + 12000;
-            break;
-        case 0x84:
-            logf_("wifid: could not join: stage %u, status %u", le16(e + 1), le16(e + 3));
-            return;
-        case 0x85:
-            if (n > 7) handle_key(e + 7, n - 7);
-            break;
-        case 0x86:
-            g_linkup = true;
-            logf_("wifid: LINK UP -- WPA2 handshake done");
-            break;
-        case 0x87:
-            logf_("wifid: link down, reason %u", le16(e + 1));
-            return;
+/* after a scan: the wanted network, else the best known one (5 GHz preferred a little) */
+static void pick(void)
+{
+    Seen *best = NULL;
+    Known *bk = NULL;
+    int bs = -1000;
+    for (int i = 0; i < g_nseen; i++) {
+        Seen *s = &g_seen[i];
+        Known *k = known_find(s->ssid);
+        if (!k || k->bad || strcmp(s->sec, "wpa2")) continue;
+        if (g_want[0] && strcmp(g_want, s->ssid)) continue;
+        int score = s->n.rssi + (s->n.ch > 14 && s->n.rssi > -72 ? 12 : 0);
+        if (score > bs) { bs = score; best = s; bk = k; }
+    }
+    if (best) { join(best, bk); return; }
+    if (g_want[0]) snprintf(g_reason, sizeof g_reason, "network not found");
+    g_want[0] = 0;
+    g_state = ST_IDLE;
+    g_next_scan = now_ms() + 20000;
+}
+
+static void leave(void)
+{
+    uint8_t c = 0x05;
+    if (g_state >= ST_JOINING) dev_send(&c, 1);
+    g_state = ST_IDLE;
+    g_cur[0] = 0;
+    g_linkup = false;
+}
+
+static void on_event(const uint8_t *e, int n)
+{
+    switch (e[0]) {
+    case 0x81: {                                        /* a network */
+        if (n < 11 || g_nfresh >= MAX_SEEN) break;
+        int sl = e[9];
+        if (10 + sl + 1 > n || sl == 0) break;
+        int rl = e[10 + sl];
+        if (10 + sl + 1 + rl > n || rl > 64) break;
+        char ssid[33];
+        memcpy(ssid, e + 10, (size_t)sl);
+        ssid[sl] = 0;
+        for (int i = 0; i < g_nfresh; i++) if (!strcmp(g_fresh[i].ssid, ssid)) { sl = -1; break; }   /* (strongest first) */
+        if (sl < 0) break;
+        Seen *s = &g_fresh[g_nfresh++];
+        snprintf(s->ssid, sizeof s->ssid, "%s", ssid);
+        memcpy(s->n.bssid, e + 1, 6);
+        s->n.ch = e[7];
+        s->n.rssi = (int8_t)e[8];
+        s->n.rsnlen = rl;
+        memcpy(s->n.rsn, e + 11 + e[9], (size_t)rl);
+        snprintf(s->sec, sizeof s->sec, "%s", sec_of(s->n.rsn, rl));
+        break;
+    }
+    case 0x82:                                          /* the scan is over */
+        memcpy(g_seen, g_fresh, sizeof(Seen) * (size_t)g_nfresh);   /* its list replaces the last */
+        g_nseen = g_nfresh;
+        g_nfresh = 0;
+        g_bgscan = false;
+        if (g_state == ST_SCANNING) pick();
+        break;
+    case 0x83:
+        if (g_state == ST_JOINING) { g_state = ST_HANDSHAKE; g_deadline = now_ms() + 12000; }
+        logf_("wifid: associated; waiting for the handshake");
+        break;
+    case 0x84:
+        logf_("wifid: could not join: stage %u, status %u", le16(e + 1), le16(e + 3));
+        snprintf(g_reason, sizeof g_reason, "the access point refused us");
+        g_state = ST_IDLE;
+        g_next_scan = now_ms() + 10000;
+        break;
+    case 0x85:
+        if (n > 7) handle_key(e + 7, n - 7);
+        break;
+    case 0x86:
+        g_linkup = true;
+        g_state = ST_CONNECTED;
+        g_want[0] = 0;
+        logf_("wifid: LINK UP -- WPA2 handshake done");
+        break;
+    case 0x87:
+        logf_("wifid: link down, reason %u", le16(e + 1));
+        if (g_state < ST_JOINING) break;                /* (the answer to our own "leave") */
+        if (g_state >= ST_JOINING) snprintf(g_reason, sizeof g_reason, "link lost (reason %u)", le16(e + 1));
+        g_state = ST_IDLE;
+        g_cur[0] = 0;
+        g_linkup = false;
+        g_next_scan = now_ms() + 3000;
+        break;
+    }
+}
+
+static void tick(void)
+{
+    uint64_t t = now_ms();
+    if ((g_state == ST_JOINING || g_state == ST_HANDSHAKE) && t > g_deadline) {
+        Known *k = known_find(g_cur);
+        if (g_wrong_mic && k) {
+            k->bad = true;
+            snprintf(g_reason, sizeof g_reason, "wrong password");
+            logf_("wifid: \"%s\": the password is wrong -- not trying it again until it is changed", g_cur);
+        } else snprintf(g_reason, sizeof g_reason, "%s", g_state == ST_JOINING ? "no association" : "the handshake did not finish");
+        leave();
+        g_next_scan = t + 10000;
+    }
+    if (g_state == ST_SCANNING && t > g_deadline) pick();
+    if (g_bgscan && t > g_bg_deadline) g_bgscan = false;
+    if (g_state == ST_IDLE && g_auto && t >= g_next_scan) {
+        bool any = false;
+        for (int i = 0; i < g_nknown; i++) if (!g_known[i].bad) any = true;
+        if (any || g_want[0]) scan_start();
+        else g_next_scan = t + 30000;
+    }
+}
+
+/* ---- the control socket (abstract "wifid"): the shell's and the wifi command's ---------- */
+#define MAX_CLI 8
+typedef struct { int fd; char in[512]; int n; } Cli;
+static Cli g_cli[MAX_CLI];
+static int g_lsock = -1;
+
+static void out(int fd, const char *fmt, ...)
+{
+    char b[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    if (n > 0) { if (send(fd, b, (size_t)(n < (int)sizeof b ? n : (int)sizeof b - 1), MSG_NOSIGNAL) < 0) { } }
+}
+
+/* one request: "status", "list", "scan", "connect SSID<TAB>PASSWORD", "forget SSID", "disconnect" */
+static void request(int fd, char *l)
+{
+    if (!strcmp(l, "status")) {
+        out(fd, "state\t%s\n", st_name[g_state]);
+        out(fd, "scanning\t%d\n", g_state == ST_SCANNING || g_bgscan ? 1 : 0);
+        if (g_cur[0]) out(fd, "ssid\t%s\nsignal\t%d\nchannel\t%d\n", g_cur, g_cur_rssi, g_cur_ch);
+        if (g_reason[0]) out(fd, "reason\t%s\n", g_reason);
+        out(fd, "auto\t%d\n", g_auto ? 1 : 0);
+    } else if (!strcmp(l, "list")) {
+        for (int i = 0; i < g_nseen; i++) {
+            Known *k = known_find(g_seen[i].ssid);
+            out(fd, "net\t%s\t%d\t%u\t%s\t%d\t%d\n", g_seen[i].ssid, g_seen[i].n.rssi, g_seen[i].n.ch, g_seen[i].sec,
+                k ? (k->bad ? 2 : 1) : 0, (g_state == ST_CONNECTED && !strcmp(g_cur, g_seen[i].ssid)) ? 1 : 0);
+        }
+    } else if (!strcmp(l, "scan")) {
+        if (g_state == ST_IDLE) scan_start();
+        else if (g_state == ST_CONNECTED && !g_bgscan) {        /* connected: the card scans in the background */
+            uint8_t c = 0x01;
+            g_nfresh = 0;
+            g_bgscan = true;
+            g_bg_deadline = now_ms() + 40000;
+            dev_send(&c, 1);
+        }
+        out(fd, "ok\n");
+    } else if (!strncmp(l, "connect ", 8)) {
+        char *ssid = l + 8, *pw = strchr(ssid, '\t');
+        if (pw) *pw++ = 0;
+        if (!ssid[0] || strlen(ssid) > 32) { out(fd, "error\tbad network name\n"); goto end; }
+        Known *k = known_find(ssid);
+        if (pw && pw[0]) {
+            size_t pl = strlen(pw);
+            if (pl < 8 || pl > 63) { out(fd, "error\tthe password must be 8 to 63 characters\n"); goto end; }
+            k = known_set(ssid, pw, true);
+            known_save();
+        }
+        if (!k) { out(fd, "error\tneed a password\n"); goto end; }
+        k->bad = false;
+        snprintf(g_want, sizeof g_want, "%s", ssid);
+        g_auto = true;
+        g_reason[0] = 0;
+        leave();
+        scan_start();
+        out(fd, "ok\n");
+    } else if (!strncmp(l, "forget ", 7)) {
+        if (!strcmp(g_cur, l + 7)) leave();
+        known_forget(l + 7);
+        out(fd, "ok\n");
+    } else if (!strcmp(l, "enable")) {                          /* Wi-Fi on: automatic joining again */
+        g_auto = true;
+        g_next_scan = 0;
+        out(fd, "ok\n");
+    } else if (!strcmp(l, "disconnect")) {
+        g_auto = false;
+        leave();
+        out(fd, "ok\n");
+    } else out(fd, "error\tunknown request\n");
+end:
+    out(fd, ".\n");
+}
+
+static void serve(void)
+{
+    struct pollfd p[1 + MAX_CLI];
+    int np = 0;
+    p[np++] = (struct pollfd){ g_lsock, POLLIN, 0 };
+    for (int i = 0; i < MAX_CLI; i++) if (g_cli[i].fd >= 0) p[np++] = (struct pollfd){ g_cli[i].fd, POLLIN, 0 };
+    if (poll(p, (nfds_t)np, 20) <= 0) return;
+    if (p[0].revents & POLLIN) {
+        int c = accept4(g_lsock, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (c >= 0) {
+            int i;
+            for (i = 0; i < MAX_CLI && g_cli[i].fd >= 0; i++) { }
+            if (i == MAX_CLI) close(c);
+            else { g_cli[i].fd = c; g_cli[i].n = 0; }
         }
     }
-    uint8_t leave = 0x05;
-    dev_send(&leave, 1);
-    logf_("wifid: %s", assoc ? "the handshake did not finish" : "no association");
+    for (int i = 0; i < MAX_CLI; i++) {
+        Cli *c = &g_cli[i];
+        if (c->fd < 0) continue;
+        ssize_t r = recv(c->fd, c->in + c->n, sizeof c->in - 1 - (size_t)c->n, 0);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) { close(c->fd); c->fd = -1; continue; }
+        if (r < 0) continue;
+        c->n += (int)r;
+        char *nl;
+        while ((nl = memchr(c->in, '\n', (size_t)c->n))) {
+            *nl = 0;
+            if (nl > c->in && nl[-1] == '\r') nl[-1] = 0;
+            request(c->fd, c->in);
+            int used = (int)(nl - c->in) + 1;
+            memmove(c->in, nl + 1, (size_t)(c->n - used));
+            c->n -= used;
+        }
+        if (c->n >= (int)sizeof c->in - 1) c->n = 0;
+        memset(c->in + c->n, 0, sizeof c->in - (size_t)c->n);   /* (a password never lingers) */
+    }
 }
 
 int main(void)
 {
+    signal(SIGPIPE, SIG_IGN);
     g_kmsg = open("/dev/kmsg", O_WRONLY);
     logf_("wifid: started");
-    if (!load_config()) {
-        logf_("wifid: no network configured (ssid / psk of at least 8 characters): nothing to do");
-        for (;;) sleep(3600);
-    }
-    while ((g_dev = open("/dev/wifi", O_RDWR)) < 0) msleep(1000);       /* (the card comes up a few seconds after boot) */
-    uint8_t hello = 0x00, e[64];
+    for (int i = 0; i < MAX_CLI; i++) g_cli[i].fd = -1;
+    known_load();
+    logf_("wifid: %d known network(s)", g_nknown);
+
+    g_lsock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    memcpy(a.sun_path, "\0wifid", 6);
+    if (g_lsock < 0 || bind(g_lsock, (struct sockaddr *)&a, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 6)) < 0 ||
+        listen(g_lsock, 4) < 0) logf_("wifid: no control socket (%s)", strerror(errno));
+
+    while ((g_dev = open("/dev/wifi", O_RDWR)) < 0) { serve(); msleep(500); }   /* (the card comes up a few seconds after boot) */
+    uint8_t hello = 0x00, e[1800];
     dev_send(&hello, 1);
     for (int i = 0; i < 100; i++) {
         int n = ev_wait(e, sizeof e, 100);
@@ -433,7 +736,9 @@ int main(void)
     }
     logf_("wifid: the card is %02x:%02x:%02x:%02x:%02x:%02x", g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5]);
     for (;;) {
-        session();
-        msleep(5000);
+        int n;
+        while ((n = (int)read(g_dev, e, sizeof e)) > 0) on_event(e, n);
+        tick();
+        serve();
     }
 }

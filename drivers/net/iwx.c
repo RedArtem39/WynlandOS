@@ -610,6 +610,9 @@ typedef struct {
     uint8_t dtim;                               /* DTIM period */
     uint8_t rates[16], nrates;                  /* its rates (IEs 1 and 50) */
     uint8_t rsn[64], rsnlen;                    /* its RSN element, whole */
+    bool ht, vht, wmm;                          /* 802.11n / ac capable, WMM (QoS) */
+    uint8_t sco;                                /* HT: secondary channel 0 none, 1 above, 3 below */
+    uint8_t vht_width, vht_center;              /* VHT operation: 0 20/40, 1 80 MHz; the centre channel */
 } Bss;
 #define MAX_BSS 64
 static Bss g_bss[MAX_BSS];
@@ -649,6 +652,8 @@ static void handle_frame(const uint8_t *p, uint32_t plen)
     const char *sec = (cap & 0x10) ? "WEP" : "open";
     bool rsn = false;
     uint8_t rates[16], nrates = 0, dtim = 1, dtimcnt = 0, rsnie[64], rsnlen = 0;
+    bool ht = false, vht = false, wmm = false;
+    uint8_t sco = 0, vw = 0, vc = 0;
     for (uint32_t o = body + 12; o + 2 <= flen;) {
         uint8_t id = f[o], l = f[o + 1];
         if (o + 2 + l > flen) break;
@@ -660,6 +665,18 @@ static void handle_frame(const uint8_t *p, uint32_t plen)
             ds = e[0];
         } else if (id == 1 || id == 50) {       /* (extended) supported rates */
             for (int i = 0; i < l && nrates < sizeof rates; i++) rates[nrates++] = e[i];
+        } else if (id == 45 && l >= 26) {       /* HT capabilities */
+            ht = true;
+        } else if (id == 61 && l >= 22) {       /* HT operation: the secondary channel */
+            sco = e[1] & 3;
+            if (!(e[1] & 4)) sco = 0;           /* (20 MHz only) */
+        } else if (id == 191 && l >= 12) {      /* VHT capabilities */
+            vht = true;
+        } else if (id == 192 && l >= 5) {       /* VHT operation */
+            vw = e[0];
+            vc = e[1];
+        } else if (id == 221 && l >= 7 && e[0] == 0x00 && e[1] == 0x50 && e[2] == 0xf2 && e[3] == 2) {
+            wmm = true;                         /* WMM parameter / information element */
         } else if (id == 5 && l >= 2) {         /* TIM: the DTIM period */
             dtim = e[1] ? e[1] : 1;
             dtimcnt = e[0];
@@ -713,6 +730,8 @@ static void handle_frame(const uint8_t *p, uint32_t plen)
     n->nrates = nrates;
     memcpy(n->rsn, rsnie, rsnlen);
     n->rsnlen = rsnlen;
+    n->ht = ht; n->vht = vht; n->wmm = wmm;
+    n->sco = sco; n->vht_width = vw; n->vht_center = vc;
     if (rssi > n->rssi) n->rssi = rssi;
     if (g_ctx_mac && same6(bssid, g_ap.bssid)) {      /* our access point's beacon: the DTIM timing */
         g_ap_tsf = ((uint64_t)ld32(f + body + 4) << 32) | ld32(f + body);
@@ -927,7 +946,7 @@ static const uint8_t nvm_channels[51] = {
     96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144,
     149, 153, 157, 161, 165, 169, 173, 177, 181
 };
-typedef struct { uint8_t num, band; bool active; } Chan;
+typedef struct { uint8_t num, band; bool active; uint16_t flags; } Chan;
 static Chan g_chan[64];
 static int g_nchan;
 static uint8_t g_mac[6];
@@ -944,6 +963,7 @@ static void channel_map(const uint8_t *prof, uint32_t n, bool v4)
         g_chan[g_nchan].num = nvm_channels[i];
         g_chan[g_nchan].band = is5 ? 0 : 1;                   /* PHY_BAND_5 / _24 */
         g_chan[g_nchan].active = (fl & 8) != 0;               /* NVM_CHANNEL_ACTIVE */
+        g_chan[g_nchan].flags = (uint16_t)fl;                 /* (40MHZ 1<<9, 80MHZ 1<<10) */
         g_nchan++;
     }
     char b[220], *q = put_s(b, "wifi: channels ");
@@ -1102,7 +1122,7 @@ static void fill_probe(uint8_t *pp)
     memcpy(pp + 16, &v, 2);                     /* common_data: empty */
 }
 
-static bool start_scan(void)
+static bool start_scan(bool bg)
 {
     int ver = cmd_ver(GRP_LONG, 0x0d);
     say("scan command version ", (uint64_t)ver);
@@ -1115,8 +1135,13 @@ static bool start_scan(void)
     memcpy(g, &flags, 2);
     g[4] = 10; g[5] = 10;                       /* active dwell */
     g[6] = 2; g[7] = 8; g[8] = 10;              /* adaptive dwell: APs on 2.4, 5, social */
-    uint16_t budget = 300;
+    uint16_t budget = bg ? 100 : 300;
     memcpy(g + 10, &budget, 2);
+    if (bg) {                                   /* associated: back on our channel every 120 TU */
+        uint32_t t = 120;
+        memcpy(g + 12, &t, 4); memcpy(g + 16, &t, 4);   /* max out of channel, per LMAC */
+        memcpy(g + 20, &t, 4); memcpy(g + 24, &t, 4);   /* suspend time */
+    }
     memcpy(g + 28, &prio, 4);
     g[32] = 110; g[33] = 110;                   /* passive dwell */
     uint8_t *ch = c + 44;                       /* channel params v6 / v7 */
@@ -1192,7 +1217,7 @@ static void list_networks(void)
 
 /* ---- the queues between the card's thread and the rest ------------------ */
 typedef struct { uint16_t len; uint8_t d[1700]; } Pkt;
-#define EV_MAX      24
+#define EV_MAX      96
 #define NETRX_MAX   48
 #define REQ_MAX     8
 static Pkt g_ev[EV_MAX], g_netrx[NETRX_MAX], g_req[REQ_MAX];
@@ -1384,6 +1409,29 @@ static bool enable_queue(void)
 #define ACT_MODIFY  2
 #define ACT_REMOVE  3
 
+/* the channel width the AP and our NVM both allow (iwx_run's choice):
+   0 20, 1 40, 2 80 MHz; the control channel's position in it */
+static uint8_t g_bw, g_ctrl;
+static bool g_wide;                             /* the PHY context at that width (after association) */
+
+static void choose_width(void)
+{
+    g_bw = 0;
+    g_ctrl = 0;
+    uint16_t cf = 0;
+    for (int i = 0; i < g_nchan; i++) if (g_chan[i].num == g_ap.ch) cf = g_chan[i].flags;
+    if (!g_ap.ht) return;
+    if (g_ap.ch > 14 && g_ap.vht && g_ap.vht_width == 1 && (cf & (1u << 10)) && g_ap.vht_center) {
+        int d = (int)g_ap.ch - (int)g_ap.vht_center;
+        int pos = d == -6 ? 1 : d == -2 ? 0 : d == 2 ? 4 : d == 6 ? 5 : -1;   /* VHT_CTRL_POS_2/1_BELOW, 1/2_ABOVE */
+        if (pos >= 0) { g_bw = 2; g_ctrl = (uint8_t)pos; return; }
+    }
+    if (g_ap.sco && (cf & (1u << 9))) {
+        g_bw = 1;
+        g_ctrl = g_ap.sco == 1 ? 0 : 4;         /* the secondary above: we are below; below: above */
+    }
+}
+
 static bool ctx_phy(uint32_t action)
 {
     uint8_t c[32];
@@ -1393,14 +1441,17 @@ static bool ctx_phy(uint32_t action)
     uint32_t chn = g_ap.ch, lmac = (band == 1 || !has_capa(40)) ? 0 : 1, rx = 0, n;
     int rlc = cmd_ver(GRP_DATA_PATH, 0x08);
     if (rlc != 2) rx = ((uint32_t)g_rx_ant << 1) | (1u << 10) | (1u << 12);   /* valid chains, 1 idle, 1 active */
+    uint8_t w = g_wide ? g_bw : 0, cp = g_wide ? g_ctrl : 0;
     if (has_capa(48)) {                         /* ULTRA_HB_CHANNELS: the larger channel info */
         memcpy(c + 8, &chn, 4);
         c[12] = band;
+        c[13] = w;
+        c[14] = cp;
         memcpy(c + 16, &lmac, 4);
         memcpy(c + 20, &rx, 4);
         n = 32;
     } else {
-        c[8] = band; c[9] = (uint8_t)chn;
+        c[8] = band; c[9] = (uint8_t)chn; c[10] = w; c[11] = cp;
         memcpy(c + 12, &lmac, 4);
         memcpy(c + 16, &rx, 4);
         n = 28;
@@ -1448,6 +1499,7 @@ static bool ctx_mac(uint32_t action, bool assoc)
             q->cw_min = cwmin[i]; q->cw_max = (i < 2) ? 1023 : cwmax[i];
             q->aifsn = aifsn[i]; q->fifos = (uint8_t)(1u << fifo[i]); q->txop = txop[i];
         }
+        m.qos_flags = (g_ap.wmm ? 1u : 0) | (g_ap.ht ? 2u : 0);   /* UPDATE_EDCA, TGN */
         m.filter = 1u << 2;                     /* ACCEPT_GRP */
         if (!assoc) m.filter |= 1u << 6;        /* IN_BEACON: until we have the DTIM's timing */
         m.is_assoc = assoc;
@@ -1494,6 +1546,74 @@ static bool ctx_sta_add(void)
     if (g_resp_len >= 4 && (ld32(g_resp) & 0xff) != 1) { say("ADD_STA refused, status ", ld32(g_resp)); return false; }
     return true;
 }
+/* the station again after the association: the channel width it may use */
+static bool ctx_sta_update(void)
+{
+    AddSta s;
+    memset(&s, 0, sizeof s);
+    s.add_modify = 1;
+    s.station_flags_msk = (3u << 26) | (3u << 28) | (0xfu << 19);   /* FAT_EN, MIMO_EN, MAX_AGG_SIZE */
+    s.station_flags = ((uint32_t)g_bw << 26) | (3u << 19);           /* the width, 64 KB aggregates */
+    if (!send_cmd("ADD_STA (update)", 0x18, &s, sizeof s)) return false;
+    if (g_resp_len >= 4 && (ld32(g_resp) & 0xff) != 1) { say("ADD_STA update refused, status ", ld32(g_resp)); return false; }
+    return true;
+}
+
+/* the firmware's own rate scaling for the station (iwx_rs_init) */
+static bool g_tlc;
+
+static bool tlc_config(void)
+{
+    static const uint8_t r11g[12] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
+    uint16_t legacy = 0;
+    for (int i = 0; i < g_ap.nrates; i++)
+        for (int k = 0; k < 12; k++)
+            if ((g_ap.rates[i] & 0x7f) == r11g[k]) legacy |= (uint16_t)(1u << k);
+    bool vht = g_ap.vht && g_ap.ch > 14, ht = g_ap.ht;
+    uint8_t mode = vht ? 3 : ht ? 2 : 0;                        /* TLC_MNG_MODE_VHT / HT / NON_HT */
+    uint16_t mcs = vht ? (g_bw ? 0x3ff : 0x1ff) : ht ? 0xff : 0;   /* (VHT MCS 9 not at 20 MHz) */
+    uint8_t sgi = 0;
+    if (ht) sgi |= 1 | (g_bw >= 1 ? 2 : 0);
+    if (vht && g_bw == 2) sgi |= 4;
+    uint16_t mpdu = vht ? 3895 : ht ? 3839 : 2312;
+    uint8_t c[28];
+    memset(c, 0, sizeof c);
+    c[4] = g_bw;                                                /* max channel width */
+    c[5] = mode;
+    c[6] = 1;                                                   /* chain A */
+    memcpy(c + 10, &legacy, 2);
+    memcpy(c + 12, &mcs, 2);                                    /* ht_rates[NSS 1][up to 80 MHz] */
+    if (cmd_ver(GRP_DATA_PATH, 0x0f) == 4) {
+        c[7] = sgi;
+        memcpy(c + 24, &mpdu, 2);
+    } else {
+        memcpy(c + 20, &mpdu, 2);
+        c[22] = sgi;
+    }
+    say("rate scaling: mode (0 legacy, 2 HT, 3 VHT) ", mode);
+    say("  channel width (0 20, 1 40, 2 80 MHz) ", g_bw);
+    if (!send_cmd("TLC_MNG_CONFIG", WIDE(GRP_DATA_PATH, 0x0f), c, sizeof c)) return false;
+    g_tlc = true;
+    return true;
+}
+
+static void hdr80211(uint8_t *h, uint8_t fc0, uint8_t fc1, const uint8_t *a1, const uint8_t *a2, const uint8_t *a3);
+
+/* an ADDBA request (block-ack aggregation): declined for now -- the AP
+   then sends single frames (receiving aggregates needs the reordering) */
+static void addba_decline(const uint8_t *f, uint32_t flen)
+{
+    if (flen < 24 + 9) return;
+    uint8_t h[24], b[9];
+    hdr80211(h, 0xd0, 0, g_ap.bssid, g_mac, g_ap.bssid);
+    b[0] = 3; b[1] = 1;                                         /* block ack, ADDBA response */
+    b[2] = f[26];                                               /* the dialog token */
+    b[3] = 37; b[4] = 0;                                        /* status: request declined */
+    memcpy(b + 5, f + 27, 2);                                   /* its parameters */
+    b[7] = f[29]; b[8] = f[30];                                 /* its timeout */
+    tx_frame(h, b, sizeof b, 0, 0, TXF_RATE | TXF_NOENC, rate_mgmt());
+}
+
 static bool ctx_sta_remove(void)
 {
     uint32_t r = 0;                                          /* struct iwx_rm_sta_cmd: sta 0 */
@@ -1530,7 +1650,7 @@ static bool send_auth(void)
 
 static bool send_assoc(const uint8_t *rsn, uint32_t rsnlen)
 {
-    uint8_t h[24], b[260], *q = b;
+    uint8_t h[24], b[320], *q = b;
     hdr80211(h, 0x00, 0, g_ap.bssid, g_mac, g_ap.bssid);
     uint16_t cap = (uint16_t)(0x0001 | (g_ap.cap & (0x0010 | 0x0020 | 0x0400)));   /* ESS, privacy, short preamble / slot */
     *q++ = (uint8_t)cap; *q++ = (uint8_t)(cap >> 8);
@@ -1556,6 +1676,25 @@ static bool send_assoc(const uint8_t *rsn, uint32_t rsnlen)
         q += n - 8u;
     }
     if (rsnlen && rsnlen <= 64) { memcpy(q, rsn, rsnlen); q += rsnlen; }
+    if (g_ap.ht) {                                              /* HT capabilities: 1 stream, MCS 0-7 */
+        uint16_t hc = 0x000c | 0x0020 | (g_bw ? 0x0002 | 0x0040 : 0);   /* SM PS off, SGI 20, (40 MHz, SGI 40) */
+        *q++ = 45; *q++ = 26;
+        *q++ = (uint8_t)hc; *q++ = (uint8_t)(hc >> 8);
+        *q++ = 0x03;                                            /* A-MPDU: up to 64 KB */
+        memset(q, 0, 23);
+        q[0] = 0xff;                                            /* RX MCS 0-7 */
+        q += 23;
+    }
+    if (g_ap.vht && g_ap.ch > 14) {                             /* VHT capabilities: 1 stream, MCS 0-9 */
+        static const uint8_t vc[14] = { 191, 12, 0x20, 0, 0, 0, 0xfe, 0xff, 0, 0, 0xfe, 0xff, 0, 0 };   /* SGI 80 */
+        memcpy(q, vc, sizeof vc);
+        q += sizeof vc;
+    }
+    if (g_ap.wmm) {                                             /* WMM information: a QoS station, no U-APSD */
+        static const uint8_t wm[9] = { 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };
+        memcpy(q, wm, sizeof wm);
+        q += sizeof wm;
+    }
     return tx_frame(h, b, (uint32_t)(q - b), 0, 0, TXF_RATE | TXF_NOENC, rate_mgmt());
 }
 
@@ -1565,8 +1704,10 @@ static bool send_eth(const uint8_t *dst, const uint8_t *etype, const uint8_t *pl
     uint8_t h[24], llc[8] = { 0xaa, 0xaa, 0x03, 0, 0, 0, etype[0], etype[1] };
     bool prot = g_ptk;
     hdr80211(h, 0x08, (uint8_t)(0x01 | (prot ? 0x40 : 0)), g_ap.bssid, g_mac, dst);
-    uint32_t fl = TXF_RATE | (prot ? 0 : TXF_NOENC) | (eapol ? TXF_HIPRI : 0);
-    return tx_frame(h, llc, sizeof llc, pl, plen, fl, eapol ? rate_mgmt() : rate_data());
+    /* data: the firmware's rate scaling once it is set up, else 24 Mbit/s; EAPOL at the lowest rate */
+    bool own = eapol || !g_tlc;
+    uint32_t fl = (own ? TXF_RATE : 0) | (prot ? 0 : TXF_NOENC) | (eapol ? TXF_HIPRI : 0);
+    return tx_frame(h, llc, sizeof llc, pl, plen, fl, eapol ? rate_mgmt() : own ? rate_data() : 0);
 }
 
 /* ---- frames in: the link's ----------------------------------------------- */
@@ -1603,6 +1744,9 @@ static void data_rx(const uint8_t *f, uint32_t flen, uint8_t flags2, uint32_t st
     }
 }
 
+static volatile bool g_addba;
+static uint8_t g_addba_frame[33];
+
 static void link_frame(const uint8_t *f, uint32_t flen, uint8_t flags2, uint32_t status)
 {
     if (!g_ctx_mac) return;
@@ -1614,6 +1758,9 @@ static void link_frame(const uint8_t *f, uint32_t flen, uint8_t flags2, uint32_t
     } else if (sub == 1 && flen >= 30) {                        /* association response */
         g_assoc_status = ld16(f + 26);
         g_aid = ld16(f + 28) & 0x3fff;
+    } else if (sub == 13 && flen >= 33 && f[24] == 3 && f[25] == 0 && same6(f + 4, g_mac)) {
+        g_addba = true;                                         /* an ADDBA request: answered by the thread */
+        memcpy(g_addba_frame, f, 33);
     } else if (sub == 12 || sub == 10) {                        /* deauthentication, disassociation */
         g_lost_reason = ld16(f + 24);
         g_link_lost = true;
@@ -1634,6 +1781,7 @@ static void teardown(void)
 {
     g_link_up = false;
     g_ptk = g_gtk = false;
+    g_wide = g_tlc = false;
     int qv = cmd_ver(GRP_DATA_PATH, 0x17);
     if (g_ctx_queue && (qv == 0 || qv == 99)) queue_cfg(false);   /* (the new command: the station's removal does it) */
     g_ctx_queue = false;
@@ -1665,6 +1813,9 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     q = put_s(q, " on channel ");
     q = put_u(q, g_ap.ch);
     put_line(b, q);
+    choose_width();
+    g_wide = false;
+    g_tlc = false;
 
     if (!ctx_phy(ACT_ADD)) { join_failed(1, 1); return; }
     g_ctx_phy = true;
@@ -1690,7 +1841,11 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     if (g_assoc_status != 0) { say("association failed, status ", (uint64_t)(int64_t)g_assoc_status); join_failed(3, (uint16_t)g_assoc_status); return; }
     say("ASSOCIATED, AID ", g_aid & 0x7ff);
 
-    /* iwx_run: the MAC context now associated, multicast, power */
+    /* iwx_run: the channel at its width, the station, the MAC context
+       now associated, multicast, power, the rate scaling */
+    g_wide = true;
+    if (g_bw && !ctx_phy(ACT_MODIFY)) { g_wide = false; g_bw = 0; ctx_phy(ACT_MODIFY); }
+    if (g_ap.ht) ctx_sta_update();
     if (!ctx_mac(ACT_MODIFY, true)) { join_failed(1, 7); return; }
     uint8_t mc[12] = { 1, 0, 0, 1 };                            /* filter_own, port 0, no list, pass all */
     memcpy(mc + 4, g_ap.bssid, 6);
@@ -1699,6 +1854,7 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     memset(pw, 0, sizeof pw);
     pw[4] = 25;                                                 /* keep-alive 25 s, no power saving */
     send_cmd("MAC_POWER", 0xa9, pw, sizeof pw);
+    if (!tlc_config()) sayx("no rate scaling: data at 24 Mbit/s");
     ev_simple(0x83, g_aid & 0x7ff, 0);
 }
 
@@ -1743,6 +1899,7 @@ static void scan_events(void)
         memcpy(q, n->ssid, sl); q += sl;
         *q++ = n->rsnlen;
         memcpy(q, n->rsn, n->rsnlen); q += n->rsnlen;
+        for (int w = 0; w < 500 && (g_ev_h + 1) % EV_MAX == g_ev_t; w++) { service(); sched_sleep_ms(2); }   /* (wifid reads them) */
         ev_push(e, (uint32_t)(q - e), 0, 0);
     }
     ev_simple(0x82, (uint16_t)g_nbss, 0);
@@ -1750,8 +1907,8 @@ static void scan_events(void)
 
 static void scan_once(void)
 {
-    if (g_ctx_mac) { ev_simple(0x82, (uint16_t)g_nbss, 0); return; }       /* joined: no new scan */
-    if (!start_scan()) { ev_simple(0x82, 0, 0); return; }
+    /* (associated: a background scan -- the firmware keeps coming back to our channel) */
+    if (!start_scan(g_ctx_mac)) { ev_simple(0x82, 0, 0); return; }
     for (uint64_t until = timer_get_ms() + 20000; !g_scan_done && !g_fw_error && timer_get_ms() < until;) {
         service();
         sched_sleep_ms(2);
@@ -1834,6 +1991,7 @@ static void wifi_main(void)
         if (g_fw_error) { sayx("the card stopped (firmware error)"); ev_simple(0x87, 0xffff, 0); return; }
         int n = ring_get(g_req, REQ_MAX, &g_req_h, &g_req_t, &g_req_lock, r, sizeof r);
         if (n > 0) handle_req(r, (uint32_t)n);
+        if (g_addba) { g_addba = false; if (g_ctx_mac) addba_decline(g_addba_frame, sizeof g_addba_frame); }
         if (g_link_lost && g_ctx_mac) {
             g_link_lost = false;
             say("the access point dropped us, reason ", g_lost_reason);
@@ -1854,7 +2012,7 @@ static void wifi_up(void)
     if (!radio_up()) { step("the radio did not come up -- step 2 stops here"); return; }
     step("RADIO UP");
     for (int attempt = 0; attempt < 2; attempt++) {
-        if (!start_scan()) return;
+        if (!start_scan(false)) return;
         for (uint64_t until = timer_get_ms() + 20000; !g_scan_done && !g_fw_error && timer_get_ms() < until;) {
             service();
             sched_sleep_ms(2);
