@@ -680,7 +680,10 @@ static void LiveLoadInner(BootInfo *info)
     }
     /* partition 3 (type 0x7F, tools/livepack.c): the kernel's own log of
        the last boot, written there as it ran (kernel/sticklog.c) */
-    if (sec[0x1DE + 4] == 0x7F) KlogRescue(disk, *(UINT32 *)(sec + 0x1DE + 8), *(UINT32 *)(sec + 0x1DE + 12));
+    if (sec[0x1DE + 4] == 0x7F) {   /* (the log: partition 3's first 4 MB, the kernel slot after it) */
+        UINT32 kc = *(UINT32 *)(sec + 0x1DE + 12);
+        KlogRescue(disk, *(UINT32 *)(sec + 0x1DE + 8), kc > 8192 ? 8192 : kc);
+    }
     UINT8 head[512];
     if (packed) {
         int ok = !EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start, 512, head));
@@ -944,8 +947,9 @@ static EFI_STATUS InitGraphics(BootInfo *info) {
 }
 
 /* ============================================================
- * The kernel slot: partition 4 of a live stick (type 0x7E, 16 MB,
- * tools/livepack.c). Sector 0: "WYNKERN1", u32 bytes, u32 sum (FNV-1a of
+ * The kernel slot: 16 MB after the kernel log in partition 3 of a live
+ * stick (type 0x7F; partition 4 is the data area, apps/persist), or
+ * partition 4 itself on older sticks (type 0x7E) -- tools/livepack.c. Sector 0: "WYNKERN1", u32 bytes, u32 sum (FNV-1a of
  * them), 64 bytes of text (what it is); then the kernel's ELF. Written
  * by test-wyn k (rootfs/usr/bin/test-wyn) from the developer's machine
  * (make devkernel, tools/kslot.py): a new kernel without flashing the
@@ -972,8 +976,13 @@ static UINT8 *SlotKernel(UINTN *size)
 {
     static UINT8 sec[512], hdr[512];
     EFI_BLOCK_IO_PROTOCOL *disk = FindOurDisk(sec);
-    if (!disk || sec[0x1EE + 4] != 0x7E) return NULL;
-    UINT32 start = *(UINT32 *)(sec + 0x1EE + 8), count = *(UINT32 *)(sec + 0x1EE + 12);
+    if (!disk) return NULL;
+    UINT32 start, count;
+    if (sec[0x1EE + 4] == 0x7E) {
+        start = *(UINT32 *)(sec + 0x1EE + 8); count = *(UINT32 *)(sec + 0x1EE + 12);
+    } else if (sec[0x1DE + 4] == 0x7F && *(UINT32 *)(sec + 0x1DE + 12) > 8192 + 2) {
+        start = *(UINT32 *)(sec + 0x1DE + 8) + 8192; count = *(UINT32 *)(sec + 0x1DE + 12) - 8192;
+    } else return NULL;
     if (count < 2 || EFI_IS_ERROR(disk->ReadBlocks(disk, disk->Media->MediaId, start, 512, hdr))) return NULL;
     for (int i = 0; i < 8; i++) if (hdr[i] != (UINT8)"WYNKERN1"[i]) return NULL;
     UINT32 bytes = *(UINT32 *)(hdr + 8), sum = *(UINT32 *)(hdr + 12);

@@ -10,7 +10,10 @@
  *   stick.img = disk.img's LBA 0 up to its root partition (the MBR and the
  *               ESP the firmware boots from), then the pack where the root
  *               partition was (partition 2, type 0xDA: no file system),
- *               then 4 MB for the running kernel's log (partition 3, 0x7F);
+ *               then partition 3 (0x7F): 4 MB for the running kernel's log
+ *               and after it 16 MB for a kernel sent over the network
+ *               (boot/boot.c SlotKernel, test-wyn k) -- in the image, so a
+ *               stick written again starts with the image's own kernel;
  *               partition 4 (0x7D) is the data area a live boot keeps its
  *               things in (apps/persist): from 1 GiB on the stick, past
  *               the image -- written to a stick again, the image leaves it
@@ -32,6 +35,7 @@
 #define CHUNK   (4u << 20)          /* RAMDISK_CHUNK (include/wynland/boot_info.h) */
 #define HBITS   16
 #define KLOG_SECTORS 8192u            /* 4 MB: the kernel log area, partition 3 */
+#define SLOT_SECTORS 32768u           /* 16 MB: the kernel slot, after the log in partition 3 */
 #define DATA_LBA 2097152u             /* 1 GiB: the data area, partition 4 (apps/persist) */
 #define DATA_SECTORS 2048u            /* 1 MB until persistd grows it */
 
@@ -167,14 +171,14 @@ int main(int argc, char **argv)
     memcpy(mbr + 0x1CE + 12, &psec, 4);
     /* partition 3: 4 MB where the running kernel keeps its log (type 0x7F,
        kernel/sticklog.c; the next boot's loader saves it to \logs) */
-    uint32_t kstart = (root + psec + 2047) / 2048 * 2048, kcount = KLOG_SECTORS;
+    uint32_t kstart = (root + psec + 2047) / 2048 * 2048, kcount = KLOG_SECTORS + SLOT_SECTORS;
     memset(mbr + 0x1DE, 0, 16);
     mbr[0x1DE + 4] = 0x7F;
     memcpy(mbr + 0x1DE + 8, &kstart, 4);
     memcpy(mbr + 0x1DE + 12, &kcount, 4);
     /* partition 4: the data area (type 0x7D, apps/persist), at 1 GiB --
        nothing of it in the image, so writing a new one keeps what is there.
-       (It was a slot for a kernel sent over the network, never wanted.) */
+       (The kernel slot that was partition 4 is in partition 3 now.) */
     if (kstart + kcount > DATA_LBA) {
         fprintf(stderr, "livepack: the image reaches past 1 GiB, into the data area\n");
         return 1;

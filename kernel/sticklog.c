@@ -85,6 +85,7 @@ static void sticklog_thread(void *arg)
     if (!wyn_disk_is_ours(mbr) || mbr[0x1DE + 4] != 0x7F) { sl_say("no log area on the stick, partition 3 type ", mbr[0x1DE + 4]); return; }
     uint32_t start = mbr[0x1DE + 8] | mbr[0x1DE + 9] << 8 | mbr[0x1DE + 10] << 16 | (uint32_t)mbr[0x1DE + 11] << 24;
     uint32_t count = mbr[0x1DE + 12] | mbr[0x1DE + 13] << 8 | mbr[0x1DE + 14] << 16 | (uint32_t)mbr[0x1DE + 15] << 24;
+    if (count > 8192) count = 8192;   /* its first 4 MB: the kernel slot follows (tools/livepack.c) */
     if (count < 2) return;
     g_sl_cap = (uint64_t)(count - 1) * 512;
     g_sl_area = (uint64_t)start * 512;
