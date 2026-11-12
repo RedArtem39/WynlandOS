@@ -282,6 +282,7 @@ F  /lib64/libdisplay-info.so.3       /usr/lib/x86_64-linux-gnu/libdisplay-info.s
 S /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt
 F  /etc/resolv.conf             rootfs/etc/resolv.conf
 F  /etc/hosts                   rootfs/etc/hosts
+F  /etc/nsswitch.conf           rootfs/etc/nsswitch.conf
 
 Fo /test_signals.elf build/test_signals.elf
 Fo /test_vma.elf build/test_vma.elf

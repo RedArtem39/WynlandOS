@@ -59,6 +59,9 @@ OS_IDENTITY = {"/etc/os-release", "/usr/lib/os-release", "/etc/lsb-release",
 SKIP_PREFIXES = ("./usr/share/doc/", "./usr/share/man/", "./usr/share/info/",
                  "./usr/share/locale/", "./usr/share/lintian/")
 
+# dependencies Debian leaves out because the target is Essential
+IMPLICIT = {"debconf": ("perl-base",)}
+
 USE_COLOR = sys.stdout.isatty()
 
 
@@ -368,11 +371,16 @@ class State:
         except (FileNotFoundError, json.JSONDecodeError):
             self.db = {}
         self.base = {}
+        self.base_prov = {}      # what the image's packages Provide: {name: [(pkg, version)]}
         try:
             for line in open(BASE):
+                line, _, prov = line.rstrip("\n").partition("\t")
                 f = line.split()
                 if len(f) >= 2:
                     self.base[f[0]] = f[1]
+                    for alts in parse_rel(prov):
+                        for pname, _, pver in alts:
+                            self.base_prov.setdefault(pname, []).append((f[0], pver))
         except FileNotFoundError:
             pass
 
@@ -391,6 +399,9 @@ class State:
                     out.append(n)
             elif op is None and name in rec.get("provides", []):
                 out.append(n)
+        # the image's (libqt6core6t64's qt6-base-private-abi (= 6.10.2): every
+        # Qt module needs it, and it was "unmet")
+        out += [n for n, pv in self.base_prov.get(name, ()) if n not in self.db and prov_ok(pv, op, ver)]
         return out
 
     def save(self):
@@ -424,10 +435,11 @@ def resolve(index, state, names, upgrade=False):
             return True
         rec = index.pkgs.get(name)
         if rec is None:
-            for prov, pver in index.provides.get(name, []):
-                if prov_ok(pver, op, ver):
-                    rec = index.pkgs[prov]
-                    break
+            # a virtual package: each provider in turn, until one fits
+            provs = [index.pkgs[p] for p, pv in index.provides.get(name, []) if prov_ok(pv, op, ver)]
+            if len(provs) > 1:
+                return try_alts([(p["Package"], None, None) for p in provs], why)
+            rec = provs[0] if provs else None
         if rec is None or (op and rec["Package"] == name and not satisfies(rec["Version"], op, ver)):
             return False
         n = rec["Package"]
@@ -441,14 +453,41 @@ def resolve(index, state, names, upgrade=False):
             held.append(f"{n} {state.base[n]}")
             return False
         plan[n] = rec
-        for field in ("Pre-Depends", "Depends"):
-            for alts in parse_rel(rec.get(field, "")):
+        ok = True
+        # Essential packages are never named as dependencies (Debian assumes
+        # them); the ones the image does not have are added where they are
+        # needed: debconf's frontend is perl ("frontend: not found" broke
+        # iproute2's postinst)
+        implicit = ",".join(IMPLICIT.get(n, ()))
+        for field in ("Pre-Depends", "Depends", None):
+            for alts in parse_rel(rec.get(field, "") if field else implicit):
                 if any(dep_met(state, plan, a, o, v) for a, o, v in alts):
                     continue
-                if not any(want(a, o, v, why=n) for a, o, v in alts):
+                if not try_alts(alts, n):
                     missing.append(f"{n} needs {' | '.join(a + (f' ({o} {v})' if o else '') for a, o, v in alts)}")
+                    ok = False
         order.append(n)
-        return True
+        return ok
+
+    def try_alts(alts, why):
+        """the first of 'a | b | c' that resolves with all it needs; what a
+        failed one put in the plan is taken out again before the next is
+        tried (systemd, needing a newer libsystemd0 than the image's, used
+        to sink evince although another alternative fitted)"""
+        first = None
+        for a, o, v in alts:
+            snap = (dict(plan), len(order), len(missing), len(held))
+            if want(a, o, v, why=why):
+                return True
+            if first is None:
+                first = (missing[snap[2]:], held[snap[3]:])
+            plan.clear()
+            plan.update(snap[0])
+            del order[snap[1]:], missing[snap[2]:], held[snap[3]:]
+        if first:   # (why the first, preferred one did not fit)
+            missing.extend(first[0])
+            held.extend(first[1])
+        return False
 
     for name in names:
         if name not in index.pkgs and name not in index.provides:
@@ -459,7 +498,7 @@ def resolve(index, state, names, upgrade=False):
         if not upgrade and name in state.db:
             say(f"{name} {state.db[name]['version']} is installed already")
             continue
-        if not want(name):
+        if not want(name) and not missing:
             die(f"cannot install {name}")
     if missing:
         msg = "unmet dependencies:\n  " + "\n  ".join(missing)
