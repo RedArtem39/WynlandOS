@@ -595,6 +595,23 @@ int main(int argc, char **argv)
         ss.ss_flags = SS_DISABLE;
         sigaltstack(&ss, NULL);
     }
+    {   /* sigwait(): a blocked signal raised is taken, not delivered;
+           sigtimedwait() with nothing pending ends with EAGAIN (it was a
+           missing call: VLC's main thread sigwait()s and quit at once) */
+        sigset_t set, old;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &set, &old);
+        raise(SIGUSR1);
+        int got = 0;
+        int r = sigwait(&set, &got);
+        struct timespec ts = { 0, 50000000 };
+        siginfo_t si;
+        int r2 = sigtimedwait(&set, &si, &ts);
+        int e2 = errno;
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        check(r == 0 && got == SIGUSR1 && r2 == -1 && e2 == EAGAIN, "sigwait takes a blocked signal; sigtimedwait times out");
+    }
     /* re-exec'd by the posix_spawn test */
     if (argc > 1 && strcmp(argv[1], "child5") == 0) return 5;
 

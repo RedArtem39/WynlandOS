@@ -8054,6 +8054,56 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                 return 0;
             }
 
+        case 128: // SYS_rt_sigtimedwait(set, info, timeout, sigsetsize): sigwait(), sigwaitinfo()
+            {
+                /* A signal of the set pending (blocked, so not delivered)
+                   is taken and its number returned; else wait for one.
+                   It was missing: glibc's sigwait() failed at once, and VLC,
+                   whose main thread sigwait()s for SIGINT/SIGTERM, took that
+                   for being told to quit -- its windows closed as they
+                   opened. A process's signals are its main thread's
+                   (signal_process()), taken from there by any thread. */
+                uint64_t m;
+                if (a4 != 8) return (uint64_t)-22;
+                if (copy_from_user(&m, (const void *)a1, 8) != 0) return (uint64_t)-14;
+                uint64_t want = (m << 1) & ~((1ULL << 9) | (1ULL << 19));
+                Thread *st = sched_current();
+                Thread *mt = proc->main_thread;
+                uint64_t deadline = ~0ULL;
+                bool once = false;
+                if (a3) {
+                    int64_t ts[2];
+                    if (copy_from_user(ts, (const void *)a3, sizeof ts) != 0) return (uint64_t)-14;
+                    if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000) return (uint64_t)-22;
+                    if (ts[0] == 0 && ts[1] == 0) once = true;
+                    else deadline = timer_get_ms() + (uint64_t)ts[0] * 1000 + ((uint64_t)ts[1] + 999999) / 1000000;
+                }
+                for (;;) {
+                    Thread *from = st;
+                    uint64_t pend = __atomic_load_n(&st->sig_pending, __ATOMIC_SEQ_CST) & want;
+                    if (!pend && mt && mt != st && mt->state != THREAD_STATE_TERMINATED) {
+                        pend = __atomic_load_n(&mt->sig_pending, __ATOMIC_SEQ_CST) & want;
+                        from = mt;
+                    }
+                    if (pend) {
+                        int sig = __builtin_ctzll(pend);
+                        __atomic_and_fetch(&from->sig_pending, ~(1ULL << sig), __ATOMIC_SEQ_CST);
+                        if (a2) {
+                            int32_t si[32];
+                            memset(si, 0, sizeof si);
+                            si[0] = sig;                      /* si_signo; si_code 0: SI_USER */
+                            if (copy_to_user((void *)a2, si, sizeof si) != 0) return (uint64_t)-14;
+                        }
+                        return (uint64_t)sig;
+                    }
+                    uint64_t now = timer_get_ms();
+                    if (once || now >= deadline) return (uint64_t)-11;   /* -EAGAIN */
+                    if (sleep_interrupted() || sched_dying()) return (uint64_t)-4;
+                    /* (a blocked signal wakes no one: looked at again in slices) */
+                    waitqueue_wait_ms(&proc->child_wq, deadline - now < 50 ? deadline : now + 50);
+                }
+            }
+
         case 130: // SYS_rt_sigsuspend(mask, sigsetsize): wait for a signal with mask in place
             {
                 uint64_t m;
