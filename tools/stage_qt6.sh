@@ -163,7 +163,7 @@ gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
 # own, for every library that calls them
 g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
     apps/zerp2/main.cpp apps/zerp2/zerp2.cpp apps/zerp2/greeter.cpp apps/zerp2/hypripc.cpp apps/zerp2/zlayershell.cpp     "$B/qwayland-server-wlr-layer-shell-unstable-v1.cpp" "$B/wlr-layer-shell-protocol.o" "$B/xdg-shell-protocol.o" -I"$B"     "$B/moc_zerp2.cpp" "$B/moc_greeter.cpp" "$B/moc_hypripc.cpp" "$B/moc_zlayershell.cpp" \
-    apps/zerp2/zglobalshortcuts.cpp apps/zerp2/keybinds.cpp "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp" \
+    apps/zerp2/zglobalshortcuts.cpp apps/zerp2/keybinds.cpp apps/zerp2/nightlight.cpp "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp" \
     "$B/hyprland-global-shortcuts-protocol.o" "$B/moc_zglobalshortcuts.cpp" \
     apps/zerp2/zsessionlock.cpp "$B/qwayland-server-ext-session-lock-v1.cpp" "$B/ext-session-lock-protocol.o" "$B/moc_zsessionlock.cpp" \
     "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
