@@ -34,6 +34,31 @@ extern "C" {
 Q_IMPORT_PLUGIN(QWynlandFbIntegrationPlugin)
 
 static WPEDisplay *g_display;
+static WebKitNetworkSession *g_session;
+
+// One session for every tab, kept on disk: cookies in SQLite under
+// ~/.local/share/web, the cache in ~/.cache/web. Left to the default
+// session the cookies were only in the network process's memory -- a
+// YouTube sign-in was gone again after a click to the next video.
+// Intelligent Tracking Prevention off: it cut google.com's cookies out of
+// youtube.com (other browsers don't), and that is a sign-out too.
+static WebKitNetworkSession *web_session()
+{
+    if (g_session) return g_session;
+    gchar *data = g_build_filename(g_get_user_data_dir(), "web", NULL);
+    gchar *cache = g_build_filename(g_get_user_cache_dir(), "web", NULL);
+    g_mkdir_with_parents(data, 0700);
+    g_mkdir_with_parents(cache, 0700);
+    g_session = webkit_network_session_new(data, cache);
+    webkit_network_session_set_itp_enabled(g_session, FALSE);
+    WebKitCookieManager *cm = webkit_network_session_get_cookie_manager(g_session);
+    gchar *db = g_build_filename(data, "cookies.sqlite", NULL);
+    webkit_cookie_manager_set_persistent_storage(cm, db, WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+    webkit_cookie_manager_set_accept_policy(cm, WEBKIT_COOKIE_POLICY_ACCEPT_NO_THIRD_PARTY);
+    fprintf(stderr, "[web] session: %s (cookies %s)\n", data, db);
+    g_free(db); g_free(cache); g_free(data);
+    return g_session;
+}
 
 
 // ---------------------------------------------------------------- GLib side
@@ -93,7 +118,8 @@ WebView::WebView(QQuickItem *parent) : QQuickPaintedItem(parent)
     setFillColor(Qt::transparent);   /* rounded corners show what's behind */
     setOpaquePainting(false);
 
-    m_web = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", g_display, NULL));
+    m_web = WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", g_display,
+                                         "network-session", web_session(), NULL));
     m_view = webkit_web_view_get_wpe_view(m_web);
     wyn_wpe_view_set_frame_func(m_view, on_frame, this);
 
@@ -365,6 +391,7 @@ int main(int argc, char **argv)
 
     // WebKit's main-thread setup before any other WebKit/WPE object
     webkit_web_context_get_default();
+    web_session();
     const QSize scr = app.primaryScreen() ? app.primaryScreen()->size() : QSize(1600, 900);
     g_display = wyn_wpe_display_new(scr.width(), scr.height());
 
