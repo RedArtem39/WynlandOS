@@ -16,7 +16,14 @@ import os
 import subprocess
 import sys
 
-out_path, manifests = sys.argv[1], sys.argv[2:]
+args = sys.argv[1:]
+complete_path = None
+if "--complete" in args:              # --complete FILE: manifest lines for what the image lacks
+    i = args.index("--complete")
+    complete_path = args[i + 1]
+    del args[i:i + 2]
+out_path, manifests = args[0], args[1:]
+complete = []
 pkgs = {}
 provides = {}      # their Provides fields: leaf meets virtual dependencies with them
 
@@ -50,8 +57,40 @@ def ships(deb):
         (libs if re.search(r"\.so(\.|$)", os.path.basename(p)) else other).append(p)
     if not libs and not other:
         return True                     # (a metapackage, nothing of its own)
-    return (any(os.path.basename(p) in shipped_names for p in libs) or
-            any(p in shipped or p.replace("/usr/bin/", "/bin/") in shipped for p in other))
+    counted = (any(os.path.basename(p) in shipped_names for p in libs) or
+               any(p in shipped or p.replace("/usr/bin/", "/bin/") in shipped for p in other))
+    if counted and complete_path is not None:
+        finish(deb, r.stdout)
+    return counted
+
+
+def finish(deb, listing):
+    """A package the image has only part of: the libraries in the main
+    directory it lacks, from the stage's own copy (--complete). Counted as
+    the system's, leaf never installs it -- libgstreamer-plugins-extra1.0-0
+    came without libgstplay-1.0.so.0, and gnome-text-editor did not start."""
+    root = os.path.join(deb.split("/debs/")[0], "root")
+    files, alias = [], {}
+    for line in listing.splitlines():
+        if not line:
+            continue
+        if line[0] == "l" and " -> " in line:
+            link = line.split(" -> ")[0].split()[-1].lstrip(".")
+            target = os.path.normpath(os.path.join(os.path.dirname(link), line.split(" -> ")[1].strip()))
+            alias.setdefault(target, set()).add(os.path.basename(link))
+        elif line[0] == "-":
+            files.append(line.split()[-1].lstrip("."))
+    for p in files:
+        if os.path.dirname(p) != "/usr/lib/x86_64-linux-gnu" or not re.search(r"\.so\.\d", os.path.basename(p)):
+            continue
+        names = {os.path.basename(p)} | alias.get(p, set())
+        if names & shipped_names or not os.path.isfile(root + p):
+            continue
+        so = min((x for x in names if re.search(r"\.so\.\d+$", x)), key=len, default=os.path.basename(p))
+        complete.append(f"F /lib64/{so} {root}{p}")
+        complete.append(f"S /usr/lib/x86_64-linux-gnu/{so} /lib64/{so}")
+        shipped_names.add(so)
+
 
 for deb in glob.glob(os.path.expanduser("~/.cache/wynland-*/debs/*.deb")):
     r = subprocess.run(["dpkg-deb", "-f", deb, "Package", "Version", "Provides"], capture_output=True, text=True)
@@ -104,6 +143,11 @@ q = subprocess.run(["dpkg-query", "-W", "-f", "${Package} ${Version}\n", *OWN], 
 for line in q.stdout.splitlines():
     n, v = line.split()
     pkgs[n] = v
+
+if complete_path is not None:
+    with open(complete_path, "w") as f:
+        f.write("".join(l + "\n" for l in complete))
+    print(f"  LEAF       {len(complete) // 2} libraries completed (packages the image had only part of)")
 
 with open(out_path, "w") as f:
     for n in sorted(pkgs):

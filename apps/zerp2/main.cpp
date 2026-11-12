@@ -614,6 +614,11 @@ int main(int argc, char **argv)
         // (ours, the Zerp clients, pick their own)
         qputenv("WAYLAND_DISPLAY", "wayland-0");
         qputenv("QT_QPA_PLATFORM", "wayland");
+        // Qt 5 programs (VLC) read /usr/bin/qt.conf too, which points at
+        // Qt 6's plugins: no "wayland" platform for them, no window. Their
+        // own directory, searched first; Qt 6 takes Qt 5's plugins for
+        // "not a plugin" and goes on to its own (Qt 5 does the same)
+        qputenv("QT_PLUGIN_PATH", "/usr/lib/x86_64-linux-gnu/qt5/plugins");
         // Qt clients read the same variable for their side: theirs is
         // wayland-egl (Mesa's EGL; it speaks linux-dmabuf to us)
         qputenv("QT_WAYLAND_CLIENT_BUFFER_INTEGRATION", "wayland-egl");

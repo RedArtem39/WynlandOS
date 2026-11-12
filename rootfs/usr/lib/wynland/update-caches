@@ -1,0 +1,31 @@
+#!/bin/sh
+# WynlandOS - the caches dpkg's triggers keep up to date, made again: the
+# compiled GSettings schemas, gdk-pixbuf's image loaders, GIO's modules,
+# GTK 3's input methods, the MIME database, icon caches, desktop files.
+# leaf runs it after installing or removing (its dpkg-trigger is a stand-in:
+# GTK programs found no settings and "No image loaders are configured"),
+# wynrc at boot (service "caches": a live stick's kept packages come back
+# without the caches, which are made, not packaged).
+#   update-caches         the quick ones
+#   update-caches all     also MIME, icons, desktop files, fonts
+L=/usr/lib/x86_64-linux-gnu
+[ -d /usr/share/glib-2.0/schemas ] && [ -x $L/glib-2.0/glib-compile-schemas ] &&
+    $L/glib-2.0/glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null
+[ -d $L/gio/modules ] && [ -x $L/glib-2.0/gio-querymodules ] &&
+    $L/glib-2.0/gio-querymodules $L/gio/modules 2>/dev/null
+[ -x $L/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders ] &&
+    $L/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders --update-cache 2>/dev/null
+[ -x $L/libgtk-3-0t64/gtk-query-immodules-3.0 ] &&
+    $L/libgtk-3-0t64/gtk-query-immodules-3.0 --update-cache 2>/dev/null
+[ "$1" = all ] || exit 0
+[ -d /usr/share/mime/packages ] && command -v update-mime-database >/dev/null &&
+    update-mime-database /usr/share/mime 2>/dev/null
+if command -v gtk-update-icon-cache >/dev/null; then
+    for t in /usr/share/icons/*/; do
+        [ -f "$t/index.theme" ] && gtk-update-icon-cache -q -f -t "$t" 2>/dev/null
+    done
+fi
+[ -d /usr/share/applications ] && command -v update-desktop-database >/dev/null &&
+    update-desktop-database -q /usr/share/applications 2>/dev/null
+command -v fc-cache >/dev/null && fc-cache 2>/dev/null
+exit 0

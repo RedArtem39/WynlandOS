@@ -10,7 +10,9 @@
 #   leaf update                  fetch the package lists
 #   leaf search WORD...          packages whose name or summary has WORD
 #   leaf show PKG                about a package
-#   leaf install PKG...          install, with what they depend on
+#   leaf install PKG...          install, with what they depend on and
+#                                recommend, as apt (--no-install-recommends:
+#                                only the dependencies)
 #   leaf remove PKG...           remove what leaf installed
 #   leaf upgrade                 newer versions of installed packages
 #   leaf list [--installed|--base]
@@ -319,7 +321,7 @@ def update_suite(url, suite, comps, have_gpgv):
         print(f"   {comp}: {len(index)} packages")
 
 
-KEEP = ("Package", "Version", "Depends", "Pre-Depends", "Provides", "Filename",
+KEEP = ("Package", "Version", "Depends", "Pre-Depends", "Recommends", "Provides", "Filename",
         "Size", "SHA256", "Description", "Installed-Size", "Section", "Conflicts",
         "Breaks", "Replaces", "Architecture", "Essential", "Priority")
 
@@ -423,7 +425,7 @@ def dep_met(state, plan, name, op, ver):
     return False
 
 
-def resolve(index, state, names, upgrade=False):
+def resolve(index, state, names, upgrade=False, recommends=True):
     """the records to install for names, dependencies first"""
     plan = {}
     order = []
@@ -466,8 +468,38 @@ def resolve(index, state, names, upgrade=False):
                 if not try_alts(alts, n):
                     missing.append(f"{n} needs {' | '.join(a + (f' ({o} {v})' if o else '') for a, o, v in alts)}")
                     ok = False
+        # Recommends, as apt installs them (APT::Install-Recommends): what
+        # a program needs to be whole -- Qt5 programs' Wayland plugin
+        # (qtwayland5: without it VLC never showed a window), wine's X
+        # libraries. One that cannot be had is left out, never an error.
+        # Ubuntu's base system (priority required, important, standard: apt,
+        # locales, ca-certificates, perl, openssl ...) apt always finds
+        # installed, so it never pulls those in as recommendations -- here
+        # neither: the image is the base system.
+        if recommends and ok:
+            for alts in parse_rel(rec.get("Recommends", "")):
+                if any(dep_met(state, plan, a, o, v) for a, o, v in alts):
+                    continue
+                # (a group with a base package in it is met on Ubuntu:
+                # "locales | locales-all" pulled the 200 MB locales-all)
+                if any(index.pkgs.get(a, {}).get("Priority") in ("required", "important", "standard")
+                       for a, o, v in alts):
+                    continue
+                try_soft(alts, n)
         order.append(n)
         return ok
+
+    def try_soft(alts, why):
+        """a recommendation: the first alternative that resolves cleanly,
+        else nothing -- and nothing it planned stays"""
+        for a, o, v in alts:
+            snap = (dict(plan), len(order), len(missing), len(held))
+            if want(a, o, v, why=why) and len(missing) == snap[2]:
+                return True
+            plan.clear()
+            plan.update(snap[0])
+            del order[snap[1]:], missing[snap[2]:], held[snap[3]:]
+        return False
 
     def try_alts(alts, why):
         """the first of 'a | b | c' that resolves with all it needs; what a
@@ -809,15 +841,35 @@ def do_install(index, state, recs, explicit):
         if name in state.db:
             state.db[name]["auto"] = False
     state.save()
+    update_caches()
     say(f"installed {len(recs)} package(s)")
 
 
 # ------------------------------------------------------------------ commands
 
+def no_recommends(args):
+    """--no-install-recommends (apt's) or --no-recommends: only what the
+    packages depend on"""
+    flags = {"--no-install-recommends", "--no-recommends"}
+    return [a for a in args if a not in flags], not any(a in flags for a in args)
+
+
+def update_caches():
+    """what dpkg's triggers do after packages come and go: GSettings
+    schemas compiled, gdk-pixbuf's loaders and GIO's modules listed, MIME,
+    icons, desktop files, fonts (rootfs/usr/lib/wynland/update-caches) --
+    without them GTK programs had no settings and could not load an icon"""
+    tool = os.path.join(ROOT, "usr/lib/wynland/update-caches")
+    if ROOT == "/" and os.access(tool, os.X_OK):
+        say("updating caches (schemas, icons, MIME, fonts)")
+        subprocess.run([tool, "all"])
+
+
 def cmd_install(args):
     need_root()
+    args, rec = no_recommends(args)
     index, state = Index(), State()
-    recs = resolve(index, state, args)
+    recs = resolve(index, state, args, recommends=rec)
     do_install(index, state, recs, args)
 
 
@@ -864,6 +916,7 @@ def cmd_remove(args):
         del state.db[name]
         state.save()
         print(f"   {c('31', 'removed')} {name}")
+    update_caches()
     # dependencies nothing needs any more
     orphans = [n for n, r in state.db.items() if r.get("auto") and not any(
         a[0] == n for o in state.db.values() for g in parse_rel(o.get("depends", "")) for a in g)]

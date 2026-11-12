@@ -2,7 +2,7 @@
 # WynlandOS - a C/C++ compiler from Ubuntu (clang, through leaf) building
 # and running programs here (shtest runs it; needs the network).
 cd "$(mktemp -d)"
-echo wyn | ary -S leaf install clang make > /tmp/clang-install.log 2>&1 || { echo "leaf install failed"; tail -3 /tmp/clang-install.log; exit 1; }
+echo wyn | ary -S leaf install --no-install-recommends clang make > /tmp/clang-install.log 2>&1 || { echo "leaf install failed"; tail -3 /tmp/clang-install.log; exit 1; }
 
 cat > a.c <<'EOF'
 #include <stdio.h>

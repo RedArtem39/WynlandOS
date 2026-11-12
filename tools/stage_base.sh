@@ -30,6 +30,7 @@ PKGS="gnu-coreutils fish fish-common dash grep sed mawk less findutils tar gzip
  xwayland xserver-common x11-xkb-utils xterm xbitmaps libxfont2 libfontenc1 libxcvt0
  libxkbfile1 libxaw7 libxmu6 libxft2 libxpm4 libutempter0 libei1 liboeffis1
  bubblewrap
+ glycin-loaders
  fastfetch libyyjson0
  man-db groff-base libpipeline1 libgdbm6t64 libuchardet0 libseccomp2
  w3m libgc1 libgpm2
@@ -231,6 +232,15 @@ L=$REPO/apps/leaf
     echo "F /usr/lib/wynland/mktestuser $REPO/rootfs/usr/lib/wynland/mktestuser"
     echo "F /usr/lib/wynland/mkliveuser $REPO/rootfs/usr/lib/wynland/mkliveuser"
     echo "F /usr/lib/wynland/dbus-system $REPO/rootfs/usr/lib/wynland/dbus-system"
+    # the caches dpkg's triggers keep (rootfs/usr/lib/wynland/update-caches;
+    # leaf and the "caches" service run it), and the host's tools for them
+    echo "F /usr/lib/wynland/update-caches $REPO/rootfs/usr/lib/wynland/update-caches"
+    echo "D /usr/lib/x86_64-linux-gnu/glib-2.0"
+    echo "D /usr/lib/x86_64-linux-gnu/gdk-pixbuf-2.0"
+    for t in glib-2.0/glib-compile-schemas glib-2.0/gio-querymodules gdk-pixbuf-2.0/gdk-pixbuf-query-loaders; do
+        [ -x "/usr/lib/x86_64-linux-gnu/$t" ] && echo "F /usr/lib/x86_64-linux-gnu/$t /usr/lib/x86_64-linux-gnu/$t"
+    done
+    echo "S /usr/bin/glib-compile-schemas /usr/lib/x86_64-linux-gnu/glib-2.0/glib-compile-schemas"
     echo "F /usr/lib/wynland/bluez-stub $OUT/bluez-stub"
     echo "F /usr/lib/wynland/wifid $OUT/wifid"
     echo "F /usr/bin/wifi $OUT/wifi"
@@ -243,7 +253,8 @@ L=$REPO/apps/leaf
     echo "D /etc/dbus-1"
     echo "D /etc/dbus-1/system.d"
     echo "F /etc/dbus-1/system.d/wynland-bluez-stub.conf $REPO/rootfs/etc/dbus-1/system.d/wynland-bluez-stub.conf"
-    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub wifid persist persistd; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    for s in wynlogin testuser liveuser xvdemouser dbus bluez-stub wifid persist persistd caches; do echo "F /etc/wynrc/services/$s $REPO/rootfs/etc/wynrc/services/$s"; done
+    echo "D /var/log"          # (postinst scripts write logs there: fontconfig)
     echo "D /var/lib/greeter"
     echo "P /var/lib/greeter 990 40755"
     # each account's look on the login screen (xvlet's settings write it,

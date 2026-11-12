@@ -178,7 +178,7 @@ static const struct sh_case CASES[] = {
     { "/bin/sh", "leaf: update (InRelease checked by gpgv)",
       "echo wyn | ary -S leaf update > /tmp/leaf-update.log 2>&1; r=$?; [ $r = 0 ] || tail -6 /tmp/leaf-update.log; echo $r; ls /var/lib/leaf/lists | wc -l", "0\n6\n" },
     { "/bin/sh", "leaf: install tree + jq from Ubuntu",
-      "echo wyn | ary -S leaf install tree jq > /tmp/leaf-install.log 2>&1; r=$?; [ $r = 0 ] || tail -4 /tmp/leaf-install.log; echo $r; tree -d /etc/leaf | tail -1; echo '{\"a\":[1,2]}' | jq -c '.a|add'",
+      "echo wyn | ary -S leaf install --no-install-recommends tree jq > /tmp/leaf-install.log 2>&1; r=$?; [ $r = 0 ] || tail -4 /tmp/leaf-install.log; echo $r; tree -d /etc/leaf | tail -1; echo '{\"a\":[1,2]}' | jq -c '.a|add'",
       "0\n0 directories\n3\n" },
     { "/bin/sh", "leaf: remove",
       "echo wyn | ary -S leaf remove tree > /dev/null 2>&1; command -v tree || echo gone; leaf list | cut -d' ' -f1 | tr '\\n' ' '",
@@ -215,7 +215,7 @@ static const struct sh_case CASES[] = {
       "dbus-send --system --print-reply --dest=org.bluez / org.freedesktop.DBus.ObjectManager.GetManagedObjects | grep -c 'array \\['",
       "1\n" },
     { "/bin/sh", "node: leaf install nodejs; JS + JIT, child_process, an http server on 127.0.0.1",
-      "echo wyn | ary -S leaf install nodejs > /tmp/leaf-node.log 2>&1; "
+      "echo wyn | ary -S leaf install --no-install-recommends nodejs > /tmp/leaf-node.log 2>&1; "
       "node -e 'const h=require(\"http\"); let s=0; for (let i=0;i<1e6;i++) s+=i%7; "
       "const srv=h.createServer((q,r)=>r.end(\"pong\")).listen(0,()=>h.get(\"http://127.0.0.1:\"+srv.address().port,r=>{"
       "let d=\"\"; r.on(\"data\",c=>d+=c); r.on(\"end\",()=>{console.log(s,d,require(\"child_process\").execSync(\"echo kid\").toString().trim()); srv.close()})}))'",

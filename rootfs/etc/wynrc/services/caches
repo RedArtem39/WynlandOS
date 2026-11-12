@@ -1,0 +1,4 @@
+description=the caches dpkg's triggers keep (GSettings schemas, image loaders, GIO modules): made after a live stick's things come back
+type=oneshot
+exec=/usr/lib/wynland/update-caches
+after=persist

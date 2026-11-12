@@ -596,7 +596,10 @@ $(EXT2_MANIFEST_FULL): $(wildcard rootfs/usr/share/wynland/wallpapers/*) tools/m
 	@# /var/lib/leaf/base (base_manifest names it): what leaf counts as the
 	@# system's own -- from the whole image, not just what the stages
 	@# before base had staged (pipewire, freedoom, libsoup were missed)
-	@python3 tools/leaf_base.py $(BUILD)/leaf_base.txt $@
+	@# (and the libraries the image has only part of a package of, completed:
+	@# counted as the system's, leaf would never install the rest)
+	@python3 tools/leaf_base.py $(BUILD)/leaf_base.txt $@ --complete $(BUILD)/leaf_complete.txt
+	@cat $(BUILD)/leaf_complete.txt >> $@
 	@# your own wallpapers (MY_WALLS): in, and then the only ones -- the
 	@# stock photos, the generated spiral and xvlet's generated ones out
 	@$(foreach f,$(MY_WALLS),echo "F /usr/share/wynland/wallpapers/$(notdir $(f)) $(f)" >> $@;)
