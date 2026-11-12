@@ -5630,6 +5630,13 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     int n = p->is_eventfd ? 8 : (int)p->count;
                     return copy_to_user(argp, &n, 4) ? (uint64_t)-14 : 0;
                 }
+                /* FIONREAD on inotify: the bytes of events waiting (Qt's
+                   QFileSystemWatcher asks first, and reads nothing at 0) */
+                if (request == 0x541B && fd >= 0 && fd < MAX_OPEN_FILES && fd_table[fd] != NULL &&
+                    fd_table[fd]->node.first_cluster == INOTIFY_FD) {
+                    int n = (int)inotify_pending((int)fd_table[fd]->current_cluster);
+                    return copy_to_user(argp, &n, 4) ? (uint64_t)-14 : 0;
+                }
                 /* DRM render/card node: straight to the virtio-gpu DRM layer
                    (hot path -- EXECBUFFER per draw batch -- so before the
                    per-call serial log below). */

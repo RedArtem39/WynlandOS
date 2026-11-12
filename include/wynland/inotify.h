@@ -22,6 +22,7 @@ int      inotify_create(void);           /* slot, refs=1; <0 errno */
 void     inotify_ref(int i);
 void     inotify_unref(int i);
 bool     inotify_readable(int i);
+uint32_t inotify_pending(int i);         /* bytes of events queued (FIONREAD) */
 int32_t  inotify_add(int i, uint32_t inum, uint32_t mask);   /* wd or <0 errno */
 int      inotify_rm(int i, int32_t wd);
 int64_t  inotify_read(int i, uint8_t *out, uint32_t cap);

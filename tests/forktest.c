@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -637,6 +638,8 @@ int main(int argc, char **argv)
         unlink(f2);
         struct pollfd pf = { in, POLLIN, 0 };
         int pr = poll(&pf, 1, 1000);
+        int queued = 0;   /* FIONREAD: Qt's QFileSystemWatcher reads nothing without it */
+        if (ioctl(in, FIONREAD, &queued) != 0) queued = -1;
         /* what came: create, modify, close_write, attrib, moved_from/to
            (one cookie), create|isdir, delete|isdir, delete */
         unsigned seen = 0, cookie_from = 0, cookie_to = 0, names_ok = 1;
@@ -658,6 +661,7 @@ int main(int argc, char **argv)
             off += sizeof(struct inotify_event) + e->len;
         }
         fprintf(stderr, "[forktest] inotify: fd=%d wd=%d poll=%d read=%zd seen=0x%x\n", in, wd, pr, n, seen);
+        check(queued > 0 && queued == n, "inotify: FIONREAD says what read() gives");
         check(in >= 0 && wd > 0 && empty && pr == 1 && seen == 0x1ff && cookie_from && cookie_from == cookie_to && names_ok,
               "inotify: create/modify/close/attrib/move/mkdir/rmdir/unlink in a watched directory, poll wakes");
         /* a watch on the file itself, and its end when the file goes */

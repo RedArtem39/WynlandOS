@@ -135,6 +135,10 @@ bool inotify_readable(int i) {
     return i >= 0 && i < IN_SLOTS && g_in[i].refs && g_in[i].qlen > 0;
 }
 
+uint32_t inotify_pending(int i) {
+    return (i >= 0 && i < IN_SLOTS && g_in[i].refs) ? g_in[i].qlen : 0;
+}
+
 static uint32_t name_len(const char *s) { uint32_t n = 0; while (s && s[n]) n++; return n; }
 
 /* g_in_lock held: one event onto an instance's queue */
