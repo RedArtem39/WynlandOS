@@ -581,7 +581,8 @@ int main(int argc, char **argv)
     // the keyboard layout's keymap for Wayland clients goes through its seat
     server.setCompositor(win->findChild<QWaylandCompositor *>());
     InputPump pump(win, &server, greeterMode);
-    if (!greeterMode) nightlightAttach(win);   // (nightlight.cpp: warmer after sunset)
+    if (!greeterMode) nightlightAttach(win);
+    HyprIpc::setWindow(win);   // ("hyprctl dispatch zsnap FILE")   // (nightlight.cpp: warmer after sunset)
     // debugging: boot.cfg "logoutat=N" -- the session logs out after N s
     // (the login screen with an account, for its picture)
     if (!greeterMode) {

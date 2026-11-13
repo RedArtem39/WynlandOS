@@ -10,12 +10,15 @@
 #include <QtCore/QTimer>
 #include <QtNetwork/QLocalServer>
 #include <QtNetwork/QLocalSocket>
+#include <QtGui/QImage>
+#include <QtQuick/QQuickWindow>
 
 #include <algorithm>
 #include <cstdio>
 #include <unistd.h>
 
 QPoint HyprIpc::s_cursor;
+QQuickWindow *HyprIpc::s_window = nullptr;
 
 HyprIpc::HyprIpc(ZServer *server, const QString &monitorName, QSize monitorSize, QObject *parent)
     : QObject(parent), m_srv(server), m_monitor(monitorName), m_size(monitorSize)
@@ -364,6 +367,13 @@ QByteArray HyprIpc::dispatch(const QByteArray &line)
         return "ok";
     }
     if (d == "exec") { m_srv->run(QString::fromUtf8(arg)); return "ok"; }
+    // WynlandOS's own: a picture of the screen as it is now, into FILE
+    // (a GL scanout cannot be screendumped; tests and docs take these)
+    if (d == "zsnap") {
+        const QString f = QString::fromUtf8(arg.trimmed());
+        if (!s_window || f.isEmpty()) return "no window";
+        return s_window->grabWindow().save(f, "PNG") ? "ok" : "not saved";
+    }
     if (d == "exit") { m_srv->logout(); return "ok"; }
     // WynlandOS's own: the session again (resolution(1) after a new mode);
     // a moment later, so the reply gets out first

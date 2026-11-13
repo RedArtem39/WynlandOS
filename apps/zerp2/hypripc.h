@@ -35,6 +35,8 @@ public:
     ~HyprIpc() override;
     bool listening() const;
     static void setCursor(QPoint p) { s_cursor = p; }
+    // the screen's window, for "dispatch zsnap FILE" (a picture of it, now)
+    static void setWindow(class QQuickWindow *w) { s_window = w; }
 
 private:
     QByteArray request(const QByteArray &req);
@@ -71,4 +73,5 @@ private:
     bool m_seenFocusValid = false;
 
     static QPoint s_cursor;
+    static class QQuickWindow *s_window;
 };

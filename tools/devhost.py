@@ -33,7 +33,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if self.path.startswith('/snap'):
             # a picture of the screen (Zerp's snapshot, curl'd from a QEMU
             # boot): kept as it is, not printed
-            name = os.path.join(self.logs, time.strftime('snap-%Y%m%d-%H%M%S') + '-%03d.png' % (int(time.time() * 1000) % 1000))
+            # ("/snap?NAME": snap-NAME.png, for a series of named pictures)
+            tag = ''.join(ch for ch in self.path.partition('?')[2] if ch.isalnum() or ch in '-_')
+            name = os.path.join(self.logs, f'snap-{tag}.png' if tag else
+                                time.strftime('snap-%Y%m%d-%H%M%S') + '-%03d.png' % (int(time.time() * 1000) % 1000))
             with open(name, 'wb') as f:
                 f.write(body)
             print(f'\n== a picture from {self.client_address[0]}: {name} ({len(body)} bytes)', flush=True)
