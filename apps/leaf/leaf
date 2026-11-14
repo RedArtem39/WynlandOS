@@ -31,6 +31,7 @@ import json
 import lzma
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -210,6 +211,12 @@ def fetch(url, dest=None, quiet=False):
         try:
             return fetch_once(url, dest, quiet)
         except (TimeoutError, ConnectionError, urllib.error.URLError, http.client.HTTPException) as e:
+            # the mirror's name not found: no network at all (Wi-Fi not
+            # connected) -- asking again will not help, and the bare
+            # "Temporary failure in name resolution" says nothing
+            if isinstance(getattr(e, "reason", None), socket.gaierror):
+                die(f"no network: {url.split('/')[2]} is not found -- connect to Wi-Fi "
+                    f"(the bar, or: wifi connect NAME) or a phone's tethering, then again")
             if isinstance(e, urllib.error.HTTPError) and e.code < 500:
                 raise                          # 404 and the like: no use asking again
             if attempt == 2:
