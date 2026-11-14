@@ -157,6 +157,15 @@ LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-heade
 LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "$SL" > "$B/qwayland-server-ext-session-lock-v1.cpp"
 gcc -O2 -fPIC -c -o "$B/ext-session-lock-protocol.o" "$B/wayland-ext-session-lock-v1-protocol.c"
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zsessionlock.cpp" apps/zerp2/zsessionlock.h
+# games' pointer: relative motion and pointer constraints (wayland-protocols)
+for P in relative-pointer-unstable-v1 pointer-constraints-unstable-v1; do
+    wayland-scanner server-header "apps/zerp2/protocols/$P.xml" "$B/wayland-$P-server-protocol.h"
+    wayland-scanner private-code "apps/zerp2/protocols/$P.xml" "$B/wayland-$P-protocol.c"
+    LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-header "apps/zerp2/protocols/$P.xml" > "$B/qwayland-server-$P.h"
+    LD_LIBRARY_PATH="$LIB" "$ROOT/usr/lib/qt6/libexec/qtwaylandscanner" server-code "apps/zerp2/protocols/$P.xml" > "$B/qwayland-server-$P.cpp"
+    gcc -O2 -fPIC -c -o "$B/$P-protocol.o" "$B/wayland-$P-protocol.c"
+done
+"$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -I"$B" -o "$B/moc_zpointer.cpp" apps/zerp2/zpointer.h
 "$ROOT/usr/lib/qt6/libexec/moc" $Z2INC -o "$B/moc_greeter.cpp" apps/zerp2/greeter.h
 gcc -O2 -fPIC -Wall -c -o "$B/wlcompat.o" apps/zerp2/wlcompat.c
 # wlcompat's two libwayland-server functions must win over the library's
@@ -166,6 +175,9 @@ g++ -std=c++17 -O2 -fPIC -DQT_NO_DEBUG $Z2INC -Iapps/zerp2 -o "$OUT/zerp2.elf" \
     apps/zerp2/zglobalshortcuts.cpp apps/zerp2/keybinds.cpp apps/zerp2/nightlight.cpp "$B/qwayland-server-hyprland-global-shortcuts-v1.cpp" \
     "$B/hyprland-global-shortcuts-protocol.o" "$B/moc_zglobalshortcuts.cpp" \
     apps/zerp2/zsessionlock.cpp "$B/qwayland-server-ext-session-lock-v1.cpp" "$B/ext-session-lock-protocol.o" "$B/moc_zsessionlock.cpp" \
+    apps/zerp2/zpointer.cpp "$B/moc_zpointer.cpp" "$B/qwayland-server-relative-pointer-unstable-v1.cpp" \
+    "$B/qwayland-server-pointer-constraints-unstable-v1.cpp" \
+    "$B/relative-pointer-unstable-v1-protocol.o" "$B/pointer-constraints-unstable-v1-protocol.o" \
     "$B/wlcompat.o" -Wl,--export-dynamic-symbol=wl_global_create -Wl,--export-dynamic-symbol=wl_resource_post_event \
     -Wl,--export-dynamic-symbol=mkstemp -Wl,--export-dynamic-symbol=wl_resource_create \
     "$LIB/libwayland-server.so.0" \

@@ -24,6 +24,9 @@
 #include <wynland/virtgpu_drm.h>
 #include <wynland/i915.h>
 #include <wynland/mouse.h>
+
+/* the pointer stream's owner (SYS_mouse_events: the display server) */
+static uint64_t mouse_owner_pid = 0;
 #include <wynland/kfile.h>
 #include <wynland/inotify.h>
 #include <wynland/unix_socket.h>
@@ -5450,13 +5453,17 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                    // an input grab) -- other processes get -EBUSY instead
                    // of reading someone else's pointer. The owner's first
                    // read starts with the current position.
+                   // a3 bit 0: MouseEventEx records, with each packet's
+                   // own motion {dx, dy} (a game's mouse look: it goes on
+                   // at the screen's edge and while the pointer is locked).
             {
-                static uint64_t mouse_owner_pid = 0;
                 int64_t max = (int64_t)a2;
+                const bool ex = (a3 & 1) != 0;
                 if (max <= 0) return (uint64_t)-22; /* -EINVAL */
                 if (max > 64) max = 64;
                 /* validate before claiming: a bad call must not take the stream */
-                if (!a1 || !user_prepare_write(a1, (uint64_t)max * sizeof(MouseEvent))) return (uint64_t)-14; /* -EFAULT */
+                if (!a1 || !user_prepare_write(a1, (uint64_t)max * (ex ? sizeof(MouseEventEx) : sizeof(MouseEvent))))
+                    return (uint64_t)-14; /* -EFAULT */
                 /* only for the display server: it holds /dev/input/mice
                    (root's; init and the login manager hand it over) */
                 {
@@ -5471,7 +5478,30 @@ static uint64_t syscall_dispatch(uint64_t num, uint64_t a1, uint64_t a2, uint64_
                     mouse_owner_pid = proc->pid;
                     mouse_events_attach();
                 }
-                return (uint64_t)mouse_events_read((MouseEvent *)a1, (int)max);
+                return (uint64_t)mouse_events_read((void *)a1, (int)max, ex);
+            }
+
+        case 416: // SYS_pointer_ctl(op, a, b) -- the pointer stream's owner
+                   // (412) says what the pointer does: 1 locked (a: on/off;
+                   // it stays put, only its motion is told), 2 confined to
+                   // a rectangle (a: x0 | y0 << 32, b: x1 | y1 << 32,
+                   // inclusive; a = b = -1: free again), 3 to a place
+                   // (a: x, b: y), 4 not shown (a: hidden). Wayland's
+                   // pointer constraints, for games and the like.
+            {
+                Process *owner = mouse_owner_pid ? process_find_by_pid(mouse_owner_pid) : NULL;
+                if (!owner || owner->exited || mouse_owner_pid != proc->pid) return (uint64_t)-1; /* -EPERM */
+                switch (a1) {
+                case 1: mouse_pointer_lock(a2 != 0); return 0;
+                case 2:
+                    if ((int64_t)a2 == -1) { mouse_pointer_confine(false, 0, 0, 0, 0); return 0; }
+                    mouse_pointer_confine(true, (int32_t)(uint32_t)a2, (int32_t)(uint32_t)(a2 >> 32),
+                                          (int32_t)(uint32_t)a3, (int32_t)(uint32_t)(a3 >> 32));
+                    return 0;
+                case 3: mouse_pointer_warp((int32_t)a2, (int32_t)a3); return 0;
+                case 4: mouse_pointer_hide(a2 != 0); return 0;
+                default: return (uint64_t)-22; /* -EINVAL */
+                }
             }
 
         case 411: // SYS_process_alive(pid) -- Phase 18. Lets zerp_term.c

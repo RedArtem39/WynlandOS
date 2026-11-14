@@ -76,6 +76,7 @@ bool     i915_disp_check(uint64_t phys, uint32_t pitch);   /* false: the display
 void     i915_disp_restore(void);
 void     i915_disp_cursor_image(const uint32_t *img, uint32_t dim, uint32_t stride);
 void     i915_disp_cursor_move(int32_t x, int32_t y);
+void     i915_disp_cursor_hidden(bool hidden);
 
 /* the uAPI (i915_uapi.c): DRM render node clients carry this bit */
 #define I915_CLIENT_BIT 0x80000000u

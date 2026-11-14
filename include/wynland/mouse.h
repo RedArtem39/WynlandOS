@@ -27,5 +27,14 @@ int     mouse_read_queue(uint8_t *buf, int size);
 /* Absolute pointer events (SYS_mouse_events): x, y and button mask after
    each PS/2 packet that changed anything. */
 typedef struct { int32_t x, y; uint32_t buttons; } MouseEvent;
+/* ... and the packet's own motion: it goes on at the screen's edge and
+   while the pointer is locked */
+typedef struct { int32_t x, y; uint32_t buttons; int32_t dx, dy; } MouseEventEx;
 void mouse_events_attach(void); /* reset; first event = current state */
-int  mouse_events_read(MouseEvent *buf, int max);
+int  mouse_events_read(void *buf, int max, bool ex);   /* ex: MouseEventEx records */
+
+/* the compositor's say over the pointer (SYS_pointer_ctl) */
+void mouse_pointer_lock(bool on);
+void mouse_pointer_confine(bool on, int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+void mouse_pointer_warp(int32_t x, int32_t y);
+void mouse_pointer_hide(bool hidden);

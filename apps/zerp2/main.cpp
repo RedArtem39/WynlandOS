@@ -38,6 +38,7 @@
 #include "greeter.h"
 #include "hypripc.h"
 #include "zlayershell.h"
+#include "zpointer.h"
 #include "zsessionlock.h"
 #include "zglobalshortcuts.h"
 #include "keybinds.h"
@@ -83,8 +84,9 @@ static int inputFd(const char *var, const char *path)
 }
 static int g_kbdFd = -1, g_miceFd = -1;   // the mouse stream (syscall 412) needs the mice fd held
 
-struct ZMouseEvent { int32_t x, y; uint32_t buttons; };
-static long mouse_events(ZMouseEvent *buf, long max) { return syscall(412, buf, max, 0); }
+// (a3 = 1: each event with the packet's own motion, dx/dy -- zpointer.h)
+struct ZMouseEvent { int32_t x, y; uint32_t buttons; int32_t dx, dy; };
+static long mouse_events(ZMouseEvent *buf, long max) { return syscall(412, buf, max, 1); }
 
 // PS/2 set-1 make codes -> Qt keys / text (US layout)
 static const int kKeys[59] = {
@@ -150,6 +152,9 @@ private:
     void mouse(const ZMouseEvent &e)
     {
         const QPointF p(e.x, e.y);
+        // the motion itself to the client under the pointer (a game's
+        // mouse look); a locked pointer moves nothing else
+        const bool locked = !m_greeter && ZPointer::instance() && ZPointer::instance()->motion(e.dx, e.dy);
         HyprIpc::setCursor(QPoint(e.x, e.y));
         m_srv->setCursor(QPoint(e.x, e.y));
         Qt::MouseButtons now;
@@ -162,7 +167,7 @@ private:
             QCoreApplication::sendEvent(m_win, &we);
             return;
         }
-        if (p != m_pos || now == m_buttons) {
+        if (!locked && (p != m_pos || now == m_buttons)) {
             m_pos = p;
             QMouseEvent mv(QEvent::MouseMove, p, p, Qt::NoButton, m_buttons, m_mods);
             QCoreApplication::sendEvent(m_win, &mv);
@@ -580,6 +585,9 @@ int main(int argc, char **argv)
     if (!win) { fprintf(stderr, "[zerp2] FAIL: root is not a Window\n"); return 1; }
     // the keyboard layout's keymap for Wayland clients goes through its seat
     server.setCompositor(win->findChild<QWaylandCompositor *>());
+    // relative motion and pointer locks: games (zpointer.h)
+    if (!greeterMode)
+        if (QWaylandCompositor *wc = win->findChild<QWaylandCompositor *>()) new ZPointer(wc);
     InputPump pump(win, &server, greeterMode);
     if (!greeterMode) nightlightAttach(win);
     HyprIpc::setWindow(win);   // ("hyprctl dispatch zsnap FILE")   // (nightlight.cpp: warmer after sunset)

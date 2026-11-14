@@ -74,6 +74,7 @@ static uint32_t g_ctl0, g_stride0, g_surf0, g_offset0;   /* the firmware's plane
 static uint32_t g_w, g_h;                             /* the plane's size (the mode) */
 static bool g_ours;                                   /* the plane shows one of our objects */
 static bool g_cursor_on;
+static bool g_cursor_hidden;   /* i915_disp_cursor_hidden: the plane off while a client wants no pointer */
 static bool g_broken;                                 /* the display failed on our frames: copies from now on */
 static uint32_t g_flips;
 static uint32_t g_armed;                              /* the last surface armed */
@@ -255,9 +256,20 @@ void i915_disp_cursor_image(const uint32_t *img, uint32_t dim, uint32_t stride)
             d[y * 64 + x] = (img && x < dim && y < dim) ? img[y * stride + x] : 0;
     i915_flush(d, 64 * 64 * 4);                       /* the display reads memory, not the CPU's cache */
     int p = g_pipe;
-    i915_wr(CUR_CTL(p), CUR_MODE_64_ARGB);
+    i915_wr(CUR_CTL(p), g_cursor_hidden ? 0 : CUR_MODE_64_ARGB);
     i915_wr(CUR_BASE(p), g_cursor.ggtt);
     g_cursor_on = true;
+}
+
+/* the pointer not shown (a game's mouse look) or shown again: the plane
+   off or on, its picture and place kept */
+void i915_disp_cursor_hidden(bool hidden)
+{
+    g_cursor_hidden = hidden;
+    if (g_pipe < 0 || !g_cursor_on) return;
+    int p = g_pipe;
+    i915_wr(CUR_CTL(p), hidden ? 0 : CUR_MODE_64_ARGB);
+    i915_wr(CUR_BASE(p), g_cursor.ggtt);              /* (the write that arms the update) */
 }
 
 /* the pointer to (x, y): from the mouse interrupt */

@@ -276,32 +276,43 @@ static void mouse_queue_push(uint8_t val)
     }
 }
 
-/* Absolute pointer events for the Ring-3 compositor: the position the
-   kernel computed AFTER each packet, so the compositor never integrates
-   packets itself and can't drift from the hardware cursor (which this
-   same IRQ drives). Only recorded while a reader is attached. */
+/* Pointer events for the Ring-3 compositor: the position the kernel
+   computed AFTER each packet, so the compositor never integrates packets
+   itself and can't drift from the hardware cursor (which this same IRQ
+   drives) -- and the packet's own motion (dx, dy), which goes on at the
+   screen's edge and while the pointer is locked: a game's mouse look.
+   Only recorded while a reader is attached. */
 #define MOUSE_EVENT_RING 256
-static MouseEvent mouse_events[MOUSE_EVENT_RING];
+static MouseEventEx mouse_events[MOUSE_EVENT_RING];
 static uint32_t mouse_ev_head = 0, mouse_ev_count = 0;
 static bool mouse_ev_enabled = false;
 
+/* the compositor's say over the pointer (SYS_pointer_ctl): locked (it
+   stays where it is, only the motion is told), confined to a rectangle,
+   or not shown */
+static bool ptr_locked = false;
+static bool ptr_confined = false;
+static int32_t conf_x0, conf_y0, conf_x1, conf_y1;   /* inclusive */
+static bool ptr_hidden = false;
+
 /* Interrupts must be off. */
-static void mouse_event_push(void)
+static void mouse_event_push(int32_t dx, int32_t dy)
 {
     if (!mouse_ev_enabled) return;
     /* buttons: bits 0-2 the buttons, bits 8-15 this packet's wheel delta
        (int8, positive = towards the user... i.e. scroll down) */
-    MouseEvent ev = { mouse_x, mouse_y, (uint32_t)mouse_buttons | ((uint32_t)(uint8_t)mouse_wheel << 8) };
+    MouseEventEx ev = { mouse_x, mouse_y, (uint32_t)mouse_buttons | ((uint32_t)(uint8_t)mouse_wheel << 8), dx, dy };
     if (mouse_ev_count == MOUSE_EVENT_RING) {
         /* Full (reader stalled): drop the oldest event whose successor has
-           the same buttons -- only a position is lost, never a press or
-           release. If every event is a button change, fold into the newest
-           when this one doesn't change buttons, else drop the oldest. */
+           the same buttons, its motion added to that one -- only a
+           position is lost, never a press or release. If every event is a
+           button change, fold into the newest when this one doesn't change
+           buttons, else drop the oldest. */
         uint32_t k;
         for (k = 0; k + 1 < mouse_ev_count; k++) {
-            MouseEvent *a = &mouse_events[(mouse_ev_head + k) % MOUSE_EVENT_RING];
-            MouseEvent *b = &mouse_events[(mouse_ev_head + k + 1) % MOUSE_EVENT_RING];
-            if (a->buttons == b->buttons) break;
+            MouseEventEx *a = &mouse_events[(mouse_ev_head + k) % MOUSE_EVENT_RING];
+            MouseEventEx *b = &mouse_events[(mouse_ev_head + k + 1) % MOUSE_EVENT_RING];
+            if (a->buttons == b->buttons) { b->dx += a->dx; b->dy += a->dy; break; }
         }
         if (k + 1 < mouse_ev_count) {
             for (; k + 1 < mouse_ev_count; k++)
@@ -309,8 +320,12 @@ static void mouse_event_push(void)
                     mouse_events[(mouse_ev_head + k + 1) % MOUSE_EVENT_RING];
             mouse_ev_count--;
         } else {
-            MouseEvent *last = &mouse_events[(mouse_ev_head + mouse_ev_count - 1) % MOUSE_EVENT_RING];
-            if (last->buttons == ev.buttons && !(ev.buttons & 0xFF00)) { *last = ev; return; }
+            MouseEventEx *last = &mouse_events[(mouse_ev_head + mouse_ev_count - 1) % MOUSE_EVENT_RING];
+            if (last->buttons == ev.buttons && !(ev.buttons & 0xFF00)) {
+                ev.dx += last->dx; ev.dy += last->dy;
+                *last = ev;
+                return;
+            }
             mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
             mouse_ev_count--;
         }
@@ -325,22 +340,124 @@ void mouse_events_attach(void)
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
     mouse_ev_head = mouse_ev_count = 0;
     mouse_ev_enabled = true;
-    mouse_event_push(); /* first event = where the pointer is right now */
+    /* a new owner: nothing of the last one's say over the pointer */
+    ptr_locked = ptr_confined = false;
+    if (ptr_hidden) {
+        extern void virtio_gpu_cursor_hidden(bool hidden);
+        ptr_hidden = false;
+        virtio_gpu_cursor_hidden(false);
+    }
+    mouse_event_push(0, 0); /* first event = where the pointer is right now */
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
-int mouse_events_read(MouseEvent *buf, int max)
+/* ex: MouseEventEx records, else the older MouseEvent (x, y, buttons) */
+int mouse_events_read(void *buf, int max, bool ex)
 {
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
     int n = 0;
     while (n < max && mouse_ev_count > 0) {
-        buf[n++] = mouse_events[mouse_ev_head];
+        const MouseEventEx *e = &mouse_events[mouse_ev_head];
+        if (ex) ((MouseEventEx *)buf)[n] = *e;
+        else {
+            MouseEvent *o = &((MouseEvent *)buf)[n];
+            o->x = e->x; o->y = e->y; o->buttons = e->buttons;
+        }
+        n++;
         mouse_ev_head = (mouse_ev_head + 1) % MOUSE_EVENT_RING;
         mouse_ev_count--;
     }
     if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
     return n;
+}
+
+/* One packet from either mouse (dx, dy: right/down): the pointer moved
+   within the screen (or the confining rectangle; not at all when locked),
+   the event, the cursor plane. Interrupts off. */
+static void mouse_apply(int32_t dx, int32_t dy, uint8_t btns, int8_t wheel)
+{
+    int32_t new_x = mouse_x + dx;
+    int32_t new_y = mouse_y + dy;
+    int32_t x0 = 0, y0 = 0, x1 = bound_w - 1, y1 = bound_h - 1;
+    if (ptr_confined) { x0 = conf_x0; y0 = conf_y0; x1 = conf_x1; y1 = conf_y1; }
+    if (ptr_locked) { new_x = mouse_x; new_y = mouse_y; }
+    else {
+        if (new_x < x0) new_x = x0;
+        if (new_x > x1) new_x = x1;
+        if (new_y < y0) new_y = y0;
+        if (new_y > y1) new_y = y1;
+    }
+
+    if (!dx && !dy && btns == mouse_buttons && !wheel) return;
+    const bool moved = new_x != mouse_x || new_y != mouse_y;
+    mouse_hide();
+    mouse_x = new_x;
+    mouse_y = new_y;
+    mouse_buttons = btns;
+    mouse_wheel = wheel;
+    mouse_event_push(dx, dy);
+    mouse_wheel = 0;   /* one packet's turn: the next move is not a scroll */
+
+    /* Hardware cursor tracks the IRQ directly: moves at input rate no
+       matter what the compositor is doing. */
+    if (moved && mouse_hw_cursor()) {
+        extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
+        virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
+    }
+    mouse_show();
+}
+
+/* SYS_pointer_ctl: the compositor's say over the pointer */
+void mouse_pointer_lock(bool on)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    ptr_locked = on;
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+void mouse_pointer_confine(bool on, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > bound_w - 1) x1 = bound_w - 1;
+    if (y1 > bound_h - 1) y1 = bound_h - 1;
+    ptr_confined = on && x0 <= x1 && y0 <= y1;
+    conf_x0 = x0; conf_y0 = y0; conf_x1 = x1; conf_y1 = y1;
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+/* the pointer to (x, y) (a locked pointer's hint, on its release): no
+   event -- the compositor knows */
+void mouse_pointer_warp(int32_t x, int32_t y)
+{
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > bound_w - 1) x = bound_w - 1;
+    if (y > bound_h - 1) y = bound_h - 1;
+    mouse_hide();
+    mouse_x = x; mouse_y = y;
+    if (mouse_hw_cursor()) {
+        extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
+        virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
+    }
+    mouse_show();
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
+}
+
+/* the cursor plane's picture off (a client asked for no cursor: a game,
+   a video player) or on again */
+void mouse_pointer_hide(bool hidden)
+{
+    extern void virtio_gpu_cursor_hidden(bool hidden);
+    if (hidden == ptr_hidden) return;
+    ptr_hidden = hidden;
+    virtio_gpu_cursor_hidden(hidden);
 }
 
 int mouse_read_queue(uint8_t *buf, int size)
@@ -393,31 +510,7 @@ void mouse_handle_interrupt(uint8_t data)
                 rel_y |= ~0xFF;
             }
 
-            int32_t new_x = mouse_x + rel_x;
-            int32_t new_y = mouse_y - rel_y;
-
-            if (new_x < 0) new_x = 0;
-            if (new_x >= bound_w) new_x = bound_w - 1;
-            if (new_y < 0) new_y = 0;
-            if (new_y >= bound_h) new_y = bound_h - 1;
-
-            if (new_x != mouse_x || new_y != mouse_y || ((buttons & 0x07) != mouse_buttons) || mouse_wheel) {
-                mouse_hide();
-
-                mouse_x = new_x;
-                mouse_y = new_y;
-                mouse_buttons = buttons & 0x07;
-                mouse_event_push();
-
-                /* Hardware cursor tracks the IRQ directly: moves at input
-                   rate no matter what the compositor is doing. */
-                if (mouse_hw_cursor()) {
-                    extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
-                    virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
-                }
-
-                mouse_show();
-            }
+            mouse_apply(rel_x, -rel_y, buttons & 0x07, mouse_wheel);
             /* Whole packets only: dropping one byte of a full queue would
                shift every packet after it for /dev/input/mice readers. */
             if ((mouse_queue_tail + MOUSE_QUEUE_SIZE - mouse_queue_head - 1) % MOUSE_QUEUE_SIZE >= 3) {
@@ -435,32 +528,10 @@ void mouse_inject_usb(int dx, int dy, uint8_t buttons, int wheel)
     if (!g_boot_info) return;
 
     uint8_t btns = buttons & 0x07;
-    int8_t  wh = (int8_t)wheel;
-    int32_t new_x = mouse_x + dx;
-    int32_t new_y = mouse_y + dy;
-
-    if (new_x < 0) new_x = 0;
-    if (new_x >= bound_w) new_x = bound_w - 1;
-    if (new_y < 0) new_y = 0;
-    if (new_y >= bound_h) new_y = bound_h - 1;
-
-    if (new_x != mouse_x || new_y != mouse_y || btns != mouse_buttons || wh) {
-        mouse_hide();
-
-        mouse_x = new_x;
-        mouse_y = new_y;
-        mouse_buttons = btns;
-        mouse_wheel = wh;
-        mouse_event_push();
-        mouse_wheel = 0;   /* one report's turn: the next move is not a scroll */
-
-        if (mouse_hw_cursor()) {
-            extern void virtio_gpu_move_cursor(uint32_t x, uint32_t y);
-            virtio_gpu_move_cursor((uint32_t)mouse_x, (uint32_t)mouse_y);
-        }
-
-        mouse_show();
-    }
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(rflags) :: "memory");
+    mouse_apply(dx, dy, btns, (int8_t)wheel);
+    if (rflags & 0x200) __asm__ volatile("sti" ::: "memory");
 
     /* /dev/input/mice speaks PS/2 packets: bit3 always set, y positive up. */
     if ((mouse_queue_tail + MOUSE_QUEUE_SIZE - mouse_queue_head - 1) % MOUSE_QUEUE_SIZE >= 3) {

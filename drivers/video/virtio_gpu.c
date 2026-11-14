@@ -827,6 +827,7 @@ static uint32_t cursor_shape = 0;
 static uint32_t cursor_x = 0, cursor_y = 0;
 static bool     cursor_shape_dirty = false;  /* needs UPDATE_CURSOR, not MOVE */
 static volatile bool cursor_pending = false; /* queue was full; resend on tick */
+static bool     cursor_hidden = false;       /* resource 0: no picture (virtio_gpu_cursor_hidden) */
 
 static uint64_t irq_save(void)
 {
@@ -874,7 +875,7 @@ static void cursor_submit(void)
     c->pos.scanout_id = 0;
     c->pos.x = cursor_x;
     c->pos.y = cursor_y;
-    c->resource_id = CURSOR_RES_BASE + cursor_shape;
+    c->resource_id = cursor_hidden ? 0 : CURSOR_RES_BASE + cursor_shape;
     c->hot_x = cursor_hotspot[cursor_shape][0];
     c->hot_y = cursor_hotspot[cursor_shape][1];
 
@@ -1467,6 +1468,24 @@ void virtio_gpu_move_cursor(uint32_t x, uint32_t y)
     cursor_x = x;
     cursor_y = y;
     cursor_submit();
+    irq_restore(fl);
+}
+
+/* The pointer's picture off (a client asked for none: a game's mouse
+   look) or on again: an UPDATE_CURSOR to resource 0 hides the plane. */
+void virtio_gpu_cursor_hidden(bool hidden)
+{
+    if (!initialized) {
+        extern void simpledrm_cursor_hidden(bool hidden);
+        simpledrm_cursor_hidden(hidden);   /* the GOP framebuffer's pointer, or the Intel display's plane */
+        return;
+    }
+    uint64_t fl = irq_save();
+    if (hidden != cursor_hidden) {
+        cursor_hidden = hidden;
+        cursor_shape_dirty = true;
+        cursor_submit();
+    }
     irq_restore(fl);
 }
 

@@ -1118,6 +1118,7 @@ static volatile uint32_t g_simple_bo;     /* BO index + 1; 0 = nothing scanned o
 static uint32_t g_simple_pitch, g_simple_fmt, g_simple_w, g_simple_h;
 static int32_t  g_cur_x, g_cur_y;         /* the pointer as drawn */
 static bool     g_cur_drawn;
+static bool     g_cur_hidden;   /* simpledrm_cursor_hidden: a client asked for no pointer */
 
 static inline uint32_t *gop_row(uint32_t y)
 {
@@ -1176,7 +1177,7 @@ static void simple_put(int32_t x0, int32_t y0, int32_t x1, int32_t y1, bool curs
     if (!g_simple_bo || x0 >= x1 || y0 >= y1) return;
     bool swap = simple_swap(g_simple_fmt);
     uint32_t dim = 0, stride = 0;
-    const uint32_t *cur = cursor ? vgpu_cursor_image(&dim, &stride) : NULL;
+    const uint32_t *cur = cursor && !g_cur_hidden ? vgpu_cursor_image(&dim, &stride) : NULL;
     for (int32_t y = y0; y < y1; y++) {
         uint32_t *dst = gop_row((uint32_t)y);
         bool row = y < (int32_t)g_simple_h;
@@ -1326,6 +1327,20 @@ void simpledrm_move_cursor(uint32_t x, uint32_t y)
     if (g_cur_drawn) simple_put(ox, oy, ox + (int32_t)dim, oy + (int32_t)dim, true);
     simple_put(g_cur_x, g_cur_y, g_cur_x + (int32_t)dim, g_cur_y + (int32_t)dim, true);
     g_cur_drawn = true;
+    spin_unlock_irqrestore(&g_simple_lock, fl);
+}
+
+/* the pointer not shown (virtio_gpu_cursor_hidden) or shown again: the
+   Intel cursor plane off/on, or the drawn one taken off/put back */
+void simpledrm_cursor_hidden(bool hidden)
+{
+    g_cur_hidden = hidden;
+    if (!g_simple_bo) return;
+    if (g_hw_scan) { i915_disp_cursor_hidden(hidden); return; }
+    uint64_t fl = spin_lock_irqsave(&g_simple_lock);
+    uint32_t dim = 0, stride;
+    vgpu_cursor_image(&dim, &stride);
+    simple_put(g_cur_x, g_cur_y, g_cur_x + (int32_t)dim, g_cur_y + (int32_t)dim, true);
     spin_unlock_irqrestore(&g_simple_lock, fl);
 }
 
