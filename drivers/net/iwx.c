@@ -1719,7 +1719,11 @@ static void data_rx(const uint8_t *f, uint32_t flen, uint8_t flags2, uint32_t st
 {
     if (flen < 24) return;
     uint8_t fc0 = f[0], fc1 = f[1];
-    if ((fc0 & 0x40) || (flags2 & 0x40)) return;              /* no data; an A-MSDU (not negotiated) */
+    /* (an A-MSDU, flags2 0x40, comes split by the card: each subframe
+       with the same MAC header and its own LLC, as OpenBSD's iwx_rx_mpdu_mq
+       says -- an HT station must take them, so the AP sends them: dropped,
+       an HT link passed DHCP and little else) */
+    if (fc0 & 0x40) return;                                     /* no data (a null frame) */
     if ((fc1 & 3) != 2 || !same6(f + 10, g_ap.bssid)) return;   /* from the AP, to us or the group */
     uint32_t hl = 24 + ((fc0 & 0x80) ? 2 : 0);
     bool prot = (fc1 & 0x40) != 0;
