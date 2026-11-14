@@ -1797,6 +1797,12 @@ static void join_failed(uint8_t stage, uint16_t status)
     teardown();
 }
 
+/* HT/VHT, WMM and the firmware's rate scaling (21540cd): off unless
+   boot.cfg says wifi_ht=1 -- on the laptop the WPA2 handshake stopped
+   completing with them (the AP sent message 1 again and again, then
+   dropped us), while the legacy join of step 3 played YouTube */
+static bool g_ht_on;
+
 static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen)
 {
     int i;
@@ -1804,6 +1810,7 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     if (i == g_nbss) { sayx("connect: that network is not in the scan"); ev_simple(0x84, 1, 0xfffe); return; }
     if (g_ctx_mac) teardown();
     g_ap = g_bss[i];
+    if (!g_ht_on) g_ap.ht = g_ap.vht = g_ap.wmm = false;     /* (as step 3 joined: legacy rates, no QoS) */
     g_rate_ver = (notif_ver(GRP_LONG, 0x1c) != 99 && notif_ver(GRP_LONG, 0x1c) > 6) ? 2 : 1;
     g_auth_status = g_assoc_status = -1;
     g_aid = 0;
@@ -1854,7 +1861,8 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     memset(pw, 0, sizeof pw);
     pw[4] = 25;                                                 /* keep-alive 25 s, no power saving */
     send_cmd("MAC_POWER", 0xa9, pw, sizeof pw);
-    if (!tlc_config()) sayx("no rate scaling: data at 24 Mbit/s");
+    if (!g_ht_on) sayx("legacy join (boot.cfg wifi_ht=1 for HT/VHT): data at 24 Mbit/s");
+    else if (!tlc_config()) sayx("no rate scaling: data at 24 Mbit/s");
     ev_simple(0x83, g_aid & 0x7ff, 0);
 }
 
@@ -2145,6 +2153,7 @@ static bool cfg_has(const char *cfg, const char *line)
 void iwx_start(const char *cfg)
 {
     if (cfg_has(cfg, "wifi=0")) { sayx("off (boot.cfg wifi=0)"); return; }
+    g_ht_on = cfg_has(cfg, "wifi_ht=1");
     extern Thread *thread_create(void (*entry)(void *), void *arg);
     thread_create(wifi_thread, NULL);
 }
