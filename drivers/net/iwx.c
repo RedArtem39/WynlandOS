@@ -492,10 +492,12 @@ static int sect_count(int start)
 /* a section copied into DMA memory; its physical address (0: no memory) */
 static uint64_t sect_dma(int i)
 {
-    Dma d;
-    if (!dma_alloc(&d, g_sect[i].len)) return 0;
-    memcpy(d.virt, g_sect[i].data, g_sect[i].len);
-    return d.phys;
+    /* (kept for a restart of the card, but copied again: the firmware
+       writes into its paging memory while it runs) */
+    static Dma made[MAX_SECT];
+    if (!made[i].virt && !dma_alloc(&made[i], g_sect[i].len)) return 0;
+    memcpy(made[i].virt, g_sect[i].data, g_sect[i].len);
+    return made[i].phys;
 }
 
 static bool ctxt_info_init(void)
@@ -1570,7 +1572,9 @@ static bool tlc_config(void)
         for (int k = 0; k < 12; k++)
             if ((g_ap.rates[i] & 0x7f) == r11g[k]) legacy |= (uint16_t)(1u << k);
     bool vht = g_ap.vht && g_ap.ch > 14, ht = g_ap.ht;
-    uint8_t mode = vht ? 3 : ht ? 2 : 0;                        /* TLC_MNG_MODE_VHT / HT / NON_HT */
+    /* enum iwx_tlc_mng_cfg_mode: NON_HT 0, HT 1, VHT 2 (3 is HE -- asking
+       a Wi-Fi 5 card for it asserted the firmware: 21540cd's bug) */
+    uint8_t mode = vht ? 2 : ht ? 1 : 0;
     uint16_t mcs = vht ? (g_bw ? 0x3ff : 0x1ff) : ht ? 0xff : 0;   /* (VHT MCS 9 not at 20 MHz) */
     uint8_t sgi = 0;
     if (ht) sgi |= 1 | (g_bw >= 1 ? 2 : 0);
@@ -1590,7 +1594,7 @@ static bool tlc_config(void)
         memcpy(c + 20, &mpdu, 2);
         c[22] = sgi;
     }
-    say("rate scaling: mode (0 legacy, 2 HT, 3 VHT) ", mode);
+    say("rate scaling: mode (0 legacy, 1 HT, 2 VHT) ", mode);
     say("  channel width (0 20, 1 40, 2 80 MHz) ", g_bw);
     if (!send_cmd("TLC_MNG_CONFIG", WIDE(GRP_DATA_PATH, 0x0f), c, sizeof c)) return false;
     g_tlc = true;
@@ -1777,8 +1781,30 @@ static bool wait_status(volatile int *st, uint32_t ms)
     return *st >= 0;
 }
 
+/* HT/VHT, WMM and the firmware's rate scaling. 21540cd's rate scaling
+   asked for the wrong mode (HE for VHT, VHT for HT) and the firmware
+   asserted; fixed, 5 GHz at 80 MHz works on the laptop. On 2.4 GHz HT
+   still ended in a firmware assert (UMAC 0x20103620) after a while --
+   Bluetooth's coexistence, perhaps -- so 2.4 GHz joins as step 3 did.
+   boot.cfg wifi_ht=0: legacy everywhere. A join that ends before the keys
+   steps one level down, telling the log which part it was:
+     3  all: HT (VHT on 5 GHz), WMM, 40/80 MHz, the firmware's rate scaling
+     2  20 MHz only
+     1  HT and WMM said, but no rate scaling (data at 24 Mbit/s)
+     0  legacy, as step 3 */
+static bool g_ht_on;
+static int g_ht_level = 3;
+static int ht_level(void) { return g_ht_on && g_ap.ch > 14 ? g_ht_level : 0; }
+
 static void teardown(void)
 {
+    /* associated, but no keys: the handshake did not complete -- the next
+       join one level down */
+    if (g_ctx_sta && g_assoc_status == 0 && !g_ptk && ht_level() > 0) {
+        g_ht_level--;
+        say("the handshake did not complete: HT level now (3 all, 2 20 MHz, 1 no rate scaling, 0 legacy) ",
+            (uint64_t)g_ht_level);
+    }
     g_link_up = false;
     g_ptk = g_gtk = false;
     g_wide = g_tlc = false;
@@ -1797,12 +1823,6 @@ static void join_failed(uint8_t stage, uint16_t status)
     teardown();
 }
 
-/* HT/VHT, WMM and the firmware's rate scaling (21540cd): off unless
-   boot.cfg says wifi_ht=1 -- on the laptop the WPA2 handshake stopped
-   completing with them (the AP sent message 1 again and again, then
-   dropped us), while the legacy join of step 3 played YouTube */
-static bool g_ht_on;
-
 static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen)
 {
     int i;
@@ -1810,7 +1830,8 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     if (i == g_nbss) { sayx("connect: that network is not in the scan"); ev_simple(0x84, 1, 0xfffe); return; }
     if (g_ctx_mac) teardown();
     g_ap = g_bss[i];
-    if (!g_ht_on) g_ap.ht = g_ap.vht = g_ap.wmm = false;     /* (as step 3 joined: legacy rates, no QoS) */
+    const int lvl = ht_level();
+    if (lvl == 0) g_ap.ht = g_ap.vht = g_ap.wmm = false;      /* (as step 3 joined: legacy rates, no QoS) */
     g_rate_ver = (notif_ver(GRP_LONG, 0x1c) != 99 && notif_ver(GRP_LONG, 0x1c) > 6) ? 2 : 1;
     g_auth_status = g_assoc_status = -1;
     g_aid = 0;
@@ -1820,7 +1841,9 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     q = put_s(q, " on channel ");
     q = put_u(q, g_ap.ch);
     put_line(b, q);
+    if (g_ht_on) say("  HT level ", (uint64_t)lvl);
     choose_width();
+    if (lvl < 3) g_bw = 0;
     g_wide = false;
     g_tlc = false;
 
@@ -1861,7 +1884,7 @@ static void connect_ap(const uint8_t *bssid, const uint8_t *rsn, uint32_t rsnlen
     memset(pw, 0, sizeof pw);
     pw[4] = 25;                                                 /* keep-alive 25 s, no power saving */
     send_cmd("MAC_POWER", 0xa9, pw, sizeof pw);
-    if (!g_ht_on) sayx("legacy join (boot.cfg wifi_ht=1 for HT/VHT): data at 24 Mbit/s");
+    if (lvl < 2) sayx("no rate scaling (HT level): data at 24 Mbit/s");
     else if (!tlc_config()) sayx("no rate scaling: data at 24 Mbit/s");
     ev_simple(0x83, g_aid & 0x7ff, 0);
 }
@@ -1988,6 +2011,65 @@ int iwx_dev_read(void *buf, uint32_t size)
     return n;
 }
 
+static bool card_boot(void);
+
+/* After a firmware error: the card reset and its firmware loaded again
+   (the queues, contexts and the station gone with it), then the radio up
+   -- wifid joins again by itself. A few times a boot at most. */
+static bool card_restart(void)
+{
+    static int restarts;
+    if (++restarts > 3) { sayx("the card failed too often: Wi-Fi off until the next boot"); return false; }
+    step("restarting the card after the firmware error");
+    if (g_ctx_sta && g_assoc_status == 0 && !g_ptk && ht_level() > 0) {   /* (teardown's rule: no commands now) */
+        g_ht_level--;
+        say("the handshake did not complete: HT level now ", (uint64_t)g_ht_level);
+    }
+    /* iwx_stop_device: interrupts off, RX DMA stopped, bus mastering
+       stopped (iwx_apm_stop), the processor reset */
+    wr(CSR_INT_MASK, 0);
+    wr(CSR_INT, ~0u);
+    wr(CSR_FH_INT_STATUS, ~0u);
+    if (nic_lock()) {
+        wr_prph_unlocked(0xA09820, 0);                          /* RFH_RXF_DMA_CFG */
+        for (int t = 0; t < 1000 && !(rd_prph_unlocked(0xA09808) & (1u << 31)); t++) udelay(10);   /* RFH_GEN_STATUS: idle */
+        nic_unlock();
+    }
+    g_nic_locks = 0;
+    clrb(CSR_GP_CNTRL, 0x8);                                    /* MAC_ACCESS_REQ */
+    setb(CSR_DBG_LINK_PWR_MGMT_REG, LINK_PWR_MGMT_DISABLED);
+    setb(CSR_HW_IF_CONFIG_REG, HWIF_PREPARE | 0x10000000u);    /* (and ENABLE_PME) */
+    mdelay(1);
+    clrb(CSR_DBG_LINK_PWR_MGMT_REG, LINK_PWR_MGMT_DISABLED);
+    mdelay(5);
+    setb(CSR_RESET, 0x200);                                     /* STOP_MASTER */
+    if (!poll_bit(CSR_RESET, 0x100, 0x100, 100)) sayx("timeout waiting for the bus master to stop");
+    clrb(CSR_GP_CNTRL, GP_INIT_DONE);
+    sw_reset();
+    wr(CSR_INT_MASK, 0);
+    wr(CSR_INT, ~0u);
+    wr(CSR_FH_INT_STATUS, ~0u);
+    g_alive_irq = g_alive_ok = g_fw_error = g_init_complete = g_scan_done = false;
+    g_cmd_done = false;
+    g_wait_idx = -1;
+    g_tx_cur = g_rx_cur = 0;
+    g_nic_locks = 0;
+    g_ctx_mac = g_ctx_phy = g_ctx_bind = g_ctx_sta = g_ctx_queue = false;
+    g_ptk = g_gtk = g_link_up = g_link_lost = false;
+    g_wide = g_tlc = false;
+    g_addba = false;
+    g_mq_cur = g_mq_inflight = 0;
+    memset(g_rx_free.virt, 0, (size_t)g_rx_free.pages * 4096);
+    memset(g_rx_used.virt, 0, (size_t)g_rx_used.pages * 4096);
+    memset(g_rx_stat.virt, 0, (size_t)g_rx_stat.pages * 4096);
+    memset(g_txq.virt, 0, (size_t)g_txq.pages * 4096);
+    if (!card_boot()) { sayx("the card did not come back"); return false; }
+    if (!radio_up()) { sayx("the radio did not come back up"); return false; }
+    step("the card is back");
+    g_dev_ready = true;
+    return true;
+}
+
 /* the card's thread after the first scan: it serves the program and the stack */
 static void wifi_main(void)
 {
@@ -1996,7 +2078,12 @@ static void wifi_main(void)
     step("ready for wifid (/dev/wifi)");
     for (;;) {
         service();
-        if (g_fw_error) { sayx("the card stopped (firmware error)"); ev_simple(0x87, 0xffff, 0); return; }
+        if (g_fw_error) {
+            sayx("the card stopped (firmware error)");
+            ev_simple(0x87, 0xffff, 0);
+            if (!card_restart()) return;
+            continue;
+        }
         int n = ring_get(g_req, REQ_MAX, &g_req_h, &g_req_t, &g_req_lock, r, sizeof r);
         if (n > 0) handle_req(r, (uint32_t)n);
         if (g_addba) { g_addba = false; if (g_ctx_mac) addba_decline(g_addba_frame, sizeof g_addba_frame); }
@@ -2108,27 +2195,32 @@ static void wifi_thread(void *arg)
     step(fw);
 
     if (!read_firmware(fw)) return;
-    if (!start_hw()) return;
     step("allocate the queues");
     if (!alloc_queues()) return;
+    if (card_boot()) { step("FIRMWARE ALIVE -- step 1 done"); wifi_up(); }
+}
 
-    /* iwx_start_fw */
+/* the card reset, its firmware started (iwx_start_hw, iwx_start_fw):
+   at the first start and after a firmware error */
+static bool card_boot(void)
+{
+    if (!start_hw()) return false;
     step("start the firmware");
     wr(CSR_INT, ~0u);
     wr(CSR_INT_MASK, 0);
     wr(CSR_UCODE_DRV_GP1_CLR, UCODE_SW_BIT_RFKILL);
     wr(CSR_UCODE_DRV_GP1_CLR, UCODE_GP1_CMD_BLOCKED);
     wr(CSR_INT, ~0u);
-    if (!apm_init()) return;
+    if (!apm_init()) return false;
     nic_config();
     wr8(CSR_INT_COALESCING, 0x40);
     setb(CSR_MAC_SHADOW_REG_CTRL, 0x800fffff);
     wr(CSR_INT_MASK, INT_ALIVE | INT_FH_RX);
-    if (!ctxt_info_init()) { sayx("the context info failed"); return; }
+    if (!ctxt_info_init()) { sayx("the context info failed"); return false; }
     step("waiting for the firmware");
     poll_causes(timer_get_ms() + 3000);
-    if (g_alive_ok) { step("FIRMWARE ALIVE -- step 1 done"); wifi_up(); }
-    else if (g_alive_irq) step("the ALIVE interrupt came, its notification not (or not OK)");
+    if (g_alive_ok) return true;
+    if (g_alive_irq) step("the ALIVE interrupt came, its notification not (or not OK)");
     else {
         say("NO ALIVE in 3 s, CSR_INT ", rd(CSR_INT));
         say("  GP_CNTRL ", rd(CSR_GP_CNTRL));
@@ -2136,6 +2228,7 @@ static void wifi_thread(void *arg)
         say("  HW_IF_CONFIG ", rd(CSR_HW_IF_CONFIG_REG));
         sticklog_panic_flush();
     }
+    return false;
 }
 
 /* boot.cfg "wifi=0": off */
@@ -2153,7 +2246,7 @@ static bool cfg_has(const char *cfg, const char *line)
 void iwx_start(const char *cfg)
 {
     if (cfg_has(cfg, "wifi=0")) { sayx("off (boot.cfg wifi=0)"); return; }
-    g_ht_on = cfg_has(cfg, "wifi_ht=1");
+    g_ht_on = !cfg_has(cfg, "wifi_ht=0");
     extern Thread *thread_create(void (*entry)(void *), void *arg);
     thread_create(wifi_thread, NULL);
 }

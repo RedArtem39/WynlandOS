@@ -119,7 +119,7 @@ static uint8_t g_pmk[32], g_ptk[48], g_snonce[32], g_anonce[32];
 static uint8_t g_mac[6], g_ap[6], g_rsn[24];
 static uint8_t g_last_rc[8];
 static int g_hs, g_hs_msg1;                    /* 0: nothing yet, 1: message 2 sent, 2: keys in */
-static bool g_linkup, g_wrong_mic;
+static bool g_linkup, g_wrong_mic, g_mic3;   /* (g_mic3: message 3 itself failed the check) */
 
 /* PRF-SHA1 (802.11i 8.5.1.1) */
 static void prf(const uint8_t *key, int klen, const char *label, const uint8_t *data, int dlen, uint8_t *out, int outlen)
@@ -284,7 +284,7 @@ static void handle_key(const uint8_t *f, int n)
     if (pairwise && ack && mic && install_) {           /* message 3: the keys, message 4 */
         if (memcmp(f + 17, g_anonce, 32)) { logf_("wifid: message 3 with another ANonce"); return; }
         if (memcmp(rc, g_last_rc, 8) <= 0 && g_hs == 2) { return; }      /* a replay of the last one */
-        if (!check_mic(f, n)) { logf_("wifid: message 3: WRONG MIC (the password?)"); g_wrong_mic = true; return; }
+        if (!check_mic(f, n)) { logf_("wifid: message 3: WRONG MIC (the password?)"); g_wrong_mic = g_mic3 = true; return; }
         uint8_t kd[256], gtk[16], gid = 0;
         int kl = kdlen;
         if (enc) {
@@ -348,7 +348,7 @@ static bool make_rsn(const Net *n)
 #define MAX_SEEN  64
 #define MAX_KNOWN 32
 typedef struct { char ssid[33]; Net n; char sec[12]; } Seen;
-typedef struct { char ssid[33]; char psk[64]; bool saved; bool bad; } Known;
+typedef struct { char ssid[33]; char psk[64]; bool saved; bool bad; uint8_t refused; } Known;
 static Seen g_seen[MAX_SEEN], g_fresh[MAX_SEEN];  /* the last scan's; the one coming in */
 static int g_nseen, g_nfresh;
 static bool g_bgscan;                           /* a scan while connected */
@@ -474,7 +474,7 @@ static void join(Seen *s, Known *k)
     memcpy(j + 8, g_rsn, 22);
     g_hs = 0;
     g_hs_msg1 = 0;
-    g_wrong_mic = false;
+    g_wrong_mic = g_mic3 = false;
     g_linkup = false;
     dev_send(j, sizeof j);
     g_state = ST_JOINING;
@@ -562,6 +562,7 @@ static void on_event(const uint8_t *e, int n)
         g_state = ST_CONNECTED;
         g_want[0] = 0;
         logf_("wifid: LINK UP -- WPA2 handshake done");
+        { Known *k = known_find(g_cur); if (k) k->refused = 0; }
         break;
     case 0x87:
         logf_("wifid: link down, reason %u", le16(e + 1));
@@ -580,7 +581,14 @@ static void tick(void)
     uint64_t t = now_ms();
     if ((g_state == ST_JOINING || g_state == ST_HANDSHAKE) && t > g_deadline) {
         Known *k = known_find(g_cur);
-        if (g_wrong_mic && k) {
+        /* message 1 again and again says our message 2 was refused: the
+           password, most likely -- or the card's link (the kernel tries
+           the join again more simply, drivers/net/iwx.c): a few times
+           before the password is given up; a wrong message 3 at once */
+        if (g_wrong_mic && k && !g_mic3 && ++k->refused < 4) {
+            snprintf(g_reason, sizeof g_reason, "the handshake did not finish");
+            logf_("wifid: \"%s\": message 2 refused (%u of 4 before the password counts as wrong)", g_cur, k->refused);
+        } else if (g_wrong_mic && k) {
             k->bad = true;
             snprintf(g_reason, sizeof g_reason, "wrong password");
             logf_("wifid: \"%s\": the password is wrong -- not trying it again until it is changed", g_cur);
